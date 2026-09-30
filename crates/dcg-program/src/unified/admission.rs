@@ -15,6 +15,8 @@ use super::classes::{self, rs1_height};
 use super::registry::{self, find_row, HEADER as DRP2_HEADER};
 use super::{no, plan, u16_at, u32_at, ADMISSION_STATE, PLAN_BINDING, REGISTRY_ROOT};
 use crate::hash;
+use crate::kernel::{ApplicationManifest, CommittedReplayWitness, LegacyFormBinding};
+use crate::pt2p::Pt2p;
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
     pubkey::Pubkey,
@@ -32,12 +34,158 @@ fn check_app_binding(
     }
 }
 
+/// Bound the largest opening the fixed revision-8 adapter can accept at this
+/// exact plan coordinate. This is shared by tag 160 and the fix-point backstop.
+pub(crate) fn app_opening_bound(
+    x: &Pt2p<'_>,
+    position: u32,
+    index: u32,
+    machine: u8,
+    manifest: &ApplicationManifest,
+) -> Result<usize, u32> {
+    let fail = || super::APP_KERNEL_UNAVAILABLE;
+    let entry = x.entry(position, index).map_err(|_| fail())?;
+    let binding = manifest
+        .resolve_legacy_form(machine, entry.kernel_index)
+        .ok_or_else(fail)?;
+    // Every graph read on an app-bound legacy form must have an opening in
+    // this adapter. Silently ignoring an extra read would leave a planned
+    // predecessor outside the coordinate-bound ARW1/RWP1 witness.
+    if entry.read_count as usize != binding.input_routes.len() {
+        return Err(fail());
+    }
+    let consumer_bytes = ApplicationManifest::max_arw1_bytes(binding).ok_or_else(fail)?;
+    if consumer_bytes > CommittedReplayWitness::MAX_WITNESS_BYTES {
+        return Err(fail());
+    }
+    if binding.input_routes.is_empty() {
+        return Ok(consumer_bytes);
+    }
+    if binding.input_routes.len() != 1 || binding.input_spans.len() != 1 {
+        return Err(fail());
+    }
+
+    let coordinate = x.coordinate(position, index).map_err(|_| fail())?;
+    let route_binding = binding.input_routes[0];
+    if route_binding.length == 0 {
+        return Err(fail());
+    }
+    let input_end = route_binding
+        .offset
+        .checked_add(route_binding.length)
+        .ok_or_else(fail)?;
+    if input_end > binding.input_spans[0].max_bytes {
+        return Err(fail());
+    }
+    let target = entry;
+    if route_binding.ordinal >= target.read_count {
+        return Err(fail());
+    }
+    let route = x
+        .route(&target, route_binding.ordinal)
+        .map_err(|_| fail())?;
+    if route.direction != 0
+        || route.binding_kind != 1
+        || route.producer_position != position
+        || route.byte_length < input_end
+    {
+        return Err(fail());
+    }
+    let producer = x
+        .entry(position, route.producer_entry)
+        .map_err(|_| fail())?;
+    let producer_coordinate = x
+        .coordinate(position, route.producer_entry)
+        .map_err(|_| fail())?;
+    if producer_coordinate.segment != coordinate.segment
+        || producer_coordinate.local >= coordinate.local
+    {
+        return Err(fail());
+    }
+    let producer_binding = manifest
+        .resolve_legacy_form(machine, producer.kernel_index)
+        .ok_or_else(fail)?;
+    let producer_route_ordinal = producer
+        .read_count
+        .checked_add(route.producer_write_ordinal as u16)
+        .ok_or_else(fail)?;
+    let producer_route = x
+        .route(&producer, producer_route_ordinal)
+        .map_err(|_| fail())?;
+    if producer_route.direction != 1
+        || producer_route.region_id != route.region_id
+        || producer_route.effective_offset != route.effective_offset
+        || producer_route.byte_length != route.byte_length
+        || producer_binding.claimed_output_bytes as u32 != route.byte_length
+    {
+        return Err(fail());
+    }
+
+    let segment_index = (0..x.segment_count)
+        .find(|&i| {
+            x.segment_row(position, i as usize)
+                .is_ok_and(|row| row.0 == coordinate.segment)
+        })
+        .ok_or_else(fail)?;
+    let entries = x
+        .segment_row(position, segment_index as usize)
+        .map_err(|_| fail())?
+        .1;
+    let height = if entries <= 1 {
+        0usize
+    } else {
+        (32 - (entries - 1).leading_zeros()) as usize
+    };
+    let producer_bytes = ApplicationManifest::max_arw1_bytes(producer_binding).ok_or_else(fail)?;
+    let complete = consumer_bytes
+        .checked_add(14)
+        .and_then(|n| n.checked_add(producer_bytes))
+        .and_then(|n| n.checked_add(32usize.checked_mul(height)?))
+        .ok_or_else(fail)?;
+    if complete > CommittedReplayWitness::MAX_WITNESS_BYTES {
+        return Err(fail());
+    }
+    Ok(complete)
+}
+
+fn validate_app_bound_class(
+    x: &Pt2p<'_>,
+    key: classes::ClassKey,
+    form: u16,
+    machine: u8,
+    _binding: &LegacyFormBinding,
+    manifest: &ApplicationManifest,
+) -> Result<(), u32> {
+    let fail = || super::APP_KERNEL_UNAVAILABLE;
+    match key {
+        classes::ClassKey::Base(old) => {
+            // Base classes can be absent in replaced windows. Check every
+            // extant instance so a position-specific producer or path height
+            // cannot become an executor timeout after admission.
+            for position in 0..x.position_count {
+                if let Some(index) = x.old_to_new(old, position).map_err(|_| fail())? {
+                    let entry = x.entry(position, index).map_err(|_| fail())?;
+                    if entry.kernel_index == form {
+                        app_opening_bound(x, position, index, machine, manifest)?;
+                    }
+                }
+            }
+        }
+        // This adapter is bound to the frozen legacy-form rows. Generated
+        // forms do not have a compatible coordinate contract yet.
+        classes::ClassKey::Gen { .. } => return Err(fail()),
+    }
+    Ok(())
+}
+
 pub const HEADER: usize = 192;
 #[cfg(feature = "revision-7")]
 pub const VERSION: u16 = 2;
 #[cfg(feature = "revision-8")]
 pub const VERSION: u16 = 3;
 pub const MAX_STEP: u16 = 256;
+const FLAG_COMPLETE: u16 = 1;
+const FLAG_APP_BOUND: u16 = 2;
 
 pub fn bytes(classes: u32) -> usize {
     HEADER + (classes as usize).div_ceil(8)
@@ -56,6 +204,7 @@ pub struct View {
     pub n_max: u32,
     pub rs1_height: u8,
     pub complete: bool,
+    pub app_bound: bool,
     pub payer: [u8; 32],
 }
 
@@ -71,7 +220,7 @@ pub fn view(program: &Pubkey, account: &AccountInfo, popcount: bool) -> Result<V
     if raw.len() < HEADER
         || raw[..4] != *b"DEA2"
         || u16_at(&raw, 4, ADMISSION_STATE)? != VERSION
-        || u16_at(&raw, 6, ADMISSION_STATE)? & !1 != 0
+        || u16_at(&raw, 6, ADMISSION_STATE)? & !(FLAG_COMPLETE | FLAG_APP_BOUND) != 0
         || raw[157..160] != [0; 3]
         || (VERSION == 2 && raw[160..192] != [0; 32])
         || (VERSION == 3 && raw[160..192] == [0; 32])
@@ -90,7 +239,8 @@ pub fn view(program: &Pubkey, account: &AccountInfo, popcount: bool) -> Result<V
         admitted: u32_at(&raw, 148, ADMISSION_STATE)?,
         n_max: u32_at(&raw, 152, ADMISSION_STATE)?,
         rs1_height: raw[156],
-        complete: u16_at(&raw, 6, ADMISSION_STATE)? & 1 != 0,
+        complete: u16_at(&raw, 6, ADMISSION_STATE)? & FLAG_COMPLETE != 0,
+        app_bound: u16_at(&raw, 6, ADMISSION_STATE)? & FLAG_APP_BOUND != 0,
         payer: if VERSION == 3 {
             raw[160..192].try_into().unwrap()
         } else {
@@ -245,6 +395,7 @@ pub fn step_with_manifest(
     }
     plan::bind_pt2s(program, &accounts[2], &accounts[4], &accounts[5], None)?;
     let mut set: Vec<u32> = Vec::with_capacity(count as usize);
+    let mut app_bound = false;
     {
         let s = accounts[2].try_borrow_data()?;
         if hash::sha256(&[&s]) != v.pt2s_sha256 {
@@ -272,6 +423,15 @@ pub fn step_with_manifest(
             if let Some(shape) = classes::class_shape(&x, key).map_err(|_| no(PLAN_BINDING))? {
                 if let Some(manifest) = manifest {
                     check_app_binding(manifest, machine_selector, shape.form)?;
+                    if let Some(machine) = machine_selector {
+                        if let Some(binding) = manifest.resolve_legacy_form(machine, shape.form) {
+                            validate_app_bound_class(
+                                &x, key, shape.form, machine, binding, manifest,
+                            )
+                            .map_err(no)?;
+                            app_bound = true;
+                        }
+                    }
                 }
                 let row = find_row(rows, shape.form).map_err(no)?;
                 let hooks: &dyn crate::compatibility::ApplicationHooks = manifest
@@ -292,9 +452,14 @@ pub fn step_with_manifest(
         admitted += 1;
     }
     raw[148..152].copy_from_slice(&admitted.to_le_bytes());
-    if admitted == v.base_classes + v.generated_classes {
-        raw[6..8].copy_from_slice(&1u16.to_le_bytes());
+    let mut flags = u16_at(&raw, 6, ADMISSION_STATE)?;
+    if app_bound {
+        flags |= FLAG_APP_BOUND;
     }
+    if admitted == v.base_classes + v.generated_classes {
+        flags |= FLAG_COMPLETE;
+    }
+    raw[6..8].copy_from_slice(&flags.to_le_bytes());
     Ok(())
 }
 

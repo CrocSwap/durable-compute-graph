@@ -72,13 +72,23 @@ standalone image has an empty app manifest and no test kernel.
 Each application binding names the versioned input schema, input byte limit,
 kernel semantic version, ABI version, and replay mode. A canonical `ARW1`
 witness carries the disputed coordinate's input slices and claimed output. Its
-`app-replay-leaf/1` digest is committed into the existing ROOT_ONLY segment and
-position trees. At the revision-8 fix-point, DCG checks the witness against the
-proved leaf and invokes only the statically linked app kernel. A malformed
-challenger preimage loses as an unproved challenge; invalid committed input or
-a wrong output rules against the executor immediately. `AccountSpanBinding`
-remains available for separately authenticated account views, but it is not
-the source of a replay input in this app path.
+`app-replay-leaf/2` digest is committed into the existing ROOT_ONLY segment and
+position trees; an optional bounded `RWP1` suffix opens one same-position,
+same-segment producer for a routed input. Tag 169 may use a challenger opening
+as a fast path, but an app-bound fix-point without a ruling remains in RESPOND
+until the executor opens the leaf through tags 183 and 184. A malformed or
+unopenable challenger preimage cannot convict the executor. Invalid committed
+input or a wrong output rules against the executor with code 799 or 800; a
+successful replay rules for the executor. Descend to the first divergent leaf:
+if a consumer correctly used a fabricated producer output, challenge the
+producer. A route-free form must have no plan read routes, and a routed form
+must account for the instance's only read route. Admission refuses unsupported
+producer provenance or any honest opening that exceeds the 900-byte witness
+cap. App-bound DCM2
+records freeze the static application binding identity; if it changes during a
+challenge, the challenge ends neutrally and the challenger bond is refunded.
+`AccountSpanBinding` remains available for separately authenticated account
+views, but it is not the source of a replay input in this app path.
 
 ## 4. Run the extracted handler tests
 

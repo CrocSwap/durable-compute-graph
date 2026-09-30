@@ -108,7 +108,7 @@ pub fn process_instruction_with_manifest(
             data,
             manifest.decision_routes,
         ),
-        131 | 132 | 156..=169 | 172..=178 | 182..=187 | 197 => {
+        131 | 132 | 156..=169 | 172..=178 | 183..=187 | 197 => {
             unified::process_with_manifest(program_id, accounts, data, manifest)
                 .unwrap_or(Err(ProgramError::InvalidInstructionData))
         }
@@ -144,6 +144,15 @@ mod application_manifest_tests {
     #[test]
     fn compiled_application_manifest_is_valid() {
         assert_eq!(super::application_manifest().validate(), Ok(()));
+    }
+
+    #[cfg(feature = "revision-8")]
+    #[test]
+    fn revision8_tag_182_matches_basanos_unsupported_tag_result() {
+        assert_eq!(
+            super::process_instruction(&solana_program::pubkey::Pubkey::new_unique(), &[], &[182]),
+            Err(solana_program::program_error::ProgramError::InvalidInstructionData)
+        );
     }
 }
 

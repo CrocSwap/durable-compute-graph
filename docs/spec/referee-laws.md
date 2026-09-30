@@ -1,17 +1,12 @@
 # Referee laws
 
-Status: **designed contract**, assessed against `durable-compute-graph` commit
-`4d1446f` (2026-09-30). This document adds no instruction or wire behavior.
-The `dcg-repo/docs/spec/` directory at that commit contains only its license;
+Status: **designed contract**, assessed against the DCG revision-8 source at
+`4d1446f` plus the app-bound replay changes described in
+[`app-bound-replay-v1.md`](app-bound-replay-v1.md). This page is not a machine
+spec. The baseline `dcg-repo/docs/spec/` directory contains only its license;
 the README and Rust comments refer to `docs/spec/dcg-unified-v1.md`, which is
-not present in the DCG checkout. The Basanos copy describes older revision-7
-semantics. Treat this page as a proposed invariant list for the revision-8
-referee, and reconcile it with a checked-in, versioned machine spec before
-claiming the laws are normative.
-
-`pending seam-fix-2` marks a law whose current status or testability depends on
-the in-flight change that moves application replay into an executor `RESPOND`
-step. No such core change is included in this checkout.
+not present in this checkout. App-bound behavior is specified separately, and
+the current SBF image has not been rebuilt and verified against these changes.
 
 ## Model and notation
 
@@ -46,15 +41,15 @@ the revision-8 Rust source at the commit above, not to a deployed image.
 
 | Law | Current Rust | Bugs this law catches | Existing harness coverage |
 |---|---|---|---|
-| Honest party wins | **No** — pending seam-fix-2 | Executor wins without opening; unprovable leaf; malformed challenge that strands an honest party | No honest app-replay role-order or silence case |
+| Honest party wins | **App path implemented; SBF unverified** | Executor wins without opening; unprovable leaf; malformed challenge that strands an honest party | Focused native app-replay and timeout cases; see §1 |
 | Conservation | **Unknown** | Unexplained bond, escrow, fee, or rent delta | Partial setup/close and malformed-refusal balance checks |
 | Authority | **Yes**, for the reviewed revision-8 paths | Tag 98/146 writable-account takeover | Malformed tag-146 attempts, wrong-authority close, and unsupported-tag refusal |
-| Binding | **No** — pending seam-fix-2 | Missing predecessor binding; stale RUN_BINDING/package digest | No predecessor substitution or stale-digest adversarial lifecycle |
-| Termination | **No** | Timeout-wins rule missing at app replay; unreachable final leaf; unbounded bond retry | Only terminal close/replay refusals; no referee timeout completion |
-| Determinism | **No** for document bond winner; pending seam-fix-2 for replay | Caller/order-dependent ruling or settlement | Does not permute competing valid challenges or submitter order |
+| Binding | **App route path implemented; SBF unverified** | Missing predecessor binding; stale RUN_BINDING/package digest | Native producer-route and first-divergent-leaf cases; see §4 |
+| Termination | **No for full account finality** | Unreachable leaf; unbounded bond retry | App RESPOND timeout is covered natively; custom settlement retry remains unbounded |
+| Determinism | **No** for document bond winner | Caller/order-dependent ruling or settlement | Does not permute competing valid challenges or submitter order |
 | Close safety | **Yes** on the reviewed revision-8 close paths | Closing a live dependency; rent paid to closer instead of named payer | PT1X rent refund, wrong-authority refusal, double-close, and reinitialization refusal |
 
-## 1. Honest party wins — pending seam-fix-2
+## 1. Honest party wins
 
 **Plain English.** A party that supplies the correct protocol data and takes
 every required turn on time never loses because the other party lies, omits an
@@ -94,20 +89,28 @@ executor (799). It catches the earlier case where malformed replay input
 refuses instead of deciding, leaving a timeout route that rewards the
 executor.
 
-**Current Rust: No.** `challenge.rs::reveal_with_manifest` accepts a `k=0`
-opening with no witness bytes; `fix_point` treats absent or malformed
-challenger-supplied preimage as proof failure 734 and records an executor win.
-The executor is the signer on tag 168. The seam re-review identifies this
-case as critical and says no SBF scenario covers it. The same review identifies
-leaves that cannot be convicted without a decodable preimage. These branches
-break the law directly.
+**Current Rust: app-bound path implemented, SBF unverified.** An app-bound
+fix-point that has no ruling remains in RESPOND. A matching executor opening
+that replays successfully wins; authenticated malformed input or a wrong
+output convicts the executor; a withheld opening loses at timeout. Tags 183
+and 184 accept the exact deadline slot, and tag 132 refuses at that slot and
+times out only after it. A changed app identity ends neutrally. Admission
+checks that every bound coordinate has a route the adapter can open and a
+complete witness no larger than the staging cap. These rules are designed to
+satisfy this law for admitted app-bound coordinates; one native processor
+attempt reached the app replay ruling and settlement path, but no rebuilt SBF
+image has verified these rules.
 
-**Existing harness.** The lifecycle property harness sends malformed
-instructions and confirms atomic refusal. The artifact-backed
-`unified_v8_document.rs` exercises honest and malicious ByteSum examples, but
-neither harness tests an executor that withholds the opening, a correct
-challenger against an undecodable leaf, or both role orders with silence.
-Those app-replay cases are **pending seam-fix-2**.
+**Existing harness.** The source tests in `unified_v8_document.rs` cover an
+honest executor, a malicious challenger, malformed and withheld openings,
+identity change, and both replay outcomes. Only
+`rev8_bytesum_matching_honest_fastpath_enters_respond_sbf` was attempted with
+the native processor in this round; it reached the executor-win ruling and
+settlement handlers but failed its old final balance assertion. The corrected
+assertion and the other source tests remain unrun. The same focused cases have
+not been run against a freshly built SBF image. Cross-position, cross-segment,
+document-input, multi-route, and non-app-producer admission cases also remain
+without individual handler tests.
 
 ## 2. Conservation
 
@@ -215,7 +218,7 @@ it includes a wrong-authority PT1X close and scans unsupported tags. It does
 not vary the transaction fee payer across every successful handler or prove
 all write sets by generated source analysis.
 
-## 4. Binding — pending seam-fix-2
+## 4. Binding
 
 **Plain English.** A step opening proves the exact committed leaf at the exact
 coordinate, and its inputs are the outputs that the committed graph says feed
@@ -228,7 +231,7 @@ bytes; and `B=(routes, geometry, payloads)` the base template accounts. Then:
 
 ```text
 leaf_path(D, q, opened_leaf) = R_D
-replay_leaf = H("app-replay-leaf/1", D, q, app/kernel/mode/form identity,
+replay_leaf = H("app-replay-leaf/2", D, q, app/kernel/mode/form identity,
                 canonical_inputs, claimed_output)
 canonical_inputs(q) = ordered predecessor outputs named by the sealed graph
 package_digest = SHA256(P)
@@ -247,26 +250,26 @@ canonical encoding and domain named by the applicable machine spec.
 predecessor output, the `RUN_BINDING`/stale package digest failure, and reuse
 of a valid witness at another coordinate or document.
 
-**Current Rust: No overall.** The exact-coordinate app leaf digest includes
-the descriptor, `(p,s,i)`, app/kernel/mode/form identity, and ARW1 witness;
-`init_v8` hashes the sealed PT2S and compares it to the admission and the
-digest-keyed DTA1/DTU1 records, and checks the PT2S base digests. Those checks
-address the package/template sublaw in the inspected source. The higher-level
-step law still fails: the seam re-review found no binding of opened inputs to
-predecessor outputs/routes, allowing an executor to commit `X'` and the
-correct `K(X')`. That finding is marked **pending seam-fix-2**. The checked-in
-DCG checkout has no versioned spec or golden that independently settles the
-stale-digest question; the source checks are evidence, not a cross-version
-conformance result.
+**Current Rust: app route path implemented, SBF unverified.** The exact
+coordinate leaf digest includes the descriptor, `(p,s,i)`, app/kernel/mode
+identity, and ARW1 bytes after stripping the RWP1 suffix. Admission refuses
+routes that are not a single supported bound read from an earlier same-segment
+producer with a matching write. Tag 184 proves the producer leaf into the
+saved segment root and compares the routed bytes to the consumer input. The
+producer's computation remains a separate challenge, so clients must challenge
+the first divergent leaf. `init_v8` also hashes the sealed PT2S and compares
+the digest-keyed DTA1/DTU1 records and PT2S base digests. The source and native
+handlers implement these checks; current SBF conformance remains unverified.
 
-**Existing harness.** The lifecycle property harness exercises wrong account
-addresses/owners and malformed inputs, but it does not substitute predecessor
-outputs while keeping an otherwise valid step opening, nor mutate an admitted
-package digest in a complete document. The app-replay SBF scenarios listed in
-the seam experiment do not cover findings 1–4. Predecessor binding remains
-**pending seam-fix-2**.
+**Existing harness.** `rev8_bytesum_fake_input_against_predecessor_loses_sbf`
+checks that a consumer's well-formed input differing from the proved producer
+bytes convicts the executor. `rev8_bytesum_first_divergent_leaf_protects_honest_consumer_sbf`
+shows that a consumer computed correctly from fabricated producer bytes wins
+and that challenging that producer exposes its wrong output. These ran under
+the native processor; no current SBF run or separate stale-package mutation
+test is claimed.
 
-## 5. Termination — pending seam-fix-2
+## 5. Termination
 
 **Plain English.** Every open dispute and document has a finite path to a
 terminal status. After a response deadline passes, any signer can submit the
@@ -299,22 +302,20 @@ cheating executor win, an undecodable leaf that cannot be convicted, and any
 transition whose failure leaves no permissionless next step. It also catches
 an unbounded bond retry if that escrow is included in the claimed final state.
 
-**Current Rust: No for full account finality.** Ordinary revision-8 challenge
-rounds write deadlines and tags 132/131/172/185 provide permissionless timeout,
-settle, and close paths. But `bond.rs` explicitly gives tag 187 no deadline:
-a custom settlement program can refuse forever, leaving the bond escrow live
-and the result tombstone unable to finish its retention close. Also, the app
-replay witness-withholding path gives the executor a winning fix-point instead
-of the timeout-required by this law. The replay part is **pending
-seam-fix-2**. The liveness claim must either bound tag 187 with a deterministic
-fallback or explicitly narrow “final state” to the already-fixed ruling and
-document close.
+**Current Rust: No for full account finality.** App RESPOND has a bounded
+900-byte staging state, exact deadlines, a permissionless timeout, and
+tag-131 settlement. Tag 172 can close the document once its own deadlines and
+dependency checks pass. However, tag 187 has no deadline: a custom settlement
+program can refuse indefinitely, leaving the bond escrow live and the result
+tombstone unable to finish its retention close. This law therefore remains
+false for the full account lifecycle. A separate timeout test exercises the
+app dispute path but does not resolve custom-settlement liveness.
 
-**Existing harness.** The lifecycle harness checks that a successfully closed
-unpublished PT1X cannot be double-closed or reinitialized at the same account
-state. It does not drive a valid DCR1 through deadline timeout, settlement,
-document close, result retention, and custom escrow retry. The seam review says
-none of the SBF scenarios reaches the disputed omission/input cases.
+**Existing harness.** The baseline lifecycle harness does not drive a valid
+DCR1 through timeout, settlement, document close, result retention, and custom
+escrow retry. The new app challenge cases exercise timeout, settlement, and
+document close with the native processor. Result retention and custom escrow
+retry remain outside those cases; the current SBF image was not rebuilt.
 
 ## 6. Determinism
 
@@ -336,20 +337,19 @@ tie-break independent of landing order.
 **Bugs caught.** This catches order-dependent verdicts, user-selected or
 caller-selected replay inputs, and first-submitter-wins payout state.
 
-**Current Rust: No for the full document payout record; app replay is also
-pending seam-fix-2.** A single DCR1 fix-point uses committed bytes and the
-selected static kernel, but the seam re-review shows its executor/challenger
-opening distinction can change who gets to supply the witness. At document
-settlement, `record_winner_if_unset` records the first settled conviction
-winner. With multiple valid challenger wins, reordering tag 131 settlements
-can change the DCM2 recorded bond winner and thus the bond split recipient.
-That is an explicit first-write rule, not an order-independent tie-break.
+**Current Rust: No for the full document payout record.** A single DCR1
+fix-point uses the admitted static identity and committed bytes; the executor
+supplies the required RESPOND opening. At document settlement,
+`record_winner_if_unset` records the first settled conviction winner. With
+multiple valid challenger wins, reordering tag 131 settlements can change the
+DCM2 recorded bond winner and thus the bond split recipient. That is an
+explicit first-write rule, not an order-independent tie-break.
 
 **Existing harness.** The lifecycle property harness uses deterministic
 malformed input seeds and checks refusal atomicity. It does not permute the
 same honest/malicious dispute through both role orders, change fee payer, or
-settle multiple winning challenges in opposite orders. The replay-order
-requirement is **pending seam-fix-2**.
+settle multiple winning challenges in opposite orders. App replay tests cover
+one challenge at a time; multi-challenger ordering remains untested.
 
 ## 7. Close safety
 

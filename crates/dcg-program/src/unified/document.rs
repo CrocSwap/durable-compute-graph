@@ -35,7 +35,7 @@ use super::terms::{Terms, Terms2, TERMS_BYTES, TERMS_BYTES_V2};
 use super::{
     admission, d32, no, plan, u16_at, u32_at, u64_at, ADMISSION_STATE, APPEND_ORDER,
     CL_AFTER_FINAL, CL_AUTHORITY, CL_COORDINATE, CL_MALFORMED, CL_MISSING, CL_OVERFLOW, CL_ROOT,
-    EPOCH, PLAN_BINDING, REGISTRY_ROOT,
+    DCR1_BAD, EPOCH, PLAN_BINDING, REGISTRY_ROOT,
 };
 use crate::hash;
 use crate::pt2p::Pt2p;
@@ -72,6 +72,9 @@ pub const BINDING_AT_V8: usize = 1_978;
 pub const BINDING_BYTES_V8: usize = 196;
 pub const ABANDON_DEADLINE_AT: usize = 2_174;
 pub const OPTION_REGION_AT: usize = 2_182;
+/// App-bound revision-8 documents append this fixed 64-byte ARI1 identity
+/// after the ordinary option table. Non-app-bound DCM2 v7 bytes stay exact.
+pub const APP_IDENTITY_BYTES: usize = 64;
 /// The four descriptor PDA bumps needed by the revision-8 close. The six
 /// formerly reserved bytes at 78..84 now hold DCM2, DPR2, DFS2 and bond-escrow
 /// bumps followed by two zero bytes. DCR2 stores its own bump at 410.
@@ -823,6 +826,17 @@ fn document_v8_inner(
     bump: Option<u8>,
 ) -> Result<[u8; 32], ProgramError> {
     let raw = account.try_borrow_data()?;
+    let option_end = raw
+        .get(BINDING_AT_V8 + 151)
+        .and_then(|count| 4usize.checked_mul(*count as usize))
+        .and_then(|options| OPTION_REGION_AT.checked_add(options));
+    let identity_end = option_end.and_then(|end| end.checked_add(APP_IDENTITY_BYTES));
+    let app_identity_present = option_end.is_some_and(|end| raw.len() == end + APP_IDENTITY_BYTES);
+    let identity_valid = !app_identity_present
+        || identity_end.is_some_and(|end| {
+            raw.get(end - APP_IDENTITY_BYTES..end)
+                .is_some_and(|identity| identity[..4] == *b"ARI1" && identity[36..] == [0; 28])
+        });
     if account.owner != program
         || (writable && !account.is_writable)
         || raw.len() < OPTION_REGION_AT
@@ -830,7 +844,8 @@ fn document_v8_inner(
         || u16_at(&raw, 4, code)? != 7
         || u16_at(&raw, 6, code)? & (FLAG_ROOT_ONLY | FLAG_SEALED) != FLAG_ROOT_ONLY | FLAG_SEALED
         || raw[PDA_BUMPS_RESERVED_AT..84] != [0; 2]
-        || raw.len() != OPTION_REGION_AT + 4 * raw[BINDING_AT_V8 + 151] as usize
+        || !(option_end == Some(raw.len()) || app_identity_present)
+        || !identity_valid
     {
         return Err(no(code));
     }
@@ -848,6 +863,32 @@ fn document_v8_inner(
         return Err(no(code));
     }
     Ok(d)
+}
+
+/// App-level ARI1 captured by UnifiedInit. Its digest commits the application
+/// id/version and the complete static form-binding table; the binding-specific
+/// suffix in each DCR1 ARI1 is filled at the challenged fix-point.
+pub fn application_identity_v8(
+    raw: &[u8],
+) -> Result<Option<[u8; APP_IDENTITY_BYTES]>, ProgramError> {
+    let option_count = *raw.get(BINDING_AT_V8 + 151).ok_or(no(DCR1_BAD))? as usize;
+    let option_bytes = 4usize.checked_mul(option_count).ok_or(no(DCR1_BAD))?;
+    let option_end = OPTION_REGION_AT
+        .checked_add(option_bytes)
+        .ok_or(no(DCR1_BAD))?;
+    if raw.len() == option_end {
+        return Ok(None);
+    }
+    if raw.len() != option_end + APP_IDENTITY_BYTES {
+        return Err(no(DCR1_BAD));
+    }
+    let identity: [u8; APP_IDENTITY_BYTES] = raw[option_end..option_end + APP_IDENTITY_BYTES]
+        .try_into()
+        .map_err(|_| no(DCR1_BAD))?;
+    if identity[..4] != *b"ARI1" || identity[36..] != [0; 28] {
+        return Err(no(DCR1_BAD));
+    }
+    Ok(Some(identity))
 }
 
 /// The peak count byte of a DCM2 v7 (528), and its peaks at `PEAKS_AT_V8`.
@@ -1091,14 +1132,25 @@ pub fn init_with_hooks(
     data: &[u8],
     hooks: &dyn crate::compatibility::ApplicationHooks,
 ) -> ProgramResult {
+    init_with_manifest(program, accounts, data, hooks, None)
+}
+
+pub fn init_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+    manifest: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
     #[cfg(feature = "revision-7")]
     {
+        let _ = manifest;
         let _ = hooks;
         init_v7(program, accounts, data)
     }
     #[cfg(feature = "revision-8")]
     {
-        init_v8_with_hooks(program, accounts, data, hooks)
+        init_v8_with_application(program, accounts, data, hooks, manifest)
     }
 }
 
@@ -1383,6 +1435,17 @@ pub fn init_v8_with_hooks(
     data: &[u8],
     hooks: &dyn crate::compatibility::ApplicationHooks,
 ) -> ProgramResult {
+    init_v8_with_application(program, accounts, data, hooks, None)
+}
+
+#[cfg(feature = "revision-8")]
+pub fn init_v8_with_application(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+    application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
     const FIXED: usize = 1 + TERMS_BYTES_V2 + BINDING_BYTES_V8 + 96 + 2;
     if accounts.len() != 14 || data.len() < FIXED {
         return Err(no(CL_MALFORMED));
@@ -1431,7 +1494,18 @@ pub fn init_v8_with_hooks(
     let body = &data[FIXED..FIXED + body_len];
     let options = &data[FIXED + body_len..];
     let pt2s_key = pt2s.key.to_bytes();
-    let (descriptor, p_count, s_count, h, total, pt2s_sha, reg_root, binding, documents) = {
+    let (
+        descriptor,
+        p_count,
+        s_count,
+        h,
+        total,
+        pt2s_sha,
+        reg_root,
+        binding,
+        documents,
+        app_identity,
+    ) = {
         let s = pt2s.try_borrow_data()?;
         let (r_bytes, g_bytes) = (routes.try_borrow_data()?, geometry.try_borrow_data()?);
         let x = plan::view(&s, &r_bytes, &g_bytes, &[], None)?;
@@ -1484,6 +1558,18 @@ pub fn init_v8_with_hooks(
         {
             return Err(no(PLAN_BINDING));
         }
+        let app_identity = if adm.app_bound {
+            let application = application.ok_or(no(super::APP_KERNEL_UNAVAILABLE))?;
+            application
+                .validate()
+                .map_err(|_| no(super::APP_KERNEL_UNAVAILABLE))?;
+            let mut identity = [0u8; APP_IDENTITY_BYTES];
+            identity[..4].copy_from_slice(b"ARI1");
+            identity[4..36].copy_from_slice(&application.admission_identity_digest());
+            Some(identity)
+        } else {
+            None
+        };
         // 4. The DFS2 body and the counts.
         let fams = parse_families(&fams_raw).map_err(no)?;
         check_family_plan(&x, &fams).map_err(no)?;
@@ -1547,10 +1633,20 @@ pub fn init_v8_with_hooks(
             }
         }
         (
-            descriptor, p_count, s_count, h, total, pt2s_sha, reg.root, binding, documents,
+            descriptor,
+            p_count,
+            s_count,
+            h,
+            total,
+            pt2s_sha,
+            reg.root,
+            binding,
+            documents,
+            app_identity,
         )
     };
-    let dcm2_bytes = OPTION_REGION_AT + 4 * binding.option_count as usize;
+    let option_end = OPTION_REGION_AT + 4 * binding.option_count as usize;
+    let dcm2_bytes = option_end + app_identity.map_or(0, |_| APP_IDENTITY_BYTES);
     let (_, doc_bump) = document_address(program, &descriptor);
     let (_, pos_bump) = position_page_address(program, &descriptor);
     let (_, fam_bump) = family_slots_address(program, &descriptor);
@@ -1643,7 +1739,10 @@ pub fn init_v8_with_hooks(
         // The PRODUCTION deadline (spec §1.3), pushed forward by every landing.
         doc[ABANDON_DEADLINE_AT..ABANDON_DEADLINE_AT + 8]
             .copy_from_slice(&abandon_deadline.to_le_bytes());
-        doc[OPTION_REGION_AT..dcm2_bytes].copy_from_slice(options);
+        doc[OPTION_REGION_AT..option_end].copy_from_slice(options);
+        if let Some(identity) = app_identity {
+            doc[option_end..option_end + APP_IDENTITY_BYTES].copy_from_slice(&identity);
+        }
     }
     {
         let mut pos = dpr2.try_borrow_mut_data()?;

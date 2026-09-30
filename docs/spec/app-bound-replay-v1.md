@@ -1,0 +1,159 @@
+# App-bound replay v1
+
+Status: **designed protocol entry** for revision 8. The mechanism uses the
+revision-8 DCM2 v7 and DCR1 v6 formats. It adds no dynamic program loading.
+Application code and replay kernels are statically linked, and their semantic
+identity must be versioned as specified below.
+
+## 1. Admission
+
+An application manifest used for admission MUST pass `ApplicationManifest::validate`.
+Until a later app-bound replay version defines multi-input routes, each legacy
+form binding MUST declare at most one input route. A route-free form MUST have
+zero plan read routes; a one-route form MUST account for the instance's only
+plan read route. Extra or unbound reads are refused. Every class whose form is
+bound by the manifest MUST be checked against the sealed plan at tag 160.
+Admission rejects with code 799 if any instance cannot be opened by the tag-184
+adapter, including when:
+
+- the consumer's route count is unsupported or its route is not a bound read;
+- the route is a document input, crosses a position or segment, or names a
+  producer that is not earlier in the same segment;
+- no application binding exists for the producer;
+- the producer's write does not match the read's region, effective offset,
+  byte length, and declared output width; or
+- the maximum honest opening exceeds the staging cap.
+
+For a form binding `b`, the maximum ARW1 size is
+`ARW1_HEADER + Σ(SPAN_HEADER + input_span.max_bytes) + claimed_output_bytes`.
+For a route-free form, that is the complete opening. For one supported route,
+the maximum complete opening is:
+
+```text
+consumer_ARW1
++ 14                         RWP1 header
++ producer_ARW1
++ 32 × segment_path_height
+```
+
+The result MUST be at most 900 bytes. The producer's ARW1 may have zero input
+spans; this is a valid zero-span ARW1, not an empty byte string. A producer
+preimage in RWP1 opens its committed output leaf and route bytes. The producer
+is separately challenged at its own coordinate to test its computation.
+
+Each kernel's declared compute units MUST be at most
+`1,400,000 - 85,433 - 25,000 = 1,289,567`. Here 85,433 CU is the measured
+worst tag-184 adapter cost in the retained SBF cases from the Round 2 receipt,
+and 25,000 CU is the declared safety margin. These numbers constrain the
+manifest; they do not prove every app kernel's actual worst-case runtime.
+
+## 2. App identity
+
+Admission state DEA2 v3 uses flag bit 0 for complete and bit 1 for app-bound.
+If any admitted class uses an app form, UnifiedInit writes a 64-byte DCM2 v7
+extension after the option table:
+
+```text
+"ARI1" | admission_identity_digest[32] | zero[28]
+```
+
+The identity digest commits the application id and version plus the static
+form-to-kernel bindings, selected modes, input span declarations, and route
+declarations. An application or kernel implementation change MUST increment
+the application version or the kernel semantic version. A program upgrade
+that changes replay behavior without changing those versions is outside this
+identity guarantee and is invalid application versioning.
+
+At every app-bound fix-point, the current admission identity is compared with
+the DCM2 identity. A missing, newly bound, or changed identity cannot be used
+to convict either role: the challenge is ruled with winner byte 0 and cause 5
+(`APP_IDENTITY_CHANGED`), without setting DCM2's refuted flag or counter. Tag
+131 refunds the challenger's challenge bond and changes only the open-challenge
+count. If the app identity changes while an app-bound challenge is waiting in
+RESPOND, tag 132 uses the same neutral rule instead of treating silence as an
+executor timeout loss. The challenger receives no conviction or protocol bond
+pot, and the executor receives no challenge-bond transfer. This rule is safe
+for both parties because it records no computational finding under a replay
+identity different from the one admitted; the challenge is not evidence for
+either side.
+
+## 3. Leaf commitment and first divergence
+
+The leaf domain is `app-replay-leaf/2`; `/1` MUST NOT be reused. The leaf
+commits the descriptor, coordinate, app/kernel/mode identity, and canonical
+ARW1 bytes. If ARW1 carries an RWP1 suffix, `/2` hashes the ARW1 prefix and
+strips the complete suffix. RWP1 has this exact encoding:
+
+```text
+"RWP1" | route_ordinal:u16 | producer_local:u32 | path_height:u8 |
+reserved_zero:u8 | producer_ARW1_length:u16 | producer_ARW1 |
+producer_leaf_path[path_height][32]
+```
+
+The route proof authenticates a same-position, same-segment producer leaf
+against the saved segment root and checks that the exact routed byte slice
+equals the consumer's ARW1 input. It does not assert that the producer computed
+those bytes correctly.
+
+Clients MUST descend to the first divergent leaf. If a consumer correctly
+computed its output from a fabricated producer output, a challenge against the
+consumer is won by the executor. The challenger must instead challenge the
+producer; its app replay then tests whether the committed producer output is
+correct. A malformed or invalid challenger fast-path RWP1 does not rule against
+the executor and sends an otherwise admitted app-bound fix-point to RESPOND.
+
+## 4. DCR1 app opening state
+
+Revision-8 DCR1 v5 remains the compatibility format. An app-bound fix-point
+that enters RESPOND switches to DCR1 v6, still 8,192 bytes, and is non-terminal
+until tag 184, timeout, or a neutral identity rule. The relevant bytes are:
+
+| Bytes | Meaning while in app RESPOND |
+| --- | --- |
+| `170..172` | staged witness total `u16` |
+| `172..174` | staged prefix length `u16` |
+| `7040..7104` | DEV2 report; status 0 means admitted but pending |
+| `7104..7168` | saved 64-byte ARI1 ruling identity |
+| `7168..8068` | witness staging buffer, maximum 900 bytes |
+| `8068..8100` | saved segment root for the challenged consumer |
+
+While staging counters occupy `170..174`, DEV2 retains the fix-point entry
+index and form. Any terminal ruling restores the ordinary `t:u32 | form:u16`
+words at `170..176` after clearing the staging region.
+
+### Tag 183 — StageAppWitnessV1
+
+Data is exactly `tag:u8 | total:u16 | offset:u16 | chunk[]`. Accounts are
+DCR1 writable and executor signer. The total MUST be in `1..=900`, the chunk
+MUST be nonempty, and its end MUST not exceed total. Offset 0 starts or restarts
+staging and clears the prior buffer. Every other offset MUST equal the current
+staged prefix length and use the original total. Staging is permitted through
+the exact deadline slot; it is refused after the deadline.
+
+### Tag 184 — RespondAppWitnessV1
+
+Data is exactly the tag. Accounts are DCR1 writable, executor signer, DCM2,
+PT2S, base routes, base geometry, DRP2, and the PT1S index. The complete staged
+preimage MUST match the challenged `/2` leaf and pass the route proof. A
+matching opening whose kernel replay succeeds rules for the executor (winner
+1, code 0). An authenticated opening with invalid committed input or incorrect
+output rules for the challenger (winner 2, code 799 or 800). A missing,
+partial, or non-matching opening is refused without ending RESPOND; timeout
+then rules for the challenger. Tag 184 can rule only once.
+
+## 5. Fix-point behavior
+
+The route-tree fold and saved segment root are computed only for a selected
+app binding. On the default revision-8 compatibility path with no selected app
+binding, the original DCR1 v5 byte layout and fix-point tree fold remain in
+force. App-bound paths leave DEV2 status 0 while awaiting the executor.
+Revision 8 does not dispatch tag 182; its default result remains
+`InvalidInstructionData`.
+
+## 6. Compatibility boundary
+
+This entry does not change the DCM2 v7 base encoding, the default app-empty
+document length, or revision-8 golden bytes. The optional DCM2 ARI1 extension
+appears only on app-bound documents. DCR1 v5 app-empty behavior is unchanged.
+The new leaf domain `/2` applies only to app-bound replay leaves; all leaf
+builders and verifiers for that path MUST use it consistently.

@@ -205,9 +205,13 @@ fn process_inner(
         TAG_REGISTRY_FREEZE => registry::freeze(program, accounts, data),
         TAG_ADMISSION_BEGIN => admission::begin(program, accounts, data),
         TAG_ADMISSION_STEP => admission::step_with_manifest(program, accounts, data, manifest),
-        TAG_UNIFIED_INIT => {
-            document::init_with_hooks(program, accounts, data, application_hooks(manifest))
-        }
+        TAG_UNIFIED_INIT => document::init_with_manifest(
+            program,
+            accounts,
+            data,
+            application_hooks(manifest),
+            manifest,
+        ),
         TAG_LAND_POSITION_ROOTS => document::land_position_roots_with_hooks(
             program,
             accounts,
@@ -294,7 +298,7 @@ fn process_inner(
             return Some(if tag == crate::root_only_challenge::TAG_SETTLE {
                 challenge::settle_with_hooks(program, accounts, data, application_hooks(manifest))
             } else {
-                challenge::timeout_with_hooks(program, accounts, data, application_hooks(manifest))
+                challenge::timeout_with_manifest(program, accounts, data, manifest)
             });
         }
     }
@@ -304,9 +308,13 @@ fn process_inner(
         TAG_REGISTRY_FREEZE => registry::freeze(program, accounts, data),
         TAG_ADMISSION_BEGIN => admission::begin(program, accounts, data),
         TAG_ADMISSION_STEP => admission::step_with_manifest(program, accounts, data, manifest),
-        TAG_UNIFIED_INIT => {
-            document::init_with_hooks(program, accounts, data, application_hooks(manifest))
-        }
+        TAG_UNIFIED_INIT => document::init_with_manifest(
+            program,
+            accounts,
+            data,
+            application_hooks(manifest),
+            manifest,
+        ),
         TAG_LAND_POSITION_ROOTS => document::land_position_roots_with_hooks(
             program,
             accounts,
@@ -335,10 +343,6 @@ fn process_inner(
         TAG_RESPOND_APP_WITNESS => {
             challenge::respond_app_witness(program, accounts, data, manifest)
         }
-        // CloseResponseV5 is a revision-7-only path. Claim its tag so it cannot
-        // fall through to the legacy root-only dispatcher, but do not link the
-        // revision-7 reader into the revision-8 image.
-        TAG_CLOSE_RESPONSE => Err(no(DCR1_BAD)),
         TAG_CLOSE_RESULT => {
             result::close_result_with_hooks(program, accounts, data, application_hooks(manifest))
         }

@@ -129,7 +129,7 @@ identity, predecessor route opening, and the selected kernel replay. An
 incomplete or non-matching response is refused (730), so the executor must
 provide the correct opening before timeout. A digest-matching decode/kernel
 failure or input that differs from the proved predecessor output convicts the
-executor (799); a matching successful replay rules for the challenger.
+executor (799); a matching successful replay rules for the executor.
 
 The route adapter currently supports one declared input route whose producer
 is earlier in the same position and segment. Its RWP1 path proves the
@@ -160,8 +160,8 @@ the test's Compute Budget instruction.
 | Scenario | Tags | Measured payload sizes | Measured CU / result |
 | --- | --- | --- | --- |
 | Wrong-output optional fast path | 169 | 635 bytes | 218,143; executor loses with 800 |
-| Matching honest fast path | 169, 183, 184 | tag 169: 635 bytes; 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 220,672 enters RESPOND; tag 184: 79,792, challenger loses |
-| Honest executor defeats non-matching malicious challenger | 169, 183, 184 | tag 169: 635 bytes; 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 170,293 enters RESPOND; tag 184: 64,792, challenger loses |
+| Matching honest fast path | 169, 183, 184 | tag 169: 635 bytes; 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 220,672 enters RESPOND; tag 184: 79,792, executor wins |
+| Honest executor defeats non-matching malicious challenger | 169, 183, 184 | tag 169: 635 bytes; 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 170,293 enters RESPOND; tag 184: 64,792, executor wins |
 | Fake `[4,5,6]` input with its correct sum against proved `[1,2,3]` predecessor bytes | 169, 183, 184 | 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 172,550 enters RESPOND; tag 184: 70,468; executor loses with 799 |
 | Schema-invalid committed input | 169, 183, 184 | tag 169: 635 bytes; 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 223,291; tag 184: 85,433, executor loses with 799 |
 | Oversize executor witness | 169, 183 | 906-byte instruction carrying a declared 901-byte witness | tag 183: 3,972; refused with 730 |
@@ -200,3 +200,43 @@ check (586), so a valid singleton tag-168 fix-point with no witness remains
 guard before proof processing, but does not replace that missing singleton
 fixture. Cross-position/document-input route proofs, a validator run, and the
 full offline suite were also not tested.
+
+## Round 3 source status (2026-09-30)
+
+This round adds admission checks for every app-bound coordinate, the DCM2
+admission identity, the versioned `/2` leaf, and executor-owned tag-183/184
+RESPOND openings. Route declarations must now account for every plan read on
+the selected form: a route-free form has no plan reads, and a routed form has
+exactly one. The documented CU bound is 1,289,567 declared kernel CU
+(1,400,000 ceiling minus 85,433 measured tag-184 overhead minus a designed
+25,000-CU margin). This limit is a manifest constraint, not a measured bound
+for arbitrary kernels. Terminal app DCR1 records restore `t:u32 | form:u16`
+from DEV2 after using bytes 170..174 as staging counters. Revision 8 excludes
+tag 182 from its dispatcher, matching Basanos' `InvalidInstructionData` result.
+
+No fresh SBF image or SBF ProgramTest result was produced for this round. The
+previous image was built before the final test manifest was reduced to the
+single ByteSum kernel, so it is stale for this source and is not evidence for
+Round 3. The pinned SBF wrapper was stopped before its SBF link stage to keep
+the filesystem above the required 5-GiB free-space floor. Subsequent checks
+found less than 5 GiB free, and no build was run below that floor.
+
+The native ProgramTest run of
+`rev8_bytesum_matching_honest_fastpath_enters_respond_sbf` reached tag 184,
+ruled for the executor, rejected a duplicate tag 184, and settled tag 131.
+It then failed the old tag-172 balance assertion by 500,000 lamports: that
+fixture is not fully attested, so close correctly applies the withheld-document
+bond disposition to the incinerator. The assertion was changed to account for
+the executor refund and incinerator credit exactly, but the corrected test was
+not rerun because free space had crossed the stop threshold. New unit checks
+for multiple manifest routes and tag 182's revision-8 refusal were added but
+also remain unrun.
+
+The requested fresh SBF cases remain open: unsupported cross-segment,
+cross-position, document-input, multi-route, and non-app-producer admission;
+RWP1 path-height admission refusal; and app-bound singleton-segment tag-168
+k=0. A same-leaf two-challenger ProgramTest was added but not run.
+Exact-deadline staging/response/timeout, staging order/restart/signer, duplicate
+response, post-timeout response, first-divergent-leaf guidance, identity
+change, and the existing winner paths have source-test coverage, but Round 3
+SBF execution has not verified them.

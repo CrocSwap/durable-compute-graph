@@ -11370,6 +11370,13 @@ async fn commit_challenge_tree_with_route_witness(
     Vec<Vec<ChallengeNode>>,
     Vec<u8>,
 ) {
+    // This offline challenge fixture installs a complete DEA2 image directly
+    // rather than running tag 160. Mark the two app-bound rows exactly as the
+    // real app image's manifest-aware admission step would.
+    let mut adm = f.account(f.dea2).await;
+    let flags = u16_at(&adm, 6) | 2;
+    adm[6..8].copy_from_slice(&flags.to_le_bytes());
+    f.ctx.set_account(&f.dea2, &shared(owned(&f.program, adm)));
     let descriptor = f.descriptor(binding, &f.terms_raw, 16);
     let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
     let x = Pt2p::new(
@@ -11674,8 +11681,12 @@ fn app_replay_witness(schema_id: u32, input: &[u8], claimed_output: u64) -> Vec<
 }
 
 fn app_route_producer_witness() -> Vec<u8> {
+    app_route_producer_witness_with(&[1, 2, 3])
+}
+
+fn app_route_producer_witness_with(prefix: &[u8; 3]) -> Vec<u8> {
     let mut output = vec![0u8; 256];
-    output[..3].copy_from_slice(&[1, 2, 3]);
+    output[..3].copy_from_slice(prefix);
     let mut witness = Vec::with_capacity(12 + output.len());
     witness.extend_from_slice(b"ARW1");
     witness.extend_from_slice(&1u16.to_le_bytes());
@@ -11727,6 +11738,230 @@ async fn executor_opens_app_witness(f: &mut Fix, record: Pubkey, document: Pubke
     )
     .await
     .expect("tag 184 authenticates and replays the executor's opening");
+}
+
+async fn settle_and_close_standard_app_challenge(
+    f: &mut Fix,
+    record: Pubkey,
+    created: [Pubkey; 4],
+    descriptor: [u8; 32],
+    challenger_won: bool,
+    terms: &Terms2,
+) {
+    let third_party = Keypair::new();
+    f.ctx
+        .set_account(&third_party.pubkey(), &shared(system_funded()));
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let record_before = f.lamports(record).await;
+    let challenger_before = f.lamports(f.signer.pubkey()).await;
+    let executor_before = f.lamports(f.executor.pubkey()).await;
+    let document_before = f.lamports(created[0]).await;
+    let winner = if challenger_won {
+        f.signer.pubkey()
+    } else {
+        f.executor.pubkey()
+    };
+    let policy_winner = if challenger_won {
+        f.signer.pubkey()
+    } else {
+        incinerator::ID
+    };
+    send_fresh_with(
+        &mut f.ctx,
+        &third_party,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_SETTLE],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(response, false),
+            AccountMeta::new(winner, false),
+            AccountMeta::new(f.executor.pubkey(), false),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(incinerator::ID, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(policy_winner, false),
+            AccountMeta::new(Pubkey::new_from_array(terms.bond_remainder), false),
+        ],
+    )
+    .await
+    .expect("tag 131 settles the app challenge");
+    let record_rent = record_before - terms.challenger_bond_lamports;
+    assert_eq!(f.lamports(record).await, 0);
+    assert_eq!(
+        f.lamports(f.signer.pubkey()).await,
+        challenger_before
+            + record_rent
+            + if challenger_won {
+                terms.challenger_bond_lamports + terms.executor_bond_lamports
+            } else {
+                0
+            }
+    );
+    assert_eq!(
+        f.lamports(f.executor.pubkey()).await,
+        executor_before
+            + if challenger_won {
+                0
+            } else {
+                terms.challenger_bond_lamports
+            }
+    );
+    assert_eq!(
+        f.lamports(created[0]).await,
+        document_before
+            - if challenger_won {
+                terms.executor_bond_lamports
+            } else {
+                0
+            }
+    );
+    assert_eq!(u32_at(&f.account(created[0]).await, 128), 0);
+
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    let dcm2_before_close = f.lamports(created[0]).await;
+    let dpr2_before_close = f.lamports(created[1]).await;
+    let dfs2_before_close = f.lamports(created[2]).await;
+    let working_accounts_before_close = dcm2_before_close + dpr2_before_close + dfs2_before_close;
+    let executor_before_close = f.lamports(f.executor.pubkey()).await;
+    let incinerator_before_close = f.lamports(incinerator::ID).await;
+    let close_bond_burned =
+        if !challenger_won && f.account(created[0]).await[529] == document::BOND_HELD {
+            terms.executor_bond_lamports
+        } else {
+            0
+        };
+    let document = f.account(created[0]).await;
+    let deadline = u64_at(&document, 144).max(u64_at(&document, document::ABANDON_DEADLINE_AT)) + 1;
+    clock_to(f, deadline).await;
+    let remainder = Pubkey::new_from_array(terms.bond_remainder);
+    let close_metas = f.close_metas_slots(
+        &c,
+        third_party.pubkey(),
+        AccountMeta::new(incinerator::ID, false),
+        AccountMeta::new(remainder, false),
+    );
+    send_fresh_with(
+        &mut f.ctx,
+        &third_party,
+        f.program,
+        close_data(&descriptor),
+        close_metas,
+    )
+    .await
+    .expect("tag 172 closes the settled app document");
+    assert_eq!(
+        f.lamports(f.executor.pubkey()).await,
+        executor_before_close + working_accounts_before_close - close_bond_burned
+    );
+    assert_eq!(
+        f.lamports(incinerator::ID).await,
+        incinerator_before_close + close_bond_burned,
+        "tag 172 applies the withheld-document bond disposition"
+    );
+    assert_eq!(
+        f.lamports(f.executor.pubkey()).await - executor_before_close
+            + f.lamports(incinerator::ID).await
+            - incinerator_before_close,
+        working_accounts_before_close,
+        "tag 172 accounts for every DCM2/DPR2/DFS2 lamport"
+    );
+    if close_bond_burned > 0 {
+        assert_eq!(
+            f.account(created[3]).await[6],
+            result::STATUS_WITHHELD,
+            "the unrefuted fixture has not completed result attestation"
+        );
+    }
+    for key in created[..3].iter().copied() {
+        assert_eq!(f.lamports(key).await, 0);
+    }
+}
+
+async fn settle_and_close_neutral_app_challenge(
+    f: &mut Fix,
+    record: Pubkey,
+    created: [Pubkey; 4],
+    descriptor: [u8; 32],
+    terms: &Terms2,
+) {
+    let third_party = Keypair::new();
+    f.ctx
+        .set_account(&third_party.pubkey(), &shared(system_funded()));
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let record_before = f.lamports(record).await;
+    let challenger_before = f.lamports(f.signer.pubkey()).await;
+    let executor_before = f.lamports(f.executor.pubkey()).await;
+    let document_before = f.lamports(created[0]).await;
+    let remainder = Pubkey::new_from_array(terms.bond_remainder);
+    send_fresh_with(
+        &mut f.ctx,
+        &third_party,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_SETTLE],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(response, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(f.executor.pubkey(), false),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(incinerator::ID, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(incinerator::ID, false),
+            AccountMeta::new(remainder, false),
+        ],
+    )
+    .await
+    .expect("tag 131 refunds a neutral app challenge");
+    assert_eq!(f.lamports(record).await, 0);
+    assert_eq!(
+        f.lamports(f.signer.pubkey()).await,
+        challenger_before + record_before
+    );
+    assert_eq!(f.lamports(f.executor.pubkey()).await, executor_before);
+    assert_eq!(f.lamports(created[0]).await, document_before);
+    assert_eq!(f.account(created[0]).await[529], document::BOND_HELD);
+    assert_eq!(u32_at(&f.account(created[0]).await, 128), 0);
+
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    let document_lamports =
+        f.lamports(created[0]).await + f.lamports(created[1]).await + f.lamports(created[2]).await;
+    let executor_before_close = f.lamports(f.executor.pubkey()).await;
+    let document = f.account(created[0]).await;
+    let close_deadline =
+        u64_at(&document, 144).max(u64_at(&document, document::ABANDON_DEADLINE_AT)) + 1;
+    clock_to(f, close_deadline).await;
+    let close_metas = f.close_metas_slots(
+        &c,
+        third_party.pubkey(),
+        AccountMeta::new(incinerator::ID, false),
+        AccountMeta::new(remainder, false),
+    );
+    send_fresh_with(
+        &mut f.ctx,
+        &third_party,
+        f.program,
+        close_data(&descriptor),
+        close_metas,
+    )
+    .await
+    .expect("tag 172 closes after neutral settlement");
+    assert_eq!(
+        f.lamports(f.executor.pubkey()).await,
+        executor_before_close + document_lamports
+    );
+    for key in created[..3].iter().copied() {
+        assert_eq!(f.lamports(key).await, 0);
+    }
 }
 
 fn challenge_leaf_packet(f: &Fix, descriptor: &[u8; 32], proof: &Rekeyed, nonce: u32) -> Vec<u8> {
@@ -12463,10 +12698,9 @@ async fn rev8_position_challenge_rounds_reach_an_admitted_fixpoint() {
     }
 }
 
-/// The extracted SBF app replays the terminal Form-22 fix-point through its
-/// static ByteSum manifest. The committed output is wrong, so tag 169 records
-/// an immediate app-replay ruling (800); tag 131 settles the STANDARD bond,
-/// and tag 172 refunds the document rent to the original payer.
+/// A wrong output with an invalid challenger-supplied RWP1 cannot use the fast
+/// path to rule. The executor opens the committed route witness in RESPOND,
+/// after which tag 131 settles the STANDARD bond and tag 172 closes the doc.
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
     let Some(mut f) = build().await else {
@@ -12490,6 +12724,8 @@ async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
         )
         .await;
     let nonce = 90;
+    let mut invalid_fastpath = witness.clone();
+    *invalid_fastpath.last_mut().unwrap() ^= 1;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -12502,9 +12738,11 @@ async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
         &levels,
         nonce,
         true,
-        Some(&witness),
+        Some(&invalid_fastpath),
     )
     .await;
+    assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
+    executor_opens_app_witness(&mut f, record, created[0], &witness).await;
     let choice = final_position_choice(&levels, target);
     let mut descend_data = vec![TAG_DESCEND, choice];
     descend_data.extend_from_slice(&witness);
@@ -12636,6 +12874,13 @@ async fn rev8_bytesum_matching_honest_fastpath_enters_respond_sbf() {
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
     };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.executor_bond_lamports = 500_000;
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 4;
     let witness_base = app_replay_witness(1, &[1, 2, 3], 6);
@@ -12677,7 +12922,36 @@ async fn rev8_bytesum_matching_honest_fastpath_enters_respond_sbf() {
     assert_eq!(ruled[5], 1, "the honest executor defeats the challenge");
     assert_eq!(ruled[178], events::CAUSE_APP_REPLAY);
     assert_eq!(u32_at(&ruled, challenge::DEV2_AT + 8), 0);
+    assert_eq!(u32_at(&ruled, 170), u32_at(&ruled, challenge::DEV2_AT + 20));
+    assert_eq!(u16_at(&ruled, 174), u16_at(&ruled, challenge::DEV2_AT + 24));
     assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
+
+    let second_response = send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::unified::TAG_RESPOND_APP_WITNESS],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+            AccountMeta::new_readonly(f.drp2, false),
+            AccountMeta::new_readonly(f.pt1s_index, false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        second_response,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(733)
+        ))
+    ));
+    settle_and_close_standard_app_challenge(&mut f, record, created, descriptor, false, &terms)
+        .await;
 }
 
 /// A challenger who supplies a preimage that does not open the committed
@@ -12740,6 +13014,13 @@ async fn rev8_bytesum_malformed_committed_input_rules_executor_sbf() {
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
     };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.executor_bond_lamports = 500_000;
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 3;
     let malformed = app_replay_witness(2, &[1, 2, 3], 6);
@@ -12775,6 +13056,8 @@ async fn rev8_bytesum_malformed_committed_input_rules_executor_sbf() {
         u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
         FLAG_REFUTED
     );
+    settle_and_close_standard_app_challenge(&mut f, record, created, descriptor, true, &terms)
+        .await;
 }
 
 /// The input schema and ByteSum result are valid, but the committed input
@@ -12822,6 +13105,139 @@ async fn rev8_bytesum_fake_input_against_predecessor_loses_sbf() {
     );
 }
 
+/// The dispute descends to the first divergent leaf. A consumer that correctly
+/// sums a fabricated predecessor output is honest relative to that input; the
+/// producer leaf is where the fake output is disproved.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_bytesum_first_divergent_leaf_protects_honest_consumer_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let binding = f.binding(29, 50);
+    let fake_output = [4, 5, 6];
+    let consumer = app_replay_witness(1, &fake_output, 15);
+    let producer = app_route_producer_witness_with(&fake_output);
+    let (descriptor, created, roots, segment, _, levels, committed) =
+        commit_challenge_tree_with_route_witness(
+            &mut f, &binding, 79, 1, 235, 207, &consumer, &producer,
+        )
+        .await;
+
+    let consumer_record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        235,
+        &levels,
+        114,
+        false,
+        Some(&committed),
+    )
+    .await;
+    assert_eq!(
+        f.account(consumer_record).await[4],
+        challenge::PHASE_RESPOND
+    );
+    executor_opens_app_witness(&mut f, consumer_record, created[0], &committed).await;
+    let consumer_ruling = f.account(consumer_record).await;
+    assert_eq!(consumer_ruling[4], challenge::PHASE_RULED);
+    assert_eq!(
+        consumer_ruling[5], 1,
+        "the correctly computed consumer wins"
+    );
+    assert_eq!(u32_at(&consumer_ruling, challenge::DEV2_AT + 8), 0);
+
+    let producer_record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        207,
+        &levels,
+        115,
+        false,
+        Some(&producer),
+    )
+    .await;
+    let producer_ruling = f.account(producer_record).await;
+    assert_eq!(producer_ruling[4], challenge::PHASE_RULED);
+    assert_eq!(
+        producer_ruling[5], 2,
+        "the fabricated producer output loses"
+    );
+    assert_eq!(u32_at(&producer_ruling, challenge::DEV2_AT + 8), 800);
+}
+
+/// Distinct challenger PDAs may contest the same committed app leaf. Each
+/// executor response is scoped to its own DCR1 record and uses the same proof.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_two_challengers_can_contest_the_same_app_leaf_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let binding = f.binding(29, 50);
+    let witness = app_replay_witness(1, &[1, 2, 3], 6);
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, committed) =
+        commit_challenge_tree_with_route_witness(
+            &mut f, &binding, 79, 1, 235, 207, &witness, &producer,
+        )
+        .await;
+
+    let first_record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        117,
+        false,
+        Some(&committed),
+    )
+    .await;
+
+    let first_challenger = std::mem::replace(&mut f.signer, Keypair::new());
+    f.ctx
+        .set_account(&f.signer.pubkey(), &shared(system_funded()));
+    let second_record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        118,
+        false,
+        Some(&committed),
+    )
+    .await;
+    f.signer = first_challenger;
+
+    assert_ne!(first_record, second_record);
+    assert_eq!(u32_at(&f.account(created[0]).await, 128), 2);
+    for record in [first_record, second_record] {
+        assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
+        executor_opens_app_witness(&mut f, record, created[0], &committed).await;
+        let ruled = f.account(record).await;
+        assert_eq!(ruled[4], challenge::PHASE_RULED);
+        assert_eq!(ruled[5], 1, "each honest replay defeats its challenge");
+    }
+}
+
 /// Missing and malformed executor openings keep the fix-point in RESPOND.
 /// Neither a random payload nor a well-formed ARW1 from another coordinate
 /// rules against the executor; timeout then awards the challenger.
@@ -12830,6 +13246,13 @@ async fn rev8_app_respond_rejects_bad_openings_and_timeout_favors_challenger_sbf
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
     };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.executor_bond_lamports = 500_000;
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
     let binding = f.binding(29, 50);
     let witness_base = app_replay_witness(1, &[1, 2, 3], 6);
     let producer = app_route_producer_witness();
@@ -12863,6 +13286,85 @@ async fn rev8_app_respond_rejects_bad_openings_and_timeout_favors_challenger_sbf
     let opened = f.account(record).await;
     assert_eq!(opened[4], challenge::PHASE_RESPOND);
     assert_eq!(opened[5], 0, "an unanswered fix-point has no winner");
+
+    let wrong_signer = b"x";
+    let mut wrong_signer_stage = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+    wrong_signer_stage.extend_from_slice(&(wrong_signer.len() as u16).to_le_bytes());
+    wrong_signer_stage.extend_from_slice(&0u16.to_le_bytes());
+    wrong_signer_stage.extend_from_slice(wrong_signer);
+    let wrong_signer_result = send_fresh_with(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        wrong_signer_stage,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.signer.pubkey(), true),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        wrong_signer_result,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(731)
+        ))
+    ));
+
+    let mut partial = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+    partial.extend_from_slice(&(committed.len() as u16).to_le_bytes());
+    partial.extend_from_slice(&0u16.to_le_bytes());
+    partial.extend_from_slice(&committed[..10]);
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        partial,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+        ],
+    )
+    .await
+    .expect("executor may begin staging at offset zero");
+    let mut out_of_order = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+    out_of_order.extend_from_slice(&(committed.len() as u16).to_le_bytes());
+    out_of_order.extend_from_slice(&20u16.to_le_bytes());
+    out_of_order.extend_from_slice(b"bad");
+    let out_of_order_result = send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        out_of_order,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        out_of_order_result,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(788)
+        ))
+    ));
+    let mut restart = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+    restart.extend_from_slice(&(committed.len() as u16).to_le_bytes());
+    restart.extend_from_slice(&0u16.to_le_bytes());
+    restart.extend_from_slice(&committed[..10]);
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        restart,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+        ],
+    )
+    .await
+    .expect("offset zero restarts and clears a partial candidate");
 
     let mut oversize = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
     oversize.extend_from_slice(&901u16.to_le_bytes());
@@ -12934,8 +13436,68 @@ async fn rev8_app_respond_rejects_bad_openings_and_timeout_favors_challenger_sbf
         assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
     }
 
-    let deadline = u64_at(&f.account(record).await, 148) + 1;
+    let deadline = u64_at(&f.account(record).await, 148);
     clock_to(&mut f, deadline).await;
+    let exact_deadline_opening = b"bad";
+    let mut exact_stage = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+    exact_stage.extend_from_slice(&(exact_deadline_opening.len() as u16).to_le_bytes());
+    exact_stage.extend_from_slice(&0u16.to_le_bytes());
+    exact_stage.extend_from_slice(exact_deadline_opening);
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        exact_stage,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+        ],
+    )
+    .await
+    .expect("tag 183 accepts the exact deadline slot");
+    let exact_response = send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::unified::TAG_RESPOND_APP_WITNESS],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+            AccountMeta::new_readonly(f.drp2, false),
+            AccountMeta::new_readonly(f.pt1s_index, false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        exact_response,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(730)
+        ))
+    ));
+    let exact_timeout = send_fresh_with(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        exact_timeout,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(736)
+        ))
+    ));
+    clock_to(&mut f, deadline + 1).await;
     send_fresh_with(
         &mut f.ctx,
         &f.executor,
@@ -12952,6 +13514,110 @@ async fn rev8_app_respond_rejects_bad_openings_and_timeout_favors_challenger_sbf
     assert_eq!(ruled[4], challenge::PHASE_RULED);
     assert_eq!(ruled[5], 2);
     assert_eq!(ruled[178], events::CAUSE_TIMEOUT);
+    let after_timeout_response = send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::unified::TAG_RESPOND_APP_WITNESS],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+            AccountMeta::new_readonly(f.drp2, false),
+            AccountMeta::new_readonly(f.pt1s_index, false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        after_timeout_response,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(733)
+        ))
+    ));
+    settle_and_close_standard_app_challenge(&mut f, record, created, descriptor, true, &terms)
+        .await;
+}
+
+/// A DCR1 app identity that no longer matches the running image cannot turn
+/// timeout into an executor loss. The ruling is neutral and tag 131 refunds
+/// the challenge bond before tag 172 closes the document.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_app_identity_change_during_respond_is_neutral_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.executor_bond_lamports = 500_000;
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
+
+    let binding = f.binding(29, 50);
+    let witness = app_replay_witness(1, &[1, 2, 3], 6);
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, _) =
+        commit_challenge_tree_with_route_witness(
+            &mut f, &binding, 79, 1, 235, 207, &witness, &producer,
+        )
+        .await;
+    let record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        116,
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
+
+    // Simulate a new image identity while the turn is pending. The bytes are
+    // otherwise a well-formed DCR1 v6 app record, so tag 132 exercises the
+    // same identity comparison as an upgraded static manifest.
+    let mut changed = f.account(record).await;
+    assert_eq!(u16_at(&changed, 6), challenge::APP_REPLAY_VERSION);
+    changed[challenge::APP_IDENTITY_AT + 4] ^= 1;
+    f.ctx
+        .set_account(&record, &shared(owned(&f.program, changed)));
+    let deadline = u64_at(&f.account(record).await, 148) + 1;
+    clock_to(&mut f, deadline).await;
+    send_fresh_with(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await
+    .expect("identity mismatch times out neutrally");
+    let ruled = f.account(record).await;
+    assert_eq!(ruled[4], challenge::PHASE_RULED);
+    assert_eq!(ruled[5], 0);
+    assert_eq!(ruled[178], events::CAUSE_APP_IDENTITY_CHANGED);
+    assert_eq!(
+        u32_at(&ruled, challenge::DEV2_AT + 8),
+        challenge::OUTCOME_IDENTITY_CHANGED as u32
+    );
+    assert_eq!(u32_at(&ruled, 170), u32_at(&ruled, challenge::DEV2_AT + 20));
+    assert_eq!(u16_at(&ruled, 174), u16_at(&ruled, challenge::DEV2_AT + 24));
+    assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
+    assert_eq!(u32_at(&f.account(created[0]).await, 132), 0);
+    settle_and_close_neutral_app_challenge(&mut f, record, created, descriptor, &terms).await;
 }
 
 /// A committed non-ARW1 preimage cannot be opened by a different executor

@@ -69,18 +69,25 @@ The app supplies `ApplicationHooks` and a `DecisionRouteSelector` through
 separate manifest fields; revision-8 policy uses the hooks, and tags 146, 199,
 and 200 use the app's selector.
 
-For a bound form, the committed ROOT_ONLY leaf is an `app-replay-leaf/1`
+For a bound form, the committed ROOT_ONLY leaf is an `app-replay-leaf/2`
 digest over the descriptor, exact `(position, segment, local)` coordinate,
 app/kernel/mode identity, and canonical `ARW1` witness. The witness contains
 the coordinate's versioned input slices and claimed output. Tags 166, 168, and
-169 carry it to the fix-point; the program checks the opened leaf digest and
-replays the selected kernel before the challenge can advance. A mismatched
-claimed output rules against the executor with code 800. Committed inputs the
-selected kernel cannot replay rule against the executor with code 799. A
-challenger who does not open the committed leaf loses with the existing proof
-refusal code. This app path uses DCR1 version 6 with an `ARI1` identity block;
-the version-5 compatibility record remains unchanged when no app binding is
-selected.
+169 carry it to the fix-point. An app-bound fix-point that is not convicted
+immediately remains in RESPOND until the executor opens the committed leaf
+through tags 183 and 184. A mismatched claimed output rules against the
+executor with code 800. Committed inputs the selected kernel cannot replay
+rule against the executor with code 799. A successful replay rules for the
+executor. For a routed input, descend to the first divergent leaf: if a
+consumer correctly used a fabricated producer output, the consumer wins and
+the producer is the challenge target. A route-free binding must have no plan
+read routes; a routed binding must account for the instance's only read route.
+Admission rejects unsupported producer provenance and any opening that cannot
+fit the bounded witness. App-bound documents record an `ARI1` manifest
+identity; a later identity mismatch ends
+the challenge neutrally and refunds the challenger bond. The app path uses
+DCR1 version 6 while it is in RESPOND; the version-5 compatibility record
+remains unchanged when no app binding is selected.
 
 The application separately supplies a `ResolutionBackend` that owns
 admission, challenge transitions, and resolution status. Commitment-scheme

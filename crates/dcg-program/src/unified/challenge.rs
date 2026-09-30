@@ -99,6 +99,8 @@ pub const PHASE_POSITION_REVEAL: u8 = 7;
 pub const PHASE_SELECT: u8 = 8;
 pub const OUTCOME_ADMITTED: u8 = 1;
 pub const OUTCOME_CONVICTED: u8 = 2;
+pub const OUTCOME_IDENTITY_CHANGED: u8 = 3;
+pub const OUTCOME_PENDING: u8 = 0;
 
 fn is_challenge_version(raw: &[u8]) -> bool {
     raw.get(6..8)
@@ -568,6 +570,7 @@ fn verify_app_route_opening(
         || producer_output_route.region_id != route.region_id
         || producer_output_route.effective_offset != route.effective_offset
         || producer_output_route.byte_length != route.byte_length
+        || producer_binding.claimed_output_bytes as u32 != route.byte_length
         || producer_witness.claimed_output.len() != route.byte_length as usize
     {
         return Err(no(DCR1_PROOF));
@@ -677,7 +680,18 @@ fn fix_point(
     let [pt2s, routes, geometry, drp2, pt1s] = plan_accounts else {
         return Err(no(DCR1_INCOMPLETE));
     };
-    let (t, form, mut code, row, root, segment_root) = {
+    let (
+        t,
+        form,
+        mut code,
+        row,
+        root,
+        segment_root,
+        app_binding,
+        saved_identity,
+        identity_changed,
+        unsupported,
+    ) = {
         let d = doc.try_borrow_data()?;
         bind_plan(program, &d, pt2s, routes, geometry, Some(drp2))?;
         let s = pt2s.try_borrow_data()?;
@@ -733,37 +747,53 @@ fn fix_point(
                 }
             }
         }
-        let (_, entries) = segment_ordinal(&x, p, segment)?;
-        let path_len = raw[PATH_LEN_AT] as usize;
-        if path_len != r::path_height(entries)? as usize {
-            return Err(no(CL_PATH));
-        }
-        let current_path: Vec<[u8; 32]> = raw[PATH_START..PATH_START + 32 * path_len]
-            .chunks_exact(32)
-            .map(|chunk| chunk.try_into().unwrap())
-            .collect();
-        let current_leaf = d32(raw, 104, DCR1_BAD)?;
-        let current_tree = dl_fold(
-            &d32(raw, 72, DCR1_BAD)?,
-            1,
-            p,
-            entries,
-            local,
-            &current_leaf,
-            &current_path,
-        )
-        .ok_or(no(CL_PATH))?;
-        let segment_root = h::hash(
-            b"segment-root/2",
-            &[
+        let app_binding =
+            application.and_then(|app| app.resolve_legacy_form(raw[MACHINE_AT], e.kernel_index));
+        let saved_identity = document::application_identity_v8(&d)?;
+        let identity_changed = match (saved_identity, application) {
+            (Some(saved), Some(app)) => saved[4..36] != app.admission_identity_digest(),
+            (Some(_), None) => true,
+            (None, _) => app_binding.is_some(),
+        };
+        let app_opening_supported = if let (Some(app), Some(_)) = (application, app_binding) {
+            super::admission::app_opening_bound(&x, p, t, raw[MACHINE_AT], app).is_ok()
+        } else {
+            true
+        };
+        let mut segment_root = [0; 32];
+        if !identity_changed && app_opening_supported && app_binding.is_some() {
+            let (_, entries) = segment_ordinal(&x, p, segment)?;
+            let path_len = raw[PATH_LEN_AT] as usize;
+            if path_len != r::path_height(entries)? as usize {
+                return Err(no(CL_PATH));
+            }
+            let current_path: Vec<[u8; 32]> = raw[PATH_START..PATH_START + 32 * path_len]
+                .chunks_exact(32)
+                .map(|chunk| chunk.try_into().unwrap())
+                .collect();
+            let current_leaf = d32(raw, 104, DCR1_BAD)?;
+            let current_tree = dl_fold(
                 &d32(raw, 72, DCR1_BAD)?,
-                &p.to_le_bytes(),
-                &segment.to_le_bytes(),
-                &entries.to_le_bytes(),
-                &current_tree,
-                &[1],
-            ],
-        );
+                1,
+                p,
+                entries,
+                local,
+                &current_leaf,
+                &current_path,
+            )
+            .ok_or(no(CL_PATH))?;
+            segment_root = h::hash(
+                b"segment-root/2",
+                &[
+                    &d32(raw, 72, DCR1_BAD)?,
+                    &p.to_le_bytes(),
+                    &segment.to_le_bytes(),
+                    &entries.to_le_bytes(),
+                    &current_tree,
+                    &[1],
+                ],
+            );
+        }
         (
             t,
             e.kernel_index,
@@ -771,12 +801,18 @@ fn fix_point(
             row,
             d32(&d, 392, DCR1_BAD)?,
             segment_root,
+            app_binding,
+            saved_identity,
+            identity_changed,
+            !app_opening_supported,
         )
     };
     let mut winner = (code != 0).then_some(2);
     let mut cause = events::CAUSE_CONVICT;
-    let mut app_identity = None;
-    let mut app_binding_selected = false;
+    let app_identity = application
+        .zip(app_binding)
+        .map(|(app, binding)| app.ruling_identity(binding));
+    let app_binding_selected = app_binding.is_some();
     if witness_bytes
         .is_some_and(|bytes| bytes.len() > crate::kernel::CommittedReplayWitness::MAX_WITNESS_BYTES)
     {
@@ -787,71 +823,80 @@ fn fix_point(
     {
         return Err(no(DCR1_BAD));
     }
+    if identity_changed || unsupported {
+        cause = events::CAUSE_APP_IDENTITY_CHANGED;
+        raw[HEADER..PATH_LEN_AT].fill(0);
+        raw[6..8].copy_from_slice(&APP_REPLAY_VERSION.to_le_bytes());
+        let identity = saved_identity.unwrap_or_else(|| {
+            let mut identity = [0; APP_IDENTITY_BYTES];
+            identity[..4].copy_from_slice(b"ARI1");
+            if let Some(application) = application {
+                identity[4..36].copy_from_slice(&application.admission_identity_digest());
+            }
+            identity
+        });
+        raw[APP_IDENTITY_AT..APP_IDENTITY_AT + APP_IDENTITY_BYTES].copy_from_slice(&identity);
+        raw[170..174].copy_from_slice(&t.to_le_bytes());
+        raw[174..176].copy_from_slice(&form.to_le_bytes());
+        raw[DEV2_AT..DEV2_AT + 64].copy_from_slice(&encode_dev2(0, row.as_ref(), t, form, &root));
+        raw[DEV2_AT + 4] = OUTCOME_IDENTITY_CHANGED;
+        raw[DEV2_AT + 8..DEV2_AT + 12]
+            .copy_from_slice(&(OUTCOME_IDENTITY_CHANGED as u32).to_le_bytes());
+        rule_for_document(
+            program,
+            challenge,
+            raw,
+            doc,
+            0,
+            cause,
+            OUTCOME_IDENTITY_CHANGED as u32,
+        )?;
+        return Ok(false);
+    }
     if code == 0 {
-        if let Some(application) = application {
-            let machine_selector = raw[MACHINE_AT];
-            let binding = application.resolve_legacy_form(machine_selector, form);
-            if let Some(binding) = binding {
-                app_binding_selected = true;
-                app_identity = Some(application.ruling_identity(binding));
-                if let Some(bytes) = witness_bytes {
-                    use crate::kernel::{CommittedReplayWitness, ManifestRunError};
-                    if bytes.len() > CommittedReplayWitness::MAX_WITNESS_BYTES {
-                        return Err(no(DCR1_BAD));
-                    }
-                    let descriptor = d32(raw, 72, DCR1_BAD)?;
-                    let digest = application.replay_leaf_digest(
-                        binding,
-                        &descriptor,
-                        p,
-                        segment,
-                        local,
-                        bytes,
-                    );
-                    if digest == d32(raw, 104, DCR1_BAD)? {
-                        match CommittedReplayWitness::decode(bytes) {
-                            Ok(witness)
-                                if verify_app_route_opening(
-                                    program,
-                                    doc,
-                                    plan_accounts,
-                                    raw,
-                                    application,
-                                    binding,
-                                    &witness,
-                                    None,
-                                )
-                                .is_ok() =>
-                            {
-                                match application.replay_legacy_form(
-                                    binding,
-                                    &witness.inputs,
-                                    witness.claimed_output,
-                                ) {
-                                    // Only a matching, successfully decoded
-                                    // witness that demonstrates a bad committed
-                                    // output can end the challenge in the fast
-                                    // path. Every other case proceeds to RESPOND,
-                                    // where the executor must open the leaf.
-                                    Ok(false) => {
-                                        cause = events::CAUSE_APP_REPLAY;
-                                        winner = Some(2);
-                                        code = super::APP_KERNEL_MISMATCH;
-                                    }
-                                    Ok(true) | Err(ManifestRunError::ClaimedOutputLength) => {}
-                                    Err(_) => {}
+        if let (Some(application), Some(binding)) = (application, app_binding) {
+            if let Some(bytes) = witness_bytes {
+                use crate::kernel::{CommittedReplayWitness, ManifestRunError};
+                let descriptor = d32(raw, 72, DCR1_BAD)?;
+                let digest =
+                    application.replay_leaf_digest(binding, &descriptor, p, segment, local, bytes);
+                if digest == d32(raw, 104, DCR1_BAD)? {
+                    match CommittedReplayWitness::decode(bytes) {
+                        Ok(witness)
+                            if verify_app_route_opening(
+                                program,
+                                doc,
+                                plan_accounts,
+                                raw,
+                                application,
+                                binding,
+                                &witness,
+                                None,
+                            )
+                            .is_ok() =>
+                        {
+                            match application.replay_legacy_form(
+                                binding,
+                                &witness.inputs,
+                                witness.claimed_output,
+                            ) {
+                                // Only a matching, successfully decoded
+                                // witness that demonstrates a bad committed
+                                // output can end the challenge in the fast
+                                // path. Every other case proceeds to RESPOND,
+                                // where the executor must open the leaf.
+                                Ok(false) => {
+                                    cause = events::CAUSE_APP_REPLAY;
+                                    winner = Some(2);
+                                    code = super::APP_KERNEL_MISMATCH;
                                 }
+                                Ok(true) | Err(ManifestRunError::ClaimedOutputLength) => {}
+                                Err(_) => {}
                             }
-                            Ok(_) => {}
-                            Err(_) => {}
                         }
+                        Ok(_) | Err(_) => {}
                     }
                 }
-            } else if application.require_legacy_form_binding {
-                // Application binding may have changed after admission. That
-                // is a neutral refusal: this image cannot convict an executor
-                // for a binding it did not use at admission.
-                return Err(no(DCR1_BAD));
             }
         }
     }
@@ -871,6 +916,7 @@ fn fix_point(
         // committed preimage. A challenger fast path that fails to open the
         // leaf is only an unsuccessful optimization, never a ruling.
         if app_binding_selected {
+            raw[DEV2_AT + 4] = OUTCOME_PENDING;
             raw[APP_WITNESS_LEN_AT..APP_WITNESS_LEN_AT + 4].fill(0);
             raw[APP_WITNESS_AT..APP_WITNESS_AT + APP_WITNESS_CAP].fill(0);
             raw[APP_SEGMENT_ROOT_AT..APP_SEGMENT_ROOT_AT + 32].copy_from_slice(&segment_root);
@@ -979,6 +1025,9 @@ pub fn rule_v8(
     if *challenge != address::challenge(program, &descriptor, &challenger, nonce).0 {
         return Err(no(DCR1_AUTH));
     }
+    if winner == 0 && cause != events::CAUSE_APP_IDENTITY_CHANGED {
+        return Err(no(DCR1_AUTH));
+    }
     document::document_v8(program, doc, Some(&descriptor), winner == 2, DCR1_AUTH)?;
     if doc.try_borrow_data()?[40..72] != raw[40..72] {
         return Err(no(DCR1_AUTH));
@@ -998,7 +1047,15 @@ pub fn rule_v8(
     } else {
         u32_at(&doc.try_borrow_data()?, 132, DCR1_BAD)?
     };
-    raw[170..178].fill(0);
+    if raw[6..8] == APP_REPLAY_VERSION.to_le_bytes() {
+        let t = u32_at(raw, DEV2_AT + 20, DCR1_BAD)?;
+        let form = u16_at(raw, DEV2_AT + 24, DCR1_BAD)?;
+        raw[170..174].copy_from_slice(&t.to_le_bytes());
+        raw[174..176].copy_from_slice(&form.to_le_bytes());
+        raw[176..178].fill(0);
+    } else {
+        raw[170..178].fill(0);
+    }
     raw[4] = PHASE_RULED;
     raw[5] = winner;
     raw[178] = cause;
@@ -2009,7 +2066,7 @@ pub fn stage_app_witness(
 /// partial opening is a refusal that leaves RESPOND open until timeout. Once
 /// the preimage matches the challenged digest, decode/kernel failures convict
 /// the executor (799), an incorrect output convicts it (800), and a successful
-/// replay rules for the challenger.
+/// replay rules for the executor.
 #[cfg(feature = "revision-8")]
 pub fn respond_app_witness(
     program: &Pubkey,
@@ -2079,6 +2136,14 @@ pub fn respond_app_witness(
     let binding = application
         .resolve_legacy_form(machine, form)
         .ok_or(no(DCR1_BAD))?;
+    let document_identity = document::application_identity_v8(&accounts[2].try_borrow_data()?)?;
+    if document_identity
+        .is_none_or(|identity| identity[4..36] != application.admission_identity_digest())
+    {
+        // A changed app table cannot be used to convict under the identity
+        // that admitted this document; timeout will close neutrally.
+        return Err(no(DCR1_BAD));
+    }
     if accounts[0].try_borrow_data()?[APP_IDENTITY_AT..APP_IDENTITY_AT + APP_IDENTITY_BYTES]
         != application.ruling_identity(binding)
     {
@@ -2318,6 +2383,72 @@ pub fn timeout_with_hooks(
 ) -> ProgramResult {
     let _ = hooks;
     timeout(program, accounts, data)
+}
+
+/// Manifest-aware revision-8 timeout. If an app-bound challenge outlives the
+/// app identity that admitted it, timeout is neutral: the challenger receives
+/// its bond back, and neither side is ruled to have won.
+pub fn timeout_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
+    if data.len() != 1 || accounts.len() != 2 {
+        return Err(no(DCR1_BAD));
+    }
+    document::revision(program, &accounts[1], DCR1_AUTH)?;
+    record_v8(program, &accounts[0], None)?;
+    let mut raw = accounts[0].try_borrow_mut_data()?;
+    if now()? <= u64_at(&raw, 148, DCR1_BAD)? {
+        return Err(no(DCR1_DEADLINE));
+    }
+    record_document_v8(program, &raw, &accounts[1], true)?;
+    let document_identity = document::application_identity_v8(&accounts[1].try_borrow_data()?)?;
+    let admission_identity_changed = match (document_identity, application) {
+        (Some(saved), Some(app)) => saved[4..36] != app.admission_identity_digest(),
+        (Some(_), None) => true,
+        // A DCM2 without ARI1 predates app-bound admission, or has no app
+        // binding. Keep its revision-8 v5 timeout semantics intact.
+        (None, _) => false,
+    };
+    let ruling_identity_changed = if raw[6..8] == APP_REPLAY_VERSION.to_le_bytes() {
+        let form = u16_at(&raw, DEV2_AT + 24, DCR1_BAD)?;
+        let current = application.and_then(|app| {
+            app.resolve_legacy_form(raw[MACHINE_AT], form)
+                .map(|binding| app.ruling_identity(binding))
+        });
+        current.is_none_or(|identity| {
+            identity != raw[APP_IDENTITY_AT..APP_IDENTITY_AT + APP_IDENTITY_BYTES]
+        })
+    } else {
+        false
+    };
+    if admission_identity_changed || ruling_identity_changed {
+        return rule_for_document(
+            program,
+            accounts[0].key,
+            &mut raw,
+            &accounts[1],
+            0,
+            events::CAUSE_APP_IDENTITY_CHANGED,
+            OUTCOME_IDENTITY_CHANGED as u32,
+        );
+    }
+    let winner = match (raw[PT2P_MODE_AT], raw[4]) {
+        (1, PHASE_RESPOND | PHASE_SEALED | PHASE_REVEAL | PHASE_POSITION_REVEAL) => 2,
+        (1, PHASE_DESCEND | PHASE_SELECT) => 1,
+        _ => return Err(no(DCR1_PHASE)),
+    };
+    rule_for_document(
+        program,
+        accounts[0].key,
+        &mut raw,
+        &accounts[1],
+        winner,
+        events::CAUSE_TIMEOUT,
+        0,
+    )
 }
 
 #[cfg(feature = "revision-7")]
@@ -2808,17 +2939,19 @@ pub fn settle_v8_with_hooks<'a>(
     {
         return Err(no(DCR1_AUTH));
     }
-    let (bond, challenger_won, descriptor, terms, bond_state, ruling_winner) = {
+    let (bond, challenger_won, neutral, descriptor, terms, bond_state, ruling_winner) = {
         let raw = record_acc.try_borrow_data()?;
         let who = match raw[5] {
             1 => &raw[40..72],
             2 => &raw[8..40],
+            0 if raw[178] == events::CAUSE_APP_IDENTITY_CHANGED => &raw[8..40],
             _ => return Err(no(DCR1_PHASE)),
         };
         if winner.key.as_ref() != who
             || challenger.key.as_ref() != &raw[8..40]
             || executor.key.as_ref() != &raw[40..72]
-            || !matches!(raw[178], 1..=events::CAUSE_APP_REPLAY)
+            || !(matches!(raw[178], 1..=events::CAUSE_APP_REPLAY)
+                || (raw[5] == 0 && raw[178] == events::CAUSE_APP_IDENTITY_CHANGED))
         {
             return Err(no(DCR1_AUTH));
         }
@@ -2829,6 +2962,7 @@ pub fn settle_v8_with_hooks<'a>(
         (
             u64_at(&raw, 162, DCR1_BAD)?,
             raw[5] == 2,
+            raw[5] == 0,
             d32(&raw, 72, DCR1_BAD)?,
             terms,
             doc[529],
@@ -2866,14 +3000,17 @@ pub fn settle_v8_with_hooks<'a>(
     } else {
         d32(&dcm2.try_borrow_data()?, WINNER_AT_V8, DCR1_BAD)? != [0u8; 32]
     };
-    if custom {
+    if neutral {
+        // The standard nine-account shape is retained, but a neutral refund
+        // neither selects nor pays any protocol bond destination.
+    } else if custom {
         // The escrow and the system program, checked by kind rather than by the
         // list's length; the escrow's own key, ownership and emptiness are
         // `validate_escrow`'s, and they run again at the funding call below.
         if *escrow_or_remainder.key != system_program::ID {
             return Err(no(DCR1_AUTH));
         }
-    } else {
+    } else if !neutral {
         let want = if recorded {
             ruling_winner_of(dcm2)?
         } else {

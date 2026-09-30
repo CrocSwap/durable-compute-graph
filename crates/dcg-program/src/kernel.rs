@@ -50,10 +50,14 @@ pub struct ResourceLimits {
     pub max_compute_units: u64,
 }
 
-/// Highest compute budget a single kernel invocation may declare for the
-/// current SVM transaction profile. Multi-step callers multiply this checked
-/// ceiling by their declared operation count before starting a transition.
-pub const MAX_DECLARED_KERNEL_COMPUTE_UNITS: u64 = 1_400_000;
+/// Transaction ceiling minus the measured worst-case tag-184 adapter cost
+/// (85,433 CU) and a 25,000-CU safety margin. A replay kernel declaring more
+/// cannot be selected for an admitted app-bound document.
+pub const APP_REPLAY_MEASURED_OVERHEAD_CU: u64 = 85_433;
+pub const APP_REPLAY_CU_MARGIN: u64 = 25_000;
+pub const MAX_TRANSACTION_COMPUTE_UNITS: u64 = 1_400_000;
+pub const MAX_DECLARED_KERNEL_COMPUTE_UNITS: u64 =
+    MAX_TRANSACTION_COMPUTE_UNITS - APP_REPLAY_MEASURED_OVERHEAD_CU - APP_REPLAY_CU_MARGIN;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelManifest {
@@ -696,6 +700,77 @@ impl ApplicationManifest {
         ])
     }
 
+    /// Identity frozen into app-bound DCM2 records at UnifiedInit. This also
+    /// commits the static form-to-kernel table, so adding or removing a form
+    /// after admission cannot silently switch a pending leaf to different
+    /// replay semantics. Kernel implementation upgrades must increment either
+    /// the app or kernel semantic version.
+    pub fn admission_identity_digest(&self) -> [u8; 32] {
+        let mut digest = hash::sha256(&[
+            b"dcg/application-admission/1",
+            &(self.application_id.len() as u32).to_le_bytes(),
+            self.application_id,
+            &self.version.to_le_bytes(),
+            &[self.require_legacy_form_binding as u8],
+            &(self.legacy_forms.len() as u32).to_le_bytes(),
+        ]);
+        for binding in self.legacy_forms {
+            let selector = binding.machine_selector.unwrap_or(0);
+            let selector_present = [binding.machine_selector.is_some() as u8];
+            digest = hash::sha256(&[
+                b"dcg/application-admission-form/1",
+                &digest,
+                &selector_present,
+                &[selector],
+                &binding.form_id.to_le_bytes(),
+                &binding.kernel_id.0,
+                &binding.semantic_version.to_le_bytes(),
+                &binding.abi_version.to_le_bytes(),
+                &binding.mode.id.to_le_bytes(),
+                &binding.mode.version.to_le_bytes(),
+                &binding.claimed_output_bytes.to_le_bytes(),
+                &(binding.input_spans.len() as u32).to_le_bytes(),
+            ]);
+            for span in binding.input_spans {
+                digest = hash::sha256(&[
+                    b"dcg/application-admission-span/1",
+                    &digest,
+                    &span.schema.id.to_le_bytes(),
+                    &span.schema.version.to_le_bytes(),
+                    &span.max_bytes.to_le_bytes(),
+                ]);
+            }
+            digest = hash::sha256(&[
+                b"dcg/application-admission-routes/1",
+                &digest,
+                &(binding.input_routes.len() as u32).to_le_bytes(),
+            ]);
+            for route in binding.input_routes {
+                digest = hash::sha256(&[
+                    b"dcg/application-admission-route/1",
+                    &digest,
+                    &route.ordinal.to_le_bytes(),
+                    &route.offset.to_le_bytes(),
+                    &route.length.to_le_bytes(),
+                ]);
+            }
+        }
+        digest
+    }
+
+    /// Maximum ARW1 byte length admitted for one form, before an optional RWP1
+    /// extension. `validate()` limits this adapter to zero or one input span.
+    pub fn max_arw1_bytes(binding: &LegacyFormBinding) -> Option<usize> {
+        binding
+            .input_spans
+            .iter()
+            .try_fold(CommittedReplayWitness::HEADER_BYTES, |n, span| {
+                n.checked_add(CommittedReplayWitness::SPAN_HEADER_BYTES)?
+                    .checked_add(span.max_bytes as usize)
+            })?
+            .checked_add(binding.claimed_output_bytes as usize)
+    }
+
     /// 64-byte ARI1 identity written only to the new app-replay DCR1 record
     /// version. Revision-8 DCR1 v5 bytes remain untouched on the compatibility
     /// path.
@@ -736,7 +811,7 @@ impl ApplicationManifest {
             .map(|opened| &witness[..witness.len() - opened.extension.len()])
             .unwrap_or(witness);
         crate::closure_v2::hash(
-            b"app-replay-leaf/1",
+            b"app-replay-leaf/2",
             &[descriptor, &coordinate, &identity[4..], committed],
         )
     }
@@ -867,6 +942,7 @@ impl ApplicationManifest {
             if binding.form_id == 0
                 || binding.claimed_output_bytes == 0
                 || binding.input_routes.len() != binding.input_spans.len()
+                || binding.input_routes.len() > 1
             {
                 return Err(ManifestError::InvalidLegacyForm(binding.form_id));
             }
@@ -1122,13 +1198,13 @@ pub mod test_kernel {
         },
         output: PortLayout {
             id: VersionedId { id: 2, version: 1 },
-            max_bytes: 8,
+            max_bytes: 256,
             alignment: 1,
         },
         state: None,
         resources: ResourceLimits {
             max_input_bytes: 64,
-            max_output_bytes: 8,
+            max_output_bytes: 256,
             max_state_bytes: 0,
             max_operations: 64,
             max_compute_units: 10_000,
@@ -1143,6 +1219,14 @@ pub mod test_kernel {
         fn execute(&self, input: &[u8], output: &mut [u8]) -> Result<usize, KernelError> {
             if input.len() > MANIFEST.resources.max_input_bytes as usize {
                 return Err(KernelError::InputTooLarge);
+            }
+            if input.is_empty() {
+                if output.len() < 256 {
+                    return Err(KernelError::OutputTooSmall);
+                }
+                output[..256].fill(0);
+                output[..3].copy_from_slice(&[1, 2, 3]);
+                return Ok(256);
             }
             if output.len() < 8 {
                 return Err(KernelError::OutputTooSmall);
@@ -1172,9 +1256,28 @@ pub mod test_kernel {
             if !prior_state.is_empty() || !claimed_state.is_empty() {
                 return Err(KernelError::InvalidInput);
             }
+            if input.is_empty() {
+                let mut expected = [0u8; 256];
+                self.execute(input, &mut expected)?;
+                return Ok(claimed_output == expected);
+            }
             let mut expected = [0u8; 8];
             self.execute(input, &mut expected)?;
             Ok(claimed_output == expected)
+        }
+
+        fn replay_input_spans(
+            &self,
+            inputs: &[ReplayInputSpan<'_>],
+            claimed_output: &[u8],
+        ) -> Result<bool, KernelError> {
+            match inputs {
+                [] => self.replay(&[], &[], claimed_output, &[]),
+                [input] if input.schema == MANIFEST.input.id => {
+                    self.replay(input.data, &[], claimed_output, &[])
+                }
+                _ => Err(KernelError::InvalidInput),
+            }
         }
     }
 
@@ -1213,7 +1316,7 @@ pub mod test_kernel {
         mode: MODE_OPTIMISTIC_V1,
         input_spans: &[],
         input_routes: &[],
-        claimed_output_bytes: 8,
+        claimed_output_bytes: 256,
     }];
     #[cfg(feature = "sbf-real-lifecycle-test")]
     pub static BYTE_SUM_REAL_LIFECYCLE_FORMS: [LegacyFormBinding; 2] =
@@ -1375,6 +1478,59 @@ mod tests {
 
     #[cfg(feature = "test-kernel")]
     #[test]
+    fn manifest_rejects_multiple_replay_routes_until_supported() {
+        static TWO_SPANS: [ReplayInputLayout; 2] = [
+            ReplayInputLayout {
+                schema: VersionedId { id: 1, version: 1 },
+                max_bytes: 16,
+            },
+            ReplayInputLayout {
+                schema: VersionedId { id: 1, version: 1 },
+                max_bytes: 16,
+            },
+        ];
+        static TWO_ROUTES: [ReplayRouteBinding; 2] = [
+            ReplayRouteBinding {
+                ordinal: 7,
+                offset: 0,
+                length: 3,
+            },
+            ReplayRouteBinding {
+                ordinal: 8,
+                offset: 0,
+                length: 3,
+            },
+        ];
+        static MULTI_ROUTE_FORMS: [LegacyFormBinding; 1] = [LegacyFormBinding {
+            machine_selector: Some(1),
+            form_id: 22,
+            kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
+            semantic_version: 1,
+            abi_version: 1,
+            mode: test_kernel::MODE_OPTIMISTIC_V1,
+            input_spans: &TWO_SPANS,
+            input_routes: &TWO_ROUTES,
+            claimed_output_bytes: 8,
+        }];
+        static MULTI_ROUTE_APP: ApplicationManifest = ApplicationManifest {
+            application_id: b"dcg-multi-route-test/1",
+            version: 1,
+            kernels: &test_kernel::KERNELS,
+            optimistic_replays: &test_kernel::REPLAY_BINDINGS,
+            legacy_forms: &MULTI_ROUTE_FORMS,
+            require_legacy_form_binding: true,
+            hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+            decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
+        };
+
+        assert_eq!(
+            MULTI_ROUTE_APP.validate(),
+            Err(ManifestError::InvalidLegacyForm(22))
+        );
+    }
+
+    #[cfg(feature = "test-kernel")]
+    #[test]
     fn static_application_manifest_resolves_exact_semantic_and_abi_versions() {
         use test_kernel::{BYTE_SUM, MODE_CONSENSUS_V1, MODE_OPTIMISTIC_V1};
         let m = &test_kernel::MANIFEST_APP;
@@ -1405,7 +1561,7 @@ mod tests {
         }
         let kernel = m.resolve(KernelId(*b"dcg-test-sum-v1\0"), 1, 1).unwrap();
         assert_eq!(kernel.manifest().id, BYTE_SUM.manifest().id);
-        let mut output = [0u8; 8];
+        let mut output = [0u8; 256];
         assert_eq!(
             m.execute(
                 KernelId(*b"dcg-test-sum-v1\0"),
@@ -1417,7 +1573,7 @@ mod tests {
             ),
             Ok(8)
         );
-        assert_eq!(u64::from_le_bytes(output), 256);
+        assert_eq!(u64::from_le_bytes(output[..8].try_into().unwrap()), 256);
         assert_eq!(
             m.resolve_optimistic_replay(BYTE_SUM.manifest().id, 1, 1, MODE_OPTIMISTIC_V1)
                 .unwrap()
