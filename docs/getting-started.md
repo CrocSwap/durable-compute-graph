@@ -156,27 +156,92 @@ export DCG_SBF_STAGING_NAME=dcg-sbf-real-lifecycle
 crates/dcg-program/scripts/build-sbf-reproducible.sh --features sbf-real-lifecycle-test --sbf-out-dir /private/tmp/dcg-sbf-real
 ```
 
-The measured image on 2026-09-30 was 751,280 bytes with SHA-256
-`80cbc43ba99da10cabf071fa4d6769b546dad73f8431f7bcce9a32a2e6fad2bf`.
+Round 5 used a 751,280-byte image with SHA-256
+`80cbc43ba99da10cabf071fa4d6769b546dad73f8431f7bcce9a32a2e6fad2bf`. The
+expanded feature image now also links the test-only stateful counter app; its
+measured size and digest are in
+[`stateful-sbf-workload-2026-09-30.md`](experiments/stateful-sbf-workload-2026-09-30.md).
 The feature binds retained machine selector 1 / Form 256 to ByteSum with exact
 semantic version 1, ABI version 1, optimistic mode 1, and two authenticated
 read-only spans. These bindings and the extra form are absent from the default
 image.
 
-The real SBF transaction driver uses the retained revision-8 fixture builders
-in a Basanos checkout because those large fixture builders are not included in
-this extraction. Point `BASANOS_CHECKOUT` at that checkout and set
-`BASANOS_PT2P_ROOT` to the retained K=80 fixture, then run a focused ProgramTest
-case against the image:
+The real SBF transaction driver is retained in this repository as
+`tests/unified_v8_document.rs`. It uses compact checked-in golden inputs and a
+retained compiler-v1 PT2P bundle supplied through `BASANOS_PT2P_ROOT`. Point
+`BPF_OUT_DIR` at the feature-built image and run a focused ProgramTest case:
 
 ```sh
-BASANOS_DCG_V8_SBF=1 BPF_OUT_DIR=/private/tmp/dcg-sbf-real BASANOS_PT2P_ROOT="$PT2P_ROOT_K80" CARGO_TARGET_DIR=/private/tmp/basanos-test-target cargo test --locked --offline --profile fasttest --manifest-path "$BASANOS_CHECKOUT/chain/dcg-program/Cargo.toml" --test unified_v8_document rev8_position_challenge_rounds_reach_an_admitted_fixpoint -- --nocapture
+BASANOS_DCG_V8_SBF=1 BPF_OUT_DIR=/private/tmp/dcg-sbf-real \
+  BASANOS_PT2P_ROOT="$PT2P_ROOT_K80" \
+  CARGO_TARGET_DIR=/private/tmp/dcg-target \
+  cargo test --locked --offline --profile fasttest -p dcg-program \
+    --features sbf-real-lifecycle-test --test unified_v8_document \
+    rev8_position_challenge_rounds_reach_an_admitted_fixpoint -- --nocapture
 ```
 
-That existing test reaches the ByteSum fix-point replay. The measured round-5
-run also used temporary focused tests for the K=10,240 registry/admission and
-honest resolve/close path, plus a ByteSum replay, wrong-role refusal, executor
-timeout, settlement, and close path. The temporary test driver and its exact
-measurements are documented in the experiment note. No Basanos source was
-changed. Treat all results as mechanics demonstrations; the input stream,
-engine-state accounts, views, and session close remain open stateful features.
+This case reaches tag 169's ByteSum fix-point replay and then tags 132, 131,
+and 172 for timeout, settlement, and close. The round-5 K=10,240 admission and
+resolve/close cases use the same target with the K=10,240 compiler-v1 bundle
+selected through `BASANOS_PT2P_ROOT`. Run the permanent K=10,240 registry and
+admission test:
+
+```sh
+BASANOS_DCG_V8_SBF=1 BPF_OUT_DIR=/private/tmp/dcg-sbf-real \
+  BASANOS_PT2P_ROOT="$PT2P_ROOT_K10240" \
+  CARGO_TARGET_DIR=/private/tmp/dcg-target \
+  cargo test --locked --offline --profile fasttest -p dcg-program \
+    --features sbf-real-lifecycle-test --test unified_v8_document \
+    rev8_pt1x_registry_and_admission_sbf -- --nocapture
+```
+
+Run the K=10,240 admission-through-resolve-and-close test with the same
+environment and command, replacing the filter with
+`rev8_pt1x_real_admission_to_resolve_sbf`:
+
+```sh
+BASANOS_DCG_V8_SBF=1 BPF_OUT_DIR=/private/tmp/dcg-sbf-real \
+  BASANOS_PT2P_ROOT="$PT2P_ROOT_K10240" \
+  CARGO_TARGET_DIR=/private/tmp/dcg-target \
+  cargo test --locked --offline --profile fasttest -p dcg-program \
+    --features sbf-real-lifecycle-test --test unified_v8_document \
+    rev8_pt1x_real_admission_to_resolve_sbf -- --nocapture
+```
+
+The K=80 ByteSum timeout, standard settlement, and close case is
+`rev8_bytesum_fixpoint_silence_settles_and_closes_sbf`. See
+[`bytesum-sbf-lifecycle-2026-09-30.md`](experiments/bytesum-sbf-lifecycle-2026-09-30.md)
+for the exercised tags, CU values, retained image identity, and artifact
+provenance. No Basanos source is required or changed.
+
+## 7. Stateful workload on the SBF image
+
+The local stateful prototype is specified in
+[`stateful-workloads-v1.md`](stateful-workloads-v1.md). Its test app is a
+two-field counter kernel with two output ABIs and one scratch span. Build the
+test-only app image, then run the real handler in ProgramTest:
+
+```sh
+export CARGO_TARGET_DIR=/private/tmp/dcg-target
+export DCG_SBF_SDK=/path/to/platform-tools-sdk
+export DCG_SBF_TOOLS_VERSION=v1.51
+export DCG_SBF_STAGING_NAME=dcg-sbf-stateful-v1
+
+crates/dcg-program/scripts/build-sbf-reproducible.sh \
+  --features sbf-real-lifecycle-test \
+  --sbf-out-dir /private/tmp/dcg-sbf-stateful
+
+SBF_OUT_DIR=/private/tmp/dcg-sbf-stateful \
+CARGO_TARGET_DIR=/private/tmp/dcg-target \
+cargo test --locked --offline --profile fasttest -p dcg-program \
+  --features sbf-real-lifecycle-test --test stateful_sbf_workload -- --nocapture
+```
+
+The ProgramTest sends tags 230–239 against the SBF image. Its honest sessions
+cover indexed and append inputs, three-step advancement, split state spans,
+two outputs from one cursor, explicit anchoring, halt, and rent-refund close.
+The controls refuse stale cursors, duplicate slots, wrong append sequences and
+writers, mismatched view cursors, live close, wrong refund authority, aliases,
+and resource limits above the manifest. The test reports CU from each
+instruction's transaction metadata. The counter result is mechanics evidence,
+not a Doom kernel or model-quality result.

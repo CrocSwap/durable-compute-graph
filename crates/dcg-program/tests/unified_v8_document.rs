@@ -1,0 +1,12439 @@
+#![cfg(all(feature = "revision-8", feature = "sbf-real-lifecycle-test"))]
+
+//! Revision 8's init, land, finalize, attest and **resolve**, driven from real
+//! instructions (`docs/spec/dcg-unified-v8.md` §1.6) natively over the **real
+//! retained rung-D template** (the PWR1 and base triple under
+//! `BASANOS_PT2P_ROOT`). The suite's fixture configuration pairs that K=80
+//! completion fixture with the compiler-v1 PXR1 fixture under
+//! `BASANOS_PT2P_F47_ROOT` for the Form-47 and Form-48 cases. The dispute
+//! position defaults to the retained p=29 fixture and is selectable with
+//! `BASANOS_PT2P_F47_POSITION` for the K=10,240 p=10,239 measurement. Both are selected in the
+//! same test invocation so all completion and decision cases run together.
+//!
+//! Real here: the template, the plan view, the registry (tags 156-158 over the
+//! v7 golden's rows), the template seal (tag 176), the DFS2 body, the position
+//! roots (the executor's own, from
+//! `tests/golden/dcg/unified_v1_executor_rung_d_80.json`), and UnifiedInit,
+//! LandPositionRoots, FinalizeDocumentV5, AttestOutputV5 and ResolveResultV5.
+//!
+//! **The honest attest and resolve paths run end to end here**, over a
+//! *re-keyed* proof set: the leaf, the value, the coordinate, the write row, the
+//! segment, the SPP1 and the plan's table root are the executor's own, and the
+//! three things that commit the **revision-7** descriptor -- the leaf's `write/2`
+//! digest, the segment tree's `node/2` parents and the `segment-root/2` wrap --
+//! are recomputed over this document's `/5` descriptor, because no retained
+//! proof commits a `/5` digest. Two of the twelve path entries and one of the
+//! SPP1's are recomputed because the duplicate-last tree ties them to the leaf
+//! itself; the other ten and the other SPP1 entries are the retained document's
+//! own digests. `rekey_with` re-keys over a **chosen** cell value, which is what
+//! puts a chosen token id in a chosen output and attests it honestly instead of
+//! forging a record the attest never wrote.
+//!
+//! Crafted, and labelled where each is used:
+//!
+//! * **the admission record**: the v7 golden's own DEA2 image with its four
+//!   instance fields (registry, root, PT2S, PT2S digest) repointed at this
+//!   fixture, because the class walk over 28,807 classes is 113 tag-160 calls
+//!   and is not this slice. Every field `admission::view` checks (length, PDA,
+//!   popcount, `complete`) is the golden's.
+//! * **DTU1**: the seal creates it in the spec (§1.7) and that creation is
+//!   stream C4's slice, so the fixture lays the record down at the program's own
+//!   derived address. `init` re-derives the address, so a substituted or
+//!   malformed DTU1 is refused rather than read.
+//! * **the deadline fixtures**: `craft` writes a DCM2 v7, DPR2 and DCR2 v6 at
+//!   their derived addresses with a chosen `init_slot`, which is how the 736
+//!   refusals and the lifetime clamp are driven. The resolve's window is opened
+//!   by **setting the clock** (`past_deadline`) rather than by warping, because
+//!   `warp_to_slot` roots the bank and a root verifies the accounts hash across
+//!   the skipped slots, which a fixture that installs accounts with
+//!   `set_account` cannot then satisfy.
+//! * **`rev8_resolve_cu_at_l_10240`** writes a DCR2 with `count = L = 10,240`
+//!   and every bit set, rather than attesting 10,240 outputs: 10,240
+//!   transactions and 10,240 re-keyed proofs is not this slice, and the CU
+//!   figure is about the clause's scan and not about how the cells got there.
+//! * **typed decisions**: UnifiedInit and the honest tag-120/121/124 cases use
+//!   the retained compiler-v1 PXR1 fixture with 4-byte lanes. The remaining
+//!   decision finalize, attest and resolve cases also cover K = 1, 4, 7, 8 and
+//!   128 over crafted records.
+//!
+//! `result::resolve_check` -- the clause itself, with no accounts and no plan --
+//! is covered separately and exhaustively in `unified_v8_resolve_check.rs`.
+//!
+//! Set `BASANOS_PT2P_ROOT` to the K=80 emission and
+//! `BASANOS_PT2P_F47_ROOT` to a compiler-v1 PXR1 emission for the
+//! documented all-cases fixture configuration. Without the needed artifact a
+//! case prints `needs_local_artifacts` and returns. `BASANOS_DCG_V8_SBF=1` with
+//! `BPF_OUT_DIR` naming an SBF image runs the same tests against that image, and
+//! is how the tag-178 CU figures were taken.
+
+use dcg_program::closure_v2 as h;
+use dcg_program::envelope_seal as envelope;
+use dcg_program::hash::sha256;
+use dcg_program::kernels::decision;
+use dcg_program::position_template as pt;
+use dcg_program::pt2p::{self, Pt2p};
+use dcg_program::pt2p_onchain as S;
+use dcg_program::unified::address;
+use dcg_program::unified::admission;
+use dcg_program::unified::challenge;
+use dcg_program::unified::classes::{class_count, rs1_height, total_entries};
+use dcg_program::unified::config::{self, TemplateLimits};
+use solana_account::AccountSharedData;
+use solana_program::incinerator;
+
+/// **The fixture template's own five limits** (spec §1.7). The example
+/// template's, which are the four protocol-wide constants this branch used to
+/// carry, kept at the same magnitudes so the numbers in the tests below are the
+/// numbers they were; the *kind* of the number is what changed.
+const EXAMPLE_LIMITS: TemplateLimits = TemplateLimits {
+    max_challenge_window_slots: 1 << 26,
+    max_response_window_slots: 1 << 23,
+    max_document_lifetime_slots: 1 << 27,
+    max_abandon_after_slots: 1 << 27,
+    min_abandon_after_slots: 2_592_000,
+};
+
+/// A second template, whose limits the withdrawn constants made impossible.
+const SHORT_LIMITS: TemplateLimits = TemplateLimits {
+    max_challenge_window_slots: 1_000_000,
+    max_response_window_slots: 40_960,
+    max_document_lifetime_slots: 4_096_000,
+    max_abandon_after_slots: 4_096_000,
+    min_abandon_after_slots: 90_000,
+};
+use dcg_program::unified::document::{
+    self, Binding2, Dpd2, Locator, BINDING_AT_V8, BINDING_BYTES_V8, BOND_RETURNED, DECISION_MODE,
+    DECISION_WIDTH, DPR2_HEADER, FLAG_ARMED, FLAG_FINAL, FLAG_REFUTED, FLAG_ROOT_ONLY, FLAG_SEALED,
+    OPTION_REGION_AT, TERMS_AT_V8,
+};
+use dcg_program::unified::events;
+use dcg_program::unified::registry;
+use dcg_program::unified::result;
+use dcg_program::unified::terms::{
+    Terms2, BOND_POLICY_CUSTOM, BOND_POLICY_STANDARD, TERMS_BYTES_V2,
+};
+use dcg_program::unified::{
+    SETTLEMENT_PROGRAM, TAG_ATTEST_OUTPUT, TAG_CHALLENGE_LEAF, TAG_CHALLENGE_POSITION,
+    TAG_CLOSE_DOCUMENT, TAG_CLOSE_TEMPLATE, TAG_DESCEND, TAG_FINALIZE_DOCUMENT,
+    TAG_LAND_POSITION_ROOTS, TAG_REGISTRY_CREATE, TAG_REGISTRY_FREEZE, TAG_REGISTRY_WRITE,
+    TAG_RESOLVE_RESULT, TAG_REVEAL, TAG_REVEAL_FAMILY_TABLE, TAG_REVEAL_POSITION,
+    TAG_SELECT_SEGMENT, TAG_TEMPLATE_SEAL, TAG_UNIFIED_INIT,
+};
+use solana_account::Account;
+use solana_instruction::{account_meta::AccountMeta, error::InstructionError, Instruction};
+use solana_keypair::Keypair;
+use solana_program_test::{processor, ProgramTest, ProgramTestContext};
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_transaction::Transaction;
+use solana_transaction_error::TransactionError;
+use std::path::PathBuf;
+
+const SYSTEM: Pubkey = solana_program::system_program::ID;
+const CL_MALFORMED: u32 = 580;
+const CL_COORDINATE: u32 = 581;
+const CL_AUTHORITY: u32 = 582;
+const DCR1_AUTH_REFUSAL: u32 = 731;
+const CL_ROOT: u32 = 583;
+const CL_MISSING: u32 = 591;
+const CL_AFTER_FINAL: u32 = 592;
+const APPEND_ORDER: u32 = 788;
+const DISPUTE_TERMS: u32 = 791;
+const TEMPLATE_SEAL: u32 = 793;
+const TEMPLATE_USED: u32 = 812;
+const CL_DEADLINE: u32 = 736;
+const CL_PATH: u32 = 586;
+const DCR1_PHASE_REFUSAL: u32 = 733;
+const FORM48_PROOF_REFUSAL: u32 = 734;
+const RUN_BINDING: u32 = 794;
+const OUTPUT_PROOF: u32 = 795;
+const PLAN_BINDING: u32 = 785;
+const DOCUMENT_LENGTH: u32 = 816;
+const RESULT_STATE: u32 = 796;
+const CL_OVERFLOW: u32 = 598;
+const BOND_HELD: u8 = 1;
+const BOND_NONE: u8 = 0;
+/// §1.1 check 11's floor, and the same model as `minimum_balance(0)`.
+const ESCROW_FLOOR: u64 = 890_880;
+
+/// The label the CU print carries, set by the case about to send.
+static LABEL: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
+
+/// Label the next CU print, so a measured figure names the row it came from.
+fn label(what: &'static str) {
+    *LABEL.lock().unwrap_or_else(|e| e.into_inner()) = what;
+}
+
+/// The label in force, for the CU print.
+fn current_label() -> String {
+    LABEL.lock().unwrap_or_else(|e| e.into_inner()).to_string()
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
+}
+
+fn u16_at(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
+}
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+fn u64_at(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+fn d32(b: &[u8], at: usize) -> [u8; 32] {
+    b[at..at + 32].try_into().unwrap()
+}
+
+fn v7_golden() -> serde_json::Value {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/dcg/unified_v7.json");
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// The retained K=10,240 census rows and digest used by the actual high-capacity
+/// template. The v7 golden's registry is intentionally a refusal fixture with
+/// position_limit=80 and cannot stand in for this admission path.
+fn k10240_registry_rows() -> (Vec<u8>, [u8; 32]) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/dcg/rev8_census_registry_rows_v1.tsv");
+    let text = std::fs::read_to_string(path).unwrap();
+    let digest = text
+        .lines()
+        .find_map(|line| line.strip_prefix("# source_census_digest\t"))
+        .map(|hex| unhex(hex).try_into().unwrap())
+        .expect("the K=10,240 census digest");
+    let mut rows = Vec::new();
+    for line in text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let row_hex = line.split('\t').nth(5).expect("row_hex column");
+        rows.extend_from_slice(&unhex(row_hex));
+    }
+    assert_eq!(rows.len() % registry::ROW_BYTES, 0);
+    (rows, digest)
+}
+
+/// The executor's own rung-D run: position roots, attest packets and the
+/// revision-7 descriptor they commit.
+fn executor() -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/dcg/unified_v1_executor_rung_d_80.json");
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+fn artifacts_at(root: PathBuf) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let read = |name: &str| std::fs::read(root.join(name)).ok();
+    let routes = read("base-routes.bin")?;
+    let geometry = read("base-geometry.bin")?;
+    let payloads = read("base-payloads.bin")?;
+    let pwr1 = read("program.bin")?;
+    let clause12 = read("clause12-v4.bin").unwrap_or_else(|| {
+        let g = pt2p::Program::decode(&pwr1).expect("compiler-v1 PWR1 decodes");
+        let view = Pt2p::new(&routes, &geometry, &payloads, None, g.clone())
+            .expect("compiler-v1 PT2P view decodes");
+        pt2p::encode_clause12_v4(view.position_count, view.segment_count, &g.digest()).to_vec()
+    });
+    Some((routes, geometry, payloads, pwr1, clause12))
+}
+
+fn artifacts() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let root = std::env::var_os("BASANOS_PT2P_ROOT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(
+        "/Users/colkitt/sith/toys/crypto/basanos/out/runs/dcg-pt2-parametric-window-routes-20260923/pt2p"));
+    artifacts_at(root)
+}
+
+fn f47_artifacts() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let root = std::env::var_os("BASANOS_PT2P_F47_ROOT").map(PathBuf::from)?;
+    let fixture = artifacts_at(root)?;
+    pt::route_header_v4_shallow(&fixture.0).ok()?.2.as_ref()?;
+    Some(fixture)
+}
+
+/// The compiler-v1 typed-decision position defaults to the retained K=35
+/// fixture's last prompt position. The K=10,240 measurement pins this to 10,239.
+fn f47_position() -> u32 {
+    std::env::var("BASANOS_PT2P_F47_POSITION")
+        .ok()
+        .map(|value| value.parse().expect("BASANOS_PT2P_F47_POSITION is a u32"))
+        .unwrap_or(29)
+}
+
+fn f47_measure_k_filter() -> Option<u8> {
+    std::env::var("BASANOS_DCG_F47_ONLY_K")
+        .ok()
+        .map(|value| value.parse().expect("BASANOS_DCG_F47_ONLY_K is a u8"))
+}
+
+fn f47_compute_limit() -> u32 {
+    std::env::var("BASANOS_DCG_F47_PROBE_LIMIT")
+        .ok()
+        .map(|value| value.parse().expect("BASANOS_DCG_F47_PROBE_LIMIT is a u32"))
+        .unwrap_or(1_400_000)
+}
+
+fn f47_measure_roles() -> impl Iterator<Item = bool> {
+    let role_count = if std::env::var_os("BASANOS_DCG_F47_DEFAULT_ROLE_ONLY").is_some() {
+        1
+    } else {
+        2
+    };
+    [false, true].into_iter().take(role_count)
+}
+
+fn f47_document_roots(f: &Fix, position: u32, position_root: [u8; 32]) -> Vec<[u8; 32]> {
+    let mut roots = (0..=position)
+        .map(|index| {
+            f.position_roots
+                .get(index as usize)
+                .copied()
+                .unwrap_or_else(|| {
+                    sha256(&[
+                        b"basanos/rev8-g1-synthetic-position-root/1",
+                        &index.to_le_bytes(),
+                    ])
+                })
+        })
+        .collect::<Vec<_>>();
+    roots[position as usize] = position_root;
+    roots
+}
+
+fn owned(program: &Pubkey, data: Vec<u8>) -> Account {
+    Account {
+        lamports: (128 + data.len() as u64) * 6_960 + 7,
+        data,
+        owner: *program,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+fn shared(account: Account) -> AccountSharedData {
+    account.into()
+}
+
+/// A system-owned, empty, funded account: what a CPI needs to create a PDA, and
+/// what every target account of `create_pda` must already be.
+fn system_funded() -> Account {
+    Account {
+        lamports: 1_000_000_000_000,
+        data: vec![],
+        owner: SYSTEM,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// Send one instruction, behind a ComputeBudget instruction so
+/// `compute_units_consumed` is a number, and print it with the mode it was
+/// measured in. **Measured-local:** these are the program-test figures, which
+/// are the SBF ones when `BASANOS_DCG_V8_SBF=1` names an SBF image and the
+/// native ones otherwise.
+async fn send(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+) -> Result<(), TransactionError> {
+    send_with_signers_mode(ctx, signer, &[], program, data, metas, true).await
+}
+
+async fn send_with_signers(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    extra_signers: &[&Keypair],
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+) -> Result<(), TransactionError> {
+    send_with_signers_mode(ctx, signer, extra_signers, program, data, metas, true).await
+}
+
+async fn send_quiet(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    extra_signers: &[&Keypair],
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+) -> Result<(), TransactionError> {
+    send_with_signers_mode(ctx, signer, extra_signers, program, data, metas, false).await
+}
+
+#[derive(Default)]
+struct QuietSendCache {
+    blockhash: Option<solana_program::hash::Hash>,
+    uses: usize,
+    nonce: u64,
+}
+
+/// Quiet setup sender that refreshes its recent blockhash every 32
+/// transactions and gives each transaction a unique, near-maximum compute
+/// limit. The budget does not change the program instruction; it prevents
+/// identical tag-142/193 chunk messages from being rejected as already
+/// processed (which would force ProgramTest to freeze and rehash all large
+/// accounts to advance the bank). The short blockhash cadence keeps large
+/// upload runs inside ProgramTest's recent-blockhash window.
+async fn send_quiet_cached(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    extra_signers: &[&Keypair],
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+    cache: &mut QuietSendCache,
+) -> Result<(), TransactionError> {
+    if cache.blockhash.is_none() || cache.uses >= 32 {
+        cache.blockhash = Some(ctx.banks_client.get_latest_blockhash().await.unwrap());
+        cache.uses = 0;
+    }
+    let nonce = cache.nonce;
+    cache.nonce = cache
+        .nonce
+        .checked_add(1)
+        .expect("quiet sender nonce overflow");
+    let compute_limit = 1_400_000 - (nonce % 100_000) as u32;
+    let make_transaction = |blockhash| {
+        let ixs = vec![
+            solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+                compute_limit,
+            ),
+            Instruction {
+                program_id: program,
+                accounts: metas.clone(),
+                data: data.clone(),
+            },
+        ];
+        let mut signers = vec![signer];
+        signers.extend_from_slice(extra_signers);
+        Transaction::new_signed_with_payer(&ixs, Some(&signer.pubkey()), &signers, blockhash)
+    };
+    let mut result = match ctx
+        .banks_client
+        .process_transaction_with_metadata(make_transaction(cache.blockhash.unwrap()))
+        .await
+    {
+        Ok(inner) => {
+            if matches!(data.first().copied(), Some(140..=147 | 156..=160 | 176)) {
+                if let Some(metadata) = inner.metadata.as_ref() {
+                    eprintln!(
+                        "CU tag {} data {} cu {}",
+                        data[0],
+                        data.len(),
+                        metadata.compute_units_consumed
+                    );
+                }
+            }
+            inner.result
+        }
+        Err(error) => panic!("the banks client refused the cached transaction: {error:?}"),
+    };
+    if matches!(&result, Err(TransactionError::AlreadyProcessed)) {
+        let slot = ctx
+            .banks_client
+            .get_sysvar::<solana_program::clock::Clock>()
+            .await
+            .unwrap()
+            .slot;
+        ctx.warp_to_slot(slot + 1).unwrap();
+        cache.blockhash = Some(
+            ctx.get_new_latest_blockhash()
+                .await
+                .expect("a cached retry blockhash"),
+        );
+        cache.uses = 0;
+        let inner = ctx
+            .banks_client
+            .process_transaction_with_metadata(make_transaction(cache.blockhash.unwrap()))
+            .await
+            .unwrap_or_else(|error| panic!("the banks client refused the retry: {error:?}"));
+        if matches!(data.first().copied(), Some(140..=147 | 156..=160 | 176)) {
+            if let Some(metadata) = inner.metadata.as_ref() {
+                eprintln!(
+                    "CU tag {} data {} cu {}",
+                    data[0],
+                    data.len(),
+                    metadata.compute_units_consumed
+                );
+            }
+        }
+        result = inner.result;
+    }
+    cache.uses += 1;
+    result
+}
+
+async fn send_with_signers_mode(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    extra_signers: &[&Keypair],
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+    log_cu: bool,
+) -> Result<(), TransactionError> {
+    let tag = *data.first().unwrap_or(&0);
+    let len = data.len();
+    let case = current_label();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    // The compute budget is what makes `compute_units_consumed` a number rather
+    // than the unset default; `custom()` then reads the refusal off instruction
+    // index 1, which is where the program's instruction sits.
+    let ixs = vec![
+        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+            1_400_000,
+        ),
+        Instruction {
+            program_id: program,
+            accounts: metas,
+            data,
+        },
+    ];
+    let mut signers = vec![signer];
+    signers.extend_from_slice(extra_signers);
+    let tx = Transaction::new_signed_with_payer(&ixs, Some(&signer.pubkey()), &signers, blockhash);
+    let out = ctx.banks_client.process_transaction_with_metadata(tx).await;
+    let (mut result, mut compute_units) = match out {
+        Ok(inner) => (
+            inner.result,
+            inner
+                .metadata
+                .as_ref()
+                .map(|m| m.compute_units_consumed)
+                .unwrap_or(0),
+        ),
+        Err(error) => panic!("the banks client refused the transaction: {error:?}"),
+    };
+    if matches!(&result, Err(TransactionError::AlreadyProcessed)) {
+        // ProgramTest can hand back the same recent blockhash while its PoH
+        // worker is between ticks. Advance one slot and retry this test-only
+        // transaction so the refusal under test comes from the program.
+        let slot = ctx
+            .banks_client
+            .get_sysvar::<solana_program::clock::Clock>()
+            .await
+            .unwrap()
+            .slot;
+        ctx.warp_to_slot(slot + 1).unwrap();
+        let blockhash = ctx
+            .get_new_latest_blockhash()
+            .await
+            .expect("a retry blockhash");
+        let retry =
+            Transaction::new_signed_with_payer(&ixs, Some(&signer.pubkey()), &signers, blockhash);
+        let inner = ctx
+            .banks_client
+            .process_transaction_with_metadata(retry)
+            .await
+            .unwrap_or_else(|error| panic!("the banks client refused the retry: {error:?}"));
+        result = inner.result;
+        compute_units = inner
+            .metadata
+            .as_ref()
+            .map(|m| m.compute_units_consumed)
+            .unwrap_or(0);
+    }
+    let mode = if std::env::var_os("BASANOS_DCG_V8_SBF").is_some() {
+        "SBF"
+    } else {
+        "native"
+    };
+    if log_cu {
+        eprintln!("CU tag {tag} data {len} cu {compute_units} mode {mode} label {case}");
+    }
+    result
+}
+
+/// The CU-returning form is used by the DPR2 close-slope census below. It runs
+/// the same compute-budget instruction and captures the SBF metadata rather
+/// than inferring it from an eprintln line.
+async fn send_cu(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+) -> Result<u64, TransactionError> {
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ixs = vec![
+        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+            1_400_000,
+        ),
+        Instruction {
+            program_id: program,
+            accounts: metas,
+            data,
+        },
+    ];
+    let tx = Transaction::new_signed_with_payer(&ixs, Some(&signer.pubkey()), &[signer], blockhash);
+    match ctx.banks_client.process_transaction_with_metadata(tx).await {
+        Ok(result) => {
+            result.result?;
+            Ok(result
+                .metadata
+                .as_ref()
+                .map(|m| m.compute_units_consumed)
+                .unwrap_or(0))
+        }
+        Err(error) => panic!("the banks client refused the measured transaction: {error:?}"),
+    }
+}
+
+fn custom(result: Result<(), TransactionError>) -> u32 {
+    match result {
+        Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => code,
+        other => panic!("expected a custom refusal, got {other:?}"),
+    }
+}
+
+fn custom_or_zero(result: Result<(), TransactionError>) -> u32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => custom(Err(error)),
+    }
+}
+
+// ------------------------------------------------------------------ builders
+
+/// The revision-8 UnifiedInit data: `terms[136] | binding[196] | model_root |
+/// position_table_root | prompt_commitment | family_count:u16 | dfs2_body |
+/// option_table[4*option_count]`.
+fn init_data(
+    terms: &[u8],
+    binding: &[u8],
+    anchors: &[[u8; 32]; 3],
+    family_count: u16,
+    body: &[u8],
+    options: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![TAG_UNIFIED_INIT];
+    out.extend_from_slice(terms);
+    out.extend_from_slice(binding);
+    for a in anchors {
+        out.extend_from_slice(a);
+    }
+    out.extend_from_slice(&family_count.to_le_bytes());
+    out.extend_from_slice(body);
+    out.extend_from_slice(options);
+    out
+}
+
+fn land_data(descriptor: &[u8; 32], first: u32, roots: &[[u8; 32]]) -> Vec<u8> {
+    let mut out = vec![TAG_LAND_POSITION_ROOTS];
+    out.extend_from_slice(descriptor);
+    out.extend_from_slice(&first.to_le_bytes());
+    out.push(roots.len() as u8);
+    for r in roots {
+        out.extend_from_slice(r);
+    }
+    out
+}
+
+fn finalize_data(descriptor: &[u8; 32], n: u32, roots: &[[u8; 32]]) -> Vec<u8> {
+    let mut out = vec![TAG_FINALIZE_DOCUMENT];
+    out.extend_from_slice(descriptor);
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&(roots.len() as u16).to_le_bytes());
+    for r in roots {
+        out.extend_from_slice(r);
+    }
+    out
+}
+
+/// A DCM2 v7 image, from the fields the handlers read. `option_count` decides
+/// the length, exactly as `document_v8` requires.
+fn dcm2_v7(
+    program: &Pubkey,
+    descriptor: &[u8; 32],
+    authority: &[u8; 32],
+    k: u32,
+    n: u32,
+    flags: u16,
+    terms: &[u8],
+    binding: &[u8],
+    pt2s: &[u8; 32],
+    pt2s_sha: &[u8; 32],
+    dea2: &[u8; 32],
+    drp2: &[u8; 32],
+    reg_root: &[u8; 32],
+    family_count: u16,
+    deadline: u64,
+    abandon: u64,
+) -> Vec<u8> {
+    let b = Binding2::decode(binding).expect("the fixture's binding decodes");
+    let mut out = vec![0u8; OPTION_REGION_AT + 4 * b.option_count as usize];
+    out[..4].copy_from_slice(b"DCM2");
+    out[4..6].copy_from_slice(&7u16.to_le_bytes());
+    out[6..8].copy_from_slice(&flags.to_le_bytes());
+    out[8..40].copy_from_slice(descriptor);
+    out[40..72].copy_from_slice(authority);
+    out[72..76].copy_from_slice(&k.to_le_bytes());
+    out[76..78].copy_from_slice(&34u16.to_le_bytes());
+    out[document::DCM2_BUMP_AT] = address::document(program, descriptor).1;
+    out[document::DPR2_BUMP_AT] = address::positions(program, descriptor).1;
+    out[document::DFS2_BUMP_AT] = address::family_slots(program, descriptor).1;
+    out[document::BOND_ESCROW_BUMP_AT] = address::bond_escrow(program, descriptor).1;
+    out[84..88].copy_from_slice(&n.to_le_bytes());
+    out[88..96].copy_from_slice(&(504_606_552u64).to_le_bytes());
+    out[144..152].copy_from_slice(&deadline.to_le_bytes());
+    out[184..192].copy_from_slice(&u64_at(terms, 8).to_le_bytes());
+    out[192..200].copy_from_slice(&(504_606_552u64).to_le_bytes());
+    out[200..232].copy_from_slice(pt2s);
+    out[232..264].copy_from_slice(pt2s_sha);
+    out[264..296].copy_from_slice(&[1u8; 32]);
+    out[296..328].copy_from_slice(&[2u8; 32]);
+    out[328..360].copy_from_slice(&[3u8; 32]);
+    out[360..392].copy_from_slice(drp2);
+    out[392..424].copy_from_slice(reg_root);
+    out[424..456].copy_from_slice(dea2);
+    out[456..488].copy_from_slice(&[4u8; 32]);
+    out[520..524].copy_from_slice(&4u32.to_le_bytes());
+    out[524..526].copy_from_slice(&family_count.to_le_bytes());
+    out[526] = rs1_height(k);
+    out[527] = 3;
+    out[529] = if u64_at(terms, 32) > 0 {
+        BOND_HELD
+    } else {
+        BOND_NONE
+    };
+    out[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2].copy_from_slice(terms);
+    out[BINDING_AT_V8..BINDING_AT_V8 + BINDING_BYTES_V8].copy_from_slice(binding);
+    out[document::ABANDON_DEADLINE_AT..document::ABANDON_DEADLINE_AT + 8]
+        .copy_from_slice(&abandon.to_le_bytes());
+    out
+}
+
+/// A DCR2 v6 image, from the fields the handlers read. `attested` cells are
+/// zero and the bitmap is empty; a caller that wants a half-attested record
+/// writes its own.
+fn dcr2_v6(program: &Pubkey, descriptor: &[u8; 32], binding: &Binding2, terms: &Terms2) -> Vec<u8> {
+    let full = result::bytes_v8(binding.output_count, binding.output_width).unwrap();
+    let mut out = vec![0u8; full];
+    out[..4].copy_from_slice(b"DCR2");
+    out[4..6].copy_from_slice(&6u16.to_le_bytes());
+    out[8..40].copy_from_slice(descriptor);
+    out[72..104].copy_from_slice(&binding.request_id);
+    out[104..136].copy_from_slice(&binding.consumer_digest);
+    out[136..168].copy_from_slice(&binding.executor);
+    out[196..200].copy_from_slice(&binding.output_count.to_le_bytes());
+    out[200..204].copy_from_slice(&binding.output_first_position.to_le_bytes());
+    out[208] = binding.output_width;
+    out[216..216 + TERMS_BYTES_V2].copy_from_slice(&terms.encode());
+    out[384..392].copy_from_slice(&terms.result_retention_slots.to_le_bytes());
+    out[result::RESULT_PDA_BUMP_AT_V6] = address::result(program, descriptor).1;
+    out
+}
+
+/// A DPR2 image with `count` landed roots at their real values.
+fn dpr2_image(descriptor: &[u8; 32], k: u32, roots: &[[u8; 32]]) -> Vec<u8> {
+    let mut out = vec![0u8; DPR2_HEADER + 32 * roots.len()];
+    out[..4].copy_from_slice(b"DPR2");
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    out[8..40].copy_from_slice(descriptor);
+    out[40..44].copy_from_slice(&k.to_le_bytes());
+    out[44..48].copy_from_slice(&(roots.len() as u32).to_le_bytes());
+    for (i, r) in roots.iter().enumerate() {
+        out[DPR2_HEADER + 32 * i..DPR2_HEADER + 32 * (i + 1)].copy_from_slice(r);
+    }
+    out
+}
+
+/// A PT2S in `STATE_HASHING` with the three flat digests PWR1 commits already in
+/// place: the image a real emission's own state carried at the moment the seal
+/// ran. **Nothing from 316 on is written** -- the clause-12 v4, the definition
+/// digest, the template descriptor and the six locator bytes are all the seal's,
+/// and a fixture that lays them down itself never exercises tag 145 at all,
+/// which is how the review's High 2 (`write == 0` refused) went unseen: the
+/// retained template's own locator is `(28_037, write 0, 16)` and no test ever
+/// sent a 39-byte seal.
+fn hashing_pt2s(
+    routes: &[u8],
+    geometry: &[u8],
+    payloads: &[u8],
+    pwr1: &[u8],
+    authority: Pubkey,
+    keys: [Pubkey; 3],
+) -> Vec<u8> {
+    let mut out = vec![0u8; S::OFF_PWR1 + pwr1.len()];
+    out[..4].copy_from_slice(S::MAGIC);
+    out[S::OFF_STATE] = S::STATE_HASHING;
+    out[S::OFF_AUTHORITY..S::OFF_AUTHORITY + 32].copy_from_slice(authority.as_ref());
+    out[S::OFF_PT1S..S::OFF_PT1S + 32].copy_from_slice(&[1u8; 32]);
+    for (i, key) in keys.into_iter().enumerate() {
+        out[S::OFF_KEYS + 32 * i..S::OFF_KEYS + 32 * (i + 1)].copy_from_slice(key.as_ref());
+    }
+    for (i, len) in [routes.len(), geometry.len(), payloads.len()]
+        .into_iter()
+        .enumerate()
+    {
+        out[S::OFF_LENGTHS + 4 * i..S::OFF_LENGTHS + 4 * (i + 1)]
+            .copy_from_slice(&(len as u32).to_le_bytes());
+    }
+    out[S::OFF_DIGESTS..S::OFF_DIGESTS + 96]
+        .copy_from_slice(&[sha256(&[routes]), sha256(&[geometry]), sha256(&[payloads])].concat());
+    out[S::OFF_CURSOR_KIND] = 3;
+    out[S::OFF_PWR1_LEN..S::OFF_PWR1_LEN + 2].copy_from_slice(&(pwr1.len() as u16).to_le_bytes());
+    out[S::OFF_PWR1..].copy_from_slice(pwr1);
+    out
+}
+
+// ------------------------------------------------------------------ the fixture
+
+/// Everything the tests share. Data only; the builders above take what they
+/// need, so there is no method-borrow dance to get wrong.
+struct Fix {
+    ctx: ProgramTestContext,
+    program: Pubkey,
+    executor: Keypair,
+    signer: Keypair,
+    pt2s: Pubkey,
+    routes: Pubkey,
+    geometry: Pubkey,
+    payloads: Pubkey,
+    drp2: Pubkey,
+    dea2: Pubkey,
+    dta1: Pubkey,
+    dtu1: Pubkey,
+    pt2s_image: Vec<u8>,
+    pt2s_sha: [u8; 32],
+    descriptor_v7: [u8; 32],
+    position_roots: Vec<[u8; 32]>,
+    attestations: Vec<Vec<u8>>,
+    family_body: Vec<u8>,
+    family_roots: Vec<[u8; 32]>,
+    k: u32,
+    segments: u16,
+    /// A program-owned stand-in for the **PT1S index** account the PT2S names at
+    /// `OFF_PT1S`, which tag 186 drains. A fresh key, so it is not the closer's
+    /// account and not a funded system account.
+    pt1s_index: Pubkey,
+    /// Signer for the live template's payload resource, retained for the
+    /// C3 self-key drain regression.
+    payload_key: Keypair,
+    reg_root: [u8; 32],
+    total_entries: u64,
+    locator: Locator,
+    terms_raw: Vec<u8>,
+    base_entry: u32,
+    output_write: u8,
+    output_width: u8,
+    real_pda_funding: bool,
+}
+
+impl Fix {
+    /// The 14 metas of UnifiedInit: revision 7's thirteen plus **DTU1**, whose
+    /// `documents + 1` is the instruction's last write (spec §1.6, §1.7).
+    fn init_metas(&self, created: [Pubkey; 4]) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new(self.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(created[1], false),
+            AccountMeta::new(created[2], false),
+            AccountMeta::new_readonly(SYSTEM, false),
+            AccountMeta::new_readonly(self.pt2s, false),
+            AccountMeta::new_readonly(self.routes, false),
+            AccountMeta::new_readonly(self.geometry, false),
+            AccountMeta::new_readonly(self.payloads, false),
+            AccountMeta::new_readonly(self.drp2, false),
+            AccountMeta::new_readonly(self.dea2, false),
+            AccountMeta::new_readonly(self.dta1, false),
+            AccountMeta::new(created[3], false),
+            AccountMeta::new(self.dtu1, false),
+        ]
+    }
+
+    fn descriptor(&self, binding: &Binding2, terms_raw: &[u8], family_count: u16) -> [u8; 32] {
+        let b = binding.encode();
+        Dpd2 {
+            position_count: self.k,
+            segment_count: self.segments,
+            family_count,
+            rs1_height: rs1_height(self.k),
+            compiler_version: 1,
+            total_entries: self.total_entries,
+            terms: terms_raw,
+            binding: &b,
+            clause12_v4: &self.pt2s_image[S::OFF_CLAUSE12..S::OFF_CLAUSE12 + 43],
+            definition_sha256: &d32(&self.pt2s_image, S::OFF_DEFINITION),
+            base_digests: &self.pt2s_image[S::OFF_DIGESTS..S::OFF_DIGESTS + 96],
+            model_root: &[1u8; 32],
+            position_table_root: &[2u8; 32],
+            prompt_commitment: &[3u8; 32],
+            registry: self.drp2.as_ref(),
+            registry_table_root: &self.reg_root,
+            dfs2_sha256: &sha256(&[&self.family_body]),
+        }
+        .digest_v8()
+    }
+
+    /// The binding a completion document over this template declares.
+    fn binding(&self, first: u32, count: u32) -> Binding2 {
+        Binding2 {
+            executor: self.executor.pubkey().to_bytes(),
+            request_id: [5u8; 32],
+            consumer_digest: [6u8; 32],
+            seed: [0; 32],
+            output_first_position: first,
+            output_count: count,
+            output_base_entry: self.base_entry,
+            output_write: self.output_write,
+            output_width: self.output_width,
+            decision_flags: 0,
+            option_count: 0,
+            prompt_positions: first + 1,
+            stop_plus_one: 0,
+            option_table_offset: 0,
+            option_table_sha256: [0; 32],
+        }
+    }
+
+    /// The CUSTOM terms of §1.1: a zero slasher share, a nonzero remainder, a
+    /// nonzero settlement program and window, and twice the abandonment floor.
+    fn terms(&self) -> Vec<u8> {
+        Terms2 {
+            challenge_window_slots: 90_000,
+            response_window_slots: 45_000,
+            challenger_bond_lamports: 1_000_000,
+            executor_bond_lamports: ESCROW_FLOOR,
+            executor_reward_bps: 0,
+            bond_policy_kind: BOND_POLICY_CUSTOM,
+            bond_slasher_bps: 0,
+            settlement_program: [7u8; 32],
+            custom_settle_window_slots: 604_800,
+            result_retention_slots: 2_592_000,
+            bond_remainder: [8u8; 32],
+            abandon_after_slots: 2 * EXAMPLE_LIMITS.min_abandon_after_slots,
+        }
+        .encode()
+        .to_vec()
+    }
+
+    /// init, then land `n` real position roots, then finalize. The document's
+    /// four created accounts are funded first so the CPIs can create them.
+    async fn run_document(&mut self, binding: &Binding2, n: u32) -> ([u8; 32], [Pubkey; 4]) {
+        self.run_document_with_options(binding, n, &[]).await
+    }
+
+    /// The same real UnifiedInit path with a binding-bound decision option table.
+    async fn run_document_with_options(
+        &mut self,
+        binding: &Binding2,
+        n: u32,
+        options: &[u8],
+    ) -> ([u8; 32], [Pubkey; 4]) {
+        let roots = self.position_roots[..n as usize].to_vec();
+        self.run_document_with_roots_and_options(binding, &roots, options)
+            .await
+    }
+
+    /// init, then land exactly these roots. A caller that has re-keyed a
+    /// position root lands that list rather than the retained one, and the
+    /// finalize is the caller's, as it always was.
+    async fn run_document_with_roots(
+        &mut self,
+        binding: &Binding2,
+        roots: &[[u8; 32]],
+    ) -> ([u8; 32], [Pubkey; 4]) {
+        self.run_document_with_roots_and_options(binding, roots, &[])
+            .await
+    }
+
+    async fn run_document_with_roots_and_options(
+        &mut self,
+        binding: &Binding2,
+        roots: &[[u8; 32]],
+        options: &[u8],
+    ) -> ([u8; 32], [Pubkey; 4]) {
+        let descriptor = self.descriptor(binding, &self.terms_raw, 16);
+        let created = [
+            address::document(&self.program, &descriptor).0,
+            address::positions(&self.program, &descriptor).0,
+            address::family_slots(&self.program, &descriptor).0,
+            address::result(&self.program, &descriptor).0,
+        ];
+        for key in created {
+            if self.real_pda_funding {
+                fund_system(&mut self.ctx, &self.executor, key, 50_000_000_000).await;
+            } else {
+                fund(&mut self.ctx, key).await;
+            }
+        }
+        let metas = self.init_metas(created);
+        let data = init_data(
+            &self.terms_raw,
+            &binding.encode(),
+            &[[1u8; 32], [2u8; 32], [3u8; 32]],
+            16,
+            &self.family_body,
+            options,
+        );
+        send(&mut self.ctx, &self.executor, self.program, data, metas)
+            .await
+            .expect("init");
+        // Tag 162 encodes its batch count as u8. Keep the generated K=10,240
+        // measurement on the same honest append path as the small fixture,
+        // with bounded batches that do not wrap that count field.
+        for (batch, batch_roots) in roots.chunks(20).enumerate() {
+            let first = u32::try_from(batch * 20).expect("position batch offset fits u32");
+            let data = land_data(&descriptor, first, batch_roots);
+            send(
+                &mut self.ctx,
+                &self.executor,
+                self.program,
+                data,
+                vec![
+                    AccountMeta::new(self.executor.pubkey(), true),
+                    AccountMeta::new(created[0], false),
+                    AccountMeta::new(created[1], false),
+                    AccountMeta::new_readonly(self.dtu1, false),
+                ],
+            )
+            .await
+            .expect("land");
+        }
+        (descriptor, created)
+    }
+
+    async fn finalize(&mut self, descriptor: &[u8; 32], created: [Pubkey; 4], n: u32) -> Vec<u8> {
+        let document = self.account(created[0]).await;
+        assert_eq!(
+            u32_at(&document, 84),
+            n,
+            "finalize n matches landed position roots"
+        );
+        let data = finalize_data(descriptor, n, &self.family_roots);
+        send(
+            &mut self.ctx,
+            &self.executor,
+            self.program,
+            data,
+            vec![
+                AccountMeta::new(self.executor.pubkey(), true),
+                AccountMeta::new(created[0], false),
+                AccountMeta::new(created[3], false),
+                AccountMeta::new_readonly(self.dtu1, false),
+            ],
+        )
+        .await
+        .expect("finalize");
+        self.account(created[0]).await
+    }
+
+    async fn account(&mut self, key: Pubkey) -> Vec<u8> {
+        self.ctx
+            .banks_client
+            .get_account(key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+    }
+
+    /// A real `UnifiedInit` over `binding`, and the code it refused with. The
+    /// four PDAs are derived and funded first, so the only thing that can
+    /// refuse is the binding, the terms or the plan -- not a missing account.
+    /// `variant` makes the descriptor (and so the four PDAs) distinct per
+    /// attempt, because a refused init writes nothing and a second attempt at
+    /// the same descriptor would be a duplicate transaction.
+    async fn init_refusal(&mut self, binding: &Binding2, variant: u8) -> u32 {
+        let b = Binding2 {
+            request_id: [variant; 32],
+            ..*binding
+        };
+        let descriptor = self.descriptor(&b, &self.terms_raw, 16);
+        let created = [
+            address::document(&self.program, &descriptor).0,
+            address::positions(&self.program, &descriptor).0,
+            address::family_slots(&self.program, &descriptor).0,
+            address::result(&self.program, &descriptor).0,
+        ];
+        for key in created {
+            fund(&mut self.ctx, key).await;
+        }
+        let data = init_data(
+            &self.terms_raw,
+            &b.encode(),
+            &[[1u8; 32], [2u8; 32], [3u8; 32]],
+            16,
+            &self.family_body,
+            &[],
+        );
+        let metas = self.init_metas(created);
+        let slot = self
+            .ctx
+            .banks_client
+            .get_sysvar::<solana_program::clock::Clock>()
+            .await
+            .unwrap()
+            .slot;
+        self.ctx.warp_to_slot(slot + 1).unwrap();
+        custom(send(&mut self.ctx, &self.executor, self.program, data, metas).await)
+    }
+}
+
+/// Pre-fund a system-owned, empty account so a CPI can create its PDA.
+async fn fund(ctx: &mut ProgramTestContext, key: Pubkey) {
+    if ctx.banks_client.get_account(key).await.unwrap().is_none() {
+        ctx.set_account(&key, &shared(system_funded()));
+    }
+}
+
+/// Fund an absent PDA with a real System Program transfer, as the permissionless
+/// document path expects. This keeps the full lifecycle test free of test-bank
+/// account replacement for protocol state.
+async fn fund_system(ctx: &mut ProgramTestContext, payer: &Keypair, key: Pubkey, lamports: u64) {
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ix = solana_program::system_instruction::transfer(&payer.pubkey(), &key, lamports);
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], blockhash);
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("System Program funds PDA");
+}
+
+/// Allocate a fresh program-owned account through the System Program, signed
+/// by its keypair and funded by the recorded template authority.
+async fn allocate_program_account(
+    ctx: &mut ProgramTestContext,
+    payer: &Keypair,
+    account: &Keypair,
+    owner: Pubkey,
+    bytes: usize,
+) {
+    let lamports = solana_program::rent::Rent::default().minimum_balance(bytes);
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let create = solana_program::system_instruction::create_account(
+        &payer.pubkey(),
+        &account.pubkey(),
+        lamports,
+        bytes as u64,
+        &owner,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[create],
+        Some(&payer.pubkey()),
+        &[payer, account],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("System Program allocates the fresh program-owned account");
+}
+
+async fn upload_pt1x(
+    ctx: &mut ProgramTestContext,
+    authority: &Keypair,
+    program: Pubkey,
+    pt1x: &Keypair,
+    byte_account_signers: [&Keypair; 3],
+    byte_accounts: [Pubkey; 3],
+    blobs: [&[u8]; 3],
+    attacker: &Keypair,
+    cache: &mut QuietSendCache,
+) {
+    let mut metas = vec![AccountMeta::new(pt1x.pubkey(), true)];
+    metas.extend(
+        byte_accounts
+            .into_iter()
+            .map(|key| AccountMeta::new(key, true)),
+    );
+    metas.push(AccountMeta::new_readonly(authority.pubkey(), true));
+    let init_signers = [
+        pt1x,
+        byte_account_signers[0],
+        byte_account_signers[1],
+        byte_account_signers[2],
+    ];
+    send_quiet_cached(
+        ctx,
+        authority,
+        &init_signers,
+        program,
+        vec![140],
+        {
+            metas.push(AccountMeta::new_readonly(SYSTEM, false));
+            metas
+        },
+        cache,
+    )
+    .await
+    .expect("PT1X init");
+    let mut malformed = vec![141, 0];
+    malformed.extend_from_slice(&1u32.to_le_bytes());
+    malformed.extend_from_slice(&blobs[0][..900]);
+    let malformed_result = send_quiet_cached(
+        ctx,
+        authority,
+        &[],
+        program,
+        malformed,
+        vec![
+            AccountMeta::new(pt1x.pubkey(), false),
+            AccountMeta::new(byte_accounts[0], false),
+            AccountMeta::new_readonly(authority.pubkey(), true),
+        ],
+        cache,
+    )
+    .await;
+    assert_eq!(
+        custom(malformed_result),
+        dcg_program::position_template::MALFORMED,
+        "an unaligned PT1X chunk refuses"
+    );
+    let mut attack = vec![141, 0];
+    attack.extend_from_slice(&0u32.to_le_bytes());
+    attack.extend_from_slice(&blobs[0][..900]);
+    let attack_result = send_quiet_cached(
+        ctx,
+        authority,
+        &[attacker],
+        program,
+        attack,
+        vec![
+            AccountMeta::new(pt1x.pubkey(), false),
+            AccountMeta::new(byte_accounts[0], false),
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+        ],
+        cache,
+    )
+    .await;
+    assert!(
+        matches!(
+            attack_result,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::InvalidAccountData
+            ))
+        ),
+        "a third party cannot write PT1X resources"
+    );
+    for kind in 0..3 {
+        for (chunk, bytes) in blobs[kind].chunks(900).enumerate() {
+            let mut data = vec![141, kind as u8];
+            data.extend_from_slice(&u32::try_from(chunk * 900).unwrap().to_le_bytes());
+            data.extend_from_slice(bytes);
+            send_quiet_cached(
+                ctx,
+                authority,
+                &[],
+                program,
+                data,
+                vec![
+                    AccountMeta::new(pt1x.pubkey(), false),
+                    AccountMeta::new(byte_accounts[kind], false),
+                    AccountMeta::new_readonly(authority.pubkey(), true),
+                ],
+                cache,
+            )
+            .await
+            .expect("PT1X upload chunk");
+        }
+    }
+}
+
+async fn seal_pt1x(
+    ctx: &mut ProgramTestContext,
+    authority: &Keypair,
+    program: Pubkey,
+    pt1x: Pubkey,
+    byte_accounts: [Pubkey; 3],
+    routes: &[u8],
+    attacker: &Keypair,
+    cache: &mut QuietSendCache,
+) {
+    let n = u32::from_le_bytes(routes[..4].try_into().unwrap()) as usize;
+    let attack_result = send_quiet_cached(
+        ctx,
+        authority,
+        &[attacker],
+        program,
+        vec![142, 64, 0],
+        vec![
+            AccountMeta::new(pt1x, false),
+            AccountMeta::new_readonly(byte_accounts[0], false),
+            AccountMeta::new_readonly(byte_accounts[1], false),
+            AccountMeta::new_readonly(byte_accounts[2], false),
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+        ],
+        cache,
+    )
+    .await;
+    assert!(
+        matches!(
+            attack_result,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::InvalidAccountData
+            ))
+        ),
+        "a third party cannot advance the PT1X seal cursor"
+    );
+    let mut prefix = vec![0usize];
+    for i in 0..n {
+        let at = 80 + 16 * i + 6;
+        let count = u16::from_le_bytes(routes[at..at + 2].try_into().unwrap()) as usize
+            + u16::from_le_bytes(routes[at + 2..at + 4].try_into().unwrap()) as usize;
+        prefix.push(prefix[i] + count);
+    }
+    loop {
+        let state = ctx
+            .banks_client
+            .get_account(pt1x)
+            .await
+            .unwrap()
+            .unwrap()
+            .data;
+        if state[4] == 3 {
+            break;
+        }
+        let cursor = u32::from_le_bytes(state[157..161].try_into().unwrap()) as usize;
+        let mut count = if state[4] == 4 {
+            [
+                (64usize, 245usize),
+                (48, 245),
+                (32, 100),
+                (20, 200),
+                (16, 220),
+                (8, 245),
+                (4, 245),
+                (1, usize::MAX),
+            ]
+            .iter()
+            .find(|(size, limit)| {
+                cursor + size <= n && prefix[cursor + size] - prefix[cursor] <= *limit
+            })
+            .map_or(1, |item| item.0)
+        } else if state[4] == 5 {
+            64
+        } else {
+            16
+        };
+        loop {
+            let data = vec![142, count as u8, (count >> 8) as u8];
+            let result = send_quiet_cached(
+                ctx,
+                authority,
+                &[],
+                program,
+                data,
+                vec![
+                    AccountMeta::new(pt1x, false),
+                    AccountMeta::new_readonly(byte_accounts[0], false),
+                    AccountMeta::new_readonly(byte_accounts[1], false),
+                    AccountMeta::new_readonly(byte_accounts[2], false),
+                    AccountMeta::new_readonly(authority.pubkey(), true),
+                ],
+                cache,
+            )
+            .await;
+            match result {
+                Ok(()) => break,
+                Err(_) if count > 1 => count /= 2,
+                Err(error) => panic!("PT1X seal phase {} at {cursor}: {error:?}", state[4]),
+            }
+        }
+    }
+}
+
+async fn seal_pt2s(
+    ctx: &mut ProgramTestContext,
+    authority: &Keypair,
+    pt2s: &Keypair,
+    program: Pubkey,
+    pt1x: Pubkey,
+    byte_accounts: [Pubkey; 3],
+    pwr1: &[u8],
+    locator: Locator,
+    attacker: &Keypair,
+    cache: &mut QuietSendCache,
+) {
+    let mut data = vec![S::TAG_INIT];
+    data.extend_from_slice(pwr1);
+    let hijack = send_quiet_cached(
+        ctx,
+        authority,
+        &[pt2s, attacker],
+        program,
+        data.clone(),
+        vec![
+            AccountMeta::new(pt2s.pubkey(), true),
+            AccountMeta::new(pt1x, false),
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+        ],
+        cache,
+    )
+    .await;
+    assert!(
+        matches!(
+            hijack,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::InvalidAccountData
+            ))
+        ),
+        "a third party cannot bind PT1X to its PT2S"
+    );
+    send_quiet_cached(
+        ctx,
+        authority,
+        &[pt2s],
+        program,
+        data,
+        vec![
+            AccountMeta::new(pt2s.pubkey(), true),
+            AccountMeta::new(pt1x, false),
+            AccountMeta::new_readonly(authority.pubkey(), true),
+        ],
+        cache,
+    )
+    .await
+    .expect("PT2S init binds PT1X");
+    let mut attacker_hash = vec![S::TAG_HASH];
+    attacker_hash.extend_from_slice(&S::MAX_HASH_BLOCKS.to_le_bytes());
+    let attacker_hash_result = send_quiet_cached(
+        ctx,
+        authority,
+        &[attacker],
+        program,
+        attacker_hash,
+        vec![
+            AccountMeta::new(pt2s.pubkey(), false),
+            AccountMeta::new_readonly(byte_accounts[0], false),
+            AccountMeta::new_readonly(byte_accounts[1], false),
+            AccountMeta::new_readonly(byte_accounts[2], false),
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+        ],
+        cache,
+    )
+    .await;
+    assert!(
+        matches!(
+            attacker_hash_result,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::InvalidAccountData
+            ))
+        ),
+        "a third party cannot advance PT2S hashing"
+    );
+    loop {
+        let state = ctx
+            .banks_client
+            .get_account(pt2s.pubkey())
+            .await
+            .unwrap()
+            .unwrap()
+            .data;
+        if state[S::OFF_CURSOR_KIND] == 3 {
+            break;
+        }
+        send_quiet_cached(
+            ctx,
+            authority,
+            &[],
+            program,
+            vec![
+                S::TAG_HASH,
+                S::MAX_HASH_BLOCKS as u8,
+                (S::MAX_HASH_BLOCKS >> 8) as u8,
+            ],
+            vec![
+                AccountMeta::new(pt2s.pubkey(), false),
+                AccountMeta::new_readonly(byte_accounts[0], false),
+                AccountMeta::new_readonly(byte_accounts[1], false),
+                AccountMeta::new_readonly(byte_accounts[2], false),
+                AccountMeta::new_readonly(authority.pubkey(), true),
+            ],
+            cache,
+        )
+        .await
+        .expect("PT2S hash chunk");
+    }
+    let mut data = vec![S::TAG_SEAL];
+    data.extend_from_slice(&[9u8; 32]);
+    data.extend_from_slice(&locator.base_entry.to_le_bytes());
+    data.push(locator.write);
+    data.push(locator.width);
+    let seal_metas = vec![
+        AccountMeta::new(pt2s.pubkey(), false),
+        AccountMeta::new_readonly(byte_accounts[0], false),
+        AccountMeta::new_readonly(byte_accounts[1], false),
+        AccountMeta::new_readonly(byte_accounts[2], false),
+        AccountMeta::new_readonly(authority.pubkey(), true),
+        AccountMeta::new_readonly(pt1x, false),
+    ];
+    let mut attacker_seal_metas = seal_metas.clone();
+    attacker_seal_metas[4] = AccountMeta::new_readonly(attacker.pubkey(), true);
+    let attacker_seal = send_quiet_cached(
+        ctx,
+        authority,
+        &[attacker],
+        program,
+        data.clone(),
+        attacker_seal_metas,
+        cache,
+    )
+    .await;
+    assert!(
+        matches!(
+            attacker_seal,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::InvalidAccountData
+            ))
+        ),
+        "a third party cannot seal PT2S"
+    );
+    send_quiet_cached(
+        ctx,
+        authority,
+        &[],
+        program,
+        data,
+        seal_metas.clone(),
+        cache,
+    )
+    .await
+    .expect("PT2S seal begin");
+    loop {
+        let state = ctx
+            .banks_client
+            .get_account(pt2s.pubkey())
+            .await
+            .unwrap()
+            .unwrap()
+            .data;
+        if state[S::OFF_STATE] == S::STATE_SEALED {
+            break;
+        }
+        assert_eq!(state[S::OFF_STATE], S::STATE_SEALING_PXR);
+        let mut data = vec![S::TAG_SEAL_PXR_CHUNK];
+        data.extend_from_slice(&S::MAX_PXR_SEAL_ROWS.to_le_bytes());
+        send_quiet_cached(
+            ctx,
+            authority,
+            &[],
+            program,
+            data,
+            seal_metas.clone(),
+            cache,
+        )
+        .await
+        .expect("PT2S PXR1 seal chunk");
+    }
+}
+
+async fn build() -> Option<Fix> {
+    build_with_pre_fix_seal_processor(false, false, false, false).await
+}
+async fn build_f47() -> Option<Fix> {
+    build_with_pre_fix_seal_processor(false, false, false, true).await
+}
+async fn build_honest_pt1x() -> Option<Fix> {
+    build_with_pre_fix_seal_processor(false, true, false, false).await
+}
+
+async fn build_with_swapped_roles() -> Option<Fix> {
+    build_with_pre_fix_seal_processor(false, false, true, false).await
+}
+async fn build_f47_with_swapped_roles() -> Option<Fix> {
+    build_with_pre_fix_seal_processor(false, false, true, true).await
+}
+
+#[cfg(feature = "test-rev8-before-payer-alias-fix")]
+
+async fn build_before_payer_alias_fix() -> Option<Fix> {
+    build_with_pre_fix_seal_processor(true, false, false, false).await
+}
+
+async fn build_with_pre_fix_seal_processor(
+    use_old_seal: bool,
+    full_honest_setup: bool,
+    swap_executor_and_challenger: bool,
+    f47_fixture: bool,
+) -> Option<Fix> {
+    let fixture = if f47_fixture {
+        f47_artifacts()
+    } else {
+        artifacts()
+    };
+    let Some((routes, geometry, payloads, pwr1, clause12)) = fixture else {
+        eprintln!("needs_local_artifacts: the retained PT2P emission is absent");
+        return None;
+    };
+    let g = v7_golden();
+    let e = executor();
+    let program = Pubkey::new_unique();
+    let mut executor_kp = Keypair::new();
+    let mut signer = Keypair::new();
+    if swap_executor_and_challenger {
+        std::mem::swap(&mut executor_kp, &mut signer);
+    }
+    let pt1x_kp = Keypair::new();
+    let pt2s_kp = Keypair::new();
+    let route_kp = Keypair::new();
+    let geometry_kp = Keypair::new();
+    let payload_kp = Keypair::new();
+    let pt1s_index = if full_honest_setup {
+        pt1x_kp.pubkey()
+    } else {
+        Pubkey::new_from_array([1u8; 32])
+    };
+    let pt2s = pt2s_kp.pubkey();
+    let routes_key = route_kp.pubkey();
+    let geometry_key = geometry_kp.pubkey();
+    let payloads_key = payload_kp.pubkey();
+    let g_prog = pt2p::Program::decode(&pwr1).unwrap();
+    let mut payload_index = Vec::new();
+    let mut payload_at = 0usize;
+    while payload_at < payloads.len() {
+        payload_index.extend_from_slice(&(payload_at as u32).to_le_bytes());
+        payload_at +=
+            6 + u16::from_le_bytes(payloads[payload_at + 4..payload_at + 6].try_into().unwrap())
+                as usize;
+    }
+    payload_index.extend_from_slice(&(payload_at as u32).to_le_bytes());
+    let (k, segments, base_entries, n_max, total, class_total) = {
+        let view = Pt2p::new(
+            &routes,
+            &geometry,
+            &payloads,
+            Some(&payload_index),
+            g_prog.clone(),
+        )
+        .unwrap();
+        (
+            view.position_count,
+            view.segment_count,
+            view.base_entries,
+            view.n_of(view.position_count - 1),
+            total_entries(&view).unwrap(),
+            class_count(&view).unwrap(),
+        )
+    };
+    if full_honest_setup {
+        assert_eq!(
+            k, 10_240,
+            "full honest path uses the single K=10,240 template"
+        );
+    }
+    if full_honest_setup {
+        // Fast local preflight of the exact admission walk. Keep a failing
+        // class index and shape visible without spending minutes uploading
+        // the PT1X fixture before finding a frozen-registry limit mismatch.
+        let (mut preflight_rows, _) = k10240_registry_rows();
+        for row in preflight_rows.chunks_exact_mut(registry::ROW_BYTES) {
+            if u16::from_le_bytes(row[..2].try_into().unwrap()) == registry::FORM_RS1_SUMMARY {
+                row[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+                row[6..8].copy_from_slice(&u16::MAX.to_le_bytes());
+                for field in [8usize, 12, 16, 40, 44, 48] {
+                    row[field..field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+                }
+                row[20..24].copy_from_slice(&1_000_000u32.to_le_bytes());
+                row[24..28].copy_from_slice(&1_000_000u32.to_le_bytes());
+                row[37] = rs1_height(k);
+            }
+        }
+        let view = Pt2p::new(
+            &routes,
+            &geometry,
+            &payloads,
+            Some(&payload_index),
+            g_prog.clone(),
+        )
+        .unwrap();
+        for i in 0..class_total {
+            let key = dcg_program::unified::classes::key_of(&view, i).unwrap();
+            let Some(shape) = dcg_program::unified::classes::class_shape(&view, key)
+                .unwrap_or_else(|code| panic!("class {i} {key:?} shape failed: {code}"))
+            else {
+                continue;
+            };
+            let row = registry::find_row(&preflight_rows, shape.form).unwrap();
+            if let Some(row) = row.as_ref() {
+                assert!(shape.position < row.position_limit, "class {i}: {:?}", row);
+            }
+            let code = registry::check(row.as_ref(), &shape);
+            assert_eq!(
+                code, 0,
+                "class {i} {key:?} failed admission: {shape:?}; row {row:?}"
+            );
+        }
+    }
+    let has_pxr1 = pt::route_header_v4_shallow(&routes)
+        .map(|(_, _, pxr)| pxr.is_some())
+        .unwrap_or(false);
+    // Compiler-v1's decision fixture places Form 47 last at the configured
+    // prompt position. The retained rung-D template keeps its original locator.
+    let (base_entry, output_write, output_width) = if has_pxr1 {
+        let view = Pt2p::new(&routes, &geometry, &payloads, None, g_prog).unwrap();
+        let position = f47_position();
+        let entry_index = view.entry_count(position).unwrap() - 1;
+        let entry = view.entry(position, entry_index).unwrap();
+        assert_eq!(entry.kernel_index, 47);
+        let route = view.route(&entry, entry.read_count).unwrap();
+        let base_entry = view.base_entries - 1;
+        assert_eq!(
+            view.old_to_new(base_entry, position).unwrap(),
+            Some(entry_index)
+        );
+        (
+            base_entry,
+            0,
+            u8::try_from(route.byte_length).expect("4-byte Form 47 output"),
+        )
+    } else {
+        (28_037u32, 0u8, 16u8)
+    };
+    let locator = Locator {
+        base_entry,
+        write: output_write,
+        width: output_width,
+    };
+    // **The PT2S is left in `STATE_HASHING`, and the locator is not written into
+    // it.** The six bytes at 426..432 are the seal's to write, and the honest
+    // path into this file is the real tag-145 instruction: the genesis image
+    // carries only what a real emission's own state carried at the seal, and
+    // the instruction below does the rest. Everything downstream -- the DTA1
+    // approval's address, the PT2S digest, the admission record, the DTU1
+    // address, and the clause-12 and definition digests the descriptor commits
+    // -- is then derived from the **sealed** account's own bytes.
+    let pt2s_image = if full_honest_setup {
+        vec![0u8; S::OFF_PWR1 + pwr1.len()]
+    } else {
+        hashing_pt2s(
+            &routes,
+            &geometry,
+            &payloads,
+            &pwr1,
+            executor_kp.pubkey(),
+            [routes_key, geometry_key, payloads_key],
+        )
+    };
+    if !full_honest_setup {
+        assert_eq!(
+            &pt2s_image[S::OFF_CLAUSE12..S::OFF_PWR1_LEN],
+            &[0u8; S::OFF_PWR1_LEN - S::OFF_CLAUSE12][..],
+            "the pre-seal image carries nothing from 316 to 424: the seal writes all of it"
+        );
+        assert_eq!(
+            &pt2s_image[S::OFF_LOCATOR..S::OFF_PWR1],
+            &[0u8; 6][..],
+            "and 426..432 is dead state -- the six locator bytes are the seal's to write"
+        );
+    }
+    // **The SBF CU census path.** `BASANOS_DCG_V8_SBF=1` with `BPF_OUT_DIR`
+
+    // pointing at a `build-sbf-reproducible.sh` output runs the same
+    // instructions against the real SBF image, and the `cu` the `send` helper
+    // prints is then the SBF figure rather than the native one. The image must
+    // come from the documented wrapper (platform-tools v1.51), because an
+    // ordinary host build is not an SBF build.
+    let mut test = if std::env::var_os("BASANOS_DCG_V8_SBF").is_some() {
+        assert!(
+            !use_old_seal,
+            "the old-seal regression runs on the native processor"
+        );
+        let dir = std::env::var("BPF_OUT_DIR").expect("BPF_OUT_DIR names the SBF image directory");
+        let elf = std::fs::read(std::path::Path::new(&dir).join("dcg_program.so")).unwrap();
+        let data_address =
+            solana_program::bpf_loader_upgradeable::get_program_data_address(&program);
+        let mut program_state = 2u32.to_le_bytes().to_vec();
+        program_state.extend_from_slice(data_address.as_ref());
+        let mut data = 3u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.push(1);
+        data.extend_from_slice(executor_kp.pubkey().as_ref());
+        data.extend_from_slice(&elf);
+        let mut test = ProgramTest::default();
+        test.prefer_bpf(true);
+        test.add_genesis_account(
+            program,
+            Account {
+                lamports: 1_000_000_000,
+                data: program_state,
+                owner: solana_program::bpf_loader_upgradeable::id(),
+                executable: true,
+                rent_epoch: 0,
+            },
+        );
+        test.add_genesis_account(
+            data_address,
+            Account {
+                lamports: 1_000_000_000_000,
+                data,
+                owner: solana_program::bpf_loader_upgradeable::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        eprintln!(
+            "SBF image {} bytes, sha256 {}",
+            elf.len(),
+            sha256(&[&elf])
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        test
+    } else {
+        let mut test = if use_old_seal {
+            #[cfg(feature = "test-rev8-before-payer-alias-fix")]
+            {
+                ProgramTest::new(
+                    "dcg_program",
+                    program,
+                    processor!(dcg_program::process_instruction_before_payer_alias_fix),
+                )
+            }
+            #[cfg(not(feature = "test-rev8-before-payer-alias-fix"))]
+            {
+                panic!("the pre-fix seal processor requires its test-only feature");
+            }
+        } else {
+            ProgramTest::new(
+                "dcg_program",
+                program,
+                processor!(dcg_program::process_instruction),
+            )
+        };
+        test.prefer_bpf(false);
+        test
+    };
+    if std::env::var_os("BASANOS_DCG_F47_PROBE_LIMIT").is_some() {
+        test.set_compute_max_units(u64::from(f47_compute_limit()));
+    }
+    test.add_account(executor_kp.pubkey(), system_funded());
+    test.add_account(signer.pubkey(), system_funded());
+    if full_honest_setup {
+        // The full honest path allocates all template accounts through the
+        // System Program after the bank starts; tag 140 and later instructions
+        // write every PT1X/PT2S byte used by the test.
+    } else {
+        for key in [pt2s, routes_key, geometry_key, payloads_key] {
+            test.add_account(key, system_funded());
+        }
+        test.add_account(pt2s, owned(&program, pt2s_image.clone()));
+        // The test fixture's PT1X payload index is rebuilt from the retained
+        // rows. Full-honest tests exercise tag 142's real writer instead.
+        let payload_index = retained_payload_index(&payloads);
+        assert_eq!(payload_index.len(), 4 * (base_entries as usize + 1));
+        let mut pt1s_data =
+            vec![0u8; dcg_program::pt1_onchain::OFF_PAYLOAD_INDEX + payload_index.len()];
+        pt1s_data[..4].copy_from_slice(b"PT1X");
+        pt1s_data[4] = 6;
+        pt1s_data[5..37].copy_from_slice(executor_kp.pubkey().as_ref());
+        for (i, key) in [routes_key, geometry_key, payloads_key]
+            .into_iter()
+            .enumerate()
+        {
+            pt1s_data[37 + 32 * i..69 + 32 * i].copy_from_slice(key.as_ref());
+        }
+        for (i, len) in [routes.len(), geometry.len(), payloads.len()]
+            .into_iter()
+            .enumerate()
+        {
+            pt1s_data[133 + 4 * i..137 + 4 * i].copy_from_slice(&(len as u32).to_le_bytes());
+        }
+        pt1s_data[dcg_program::pt1_onchain::PT1X_BOUND_PT2S_AT
+            ..dcg_program::pt1_onchain::PT1X_BOUND_PT2S_AT + 32]
+            .copy_from_slice(pt2s.as_ref());
+        pt1s_data[dcg_program::pt1_onchain::OFF_PAYLOAD_INDEX..].copy_from_slice(&payload_index);
+        test.add_account(pt1s_index, owned(&program, pt1s_data));
+        test.add_account(routes_key, owned(&program, routes.clone()));
+        test.add_account(geometry_key, owned(&program, geometry.clone()));
+        test.add_account(payloads_key, owned(&program, payloads.clone()));
+    }
+    // DCF1, the one account ConfigInit cannot write natively (it wants a
+    // loader-v3 program account), as `unified_registry_machine.rs` does.
+    let config_key = address::config(&program).0;
+    let mut dcf1 = vec![0u8; config::CONFIG_BYTES];
+    dcf1[..4].copy_from_slice(b"DCF1");
+    dcf1[4..6].copy_from_slice(&1u16.to_le_bytes());
+    for role in 0..3 {
+        dcf1[8 + 32 * role..40 + 32 * role].copy_from_slice(executor_kp.pubkey().as_ref());
+    }
+    test.add_account(config_key, owned(&program, dcf1));
+    let mut ctx = test.start_with_context().await;
+    let mut cached_sender = QuietSendCache::default();
+    if full_honest_setup {
+        allocate_program_account(
+            &mut ctx,
+            &executor_kp,
+            &pt1x_kp,
+            program,
+            dcg_program::pt1_onchain::OFF_PAYLOAD_INDEX + 4 * (base_entries as usize + 1),
+        )
+        .await;
+        allocate_program_account(&mut ctx, &executor_kp, &route_kp, SYSTEM, routes.len()).await;
+        allocate_program_account(&mut ctx, &executor_kp, &geometry_kp, SYSTEM, geometry.len())
+            .await;
+        allocate_program_account(&mut ctx, &executor_kp, &payload_kp, SYSTEM, payloads.len()).await;
+        allocate_program_account(
+            &mut ctx,
+            &executor_kp,
+            &pt2s_kp,
+            program,
+            S::OFF_PWR1 + pwr1.len(),
+        )
+        .await;
+    }
+    // **The template seal, by the real 39-byte instruction (tag 145).** The
+    // locator is the retained template's own `(28_037, write 0, width 16)`, and
+    // `write = 0` is the case the review found the seal refusing: it is the
+    // only real template in this tree, its golden example binding declares
+    // `output_write = 0`, and the mirror's `OutputLocator` admits it, so a
+    // `write != 0` rule at the seal made the honest path from a seal through
+    // init to attest unreachable. The instruction writes 316..432 -- the clause
+    // -12 v4, the definition digest, the template descriptor and the six
+    // locator bytes -- and every value below is read back out of the sealed
+    // account rather than laid down here.
+    let mut seal_data = vec![S::TAG_SEAL];
+    seal_data.extend_from_slice(&[9u8; 32]);
+    seal_data.extend_from_slice(&base_entry.to_le_bytes());
+    seal_data.push(output_write);
+    seal_data.push(output_width);
+    assert_eq!(seal_data.len(), 39, "the revision-8 seal argument");
+    let mut seal_metas = vec![
+        AccountMeta::new(pt2s, false),
+        AccountMeta::new_readonly(routes_key, false),
+        AccountMeta::new_readonly(geometry_key, false),
+        AccountMeta::new_readonly(payloads_key, false),
+        AccountMeta::new(executor_kp.pubkey(), true),
+    ];
+    seal_metas.push(AccountMeta::new_readonly(pt1s_index, false));
+    let mut pxr_seal_chunk_calls = 0usize;
+    if full_honest_setup {
+        upload_pt1x(
+            &mut ctx,
+            &executor_kp,
+            program,
+            &pt1x_kp,
+            [&route_kp, &geometry_kp, &payload_kp],
+            [routes_key, geometry_key, payloads_key],
+            [&routes, &geometry, &payloads],
+            &signer,
+            &mut cached_sender,
+        )
+        .await;
+        seal_pt1x(
+            &mut ctx,
+            &executor_kp,
+            program,
+            pt1s_index,
+            [routes_key, geometry_key, payloads_key],
+            &routes,
+            &signer,
+            &mut cached_sender,
+        )
+        .await;
+        seal_pt2s(
+            &mut ctx,
+            &executor_kp,
+            &pt2s_kp,
+            program,
+            pt1s_index,
+            [routes_key, geometry_key, payloads_key],
+            &pwr1,
+            locator,
+            &signer,
+            &mut cached_sender,
+        )
+        .await;
+    } else {
+        send(
+            &mut ctx,
+            &executor_kp,
+            program,
+            seal_data,
+            seal_metas.clone(),
+        )
+        .await
+        .expect("the 39-byte template seal");
+        if has_pxr1 {
+            loop {
+                let state = ctx
+                    .banks_client
+                    .get_account(pt2s)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data;
+                if state[S::OFF_STATE] == S::STATE_SEALED {
+                    break;
+                }
+                assert_eq!(state[S::OFF_STATE], S::STATE_SEALING_PXR);
+                let mut chunk = vec![S::TAG_SEAL_PXR_CHUNK];
+                chunk.extend_from_slice(&S::MAX_PXR_SEAL_ROWS.to_le_bytes());
+                send(&mut ctx, &executor_kp, program, chunk, seal_metas.clone())
+                    .await
+                    .expect("the tag-193 PXR1 seal chunk");
+                pxr_seal_chunk_calls += 1;
+            }
+            assert_eq!(
+                pxr_seal_chunk_calls, 50,
+                "the complete PXR1 seal cursor walk uses tag 193"
+            );
+            eprintln!("tag193 PXR1 seal cursor completed {pxr_seal_chunk_calls} chunks");
+        }
+    }
+    let pt2s_image = ctx
+        .banks_client
+        .get_account(pt2s)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(
+        pt2s_image[S::OFF_STATE],
+        S::STATE_SEALED,
+        "the seal sealed the state"
+    );
+    assert_eq!(
+        &pt2s_image[S::OFF_LOCATOR..S::OFF_LOCATOR + 4],
+        &base_entry.to_le_bytes()
+    );
+    assert_eq!(pt2s_image[S::OFF_LOCATOR + 4], output_write);
+    assert_eq!(pt2s_image[S::OFF_LOCATOR + 5], output_width);
+    assert_eq!(
+        &pt2s_image[S::OFF_CLAUSE12..S::OFF_CLAUSE12 + 43],
+        &clause12[..],
+        "the seal recomputed the retained clause-12 v4 byte for byte"
+    );
+    assert_eq!(
+        &pt2s_image[S::OFF_DEFINITION..S::OFF_DEFINITION + 32],
+        &[9u8; 32][..]
+    );
+    assert_eq!(
+        pt2s_image.len(),
+        S::OFF_PWR1 + pwr1.len(),
+        "the account did not grow"
+    );
+    let pt2s_sha = sha256(&[&pt2s_image]);
+    // The registry, by real instructions over the v7 golden's rows.
+    let (mut rows, census) = if full_honest_setup {
+        k10240_registry_rows()
+    } else {
+        (
+            unhex(g["drp2"]["rows"].as_str().unwrap()),
+            unhex(g["drp2"]["census_digest"].as_str().unwrap())
+                .try_into()
+                .unwrap(),
+        )
+    };
+    // **The v7 golden row set is the refusal variant.** Its summary row
+    // (`form 0xF001`) is narrowed below the real plan's summary shapes -- an
+    // out-of-range `execute_cu` (the golden's own 779 vector) and a
+    // `max_rs1_height` under this plan's 7 -- because that row exists to make
+    // the class walk refuse. The registry that admitted the revision-7 document
+    // is not in this tree. The fixture lifts that one row's limit fields (never
+    // its `form_id`, `respond_path` or `witness_kind`, which the program
+    // capability-checks) so the summary-class check at init runs for real over
+    // the real shapes. Every other row is the golden's byte for byte.
+    for i in 0..rows.len() / registry::ROW_BYTES {
+        let at = i * registry::ROW_BYTES;
+        if u16::from_le_bytes(rows[at..at + 2].try_into().unwrap()) == registry::FORM_RS1_SUMMARY {
+            rows[at + 4..at + 6].copy_from_slice(&u16::MAX.to_le_bytes());
+            rows[at + 6..at + 8].copy_from_slice(&u16::MAX.to_le_bytes());
+            for field in [8usize, 12, 16, 40, 44, 48] {
+                rows[at + field..at + field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            }
+            // The two CU fields must be in 1..=CU_LIMIT (779), not maximal.
+            for field in [20usize, 24] {
+                rows[at + field..at + field + 4].copy_from_slice(&1_000_000u32.to_le_bytes());
+            }
+            rows[at + 37] = rs1_height(k);
+        }
+    }
+    let drp2 = address::registry(&program, 1).0;
+    if full_honest_setup {
+        fund_system(&mut ctx, &executor_kp, drp2, 50_000_000_000).await;
+    } else {
+        fund(&mut ctx, drp2).await;
+    }
+    let create = vec![
+        AccountMeta::new(executor_kp.pubkey(), true),
+        AccountMeta::new_readonly(config_key, false),
+        AccountMeta::new(drp2, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+    ];
+    let mut data = vec![TAG_REGISTRY_CREATE];
+    data.extend_from_slice(&1u32.to_le_bytes());
+    data.extend_from_slice(&((rows.len() / registry::ROW_BYTES) as u32).to_le_bytes());
+    data.extend_from_slice(&census);
+    send_quiet_cached(
+        &mut ctx,
+        &executor_kp,
+        &[],
+        program,
+        data,
+        create,
+        &mut cached_sender,
+    )
+    .await
+    .unwrap();
+    let rw = vec![
+        AccountMeta::new(executor_kp.pubkey(), true),
+        AccountMeta::new_readonly(config_key, false),
+        AccountMeta::new(drp2, false),
+    ];
+    for (i, row) in rows.chunks_exact(registry::ROW_BYTES).enumerate() {
+        let mut d = vec![TAG_REGISTRY_WRITE];
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&(i as u32).to_le_bytes());
+        d.extend_from_slice(row);
+        send_quiet_cached(
+            &mut ctx,
+            &executor_kp,
+            &[],
+            program,
+            d,
+            rw.clone(),
+            &mut cached_sender,
+        )
+        .await
+        .unwrap();
+    }
+    send_quiet_cached(
+        &mut ctx,
+        &executor_kp,
+        &[],
+        program,
+        vec![TAG_REGISTRY_FREEZE, 1, 0, 0, 0],
+        rw,
+        &mut cached_sender,
+    )
+    .await
+    .unwrap();
+    let drp2_data = ctx
+        .banks_client
+        .get_account(drp2)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    let reg_root = d32(&drp2_data, 152);
+    assert_eq!(
+        reg_root,
+        registry::table_root(1, executor_kp.pubkey().as_ref(), &census, &rows)
+    );
+    // The template seal (tag 176), by the real revision-8 instruction: its
+    // 42-byte action-1 form and eleven single-base metas.
+    // The seal is what creates both new records, so everything downstream --
+    // the DTU1 address, its five limits and its registry -- is read back out of
+    // the accounts the instruction wrote rather than laid down here.
+    let dta1 = address::template_seal(&program, &pt2s, &pt2s_sha).0;
+    let dtu1 = address::template_use(&program, &pt2s, &pt2s_sha).0;
+    let seal = vec![
+        AccountMeta::new(executor_kp.pubkey(), true),
+        AccountMeta::new_readonly(config_key, false),
+        AccountMeta::new(dta1, false),
+        AccountMeta::new_readonly(pt2s, false),
+        AccountMeta::new(dtu1, false),
+        AccountMeta::new_readonly(pt1s_index, false),
+        AccountMeta::new_readonly(geometry_key, false),
+        AccountMeta::new_readonly(routes_key, false),
+        AccountMeta::new_readonly(payloads_key, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+        AccountMeta::new_readonly(drp2, false),
+    ];
+    let mut data = vec![TAG_TEMPLATE_SEAL, config::SEAL_APPROVED];
+    for limit in [
+        EXAMPLE_LIMITS.max_challenge_window_slots,
+        EXAMPLE_LIMITS.max_response_window_slots,
+        EXAMPLE_LIMITS.max_document_lifetime_slots,
+        EXAMPLE_LIMITS.max_abandon_after_slots,
+        EXAMPLE_LIMITS.min_abandon_after_slots,
+    ] {
+        data.extend_from_slice(&limit.to_le_bytes());
+    }
+    assert_eq!(
+        data.len(),
+        config::SEAL_DATA_APPROVE,
+        "the revision-8 seal argument"
+    );
+    send_quiet_cached(
+        &mut ctx,
+        &executor_kp,
+        &[],
+        program,
+        data,
+        seal,
+        &mut cached_sender,
+    )
+    .await
+    .unwrap();
+    // The DTU1 the seal wrote: live, no documents, the sealer as authority, the
+    // registry the seal's own meta named, and the five limits it carried.
+    let use_record = ctx
+        .banks_client
+        .get_account(dtu1)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(use_record.len(), config::DTU1_BYTES);
+    assert_eq!(
+        (&use_record[..4], use_record[6], u32_at(&use_record, 8)),
+        (&b"DTU1"[..], config::DTU1_STATE_LIVE, 0)
+    );
+    assert_eq!(
+        use_record[config::DTU1_AUTHORITY_AT..config::DTU1_AUTHORITY_AT + 32],
+        executor_kp.pubkey().to_bytes()
+    );
+    assert_eq!(
+        use_record[config::DTU1_REGISTRY_AT..config::DTU1_REGISTRY_AT + 32],
+        drp2.to_bytes()
+    );
+    for (i, limit) in [
+        EXAMPLE_LIMITS.max_challenge_window_slots,
+        EXAMPLE_LIMITS.max_response_window_slots,
+        EXAMPLE_LIMITS.max_document_lifetime_slots,
+        EXAMPLE_LIMITS.max_abandon_after_slots,
+        EXAMPLE_LIMITS.min_abandon_after_slots,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            u64_at(&use_record, config::DTU1_MAX_CHALLENGE_AT + 8 * i),
+            limit
+        );
+    }
+
+    // The admission record: the golden's own image, repointed at this fixture.
+    let dea2 = address::admission(&program, &drp2, &pt2s, k).0;
+    let mut adm = unhex(g["dea2"]["complete"].as_str().unwrap());
+    adm[4..6].copy_from_slice(&3u16.to_le_bytes());
+    // This proof harness can use the retained compiler-v1 form-47 emission,
+    // whose compact fixture has 35 positions, or the older 80-position rung-D
+    // emission. Rebind the admission image to the artifact actually loaded.
+    adm[136..140].copy_from_slice(&k.to_le_bytes());
+    adm[156] = rs1_height(k);
+    assert_eq!(u32_at(&adm, 136), k);
+    if has_pxr1 {
+        adm.resize(admission::bytes(class_total), 0);
+        adm[140..144].copy_from_slice(&base_entries.to_le_bytes());
+        adm[144..148].copy_from_slice(&(class_total - base_entries).to_le_bytes());
+        adm[148..152].copy_from_slice(&class_total.to_le_bytes());
+        adm[152..156].copy_from_slice(&u32::try_from(n_max).unwrap().to_le_bytes());
+        adm[admission::HEADER..].fill(0xff);
+        if class_total % 8 != 0 {
+            *adm.last_mut().unwrap() &= (1u8 << (class_total % 8)) - 1;
+        }
+    } else {
+        assert_eq!(u32_at(&adm, 140), base_entries);
+        if full_honest_setup {
+            // The K=10,240 retained compiler-v1 bundle has a different maximum
+            // per-position entry count than the older capacity-80 fixture.
+            adm[152..156].copy_from_slice(&u32::try_from(n_max).unwrap().to_le_bytes());
+        } else {
+            assert_eq!(u32_at(&adm, 152) as u64, n_max);
+        }
+    }
+    adm[8..40].copy_from_slice(drp2.as_ref());
+    adm[40..72].copy_from_slice(&reg_root);
+    adm[72..104].copy_from_slice(pt2s.as_ref());
+    adm[104..136].copy_from_slice(&pt2s_sha);
+    adm[160..192].copy_from_slice(executor_kp.pubkey().as_ref());
+    if full_honest_setup {
+        send_quiet_cached(
+            &mut ctx,
+            &executor_kp,
+            &[],
+            program,
+            vec![159],
+            vec![
+                AccountMeta::new(executor_kp.pubkey(), true),
+                AccountMeta::new(dea2, false),
+                AccountMeta::new_readonly(drp2, false),
+                AccountMeta::new_readonly(pt2s, false),
+                AccountMeta::new_readonly(routes_key, false),
+                AccountMeta::new_readonly(geometry_key, false),
+                AccountMeta::new_readonly(SYSTEM, false),
+                AccountMeta::new_readonly(dtu1, false),
+            ],
+            &mut cached_sender,
+        )
+        .await
+        .expect("permissionless admission begins from the sealed PT1X/PT2S");
+        let mut first = 0u32;
+        while first < class_total {
+            // `MAX_STEP` is a protocol ceiling, while 128 classes can exceed
+            // the release-SBF transaction budget for this 10,240-position
+            // bundle. Keep the honest end-to-end fixture within budget.
+            let count = (class_total - first).min(16) as u16;
+            let mut step = vec![160];
+            step.extend_from_slice(&first.to_le_bytes());
+            step.extend_from_slice(&count.to_le_bytes());
+            send_quiet_cached(
+                &mut ctx,
+                &executor_kp,
+                &[],
+                program,
+                step,
+                vec![
+                    AccountMeta::new(dea2, false),
+                    AccountMeta::new_readonly(drp2, false),
+                    AccountMeta::new_readonly(pt2s, false),
+                    AccountMeta::new_readonly(pt1s_index, false),
+                    AccountMeta::new_readonly(routes_key, false),
+                    AccountMeta::new_readonly(geometry_key, false),
+                ],
+                &mut cached_sender,
+            )
+            .await
+            .expect("admission step checks compiler-v1 classes");
+            first += count as u32;
+        }
+    } else {
+        ctx.set_account(&dea2, &shared(owned(&program, adm)));
+    }
+    let position_roots: Vec<[u8; 32]> = e["positions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| d32(&unhex(p["position_root"].as_str().unwrap()), 0))
+        .collect();
+    let attestations: Vec<Vec<u8>> = e["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| unhex(o["attestation"].as_str().unwrap()))
+        .collect();
+    let dfs2 = unhex(g["dfs2"]["hex"].as_str().unwrap());
+    let family_roots: Vec<[u8; 32]> = g["dfs2"]["family_roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| d32(&unhex(r.as_str().unwrap()), 0))
+        .collect();
+    let terms_raw = Terms2 {
+        challenge_window_slots: 90_000,
+        response_window_slots: 45_000,
+        challenger_bond_lamports: 1_000_000,
+        executor_bond_lamports: ESCROW_FLOOR,
+        executor_reward_bps: 0,
+        bond_policy_kind: BOND_POLICY_CUSTOM,
+        bond_slasher_bps: 0,
+        settlement_program: [7u8; 32],
+        custom_settle_window_slots: 604_800,
+        result_retention_slots: 2_592_000,
+        bond_remainder: [8u8; 32],
+        abandon_after_slots: 2 * EXAMPLE_LIMITS.min_abandon_after_slots,
+    }
+    .encode()
+    .to_vec();
+    Some(Fix {
+        ctx,
+        program,
+        executor: executor_kp,
+        signer,
+        pt2s,
+        routes: routes_key,
+        geometry: geometry_key,
+        payloads: payloads_key,
+        drp2,
+        dea2,
+        dta1,
+        dtu1,
+        pt1s_index,
+        pt2s_image,
+        pt2s_sha,
+        descriptor_v7: d32(&unhex(e["descriptor"].as_str().unwrap()), 0),
+        position_roots,
+        attestations,
+        family_body: dfs2[document::DFS2_HEADER..].to_vec(),
+        family_roots,
+        k,
+        segments,
+        reg_root,
+        total_entries: total,
+        locator,
+        terms_raw,
+        base_entry,
+        output_write,
+        output_width,
+        real_pda_funding: full_honest_setup,
+        payload_key: payload_kp,
+    })
+}
+
+// ------------------------------------------------------------------- the tests
+
+/// The honest path: UnifiedInit, LandPositionRoots over the executor's own roots
+/// and FinalizeDocumentV5 at three document lengths -- `n = 31`, a mid value, and
+/// `n = K` -- with every field the spec's table gives DCM2 v7 and DCR2 v6.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_init_land_and_finalize_at_three_lengths() {
+    let Some(mut f) = build().await else { return };
+    // Three lengths, three bindings and so three documents: `n = 31` (the
+    // smallest a completion can finalize at with `first = 29`), a mid value, and `n = K`.
+    for (variant, (n, first, count)) in [(31u32, 29u32, 50u32), (40, 29, 50), (f.k, 29, 50)]
+        .into_iter()
+        .enumerate()
+    {
+        let binding = Binding2 {
+            request_id: [5 + variant as u8; 32],
+            ..f.binding(first, count)
+        };
+        assert!(f.k >= 80, "the retained plan has 80 positions");
+        let (descriptor, created) = f.run_document(&binding, n).await;
+        let doc = f.account(created[0]).await;
+        let dcr2 = f.account(created[3]).await;
+        let terms = Terms2::decode(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2]).unwrap();
+        // The record init wrote, field for field, at the frozen offsets.
+        assert_eq!(doc.len(), OPTION_REGION_AT, "a completion is 2,182 bytes");
+        assert_eq!(&doc[..4], b"DCM2");
+        assert_eq!(u32_at(&doc, 4) as u16, 7, "version 7");
+        assert_eq!(
+            u32_at(&doc, 6) as u16,
+            FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED,
+            "flags armed | root_only | sealed, and no new flag"
+        );
+        assert_eq!(&doc[8..40], &descriptor);
+        assert_eq!(
+            &doc[40..72],
+            f.executor.pubkey().as_ref(),
+            "authority is the init signer"
+        );
+        assert_eq!(u32_at(&doc, 72), f.k, "position_capacity is the sealed K");
+        assert_eq!(u32_at(&doc, 76) as u16, f.segments);
+        assert_eq!(u32_at(&doc, 84), n, "positions_complete is the landed n");
+        assert_eq!(
+            u32_at(&doc, 184),
+            90_000,
+            "challenge_window_slots = DDT2[8..16]"
+        );
+        assert_eq!(
+            u64_at(&doc, 192),
+            f.total_entries,
+            "the capacity-level total"
+        );
+        assert_eq!(&doc[200..232], f.pt2s.as_ref());
+        assert_eq!(&doc[232..264], &f.pt2s_sha);
+        assert_eq!(&doc[360..392], f.drp2.as_ref());
+        assert_eq!(&doc[392..424], &f.reg_root[..]);
+        assert_eq!(&doc[424..456], f.dea2.as_ref());
+        assert_eq!(u32_at(&doc, 520), 4, "registry_epoch");
+        assert_eq!(u32_at(&doc, 524) as u16, 16, "family_count");
+        assert_eq!(doc[526], rs1_height(f.k));
+        assert_eq!(doc[527], 3);
+        assert_eq!(doc[529], BOND_HELD, "a nonzero bond is held");
+        assert_eq!(
+            &doc[530..562],
+            &[0u8; 32],
+            "conviction_winner is zero at init"
+        );
+        assert!(doc[528] as usize <= 32, "peak_count");
+        assert_eq!(
+            &doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2],
+            &f.terms_raw[..]
+        );
+        assert_eq!(
+            &doc[BINDING_AT_V8..BINDING_AT_V8 + BINDING_BYTES_V8],
+            &binding.encode()[..]
+        );
+        assert_eq!(
+            u64_at(&doc, document::ABANDON_DEADLINE_AT),
+            1 + terms.abandon_after_slots,
+            "abandon_deadline = init_slot + abandon_after_slots"
+        );
+        // The DCR2 v6 init wrote.
+        assert_eq!(dcr2.len(), result::bytes_v8(count, 16).unwrap());
+        assert_eq!(&dcr2[..4], b"DCR2");
+        assert_eq!(u32_at(&dcr2, 4) as u16, 6);
+        assert_eq!(dcr2[6], 0, "PENDING");
+        assert_eq!(dcr2[7], 0);
+        assert_eq!(&dcr2[8..40], &descriptor);
+        assert_eq!(&dcr2[136..168], f.executor.pubkey().as_ref());
+        assert_eq!(u32_at(&dcr2, 196), count, "output_count");
+        assert_eq!(u32_at(&dcr2, 200), first, "output_first_position");
+        assert_eq!(u32_at(&dcr2, 204), 0, "outputs_attested");
+        assert_eq!(dcr2[208], 16);
+        assert_eq!(
+            &dcr2[209..212],
+            &[0; 3],
+            "v5's zero[7] is zero[3] plus position_length"
+        );
+        assert_eq!(u32_at(&dcr2, 212), 0, "position_length is 0 until finalize");
+        assert_eq!(&dcr2[216..352], &f.terms_raw[..], "the terms mirror");
+        assert_eq!(
+            &dcr2[352..384],
+            &[0u8; 32],
+            "the close is 352's only writer"
+        );
+        assert_eq!(
+            u64_at(&dcr2, 384),
+            2_592_000,
+            "retention_slots from the terms"
+        );
+        assert_eq!((u64_at(&dcr2, 392), u64_at(&dcr2, 400)), (0, 0));
+        assert_eq!((dcr2[408], dcr2[409]), (0, 0));
+        // The landing pushed the production deadline forward and the peaks moved
+        // to 562, then finalize set flag 2 and rewrote the challenge deadline.
+        let doc = f.finalize(&descriptor, created, n).await;
+        assert_eq!(
+            u32_at(&doc, 6) as u16,
+            FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
+            "flag 2 is set by finalize"
+        );
+        assert_eq!(u32_at(&doc, 84), n);
+        assert_eq!(
+            &doc[96..128],
+            &doc[152..184],
+            "document_root := prefix_root"
+        );
+        assert_eq!(
+            u64_at(&doc, 144),
+            90_000 + 1,
+            "dispute_deadline = finalize_slot + window"
+        );
+        assert_eq!(
+            &doc[488..520],
+            &document::family_table_digest(&descriptor, &{
+                let mut roots = Vec::new();
+                for r in &f.family_roots {
+                    roots.extend_from_slice(r);
+                }
+                roots
+            }),
+            "family_table_digest"
+        );
+        let dcr2 = f.account(created[3]).await;
+        assert_eq!(&dcr2[40..72], &doc[96..128], "DCR2 40 is the document root");
+        assert_eq!(u32_at(&dcr2, 212), n, "DCR2 212 is the document length");
+        assert_eq!(
+            u64_at(&dcr2, 168) + 90_000,
+            u64_at(&dcr2, 176),
+            "the deadline moved with it"
+        );
+        // The two-case L at this n.
+        let l = binding.output_span(n);
+        assert!(
+            l >= 1 && l <= binding.output_count,
+            "1 <= L <= count at FINAL: L = {l}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_refuses_revision7_unified_init_account_list_on_v8_template() {
+    let Some(mut f) = build().await else { return };
+    let created = [
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    ];
+    let mut legacy = vec![TAG_UNIFIED_INIT];
+    legacy.extend_from_slice(&[0u8; 96]); // revision-7 DDT1
+    legacy.extend_from_slice(&[0u8; 160]); // revision-7 DRB1
+    legacy.extend_from_slice(&[[1u8; 32], [2u8; 32], [3u8; 32]].concat());
+    legacy.extend_from_slice(&16u16.to_le_bytes());
+    legacy.extend_from_slice(&f.family_body);
+    assert!(legacy.len() >= 1 + 96 + 160 + 96 + 2);
+    let mut metas = f.init_metas(created);
+    metas.truncate(13); // the revision-7 list has no DTU1 document counter
+    assert_eq!(
+        custom(send_fresh_with(&mut f.ctx, &f.executor, f.program, legacy, metas).await),
+        CL_MALFORMED,
+        "the revision-8 reader rejects the legacy instruction shape"
+    );
+    assert_eq!(
+        u32_at(&f.account(f.dtu1).await, 8),
+        0,
+        "a legacy call did not create an uncounted document"
+    );
+}
+
+/// 816 through the handler: `n == positions_complete` and the length itself is
+/// out of range, which needs a document landed to `first + 1`. The other end
+/// (`n > first + count + 1`) and the whole decision branch are pinned by
+/// `document_length_816_both_branches` in `unified_v8_records.rs`, against the
+/// same rule and the same vectors the B refusal table names.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_finalize_refuses_a_document_length_out_of_range() {
+    let Some(mut f) = build().await else { return };
+    let binding = f.binding(29, 50);
+    let (descriptor, created) = f.run_document(&binding, 1).await;
+    let executor_key = f.executor.pubkey();
+    let metas: Vec<AccountMeta> = vec![
+        AccountMeta::new(executor_key, true),
+        AccountMeta::new(created[0], false),
+        AccountMeta::new(created[3], false),
+        AccountMeta::new_readonly(f.dtu1, false),
+    ];
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                finalize_data(&descriptor, 1, &f.family_roots),
+                metas
+            )
+            .await
+        ),
+        DOCUMENT_LENGTH,
+        "n = first + 1"
+    );
+}
+
+/// Every refusal finalize and land name, on a real document.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_finalize_and_land_refusals() {
+    let Some(mut f) = build().await else { return };
+    let binding = f.binding(29, 50);
+    let (descriptor, created) = f.run_document(&binding, 40).await;
+    let executor_key = f.executor.pubkey();
+    // Four metas on revision 8: revision 7's three plus DTU1, whose lifetime
+    // limit is the clamp's ceiling (spec §1.6).
+    let metas = |created: [Pubkey; 4]| {
+        vec![
+            AccountMeta::new(executor_key, true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(created[3], false),
+            AccountMeta::new_readonly(f.dtu1, false),
+        ]
+    };
+    // 591 first: `positions_complete = n` is checked before 816, so 816 needs
+    // a document landed to a length that is itself out of range. `n = 41` is
+    // that check.
+    for n in [41u32, 0, 81] {
+        let code = custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                finalize_data(&descriptor, n, &f.family_roots),
+                metas(created),
+            )
+            .await,
+        );
+        assert_eq!(
+            code, CL_MISSING,
+            "n = {n} must equal positions_complete first"
+        );
+    }
+
+    // 580: exact length, and F against DCM2 524.
+    let mut bad = finalize_data(&descriptor, 40, &f.family_roots);
+    bad.push(0);
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.executor, f.program, bad, metas(created)).await),
+        CL_MALFORMED
+    );
+    let mut few = finalize_data(&descriptor, 40, &f.family_roots);
+    few[37..39].copy_from_slice(&15u16.to_le_bytes());
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.executor, f.program, few, metas(created)).await),
+        CL_MALFORMED,
+        "F must equal DCM2 524"
+    );
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                finalize_data(&descriptor, 40, &f.family_roots),
+                metas(created)[..2].to_vec()
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "a short account list"
+    );
+    // 583: a zero root.
+    let mut zero = f.family_roots.clone();
+    zero[3] = [0; 32];
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                finalize_data(&descriptor, 40, &zero),
+                metas(created)
+            )
+            .await
+        ),
+        CL_ROOT
+    );
+    // 582: a signer that is not the authority.
+    let mut wrong = metas(created);
+    wrong[0] = AccountMeta::new(f.signer.pubkey(), true);
+    let signer_pubkey = f.signer.pubkey();
+    let signer_ref = &f.signer;
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                signer_ref,
+                f.program,
+                finalize_data(&descriptor, 40, &f.family_roots),
+                wrong
+            )
+            .await
+        ),
+        CL_AUTHORITY
+    );
+    let _ = signer_pubkey;
+    // The honest finalize, then 592.
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        finalize_data(&descriptor, 40, &f.family_roots),
+        metas(created),
+    )
+    .await
+    .unwrap();
+    // Flag 2 is now set, which is what makes the landing below 592 and what
+    // makes a second finalize 592 (`finalize_v8` reads the same byte it wrote).
+    let doc = f.account(created[0]).await;
+    assert_eq!(
+        u32_at(&doc, 6) as u16,
+        FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED
+    );
+    assert_eq!(
+        u32_at(&doc, 84),
+        40,
+        "positions_complete is the finalized n"
+    );
+    // Land, after finalize, is 592.
+    let l1: Vec<AccountMeta> = vec![
+        AccountMeta::new(executor_key, true),
+        AccountMeta::new(created[0], false),
+        AccountMeta::new(created[1], false),
+        AccountMeta::new_readonly(f.dtu1, false),
+    ];
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                land_data(&descriptor, 40, &f.position_roots[40..41]),
+                l1
+            )
+            .await
+        ),
+        CL_AFTER_FINAL,
+        "land after finalize"
+    );
+}
+
+/// **A short account list is a refusal, not a panic.** Both deadline writers
+/// settle the revision from `accounts[1]`, so the count has to be settled before
+/// that read. Revision 7 did: it refused any list whose length was not three
+/// with 580, first statement of the handler. The revision split moved the
+/// length into the match arms, where a list of one account or none matches no
+/// arm and the reader runs first -- so a caller that named fewer accounts than
+/// the instruction needs took the program out of bounds. On a real document,
+/// with data that would otherwise have been accepted, both tags and both short
+/// lengths are 580.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_land_and_finalize_refuse_a_short_account_list_before_reading_one() {
+    let Some(mut f) = build().await else { return };
+    let binding = f.binding(29, 50);
+    // Thirty roots landed, so `positions_complete = 30` and both instructions below
+    // are honest on the full list: the landing is `first = 30, count = 1` and the
+    // finalize is `n = 31`.
+    let (descriptor, created) = f.run_document(&binding, 30).await;
+    let executor_key = f.executor.pubkey();
+    let land = vec![
+        AccountMeta::new(executor_key, true),
+        AccountMeta::new(created[0], false),
+        AccountMeta::new(created[1], false),
+        AccountMeta::new_readonly(f.dtu1, false),
+    ];
+    let fin = vec![
+        AccountMeta::new(executor_key, true),
+        AccountMeta::new(created[0], false),
+        AccountMeta::new(created[3], false),
+        AccountMeta::new_readonly(f.dtu1, false),
+    ];
+    let land_roots = f.position_roots[30..31].to_vec();
+    // Every prefix of the list, both tags: 0 and 1 accounts cannot hold a
+    // document at all, and 2 and 3 are revision 7's count on a revision-7
+    // document, so none of the four is a legal shape here. The full list is the
+    // control, below: it lands and finalizes, so a 580 above is the account
+    // count and not a stale document.
+    for take in 0..land.len() {
+        assert_eq!(
+            custom(
+                send(
+                    &mut f.ctx,
+                    &f.executor,
+                    f.program,
+                    land_data(&descriptor, 30, &land_roots),
+                    land[..take].to_vec()
+                )
+                .await
+            ),
+            CL_MALFORMED,
+            "tag 162 with {take} account(s)"
+        );
+        assert_eq!(
+            custom(
+                send(
+                    &mut f.ctx,
+                    &f.executor,
+                    f.program,
+                    finalize_data(&descriptor, 31, &f.family_roots),
+                    fin[..take].to_vec()
+                )
+                .await
+            ),
+            CL_MALFORMED,
+            "tag 165 with {take} account(s)"
+        );
+    }
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        land_data(&descriptor, 30, &land_roots),
+        land,
+    )
+    .await
+    .expect("the four-account landing is the honest one");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        finalize_data(&descriptor, 31, &f.family_roots),
+        fin,
+    )
+    .await
+    .expect("the four-account finalize is the honest one");
+    let doc = f.account(created[0]).await;
+    assert_eq!(
+        u32_at(&doc, 84),
+        31,
+        "positions_complete is the finalized n"
+    );
+    assert!(
+        u32_at(&doc, 6) as u16 & FLAG_FINAL != 0,
+        "the document is finalized"
+    );
+}
+
+/// The land refusals and the push-forward, on a document of their own so the
+/// finalize cases above cannot mask them.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_land_refusals_and_the_production_deadline() {
+    let Some(mut f) = build().await else { return };
+    let binding = f.binding(29, 50);
+    let (descriptor, created) = f.run_document(&binding, 2).await;
+    let executor_key = f.executor.pubkey();
+    let l2: Vec<AccountMeta> = vec![
+        AccountMeta::new(executor_key, true),
+        AccountMeta::new(created[0], false),
+        AccountMeta::new(created[1], false),
+        AccountMeta::new_readonly(f.dtu1, false),
+    ];
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                land_data(&descriptor, 5, &f.position_roots[5..6]),
+                l2.clone()
+            )
+            .await
+        ),
+        APPEND_ORDER,
+        "first must equal positions_complete"
+    );
+    let mut over = f.position_roots[2..].to_vec();
+    over.push(f.position_roots[79]);
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                land_data(&descriptor, 2, &over),
+                l2.clone()
+            )
+            .await
+        ),
+        CL_COORDINATE,
+        "first + count must stay within K"
+    );
+    let mut zero = f.position_roots.clone();
+    zero[2] = [0; 32];
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                land_data(&descriptor, 2, &zero[2..3]),
+                l2.clone()
+            )
+            .await
+        ),
+        CL_ROOT
+    );
+    let mut short = vec![TAG_LAND_POSITION_ROOTS];
+    short.extend_from_slice(&descriptor);
+    short.extend_from_slice(&2u32.to_le_bytes());
+    short.push(0);
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.executor, f.program, short, l2.clone()).await),
+        CL_MALFORMED,
+        "count >= 1"
+    );
+    // The push-forward: a landing moves the production deadline to slot + window.
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        land_data(&descriptor, 2, &f.position_roots[2..3]),
+        l2,
+    )
+    .await
+    .unwrap();
+    let doc = f.account(created[0]).await;
+    let terms = Terms2::decode(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2]).unwrap();
+    let slot = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    assert!(u64_at(&doc, document::ABANDON_DEADLINE_AT) >= slot + terms.abandon_after_slots - 2);
+    assert!(u64_at(&doc, document::ABANDON_DEADLINE_AT) >= slot + terms.abandon_after_slots - 2);
+    assert_eq!(u32_at(&doc, 84), 3, "positions_complete moved");
+}
+
+// ------------------------------------------------- the honest AttestOutputV5
+
+/// The leaf preimage's own domain and offsets (spec §6.11, and the Python
+/// mirror's `closure_v2_model.leaf`): `domain[27] | descriptor[32] |
+/// coordinate[10] | tail`, the write count at 143 and the write rows at 147.
+const LEAF_DOMAIN: &[u8] = b"basanos/dcg-hclosure-leaf/2";
+const LEAF_WRITE_COUNT_AT: usize = 143 - 69;
+const LEAF_WRITES_AT: usize = 147 - 69;
+
+/// One attest packet, **re-keyed** to a revision-8 descriptor.
+///
+/// The retained packets are real: the executor's own leaf, path, SPP1, table
+/// root and value, over the real rung-D plan. Three things in them commit the
+/// **revision-7** descriptor, and no retained proof commits a `/5` digest:
+/// the leaf's `write/2` digest, the segment tree's `node/2` parents and the
+/// `segment-root/2` wrap. So the leaf's own write row is re-keyed (same region,
+/// same offset, same length, same value, the digest recomputed over this
+/// document's descriptor), the leaf is re-hashed, the segment root and the
+/// position root are re-folded from the **retained** path and SPP1 siblings, and
+/// the result is what the test lands at that position. Every plan-derived fact
+/// the handler reads -- the coordinate, the entry, the write ordinal, the
+/// route's region/offset/length, the segment's leaf count, the segment ordinal
+/// and the segment table root -- comes from the sealed plan, not from the
+/// fixture.
+struct Rekeyed {
+    data: Vec<u8>,
+    root: [u8; 32],
+    value: Vec<u8>,
+    p: u32,
+}
+
+fn leaf_hash_of(leaf: &[u8]) -> [u8; 32] {
+    sha256(&[leaf])
+}
+
+/// **The duplicate-last tree's self-referential siblings.** At every level whose
+/// sibling index is past the width, the tree repeats the node the lower levels
+/// just folded, and `dl_fold` checks that entry by equality. A re-keyed leaf
+/// cannot reuse those entries -- and could not have reused them anyway, because
+/// it changed the node they repeat. Every other sibling covers indices that
+/// exclude this leaf, so those are the retained document's own digests and are
+/// left alone. `path` is rewritten in place, over the same ranges `dl_fold`
+/// uses.
+fn rekey_duplicates(
+    descriptor: &[u8; 32],
+    kind: u8,
+    scope: u32,
+    count: u32,
+    index: u32,
+    value: [u8; 32],
+    path: &mut [[u8; 32]],
+) {
+    let (mut index, mut width, mut span) = (index, count, 1u32);
+    let mut node = (value, index, index + 1);
+    let mut rekeyed = 0;
+    for level in 0..path.len() {
+        let sib = index ^ 1;
+        let sibling = if sib >= width {
+            rekeyed += 1;
+            path[level] = node.0;
+            node
+        } else {
+            let first = sib.checked_mul(span).unwrap();
+            (path[level], first, first.saturating_add(span).min(count))
+        };
+        node = if index % 2 == 0 {
+            node_parent(descriptor, kind, scope, level as u8 + 1, node, sibling)
+        } else {
+            node_parent(descriptor, kind, scope, level as u8 + 1, sibling, node)
+        };
+        index /= 2;
+        width = width.div_ceil(2);
+        span *= 2;
+    }
+    assert!(
+        rekeyed >= 1,
+        "a leaf this far right duplicates at least one level"
+    );
+}
+
+/// `node/2` with the ranges, the crate's own hash over its own layout:
+/// `(left, right) = (digest, first, end)`, height counted from one.
+fn node_parent(
+    descriptor: &[u8; 32],
+    kind: u8,
+    scope: u32,
+    height: u8,
+    left: ([u8; 32], u32, u32),
+    right: ([u8; 32], u32, u32),
+) -> ([u8; 32], u32, u32) {
+    let digest = h::hash(
+        b"node/2",
+        &[
+            descriptor,
+            &[kind],
+            &scope.to_le_bytes(),
+            &left.1.to_le_bytes(),
+            &right.2.to_le_bytes(),
+            &[height, 1],
+            &left.0,
+            &right.0,
+        ],
+    );
+    (digest, left.1, right.2)
+}
+
+fn rekey(f: &Fix, descriptor: &[u8; 32], index: u32, p: u32) -> Rekeyed {
+    let w = f.output_width as usize;
+    let value = f.attestations[index as usize][37..37 + w].to_vec();
+    rekey_with(f, descriptor, index, p, value)
+}
+
+/// The same walk with a **chosen** cell value. The re-keying is over the value
+/// as much as over the descriptor — the leaf's write row is `write/2` over the
+/// value, so a different value is a different leaf and the fold, the segment
+/// root and the SPP1 are rebuilt over it. That is what lets the stop-rule tests
+/// put a chosen token id in a chosen output's cell and attest it honestly,
+/// instead of forging a DCR2 the attest never wrote.
+fn rekey_with(f: &Fix, descriptor: &[u8; 32], index: u32, p: u32, value: Vec<u8>) -> Rekeyed {
+    let packet = &f.attestations[index as usize];
+    assert_eq!(
+        packet[0], TAG_ATTEST_OUTPUT,
+        "the retained packet is a tag 177"
+    );
+    assert_eq!(u32_at(packet, 33), index);
+    let w = f.output_width as usize;
+    assert_eq!(
+        value.len(),
+        w,
+        "the value is one cell at the document's width"
+    );
+    let tail_len = u16_at(packet, 37 + w) as usize;
+    let tail_at = 39 + w;
+    let tail = &packet[tail_at..tail_at + tail_len];
+    let height = packet[tail_at + tail_len] as usize;
+    let path_at = tail_at + tail_len + 1;
+    let mut path: Vec<[u8; 32]> = packet[path_at..path_at + 32 * height]
+        .chunks_exact(32)
+        .map(|c| <[u8; 32]>::try_from(c).unwrap())
+        .collect();
+    let (ordinal, proof_table, spp1_path, _) =
+        challenge::decode_spp1(&packet[path_at + 32 * height..]).expect("a self-delimiting SPP1");
+    let mut spp1_path = spp1_path;
+    // The plan facts, derived exactly as `attest_v8` derives them.
+    let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
+    let x = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        None,
+        pt2p::Program::decode(&pwr1).unwrap(),
+    )
+    .unwrap();
+    let t = x
+        .old_to_new(f.base_entry, p)
+        .unwrap()
+        .expect("the base entry is live at p");
+    let e = x.entry(p, t).unwrap();
+    let route = x.route(&e, e.read_count + f.output_write as u16).unwrap();
+    let c = x.coordinate(p, t).unwrap();
+    let (mut entries, mut seg_ordinal) = (0u32, 0u16);
+    for s in 0..x.segment_count as usize {
+        let (id, n) = x.segment_row(p, s).unwrap();
+        if id == c.segment {
+            seg_ordinal = s as u16;
+            entries = n;
+        }
+    }
+    assert_eq!(ordinal, seg_ordinal, "the proof's ordinal is the plan's");
+    assert_eq!(
+        proof_table.to_vec(),
+        x.segment_table_root(p).unwrap().to_vec(),
+        "the proof's table root is the plan's"
+    );
+    assert_eq!(
+        route.byte_length as usize, w,
+        "the lane is the document's width"
+    );
+    // Re-key the leaf's own write row: the same write, over this descriptor.
+    let coordinate = h::Coordinate {
+        position: p,
+        segment: c.segment,
+        entry: c.local,
+    };
+    let digest = h::write_digest(
+        descriptor,
+        coordinate,
+        route.region_id,
+        route.effective_offset,
+        &value,
+    )
+    .unwrap();
+    let mut row = [0u8; 48];
+    row[0..2].copy_from_slice(&route.region_id.to_le_bytes());
+    row[4..8].copy_from_slice(&route.byte_length.to_le_bytes());
+    row[8..16].copy_from_slice(&route.effective_offset.to_le_bytes());
+    row[16..48].copy_from_slice(&digest);
+    let mut tail = tail.to_vec();
+    let writes =
+        u16::from_le_bytes([tail[LEAF_WRITE_COUNT_AT], tail[LEAF_WRITE_COUNT_AT + 1]]) as usize;
+    assert_eq!(
+        tail.len(),
+        LEAF_WRITES_AT + 48 * writes,
+        "the tail is its own length"
+    );
+    let mut seen = false;
+    for i in 0..writes {
+        let at = LEAF_WRITES_AT + 48 * i;
+        if tail[at..at + 2] == row[0..2]
+            && tail[at + 4..at + 8] == row[4..8]
+            && tail[at + 8..at + 16] == row[8..16]
+        {
+            tail[at + 16..at + 48].copy_from_slice(&digest);
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "the retained leaf carries this cell's own write row");
+    // The fold the handler will run, over the re-keyed leaf.
+    let mut leaf = Vec::new();
+    leaf.extend_from_slice(LEAF_DOMAIN);
+    leaf.extend_from_slice(descriptor);
+    leaf.extend_from_slice(&coordinate.bytes());
+    leaf.extend_from_slice(&tail);
+    let leaf_hash = leaf_hash_of(&leaf);
+    // Leaf 3,242 of a 3,244-leaf segment duplicates at levels 2 and 4; every
+    // other sibling is the retained document's own digest.
+    rekey_duplicates(descriptor, 1, p, entries, c.local, leaf_hash, &mut path);
+    let tree = challenge::dl_fold(descriptor, 1, p, entries, c.local, &leaf_hash, &path)
+        .expect("the re-keyed path folds the re-keyed leaf");
+    let segment_root = h::hash(
+        b"segment-root/2",
+        &[
+            descriptor,
+            &p.to_le_bytes(),
+            &c.segment.to_le_bytes(),
+            &entries.to_le_bytes(),
+            &tree,
+            &[1],
+        ],
+    );
+    // The SPP1 tree duplicates the same way: segment 33 of 34 is the last one.
+    rekey_duplicates(
+        descriptor,
+        2,
+        p,
+        f.segments as u32,
+        ordinal as u32,
+        segment_root,
+        &mut spp1_path,
+    );
+    let root = challenge::spp1_position_root(
+        descriptor,
+        p,
+        f.segments,
+        &segment_root,
+        ordinal,
+        &proof_table,
+        &spp1_path,
+        &x.segment_table_root(p).unwrap(),
+    )
+    .unwrap()
+    .expect("the re-keyed SPP1 folds the re-keyed segment root");
+    // The instruction data, with the descriptor, the index, the value and the
+    // tail replaced and the proof carried through unchanged.
+    let mut data = Vec::new();
+    data.push(TAG_ATTEST_OUTPUT);
+    data.extend_from_slice(descriptor);
+    data.extend_from_slice(&index.to_le_bytes());
+    data.extend_from_slice(&value);
+    data.extend_from_slice(&(tail.len() as u16).to_le_bytes());
+    data.extend_from_slice(&tail);
+    data.push(height as u8);
+    for s in &path {
+        data.extend_from_slice(s);
+    }
+    // The SPP1 blob, rebuilt with the same header: `ordinal:u16 | count:u8 |
+    // 0:u8 | table_root[32] | sibling[count][32]`.
+    data.extend_from_slice(&ordinal.to_le_bytes());
+    data.push(spp1_path.len() as u8);
+    data.push(0);
+    data.extend_from_slice(&proof_table);
+    for s in &spp1_path {
+        data.extend_from_slice(s);
+    }
+    Rekeyed {
+        data,
+        root,
+        value,
+        p,
+    }
+}
+
+/// tag 177's seven metas: the permissionless prover (s), DCM2, DPR2, DCR2 and
+/// the three plan accounts.
+fn attest_metas(
+    signer: Pubkey,
+    template: (Pubkey, Pubkey, Pubkey),
+    created: [Pubkey; 4],
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(signer, true),
+        AccountMeta::new(created[0], false),
+        AccountMeta::new(created[1], false),
+        AccountMeta::new(created[3], false),
+        AccountMeta::new_readonly(template.0, false),
+        AccountMeta::new_readonly(template.1, false),
+        AccountMeta::new_readonly(template.2, false),
+    ]
+}
+
+/// **The honest path, end to end**: a real init, a real landing that carries the
+/// re-keyed proof's position root, a real finalize, and a real
+/// `AttestOutputV5` that discharges the proof. Everything the handler reads
+/// about the plan is the sealed plan's own value.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_attest_output_end_to_end() {
+    let Some(mut f) = build().await else { return };
+    // The retained run: `first = 29`, outputs of 16 bytes at positions 29..79.
+    // Revision 8's binding check is `first + count + 1 <= position_capacity`
+    // (revision 7's was `first + count <= P`), so 51 outputs over 80 positions
+    // is **not** admissible and the count is 50: `29 + 50 + 1 = 80`, which makes
+    // `n = K` the largest legal finalize and `L = n - 1 - first = 50 = count`.
+    let (first, count) = (29u32, 50u32);
+    let binding = f.binding(first, count);
+    let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+    let n = f.k;
+    let proof = rekey(&f, &descriptor, 0, first);
+    // Land the executor's own roots with the re-keyed root at the attested
+    // position, then finalize at `n = K` (`first + 2 <= n <= first + count + 1`
+    // is `31 <= 80 <= 81`, so 816 holds and `L = 50`).
+    let mut roots = f.position_roots[..n as usize].to_vec();
+    roots[proof.p as usize] = proof.root;
+    let created = [
+        address::document(&f.program, &descriptor).0,
+        address::positions(&f.program, &descriptor).0,
+        address::family_slots(&f.program, &descriptor).0,
+        address::result(&f.program, &descriptor).0,
+    ];
+    for key in created {
+        fund(&mut f.ctx, key).await;
+    }
+    let metas = f.init_metas(created);
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        init_data(
+            &f.terms_raw,
+            &binding.encode(),
+            &[[1u8; 32], [2u8; 32], [3u8; 32]],
+            16,
+            &f.family_body,
+            &[],
+        ),
+        metas,
+    )
+    .await
+    .expect("init");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        land_data(&descriptor, 0, &roots),
+        vec![
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(created[1], false),
+            AccountMeta::new_readonly(f.dtu1, false),
+        ],
+    )
+    .await
+    .expect("land");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        finalize_data(&descriptor, n, &f.family_roots),
+        vec![
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(created[3], false),
+            AccountMeta::new_readonly(f.dtu1, false),
+        ],
+    )
+    .await
+    .expect("finalize");
+    let doc = f.account(created[0]).await;
+    let before = u64_at(&doc, document::ABANDON_DEADLINE_AT);
+    // The attest. **Permissionless** (revision 7 §6.11), so the fixture's second
+    // keypair signs it: that is the round-4 Medium 1 property, tested.
+    let other = f.signer.pubkey();
+    let metas = attest_metas(other, (f.pt2s, f.routes, f.geometry), created);
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        proof.data.clone(),
+        metas.clone(),
+    )
+    .await
+    .expect("attest");
+    let dcr2 = f.account(created[3]).await;
+    let l = binding.output_span(n);
+    assert_eq!(l, 50, "L = n - 1 - first = count at n = K");
+    let cell_at = result::HEADER_V6;
+    assert_eq!(
+        &dcr2[cell_at..cell_at + 16],
+        &proof.value[..],
+        "the attested value is the cell"
+    );
+    assert_eq!(u32_at(&dcr2, 204), 1, "outputs_attested");
+    assert_eq!(
+        dcr2[result::HEADER_V6 + count as usize * 16] & 1,
+        1,
+        "the bitmap's bit 0"
+    );
+    assert_eq!(&dcr2[8..40], &descriptor[..], "the record is the v8 one");
+    // The round-4 rule (a): the attest writes **no** deadline. Revision 7 makes
+    // tag 177 permissionless, so a write here would be a third party's.
+    let doc = f.account(created[0]).await;
+    assert_eq!(
+        u64_at(&doc, document::ABANDON_DEADLINE_AT),
+        before,
+        "AttestOutputV5 does not write abandon_deadline"
+    );
+    // 795 on a value the leaf does not carry, and 591 at `index = L`.
+    let mut bad = proof.data.clone();
+    let value_at = 37;
+    bad[value_at] ^= 1;
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.signer, f.program, bad, metas.clone()).await),
+        OUTPUT_PROOF,
+        "a value the leaf does not carry"
+    );
+    let mut late = proof.data.clone();
+    late[33..37].copy_from_slice(&l.to_le_bytes());
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.signer, f.program, late, metas.clone()).await),
+        CL_MISSING,
+        "index = L is 591"
+    );
+    // A second attest of the same index is 795: the bit is set. One slot is
+    // warped first, so this is a **new** transaction and not a duplicate of the
+    // one the banks client already processed.
+    let slot = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    f.ctx.warp_to_slot(slot + 1).unwrap();
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                proof.data.clone(),
+                metas.clone()
+            )
+            .await
+        ),
+        OUTPUT_PROOF,
+        "the bit is already set"
+    );
+}
+
+/// **A stale descriptor and a wrong one are refused at the attest** (this
+/// review's Medium 1b), with the codes the handler actually produces.
+///
+/// The refusals hold by construction, and the construction is the point:
+///
+/// * **A wrong descriptor is 580 at `document_v8`, the first check in
+///   `attest_v8`.** The DCM2 account's key **is** `PDA(descriptor)` and the
+///   record's own header carries the same 32 bytes, so naming a descriptor the
+///   account is not derived from fails both halves of that check before the
+///   flag, the record, the plan or the proof is read. A stale `/4` descriptor
+///   is the same case: revision 7's descriptor is a different digest, so the
+///   revision-8 record is at a different address, and a proof committed to it
+///   is a proof about a document that does not exist.
+/// * **A `/4`-committed packet against the `/5` document is 795 at the fold,
+///   not 580 at the account.** The retained packet is real, and three of its
+///   twelve digests commit the **revision-7** descriptor; the program rebuilds
+///   the leaf, the segment root and the SPP1 over the descriptor the *record*
+///   names, so a retained packet's own digests cannot satisfy the fold. This
+///   is the case the re-keying in `rekey` exists to discharge, so it is also
+///   the case that shows the re-keying is doing what it claims.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_attest_refuses_a_stale_or_wrong_descriptor() {
+    let Some(mut f) = build().await else { return };
+    let (first, count) = (29u32, 50u32);
+    let binding = f.binding(first, count);
+    let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+    let n = f.k;
+    let proof = rekey(&f, &descriptor, 0, first);
+    let mut roots = f.position_roots[..n as usize].to_vec();
+    roots[proof.p as usize] = proof.root;
+    let (descriptor, created) = f.run_document_with_roots(&binding, &roots).await;
+    f.finalize(&descriptor, created, n).await;
+    let metas = attest_metas(f.signer.pubkey(), (f.pt2s, f.routes, f.geometry), created);
+    // The honest packet, once, so the refusals below are on a proven document
+    // and not on a document that had nothing to prove.
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        proof.data.clone(),
+        metas.clone(),
+    )
+    .await
+    .expect("the honest attest");
+    // **The retained packet, unmodified.** Its twelve path entries and its
+    // SPP1 siblings are the revision-7 document's own digests over the
+    // revision-7 descriptor, and it is sent against the revision-8 record.
+    let retained = f.attestations[0].clone();
+    assert_eq!(retained[0], TAG_ATTEST_OUTPUT);
+    assert_ne!(
+        &retained[1..33],
+        &descriptor[..],
+        "the retained packet names the /4 descriptor"
+    );
+    assert_eq!(
+        &f.descriptor_v7[..],
+        &retained[1..33],
+        "and it is the executor's own revision-7 digest"
+    );
+    let mut stale = retained.clone();
+    // **A wrong descriptor, from every angle.** Each of these differs from the
+    // record's header digest, so `document_v8`'s PDA and header compares fail.
+    let mut wrong = retained.clone();
+    wrong[1..33].copy_from_slice(&f.descriptor_v7);
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.signer, f.program, wrong, metas.clone()).await),
+        CL_MALFORMED,
+        "the /4 descriptor is 580 at the record's PDA"
+    );
+    let mut flipped = proof.data.clone();
+    flipped[1] ^= 1;
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.signer, f.program, flipped, metas.clone()).await),
+        CL_MALFORMED,
+        "one flipped byte of the descriptor is 580"
+    );
+    let mut zeroed = proof.data.clone();
+    zeroed[1..33].copy_from_slice(&[0u8; 32]);
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.signer, f.program, zeroed, metas.clone()).await),
+        CL_MALFORMED,
+        "a zero descriptor is 580"
+    );
+    // The record is untouched by every one of those, and its own header still
+    // names the descriptor the honest packet named.
+    let doc = f.account(created[0]).await;
+    assert_eq!(
+        &doc[8..40],
+        &descriptor[..],
+        "a refused attest wrote nothing to DCM2"
+    );
+    assert_eq!(
+        u32_at(&f.account(created[3]).await, 204),
+        1,
+        "and nothing to the record's count"
+    );
+    // **A `/4` packet re-keyed to this document's descriptor is 795 at the
+    // fold.** This is the one that needed the code to be right rather than the
+    // account check to be right: the leaf is rebuilt from the packet's own
+    // (revision-7) write row, the segment root and the SPP1 are folded over
+    // the **revision-8** descriptor, and the tree does not contain the leaf
+    // the packet carries. `rekey` is exactly the same walk with the write row
+    // replaced, which is why the honest packet above discharges and this one
+    // cannot.
+    stale[1..33].copy_from_slice(&descriptor);
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.signer, f.program, stale, metas.clone()).await),
+        OUTPUT_PROOF,
+        "a retained /4 packet against the /5 record fails the fold with 795"
+    );
+    // **And the wrong account is refused even with the right descriptor.** The
+    // document account's key *is* `PDA(descriptor)`, so the same well-formed
+    // revision-8 record installed somewhere else fails `document_v8`'s address
+    // compare with the same 580: the descriptor a packet names and the account
+    // a caller supplies have to be the same document, and neither half of that
+    // check is the proof's business.
+    let doc = f.account(created[0]).await;
+    assert_eq!(
+        &doc[8..40],
+        &descriptor[..],
+        "the record's own header names the descriptor"
+    );
+    let elsewhere = address::document(&f.program, &[7u8; 32]).0;
+    f.ctx
+        .set_account(&elsewhere, &shared(owned(&f.program, doc)));
+    let mut wrong_account =
+        attest_metas(f.signer.pubkey(), (f.pt2s, f.routes, f.geometry), created);
+    wrong_account[1] = AccountMeta::new_readonly(elsewhere, false);
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                proof.data.clone(),
+                wrong_account
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "the same record at another address is 580: the key is PDA(descriptor)"
+    );
+    // The refused packets left the proven cell alone, and the honest cell is
+    // still the value the re-keyed leaf committed.
+    let dcr2 = f.account(created[3]).await;
+    assert_eq!(
+        u32_at(&dcr2, 204),
+        1,
+        "one attested output, from the honest packet only"
+    );
+    let at = result::HEADER_V6;
+    assert_eq!(&dcr2[at..at + 16], &proof.value[..]);
+}
+
+/// The second and third outputs of the same run, so the path is not a
+/// single-cell accident: each re-keys its own leaf and each is a real leaf of
+/// the real segment.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_attest_three_outputs_of_one_run() {
+    let Some(mut f) = build().await else { return };
+    let (first, count) = (29u32, 50u32);
+    let binding = f.binding(first, count);
+    let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+    let n = f.k;
+    let proofs: Vec<Rekeyed> = [0u32, 1, 7]
+        .iter()
+        .map(|i| rekey(&f, &descriptor, *i, first + *i))
+        .collect();
+    // Every position in [first, first + 8) is attested, so every one of those
+    // positions' roots is a re-keyed root.
+    let mut roots = f.position_roots[..n as usize].to_vec();
+    for p in &proofs {
+        roots[p.p as usize] = p.root;
+    }
+    let created = [
+        address::document(&f.program, &descriptor).0,
+        address::positions(&f.program, &descriptor).0,
+        address::family_slots(&f.program, &descriptor).0,
+        address::result(&f.program, &descriptor).0,
+    ];
+    for key in created {
+        fund(&mut f.ctx, key).await;
+    }
+    let metas = f.init_metas(created);
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        init_data(
+            &f.terms_raw,
+            &binding.encode(),
+            &[[1u8; 32], [2u8; 32], [3u8; 32]],
+            16,
+            &f.family_body,
+            &[],
+        ),
+        metas,
+    )
+    .await
+    .expect("init");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        land_data(&descriptor, 0, &roots),
+        vec![
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(created[1], false),
+            AccountMeta::new_readonly(f.dtu1, false),
+        ],
+    )
+    .await
+    .expect("land");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        finalize_data(&descriptor, n, &f.family_roots),
+        vec![
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(created[3], false),
+            AccountMeta::new_readonly(f.dtu1, false),
+        ],
+    )
+    .await
+    .expect("finalize");
+    let other = f.signer.pubkey();
+    let metas = attest_metas(other, (f.pt2s, f.routes, f.geometry), created);
+    for p in &proofs {
+        send(
+            &mut f.ctx,
+            &f.signer,
+            f.program,
+            p.data.clone(),
+            metas.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "attest of output {} at position {}: {e:?}",
+                u32_at(&p.data, 33),
+                p.p
+            )
+        });
+    }
+    let dcr2 = f.account(created[3]).await;
+    assert_eq!(u32_at(&dcr2, 204), 3, "three attested outputs");
+    for p in &proofs {
+        let i = u32_at(&p.data, 33) as usize;
+        let at = result::HEADER_V6 + 16 * i;
+        assert_eq!(
+            &dcr2[at..at + 16],
+            &p.value[..],
+            "cell {i} is the attested value"
+        );
+        assert_eq!(
+            dcr2[result::HEADER_V6 + count as usize * 16 + i / 8] >> (i % 8) & 1,
+            1,
+            "bitmap bit {i}"
+        );
+        assert!(
+            p.p >= first && p.p < n,
+            "output {i} is a generated position"
+        );
+    }
+}
+
+// ------------------------------------- the deadlines: 736 and the lifetime clamp
+
+/// A crafted document at a chosen `init_slot`, for the two deadline rules. The
+/// three account addresses are derived from the descriptor, so the fixture
+/// installs the images at their own PDAs; everything the handlers read is
+/// written here, and the ones they check are the frozen offsets.
+struct Crafted {
+    dcm2: Pubkey,
+    dpr2: Pubkey,
+    dcr2: Pubkey,
+    descriptor: [u8; 32],
+}
+
+impl Fix {
+    /// A DCM2 v7 + DPR2 + DCR2 v6 for `binding`, with `init_slot` and the two
+    /// deadlines written as the init instruction would have left them.
+    async fn craft(
+        &mut self,
+        binding: &Binding2,
+        n: u32,
+        roots: &[[u8; 32]],
+        init_slot: u64,
+        descriptor: [u8; 32],
+    ) -> Crafted {
+        self.craft_with(binding, n, roots, init_slot, descriptor, &[])
+            .await
+    }
+
+    async fn craft_with(
+        &mut self,
+        binding: &Binding2,
+        n: u32,
+        roots: &[[u8; 32]],
+        init_slot: u64,
+        descriptor: [u8; 32],
+        options: &[u8],
+    ) -> Crafted {
+        let window = u64_at(&self.terms_raw, 8);
+        let abandon = u64_at(&self.terms_raw, 128);
+        let mut doc = dcm2_v7(
+            &self.program,
+            &descriptor,
+            &self.executor.pubkey().to_bytes(),
+            self.k,
+            n,
+            FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED,
+            &self.terms_raw,
+            &binding.encode(),
+            &self.pt2s.to_bytes(),
+            &self.pt2s_sha,
+            &self.dea2.to_bytes(),
+            &self.drp2.to_bytes(),
+            &self.reg_root,
+            16,
+            init_slot + window,
+            init_slot + abandon,
+        );
+        // The prefix root. `finalize` copies 152 to 96 and to DCR2 40 without
+        // re-deriving it, so a fixture may leave any nonzero value here; this is
+        // the one that the real landing of `roots` would leave, computed by the
+        // crate's own mountain range from a fresh peak list.
+        let mut peaks = Vec::new();
+        for (i, r) in roots.iter().enumerate() {
+            document::mmr_append(&descriptor, i as u32, &mut peaks, r).unwrap();
+        }
+        doc[528] = peaks.len() as u8;
+        for (i, p) in peaks.iter().enumerate() {
+            let at = document::PEAKS_AT_V8 + document::PEAK_BYTES * i;
+            doc[at] = p.level;
+            doc[at + 4..at + 8].copy_from_slice(&p.first.to_le_bytes());
+            doc[at + 8..at + 40].copy_from_slice(&p.digest);
+        }
+        let prefix = document::mmr_root(&descriptor, n, &peaks).unwrap();
+        doc[152..184].copy_from_slice(&prefix);
+        assert_eq!(options.len(), 4 * binding.option_count as usize);
+        doc[OPTION_REGION_AT..OPTION_REGION_AT + options.len()].copy_from_slice(options);
+        let dcm2 = address::document(&self.program, &descriptor).0;
+        let dpr2 = address::positions(&self.program, &descriptor).0;
+        let dcr2 = address::result(&self.program, &descriptor).0;
+        self.ctx
+            .set_account(&dcm2, &shared(owned(&self.program, doc)));
+        // The page is written a few positions longer than `n`, so a landing in
+        // the clamp test does not have to realloc an account the fixture
+        // funded at exactly its own length.
+        let spare = (n as usize + 8).min(self.position_roots.len());
+        let mut pos = dpr2_image(&descriptor, self.k, &self.position_roots[..spare]);
+        pos[44..48].copy_from_slice(&n.to_le_bytes());
+        self.ctx
+            .set_account(&dpr2, &shared(owned(&self.program, pos)));
+        let res = dcr2_v6(
+            &self.program,
+            &descriptor,
+            binding,
+            &Terms2::decode(&self.terms_raw).unwrap(),
+        );
+        self.ctx
+            .set_account(&dcr2, &shared(owned(&self.program, res)));
+        Crafted {
+            dcm2,
+            dpr2,
+            dcr2,
+            descriptor,
+        }
+    }
+
+    /// **Four metas on both**, revision 7's three plus DTU1: the clamp's ceiling
+    /// is the *template's* lifetime limit, and the template is the only place
+    /// that number lives (spec §1.6, §1.7).
+    fn fin_metas(&self, c: &Crafted) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new(self.executor.pubkey(), true),
+            AccountMeta::new(c.dcm2, false),
+            AccountMeta::new(c.dcr2, false),
+            AccountMeta::new_readonly(self.dtu1, false),
+        ]
+    }
+
+    fn land_metas(&self, c: &Crafted) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new(self.executor.pubkey(), true),
+            AccountMeta::new(c.dcm2, false),
+            AccountMeta::new(c.dpr2, false),
+            AccountMeta::new_readonly(self.dtu1, false),
+        ]
+    }
+}
+
+/// **736 at finalize**, twice: past the production deadline, and past the
+/// attestation budget. Both are refusals, so the record is unchanged by each.
+///
+/// The slots are the fixture's own rather than warped ones: a document whose
+/// `abandon_deadline` is already behind the clock is one whose executor stopped
+/// landing a window ago, and a document created at slot 0 with a grace equal to
+/// **its template's** `max_document_lifetime_slots` has a budget ceiling of
+/// `init_slot + lifetime - abandon_after_slots = init_slot`, which is check 20
+/// (`abandon_after_slots <= max_document_lifetime_slots`) at its tightest. The
+/// second case is the honest shape of the rule and the reason it is a refusal
+/// rather than tooling guidance.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_finalize_refuses_a_late_document_with_736() {
+    let Some(mut f) = build().await else { return };
+    let n = 40u32;
+    let roots = f.position_roots[..n as usize].to_vec();
+    // (1) At or after the production deadline. `abandon_deadline` is in the
+    // past, which is what a document whose executor stopped landing looks like
+    // one window later.
+    let binding = f.binding(0, 50);
+    let window = u64_at(&f.terms_raw, 8);
+    // One slot, once, before anything is installed: a bank only verifies its
+    // accounts hash across the slots it skips, and a fixture that rewrites
+    // accounts with `set_account` cannot then skip a range.
+    let base = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    f.ctx.warp_to_slot(base + 1).unwrap();
+    let now = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    assert!(now >= 1);
+    let mut c = f.craft(&binding, n, &roots, 0, [30u8; 32]).await;
+    // The record as init would have left it, then the window elapsed: 2174 is
+    // rewritten to a slot already behind the clock.
+    let mut doc = f.account(c.dcm2).await;
+    doc[document::ABANDON_DEADLINE_AT..document::ABANDON_DEADLINE_AT + 8]
+        .copy_from_slice(&0u64.to_le_bytes());
+    f.ctx.set_account(&c.dcm2, &shared(owned(&f.program, doc)));
+    let metas = f.fin_metas(&c);
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                finalize_data(&c.descriptor, n, &f.family_roots),
+                metas.clone()
+            )
+            .await
+        ),
+        CL_DEADLINE,
+        "now >= abandon_deadline is 736"
+    );
+    let after = f.account(c.dcm2).await;
+    assert_eq!(
+        u32_at(&after, 6) as u16,
+        FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED,
+        "a refused finalize writes nothing, and flag 2 is still clear"
+    );
+    assert_eq!(
+        u64_at(&after, document::ABANDON_DEADLINE_AT),
+        0,
+        "and the deadline is untouched"
+    );
+    assert_eq!(
+        u64_at(&after, 144),
+        window,
+        "the challenge deadline is the init one"
+    );
+    // (2) A finalize that would leave less than a full attestation budget. The
+    // maximum window is LIFETIME, so the ceiling is the init slot itself.
+    let big = Terms2 {
+        abandon_after_slots: EXAMPLE_LIMITS.max_document_lifetime_slots,
+        ..Terms2::decode(&f.terms_raw).unwrap()
+    };
+    let mut f2 = Fix {
+        terms_raw: big.encode().to_vec(),
+        ..f
+    };
+    let b2 = f2.binding(0, 50);
+    let c2 = f2.craft(&b2, n, &roots, 0, [31u8; 32]).await;
+    let metas = f2.fin_metas(&c2);
+    assert_eq!(
+        custom(
+            send(
+                &mut f2.ctx,
+                &f2.executor,
+                f2.program,
+                finalize_data(&c2.descriptor, n, &f2.family_roots),
+                metas.clone()
+            )
+            .await
+        ),
+        CL_DEADLINE,
+        "a finalize that would leave less than a full attestation budget is 736"
+    );
+    // (3) The same document with a window the budget can cover: legal, and the
+    // deadline it writes is `finalize_slot + abandon_after_slots` with the clamp
+    // not binding, which is what the refusal in (2) guarantees.
+    let c3 = f2.craft(&binding, n, &roots, now, [32u8; 32]).await;
+    let metas = f2.fin_metas(&c3);
+    send(
+        &mut f2.ctx,
+        &f2.executor,
+        f2.program,
+        finalize_data(&c3.descriptor, n, &f2.family_roots),
+        metas,
+    )
+    .await
+    .expect("a finalize inside the budget");
+    let doc = f2.account(c3.dcm2).await;
+    let slot = f2
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    assert_eq!(
+        u32_at(&doc, 6) as u16,
+        FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED
+    );
+    assert_eq!(
+        u64_at(&doc, document::ABANDON_DEADLINE_AT),
+        slot + EXAMPLE_LIMITS.max_document_lifetime_slots,
+        "the finalize wrote finalize_slot + abandon_after_slots, and the clamp did not bind"
+    );
+    assert!(slot >= now);
+    c = c3;
+    let _ = c;
+}
+
+/// **The clamp, taking effect.** A document created at slot 0 with a grace
+/// equal to its template's `max_document_lifetime_slots` has a ceiling of
+/// `0 + that limit`, so a landing at the fixture's own slot is already past it:
+/// the write is the clamp and not `slot + abandon_after_slots`, and the two
+/// differ by `slot - init_slot`. The same number is what row 2 of the close
+/// fires at, which is the one exit a clamped document has.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_land_clamps_the_production_deadline_to_the_lifetime() {
+    let Some(mut f) = build().await else { return };
+    let n = 2u32;
+    let roots = f.position_roots[..n as usize].to_vec();
+    let base = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    f.ctx.warp_to_slot(base + 1).unwrap();
+    let slot = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    assert!(slot >= 1);
+    // The template's maximum grace: the ceiling is `init_slot + the template's
+    // max_document_lifetime_slots` and the forward write is `slot + the same
+    // number`, so the clamp binds exactly when `slot > init_slot`.
+    let big = Terms2 {
+        abandon_after_slots: EXAMPLE_LIMITS.max_document_lifetime_slots,
+        ..Terms2::decode(&f.terms_raw).unwrap()
+    };
+    let mut f = Fix {
+        terms_raw: big.encode().to_vec(),
+        ..f
+    };
+    let binding = f.binding(0, 50);
+    let c = f.craft(&binding, n, &roots, 0, [33u8; 32]).await;
+    let ceiling = EXAMPLE_LIMITS.max_document_lifetime_slots;
+    assert!(slot > 0, "the fixture is past the document's init slot");
+    let metas = f.land_metas(&c);
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        land_data(
+            &c.descriptor,
+            n,
+            &f.position_roots[n as usize..n as usize + 1],
+        ),
+        metas,
+    )
+    .await
+    .expect("a landing past the lifetime ceiling");
+    let doc = f.account(c.dcm2).await;
+    assert_eq!(
+        u64_at(&doc, document::ABANDON_DEADLINE_AT),
+        ceiling,
+        "the landing was clamped to init_slot + the template's lifetime limit"
+    );
+    assert!(
+        slot + EXAMPLE_LIMITS.max_document_lifetime_slots > ceiling,
+        "and the unclamped value would have been larger by slot - init_slot"
+    );
+    // `init_slot` is recovered as `dispute_deadline - challenge_window_slots`,
+    // and the landing did not touch 144, so the recovery is this document's own
+    // init slot and not the slot the landing ran at.
+    assert_eq!(
+        u64_at(&doc, 144) - u64_at(&doc, 184),
+        0,
+        "init_slot is recovered as dispute_deadline - challenge_window_slots"
+    );
+    assert_eq!(u32_at(&doc, 84), n + 1, "the landing landed");
+    // A document created in the future has not reached its ceiling, and the same
+    // landing writes the plain forward value.
+    let c2 = f.craft(&binding, n, &roots, slot, [34u8; 32]).await;
+    let metas = f.land_metas(&c2);
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        land_data(
+            &c2.descriptor,
+            n,
+            &f.position_roots[n as usize..n as usize + 1],
+        ),
+        metas,
+    )
+    .await
+    .expect("a landing before the ceiling");
+    let doc = f.account(c2.dcm2).await;
+    assert_eq!(
+        u64_at(&doc, document::ABANDON_DEADLINE_AT),
+        slot + EXAMPLE_LIMITS.max_document_lifetime_slots,
+        "before the ceiling the write is slot + abandon_after_slots"
+    );
+    assert_eq!(
+        u64_at(&doc, 144) - u64_at(&doc, 184),
+        slot,
+        "init_slot is recovered as dispute_deadline - challenge_window_slots"
+    );
+}
+
+// ------------------------------------------------------- typed decisions at K
+
+/// A decision binding over this template's declared fields, with `K` options.
+/// The plan has no 4-byte write lane, so this binding is refused **794** at
+/// init -- which is the honest answer and is asserted in
+/// `unified_v8_records.rs` -- and the finalize and attest below are driven over
+/// a crafted record, where no plan check applies to finalize.
+fn decision_binding(executor: &[u8; 32], prompt_positions: u32, k: u8) -> (Binding2, Vec<u8>) {
+    decision_binding_at(executor, prompt_positions, k, 28_037)
+}
+
+fn decision_binding_at(
+    executor: &[u8; 32],
+    prompt_positions: u32,
+    k: u8,
+    base_entry: u32,
+) -> (Binding2, Vec<u8>) {
+    let mut options = Vec::new();
+    for j in 0..k as u32 {
+        options.extend_from_slice(&(1_000u32 + j).to_le_bytes());
+    }
+    let b = Binding2 {
+        executor: *executor,
+        request_id: [5u8; 32],
+        consumer_digest: [6u8; 32],
+        seed: [0; 32],
+        output_first_position: prompt_positions - 1,
+        output_count: 1 + k as u32,
+        output_base_entry: base_entry,
+        output_write: 0,
+        output_width: 4,
+        decision_flags: DECISION_MODE,
+        option_count: k,
+        prompt_positions,
+        stop_plus_one: 0,
+        option_table_offset: OPTION_REGION_AT as u16,
+        option_table_sha256: sha256(&[&options]),
+    };
+    (b, options)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unified_init_rejects_prompt_shorter_than_template_producer_delta() {
+    let Some(mut f) = build_f47().await else {
+        return;
+    };
+    let mut binding = f.binding(0, 2);
+    binding.prompt_positions = 1;
+    binding.output_first_position = 0;
+    assert_eq!(f.init_refusal(&binding, 236).await, RUN_BINDING,
+        "UnifiedInit refuses before route instantiation when prompt_positions is below the template maximum");
+}
+
+/// The compiler-v1 PXR1 decision lane accepts a complete option table through
+/// UnifiedInit at each supported boundary count, including both read-key
+/// boundary sizes around tag 120's 48-account limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn f47_compiler_v1_unified_init_accepts_option_counts_1_47_48_80() {
+    let Some(mut f) = build_f47().await else {
+        return;
+    };
+    assert_eq!(
+        f.output_width, 4,
+        "the compiler-v1 fixture seals a 4-byte decision lane"
+    );
+    assert_eq!(
+        f.base_entry, 28_040,
+        "Form 47 is the final compiler-v1 entry"
+    );
+    let n = 30u32;
+    for (variant, k) in [1u8, 47, 48, 80].into_iter().enumerate() {
+        let (mut binding, _) =
+            decision_binding_at(&f.executor.pubkey().to_bytes(), n, k, f.base_entry);
+        let mut options = Vec::with_capacity(k as usize * 4);
+        for token in 0..k as u32 {
+            options.extend_from_slice(&token.to_le_bytes());
+        }
+        binding.request_id = [80 + variant as u8; 32];
+        binding.option_table_sha256 = sha256(&[&options]);
+        let (descriptor, created) = f.run_document_with_options(&binding, n, &options).await;
+        let doc = f.account(created[0]).await;
+        assert_eq!(&doc[8..40], &descriptor);
+        assert_eq!(
+            &doc[OPTION_REGION_AT..],
+            options.as_slice(),
+            "option table at K = {k}"
+        );
+        assert_eq!(
+            doc.len(),
+            OPTION_REGION_AT + options.len(),
+            "DCM2 length at K = {k}"
+        );
+        let finalized = f.finalize(&descriptor, created, n).await;
+        assert_eq!(
+            u16_at(&finalized, 6),
+            FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
+            "UnifiedInit document finalizes at K = {k}"
+        );
+        // Tag 146 resolves the gather entry and Form 47 against the
+        // immutable option table committed by this exact UnifiedInit.
+        for entry in [f.base_entry - 1, f.base_entry] {
+            let output = Keypair::new();
+            let output_bytes = vec![0; 128 * 1024];
+            f.ctx.set_account(
+                &output.pubkey(),
+                &shared(Account {
+                    lamports: solana_program::rent::Rent::default()
+                        .minimum_balance(output_bytes.len()),
+                    data: output_bytes,
+                    owner: SYSTEM,
+                    executable: false,
+                    rent_epoch: 0,
+                }),
+            );
+            let mut data = vec![S::TAG_INSTANTIATE];
+            data.extend_from_slice(&29u32.to_le_bytes());
+            data.extend_from_slice(&entry.to_le_bytes());
+            data.extend_from_slice(&1u16.to_le_bytes());
+            send_with_signers(
+                &mut f.ctx,
+                &f.executor,
+                &[&output],
+                f.program,
+                data,
+                vec![
+                    AccountMeta::new_readonly(f.pt2s, false),
+                    AccountMeta::new_readonly(f.pt1s_index, false),
+                    AccountMeta::new_readonly(f.routes, false),
+                    AccountMeta::new_readonly(f.geometry, false),
+                    AccountMeta::new_readonly(f.payloads, false),
+                    AccountMeta::new(output.pubkey(), true),
+                    AccountMeta::new_readonly(created[0], false),
+                    AccountMeta::new_readonly(SYSTEM, false),
+                ],
+            )
+            .await
+            .expect("tag 146 decision fixture instantiation");
+            let stream = f.account(output.pubkey()).await;
+            assert_eq!(&stream[..4], b"PT1O");
+            assert_eq!(u32_at(&stream, 4), 29);
+            assert_eq!(u32_at(&stream, 8), entry);
+            assert!(u32_at(&stream, 12) > 0);
+        }
+        eprintln!(
+            "f47 compiler-v1 UnifiedInit finalized K={k} options_bytes={} descriptor={}",
+            options.len(),
+            descriptor
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+    }
+}
+
+/// Build a duplicate-last closure tree path while retaining the exact node
+/// ranges used by `challenge::dl_fold`.
+fn f47_tree_path(
+    descriptor: &[u8; 32],
+    kind: u8,
+    scope: u32,
+    leaves: &[[u8; 32]],
+    target: usize,
+) -> (Vec<[u8; 32]>, [u8; 32]) {
+    #[derive(Clone, Copy)]
+    struct Node {
+        hash: [u8; 32],
+        first: u32,
+        end: u32,
+    }
+    let mut nodes = leaves
+        .iter()
+        .enumerate()
+        .map(|(i, hash)| Node {
+            hash: *hash,
+            first: i as u32,
+            end: i as u32 + 1,
+        })
+        .collect::<Vec<_>>();
+    let mut at = target;
+    let mut path = Vec::new();
+    let mut height = 0u8;
+    while nodes.len() > 1 {
+        let sibling = at ^ 1;
+        path.push(nodes.get(sibling).unwrap_or(&nodes[at]).hash);
+        let next_height = height + 1;
+        let mut next = Vec::with_capacity(nodes.len().div_ceil(2));
+        for pair in nodes.chunks(2) {
+            let left = pair[0];
+            let right = *pair.get(1).unwrap_or(&left);
+            next.push(Node {
+                hash: h::hash(
+                    b"node/2",
+                    &[
+                        descriptor,
+                        &[kind],
+                        &scope.to_le_bytes(),
+                        &left.first.to_le_bytes(),
+                        &right.end.to_le_bytes(),
+                        &[next_height, 1],
+                        &left.hash,
+                        &right.hash,
+                    ],
+                ),
+                first: left.first,
+                end: right.end,
+            });
+        }
+        at /= 2;
+        nodes = next;
+        height = next_height;
+    }
+    (path, nodes[0].hash)
+}
+
+/// Canonical level-first boundary hashes for a set of leaves in a duplicate-last
+/// closure tree. Selected coordinates are sorted and unique.
+fn f48_sparse_siblings(
+    descriptor: &[u8; 32],
+    kind: u8,
+    scope: u32,
+    leaves: &[[u8; 32]],
+    selected: &[usize],
+) -> Vec<[u8; 32]> {
+    use std::collections::BTreeSet;
+
+    #[derive(Clone, Copy)]
+    struct Node {
+        digest: [u8; 32],
+        first: u32,
+        end: u32,
+    }
+    let mut nodes = leaves
+        .iter()
+        .enumerate()
+        .map(|(index, digest)| Node {
+            digest: *digest,
+            first: index as u32,
+            end: index as u32 + 1,
+        })
+        .collect::<Vec<_>>();
+    let mut active = selected.iter().copied().collect::<BTreeSet<_>>();
+    assert!(!active.is_empty());
+    assert_eq!(active.len(), selected.len());
+    assert!(active.iter().all(|index| *index < leaves.len()));
+    let mut siblings = Vec::new();
+    let mut height = 0u8;
+    while nodes.len() > 1 {
+        let active_now = active.iter().copied().collect::<Vec<_>>();
+        for index in &active_now {
+            if *index & 1 == 0 {
+                if !active.contains(&(*index + 1)) && *index + 1 < nodes.len() {
+                    siblings.push(nodes[*index + 1].digest);
+                }
+            } else if !active.contains(&(*index - 1)) {
+                siblings.push(nodes[*index - 1].digest);
+            }
+        }
+        let next_height = height + 1;
+        let mut next = Vec::with_capacity(nodes.len().div_ceil(2));
+        for pair in nodes.chunks(2) {
+            let left = pair[0];
+            let right = *pair.get(1).unwrap_or(&left);
+            next.push(Node {
+                digest: h::hash(
+                    b"node/2",
+                    &[
+                        descriptor,
+                        &[kind],
+                        &scope.to_le_bytes(),
+                        &left.first.to_le_bytes(),
+                        &right.end.to_le_bytes(),
+                        &[next_height, 1],
+                        &left.digest,
+                        &right.digest,
+                    ],
+                ),
+                first: left.first,
+                end: right.end,
+            });
+        }
+        nodes = next;
+        active = active.into_iter().map(|index| index / 2).collect();
+        height = next_height;
+    }
+    assert_eq!(active.len(), 1);
+    siblings
+}
+
+fn f47_dcl2_preimage(
+    descriptor: &[u8; 32],
+    coordinate: h::Coordinate,
+    operation: u16,
+    form: u16,
+    read_count: u16,
+    input_root: [u8; 32],
+    writes: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(b"basanos/dcg-hclosure-leaf/2".len() + 120 + 48 * writes.len());
+    out.extend_from_slice(b"basanos/dcg-hclosure-leaf/2");
+    out.extend_from_slice(descriptor);
+    out.extend_from_slice(&coordinate.position.to_le_bytes());
+    out.extend_from_slice(&coordinate.segment.to_le_bytes());
+    out.extend_from_slice(&coordinate.entry.to_le_bytes());
+    out.extend_from_slice(&operation.to_le_bytes());
+    out.extend_from_slice(&form.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes()); // MODE_COMMIT
+    out.extend_from_slice(&read_count.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(&input_root);
+    out.extend_from_slice(&[0u8; 32]);
+    out.extend_from_slice(&(writes.len() as u16).to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    for row in writes {
+        out.extend_from_slice(row);
+    }
+    out
+}
+
+fn f47_read_row(
+    route: pt::InstantiatedRoute,
+    kind: u8,
+    bytes_digest: [u8; 32],
+    producer_ref: [u8; 32],
+) -> [u8; 120] {
+    let mut row = [0u8; 120];
+    row[0..2].copy_from_slice(&route.region_id.to_le_bytes());
+    row[2] = route.read_class;
+    row[3] = kind;
+    row[8..16].copy_from_slice(&route.effective_offset.to_le_bytes());
+    row[16..20].copy_from_slice(&route.byte_length.to_le_bytes());
+    row[24..56].copy_from_slice(&bytes_digest);
+    row[56..88].copy_from_slice(&producer_ref);
+    row
+}
+
+fn f47_write_row(route: pt::InstantiatedRoute, digest: [u8; 32]) -> Vec<u8> {
+    let mut row = vec![0u8; 48];
+    row[0..2].copy_from_slice(&route.region_id.to_le_bytes());
+    row[4..8].copy_from_slice(&route.byte_length.to_le_bytes());
+    row[8..16].copy_from_slice(&route.effective_offset.to_le_bytes());
+    row[16..48].copy_from_slice(&digest);
+    row
+}
+
+fn f47_put_u16(dst: &mut [u8], at: usize, value: u16) {
+    dst[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn f47_put_u32(dst: &mut [u8], at: usize, value: u32) {
+    dst[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn source_commit() -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git is needed to label the F48 measurement receipt");
+    assert!(output.status.success(), "git rev-parse HEAD failed");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn f47_put_u64(dst: &mut [u8], at: usize, value: u64) {
+    dst[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn f47_gather_before(x: &Pt2p<'_>, position: u32, decision_entry: u32) -> u32 {
+    (0..decision_entry)
+        .rev()
+        .find(|index| {
+            x.entry(position, *index)
+                .is_ok_and(|entry| entry.kernel_index == decision::GATHER_FORM_ID)
+        })
+        .expect("compiler-v1 decision has a preceding form-48 gather")
+}
+
+/// Host-side fixture synthesis for the typed-decision dispute cases. This
+/// exact integer reducer only creates test witnesses; revision-8 execution
+/// remains in the SBF handlers and the feature-built image contains no model.
+fn fixture_decision_record(logits: &[i64]) -> Vec<u8> {
+    const LUT_LEN: usize = 8_192;
+    const PROB_ONE: u64 = 1 << 16;
+    const LUT: &[u8] = include_bytes!("fixtures/qwen35_exp_lut.bin");
+    assert!(!logits.is_empty() && logits.len() <= u8::MAX as usize);
+
+    let scores = logits
+        .iter()
+        .map(|value| {
+            let quotient = value >> 4;
+            let remainder = (*value as u64) & 0x0f;
+            if remainder >= 8 {
+                quotient.checked_add(1).expect("rounded score fits i64")
+            } else {
+                quotient
+            }
+        })
+        .collect::<Vec<_>>();
+    let largest = *scores.iter().max().unwrap();
+    let mut exps = Vec::with_capacity(scores.len());
+    let mut total = 0u64;
+    for score in &scores {
+        let delta = (largest as u64).wrapping_sub(*score as u64);
+        let index = delta.min((LUT_LEN - 1) as u64) as usize;
+        let at = index * 8;
+        let exp = u64::from_le_bytes(LUT[at..at + 8].try_into().unwrap());
+        total = total
+            .checked_add(exp)
+            .expect("bounded fixture option count");
+        exps.push(exp);
+    }
+    assert_ne!(total, 0);
+    let mut chosen = 0usize;
+    for index in 1..logits.len() {
+        if logits[index] > logits[chosen] {
+            chosen = index;
+        }
+    }
+    let mut record = Vec::with_capacity(4 + exps.len() * 4);
+    record.extend_from_slice(&(chosen as u32).to_le_bytes());
+    for exp in exps {
+        let probability = exp
+            .checked_mul(PROB_ONE)
+            .and_then(|numerator| numerator.checked_add(total / 2))
+            .expect("bounded fixture probability");
+        record.extend_from_slice(&(probability / total).to_le_bytes());
+    }
+    record
+}
+
+/// The compiler-v1 form-47 dispute fixture uses a committed form-48 output as
+/// its producer write, with a finalized path through the real PT2P segment
+/// table. The proof is synthetic data; the compiler routes and PXR1 directory
+/// are the captured compiler-v1 fixture.
+fn f47_honest_body(
+    x: &Pt2p<'_>,
+    descriptor: &[u8; 32],
+    position: u32,
+    decision_entry: u32,
+    table: &[u8],
+    logits: &[i64],
+    wrong_option_write_order: bool,
+    wrong_duplicate_probability: bool,
+    position_root_at: &mut [u8; 32],
+) -> (Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>) {
+    let gather_index = f47_gather_before(x, position, decision_entry);
+    let gather_entry = x.entry(position, gather_index).unwrap();
+    let target_entry = x.entry(position, decision_entry).unwrap();
+    let gather_at = x.coordinate(position, gather_index).unwrap();
+    let target_at = x.coordinate(position, decision_entry).unwrap();
+    assert_eq!(gather_entry.kernel_index, decision::GATHER_FORM_ID);
+    assert_eq!(target_entry.kernel_index, decision::FORM_ID);
+    assert_eq!(
+        (target_entry.read_count, target_entry.write_count),
+        (2, 256)
+    );
+
+    let mut gathered = vec![0u8; 128 * 8];
+    for (i, value) in logits.iter().enumerate() {
+        gathered[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let gather_output_route = x.route(&gather_entry, gather_entry.read_count).unwrap();
+    let gather_coordinate = h::Coordinate {
+        position,
+        segment: gather_at.segment,
+        entry: gather_at.local,
+    };
+    let gather_digest = h::write_digest(
+        descriptor,
+        gather_coordinate,
+        gather_output_route.region_id,
+        gather_output_route.effective_offset,
+        &gathered,
+    )
+    .unwrap();
+    let gather_write = f47_write_row(gather_output_route, gather_digest);
+    let gather_preimage = f47_dcl2_preimage(
+        descriptor,
+        gather_coordinate,
+        gather_at.operation_ordinal,
+        decision::GATHER_FORM_ID,
+        128,
+        [0; 32],
+        &[gather_write],
+    );
+    let gather_leaf = sha256(&[&gather_preimage]);
+
+    let (gather_segment_ordinal, gather_segment_count) = (0..x.segment_count as usize)
+        .find_map(|ordinal| {
+            let row = x.segment_row(position, ordinal).ok()?;
+            (row.0 == gather_at.segment).then_some((ordinal, row.1))
+        })
+        .expect("gather segment exists");
+    let mut segment_leaves = (0..gather_segment_count as usize)
+        .map(|i| sha256(&[b"f47-producer-sibling", &i.to_le_bytes()]))
+        .collect::<Vec<_>>();
+    segment_leaves[gather_at.local as usize] = gather_leaf;
+    let (producer_path, producer_segment_tree_root) = f47_tree_path(
+        descriptor,
+        1,
+        position,
+        &segment_leaves,
+        gather_at.local as usize,
+    );
+    let producer_segment_root = h::hash(
+        b"segment-root/2",
+        &[
+            descriptor,
+            &position.to_le_bytes(),
+            &gather_at.segment.to_le_bytes(),
+            &(gather_segment_count as u32).to_le_bytes(),
+            &producer_segment_tree_root,
+            &[1],
+        ],
+    );
+
+    let table_hash = sha256(&[table]);
+    let target_coordinate = h::Coordinate {
+        position,
+        segment: target_at.segment,
+        entry: target_at.local,
+    };
+    let mut read_rows = vec![[0u8; 120]; target_entry.read_count as usize];
+    for ordinal in 0..target_entry.read_count {
+        let mut route = x.route(&target_entry, ordinal).unwrap();
+        if route.region_id == u16::MAX {
+            route.byte_length = table.len() as u32;
+            let table_ref = sha256(&[
+                b"basanos/dcg-dcm2-option-table-route/1",
+                &route.region_id.to_le_bytes(),
+                &(table.len() as u32).to_le_bytes(),
+                &table_hash,
+            ]);
+            let table_digest = sha256(&[
+                b"basanos/dcg-hclosure-read-bytes/2",
+                descriptor,
+                &target_coordinate.bytes(),
+                &route.region_id.to_le_bytes(),
+                &route.effective_offset.to_le_bytes(),
+                &(table.len() as u32).to_le_bytes(),
+                table,
+            ]);
+            read_rows[ordinal as usize] = f47_read_row(route, 0, table_digest, table_ref);
+        } else {
+            let gather_read_digest = h::write_digest(
+                descriptor,
+                gather_coordinate,
+                route.region_id,
+                route.effective_offset,
+                &gathered,
+            )
+            .unwrap();
+            read_rows[ordinal as usize] = f47_read_row(route, 1, gather_read_digest, gather_leaf);
+        }
+    }
+    let flat_rows = read_rows
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect::<Vec<_>>();
+    let input_root = sha256(&[
+        b"basanos/dcg-hclosure-input/2",
+        descriptor,
+        &target_coordinate.bytes(),
+        &decision::FORM_ID.to_le_bytes(),
+        &2u16.to_le_bytes(),
+        &flat_rows,
+    ]);
+
+    let result = fixture_decision_record(logits);
+    let mut claimed = vec![0u8; 256 * 4];
+    claimed[..result.len()].copy_from_slice(&result);
+    if wrong_option_write_order {
+        assert!(logits.len() >= 2);
+        let first_probability = claimed[4..8].to_vec();
+        claimed.copy_within(8..12, 4);
+        claimed[8..12].copy_from_slice(&first_probability);
+    }
+    if wrong_duplicate_probability {
+        assert!(table.len() >= 8);
+        let duplicate0 = u32::from_le_bytes(table[0..4].try_into().unwrap());
+        let duplicate1 = u32::from_le_bytes(table[4..8].try_into().unwrap());
+        assert_eq!(duplicate0, duplicate1);
+        claimed[8] ^= 1;
+    }
+    let mut write_rows = Vec::with_capacity(256);
+    let mut write_bytes = Vec::with_capacity(256);
+    for lane in 0..256 {
+        let route = x
+            .route(&target_entry, target_entry.read_count + lane as u16)
+            .unwrap();
+        let bytes = &claimed[lane * 4..lane * 4 + 4];
+        let digest = h::write_digest(
+            descriptor,
+            target_coordinate,
+            route.region_id,
+            route.effective_offset,
+            bytes,
+        )
+        .unwrap();
+        write_rows.push(f47_write_row(route, digest));
+        write_bytes.push(bytes.to_vec());
+    }
+    let target_preimage = f47_dcl2_preimage(
+        descriptor,
+        target_coordinate,
+        target_at.operation_ordinal,
+        decision::FORM_ID,
+        2,
+        input_root,
+        &write_rows,
+    );
+    let target_leaf = sha256(&[&target_preimage]);
+
+    let mut segment_roots = (0..x.segment_count as usize)
+        .map(|i| sha256(&[b"f47-segment-sibling", &i.to_le_bytes()]))
+        .collect::<Vec<_>>();
+    segment_roots[gather_segment_ordinal] = producer_segment_root;
+    let (spp_path, _) = f47_tree_path(
+        descriptor,
+        2,
+        position,
+        &segment_roots,
+        gather_segment_ordinal,
+    );
+    let table_root = x.segment_table_root(position).unwrap();
+    let root = challenge::spp1_position_root(
+        descriptor,
+        position,
+        x.segment_count,
+        &producer_segment_root,
+        gather_segment_ordinal as u16,
+        &table_root,
+        &spp_path,
+        &table_root,
+    )
+    .unwrap()
+    .unwrap();
+    *position_root_at = root;
+    let mut spp1 = Vec::with_capacity(36 + 32 * spp_path.len());
+    spp1.extend_from_slice(&(gather_segment_ordinal as u16).to_le_bytes());
+    spp1.push(spp_path.len() as u8);
+    spp1.push(0);
+    spp1.extend_from_slice(&table_root);
+    for sibling in &spp_path {
+        spp1.extend_from_slice(sibling);
+    }
+
+    let mut producer_proof = Vec::new();
+    producer_proof.extend_from_slice(&(gather_preimage.len() as u16).to_le_bytes());
+    producer_proof.extend_from_slice(&gather_preimage);
+    producer_proof.push(producer_path.len() as u8);
+    for sibling in &producer_path {
+        producer_proof.extend_from_slice(sibling);
+    }
+    producer_proof.extend_from_slice(&spp1);
+    let mut read_sections = vec![Vec::new(); target_entry.read_count as usize];
+    for ordinal in 0..target_entry.read_count {
+        let route = x.route(&target_entry, ordinal).unwrap();
+        let section = &mut read_sections[ordinal as usize];
+        if route.region_id == u16::MAX {
+            section.extend_from_slice(&(table.len() as u32).to_le_bytes());
+            section.extend_from_slice(table);
+            section.push(0);
+        } else {
+            section.extend_from_slice(&(gathered.len() as u32).to_le_bytes());
+            section.extend_from_slice(&gathered);
+            section.push(1);
+            section.extend_from_slice(&producer_proof);
+        }
+    }
+    let head = 28 + 4 * 2;
+    let target_at_body = head;
+    let rows_at = target_at_body + target_preimage.len();
+    let mut cursor = rows_at + flat_rows.len();
+    let section_offsets = read_sections
+        .iter()
+        .map(|section| {
+            let at = cursor;
+            cursor += section.len();
+            at
+        })
+        .collect::<Vec<_>>();
+    let mut body = vec![0u8; cursor];
+    body[..4].copy_from_slice(b"DGR1");
+    f47_put_u16(&mut body, 4, 1);
+    f47_put_u16(&mut body, 6, 2);
+    f47_put_u32(&mut body, 8, target_preimage.len() as u32);
+    for (i, offset) in section_offsets.iter().enumerate() {
+        f47_put_u32(&mut body, 28 + 4 * i, *offset as u32);
+    }
+    body[target_at_body..rows_at].copy_from_slice(&target_preimage);
+    body[rows_at..rows_at + flat_rows.len()].copy_from_slice(&flat_rows);
+    for (offset, section) in section_offsets.iter().zip(&read_sections) {
+        body[*offset..*offset + section.len()].copy_from_slice(section);
+    }
+    (body, gather_preimage, target_leaf, root, claimed)
+}
+
+/// A full form-48 responder body with one shared producer multiproof. The route
+/// table and PXR1 directory are the captured compiler-v1 artifact; producer
+/// bytes and unrelated Merkle leaves are deterministic synthetic values. The
+/// caller can deliberately corrupt the gather write digest to exercise tag 124.
+fn f48_honest_body(
+    x: &Pt2p<'_>,
+    routes: &[u8],
+    descriptor: &[u8; 32],
+    position: u32,
+    gather_index: u32,
+    table: &[u8],
+    wrong_gather_write_digest: bool,
+    position_root_at: &mut [u8; 32],
+) -> (Vec<u8>, [u8; 32]) {
+    use std::collections::BTreeMap;
+
+    let gather = x.entry(position, gather_index).unwrap();
+    let gather_at = x.coordinate(position, gather_index).unwrap();
+    assert_eq!(gather.kernel_index, decision::GATHER_FORM_ID);
+    let option_count = table.len() / 4;
+    assert!((1..=80).contains(&option_count));
+    let (_, _, pxr) = pt::route_header_v4_shallow(routes).unwrap();
+    let pxr = pxr.unwrap();
+
+    let mut selected = Vec::with_capacity(option_count);
+    let mut producer_coordinates = BTreeMap::<(u16, u32), (u32, Vec<u8>)>::new();
+    for ordinal in 0..option_count {
+        let token = u32::from_le_bytes(table[ordinal * 4..ordinal * 4 + 4].try_into().unwrap());
+        let (pxr_row, _) = pxr.find(token).unwrap();
+        let producer_index = x
+            .old_to_new(pxr_row.producer_entry, position)
+            .unwrap()
+            .unwrap();
+        assert!(producer_index < gather_index);
+        let producer = x.entry(position, producer_index).unwrap();
+        let declared = x
+            .route(
+                &producer,
+                producer.read_count + pxr_row.producer_write_ordinal,
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                declared.direction,
+                declared.region_id,
+                declared.effective_offset,
+                declared.byte_length,
+                declared.producer_write_ordinal
+            ),
+            (
+                1,
+                pxr.region_id,
+                pxr_row.region_offset,
+                pxr_row.byte_length,
+                pxr_row.producer_write_ordinal as u8
+            )
+        );
+        let placeholder = x.route(&gather, ordinal as u16).unwrap();
+        let route = pt::InstantiatedRoute {
+            direction: 0,
+            ordinal: ordinal as u16,
+            region_id: pxr.region_id,
+            effective_offset: declared.effective_offset,
+            byte_length: declared.byte_length,
+            read_class: 0,
+            binding_kind: 1,
+            source_supplied: false,
+            initial_content: false,
+            producer_position: position,
+            producer_entry: producer_index,
+            producer_write_ordinal: pxr_row.producer_write_ordinal as u8,
+            range_first: 0,
+            range_end: 0,
+            family_ordinal: 0,
+            template_offset: placeholder.template_offset,
+        };
+        let witness = vec![0u8; route.byte_length as usize];
+        producer_coordinates
+            .entry((
+                x.coordinate(position, producer_index).unwrap().segment,
+                x.coordinate(position, producer_index).unwrap().local,
+            ))
+            .or_insert((producer_index, witness.clone()));
+        selected.push((route, witness, producer_index));
+    }
+    if option_count == 80 {
+        assert_eq!(
+            producer_coordinates.len(),
+            option_count,
+            "the K=80 CU case must cover 80 distinct PXR1 producer rows"
+        );
+    }
+
+    let mut preimages = BTreeMap::<(u16, u32), Vec<u8>>::new();
+    for ((segment, local), (producer_index, _)) in &producer_coordinates {
+        let producer = x.entry(position, *producer_index).unwrap();
+        let coordinate = h::Coordinate {
+            position,
+            segment: *segment,
+            entry: *local,
+        };
+        let mut writes = Vec::with_capacity(producer.write_count as usize);
+        for write_ordinal in 0..producer.write_count {
+            let route = x
+                .route(&producer, producer.read_count + write_ordinal)
+                .unwrap();
+            let bytes = vec![0u8; route.byte_length as usize];
+            let digest = h::write_digest(
+                descriptor,
+                coordinate,
+                route.region_id,
+                route.effective_offset,
+                &bytes,
+            )
+            .unwrap();
+            writes.push(f47_write_row(route, digest));
+        }
+        let preimage = f47_dcl2_preimage(
+            descriptor,
+            coordinate,
+            x.coordinate(position, *producer_index)
+                .unwrap()
+                .operation_ordinal,
+            producer.kernel_index,
+            producer.read_count,
+            [0; 32],
+            &writes,
+        );
+        preimages.insert((*segment, *local), preimage);
+    }
+
+    let gather_coordinate = h::Coordinate {
+        position,
+        segment: gather_at.segment,
+        entry: gather_at.local,
+    };
+    let mut read_rows = Vec::with_capacity(option_count);
+    let mut read_sections = Vec::with_capacity(option_count);
+    for (route, witness, producer_index) in &selected {
+        let producer_coordinate = x.coordinate(position, *producer_index).unwrap();
+        let producer_preimage =
+            &preimages[&(producer_coordinate.segment, producer_coordinate.local)];
+        let producer_leaf = sha256(&[producer_preimage]);
+        let digest = h::write_digest(
+            descriptor,
+            h::Coordinate {
+                position,
+                segment: producer_coordinate.segment,
+                entry: producer_coordinate.local,
+            },
+            route.region_id,
+            route.effective_offset,
+            witness,
+        )
+        .unwrap();
+        read_rows.push(f47_read_row(*route, 1, digest, producer_leaf));
+    }
+    let flat_rows = read_rows
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect::<Vec<_>>();
+    let input_root = sha256(&[
+        b"basanos/dcg-hclosure-input/2",
+        descriptor,
+        &gather_coordinate.bytes(),
+        &decision::GATHER_FORM_ID.to_le_bytes(),
+        &(option_count as u16).to_le_bytes(),
+        &flat_rows,
+    ]);
+    let mut output = vec![0u8; 128 * 8];
+    for (i, value) in output.chunks_exact_mut(8).enumerate() {
+        value.copy_from_slice(&(i as i64).to_le_bytes());
+    }
+    let output_route = x.route(&gather, gather.read_count).unwrap();
+    let mut output_digest = h::write_digest(
+        descriptor,
+        gather_coordinate,
+        output_route.region_id,
+        output_route.effective_offset,
+        &output,
+    )
+    .unwrap();
+    if wrong_gather_write_digest {
+        output_digest[0] ^= 1;
+    }
+    let target_preimage = f47_dcl2_preimage(
+        descriptor,
+        gather_coordinate,
+        gather_at.operation_ordinal,
+        decision::GATHER_FORM_ID,
+        option_count as u16,
+        input_root,
+        &[f47_write_row(output_route, output_digest)],
+    );
+    let target_leaf = sha256(&[&target_preimage]);
+
+    let mut segment_leaves = BTreeMap::<u16, Vec<[u8; 32]>>::new();
+    let mut segment_ordinals = BTreeMap::<u16, usize>::new();
+    for ordinal in 0..x.segment_count as usize {
+        let (segment, count) = x.segment_row(position, ordinal).unwrap();
+        segment_ordinals.insert(segment, ordinal);
+        segment_leaves.insert(
+            segment,
+            (0..count as usize)
+                .map(|local| {
+                    sha256(&[
+                        b"f48-producer-sibling",
+                        &segment.to_le_bytes(),
+                        &(local as u32).to_le_bytes(),
+                    ])
+                })
+                .collect(),
+        );
+    }
+    for ((segment, local), preimage) in &preimages {
+        segment_leaves.get_mut(segment).unwrap()[*local as usize] = sha256(&[preimage]);
+    }
+    segment_leaves.get_mut(&gather_at.segment).unwrap()[gather_at.local as usize] = target_leaf;
+    let mut segment_roots = Vec::with_capacity(x.segment_count as usize);
+    let mut segment_roots_by_id = BTreeMap::new();
+    for ordinal in 0..x.segment_count as usize {
+        let (segment, count) = x.segment_row(position, ordinal).unwrap();
+        let leaves = &segment_leaves[&segment];
+        let (_, tree) = f47_tree_path(descriptor, 1, position, leaves, 0);
+        let root = h::hash(
+            b"segment-root/2",
+            &[
+                descriptor,
+                &position.to_le_bytes(),
+                &segment.to_le_bytes(),
+                &count.to_le_bytes(),
+                &tree,
+                &[1],
+            ],
+        );
+        segment_roots.push(root);
+        segment_roots_by_id.insert(segment, root);
+    }
+    let mut outer_roots = segment_roots;
+    outer_roots[segment_ordinals[&gather_at.segment]] = segment_roots_by_id[&gather_at.segment];
+    for (segment, _) in producer_coordinates.keys().copied() {
+        let ordinal = segment_ordinals[&segment];
+        outer_roots[ordinal] = segment_roots_by_id[&segment];
+    }
+    let table_root = x.segment_table_root(position).unwrap();
+    let first_producer_segment = producer_coordinates.keys().next().unwrap().0;
+    let (_, outer_tree) = f47_tree_path(
+        descriptor,
+        2,
+        position,
+        &outer_roots,
+        segment_ordinals[&first_producer_segment],
+    );
+    *position_root_at = h::hash(
+        b"position-root/2",
+        &[
+            descriptor,
+            &position.to_le_bytes(),
+            &x.segment_count.to_le_bytes(),
+            &table_root,
+            &outer_tree,
+            &[1],
+        ],
+    );
+
+    let mut unique_coordinates = producer_coordinates.keys().copied().collect::<Vec<_>>();
+    unique_coordinates.sort_by_key(|(segment, local)| (segment_ordinals[segment], *local));
+    let unique_index = unique_coordinates
+        .iter()
+        .enumerate()
+        .map(|(index, coordinate)| (*coordinate, index as u16))
+        .collect::<BTreeMap<_, _>>();
+    let mut batch = vec![0u8; 12];
+    batch[..4].copy_from_slice(b"F48M");
+    f47_put_u16(&mut batch, 4, 1);
+    f47_put_u16(&mut batch, 6, option_count as u16);
+    let mut group_count = 0usize;
+    let mut group_start = 0usize;
+    while group_start < unique_coordinates.len() {
+        let segment = unique_coordinates[group_start].0;
+        let mut group_end = group_start + 1;
+        while group_end < unique_coordinates.len() && unique_coordinates[group_end].0 == segment {
+            group_end += 1;
+        }
+        group_count += 1;
+        group_start = group_end;
+    }
+    f47_put_u16(&mut batch, 8, group_count as u16);
+    f47_put_u16(&mut batch, 10, unique_coordinates.len() as u16);
+    for (_, _, producer_index) in &selected {
+        let coordinate = x.coordinate(position, *producer_index).unwrap();
+        let mapped = unique_index[&(coordinate.segment, coordinate.local)];
+        batch.extend_from_slice(&mapped.to_le_bytes());
+    }
+    let mut group_start = 0usize;
+    let mut group_ordinals = Vec::with_capacity(group_count);
+    while group_start < unique_coordinates.len() {
+        let segment = unique_coordinates[group_start].0;
+        let ordinal = segment_ordinals[&segment];
+        let mut group_end = group_start + 1;
+        while group_end < unique_coordinates.len() && unique_coordinates[group_end].0 == segment {
+            group_end += 1;
+        }
+        group_ordinals.push(ordinal);
+        batch.extend_from_slice(&(ordinal as u16).to_le_bytes());
+        batch.extend_from_slice(&segment.to_le_bytes());
+        batch.extend_from_slice(&((group_end - group_start) as u16).to_le_bytes());
+        let mut selected_entries = Vec::with_capacity(group_end - group_start);
+        for (leaf_segment, local) in &unique_coordinates[group_start..group_end] {
+            let preimage = &preimages[&(*leaf_segment, *local)];
+            batch.extend_from_slice(&position.to_le_bytes());
+            batch.extend_from_slice(&leaf_segment.to_le_bytes());
+            batch.extend_from_slice(&local.to_le_bytes());
+            batch.extend_from_slice(&(preimage.len() as u16).to_le_bytes());
+            batch.extend_from_slice(preimage);
+            selected_entries.push(*local as usize);
+        }
+        let siblings = f48_sparse_siblings(
+            descriptor,
+            1,
+            position,
+            &segment_leaves[&segment],
+            &selected_entries,
+        );
+        batch.extend_from_slice(&(siblings.len() as u16).to_le_bytes());
+        for sibling in &siblings {
+            batch.extend_from_slice(sibling);
+        }
+        group_start = group_end;
+    }
+    let outer_siblings =
+        f48_sparse_siblings(descriptor, 2, position, &outer_roots, &group_ordinals);
+    batch.extend_from_slice(&(outer_siblings.len() as u16).to_le_bytes());
+    for sibling in &outer_siblings {
+        batch.extend_from_slice(sibling);
+    }
+    for (ordinal, (_, witness, _)) in selected.iter().enumerate() {
+        let proof = if ordinal == 0 { batch.as_slice() } else { &[] };
+        let mut section = Vec::with_capacity(5 + witness.len() + proof.len());
+        section.extend_from_slice(&(witness.len() as u32).to_le_bytes());
+        section.extend_from_slice(witness);
+        section.push(1);
+        section.extend_from_slice(proof);
+        read_sections.push(section);
+    }
+
+    let head = 28 + 4 * option_count;
+    let target_at = head;
+    let rows_at = target_at + target_preimage.len();
+    let mut cursor = rows_at + flat_rows.len();
+    let section_offsets = read_sections
+        .iter()
+        .map(|section| {
+            let at = cursor;
+            cursor += section.len();
+            at
+        })
+        .collect::<Vec<_>>();
+    let mut body = vec![0u8; cursor];
+    body[..4].copy_from_slice(b"DGR1");
+    f47_put_u16(&mut body, 4, 1);
+    f47_put_u16(&mut body, 6, option_count as u16);
+    f47_put_u32(&mut body, 8, target_preimage.len() as u32);
+    for (i, offset) in section_offsets.iter().enumerate() {
+        f47_put_u32(&mut body, 28 + 4 * i, *offset as u32);
+    }
+    body[target_at..rows_at].copy_from_slice(&target_preimage);
+    body[rows_at..rows_at + flat_rows.len()].copy_from_slice(&flat_rows);
+    for (offset, section) in section_offsets.iter().zip(&read_sections) {
+        body[*offset..*offset + section.len()].copy_from_slice(section);
+    }
+    (body, target_leaf)
+}
+
+async fn f47_measured_send(f: &mut Fix, data: Vec<u8>, metas: Vec<AccountMeta>, case: &str) -> u64 {
+    let blockhash = f.ctx.get_new_latest_blockhash().await.unwrap();
+    let instructions = [
+        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+            f47_compute_limit(),
+        ),
+        solana_compute_budget_interface::ComputeBudgetInstruction::request_heap_frame(256 * 1024),
+        Instruction {
+            program_id: f.program,
+            accounts: metas,
+            data,
+        },
+    ];
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&f.executor.pubkey()),
+        &[&f.executor],
+        blockhash,
+    );
+    let result = f
+        .ctx
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await
+        .unwrap();
+    if let Err(error) = result.result {
+        let consumed = result
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.compute_units_consumed);
+        panic!(
+            "{case} failed at compute limit {} after {consumed} transaction CU: {error:?}",
+            f47_compute_limit()
+        );
+    }
+    result.metadata.unwrap().compute_units_consumed
+}
+
+/// Full compiler-v1 form-47 dispute response, including the producer write
+/// preimage, DGR1 sections, and finalized segment/position proof paths.
+async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
+    let maybe = if role_swapped {
+        build_f47_with_swapped_roles().await
+    } else {
+        build_f47().await
+    };
+    let Some(mut f) = maybe else { return };
+    let receipt_dir = std::env::var_os("BASANOS_DCG_F47_RECEIPT").map(PathBuf::from);
+    if let Some(dir) = &receipt_dir {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let (routes, geometry, payloads, pwr1, _) = f47_artifacts().unwrap();
+    let program = pt2p::Program::decode(&pwr1).unwrap();
+    let x = Pt2p::new(&routes, &geometry, &payloads, None, program).unwrap();
+    let family_plan = document::parse_family_body(&f.family_body).unwrap();
+    assert_eq!(
+        document::check_family_plan(&x, &family_plan),
+        Ok(()),
+        "compiler-v1 artifact and retained DFS2 family plan agree"
+    );
+    let position = f47_position();
+    assert!(
+        position < f.k,
+        "the decision position fits the compiler-v1 template"
+    );
+    let decision_entry = x.entry_count(position).unwrap() - 1;
+    let base_decision_entry = x.base_entries - 1;
+    assert_eq!(
+        x.old_to_new(base_decision_entry, position).unwrap(),
+        Some(decision_entry)
+    );
+    let mut receipt = Vec::new();
+    let cases = [
+        (1u8, false, false, false),
+        (2, false, false, false),
+        (47, false, false, false),
+        (48, false, false, false),
+        (64, false, false, false),
+        (80, false, false, false),
+        (2, false, true, false), // probability values committed to the wrong option lanes
+        (2, true, false, true),  // duplicate ids must have equal probabilities
+    ];
+    for (variant, (k, duplicate, wrong_mapping, wrong_duplicate_probability)) in cases
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (k, _, _, _))| f47_measure_k_filter().is_none_or(|only| *k == only))
+    {
+        let (mut binding, _) = decision_binding_at(
+            &f.executor.pubkey().to_bytes(),
+            position + 1,
+            k,
+            base_decision_entry,
+        );
+        binding.request_id = [120 + variant as u8; 32];
+        let options = if duplicate {
+            vec![0u32, 0]
+        } else {
+            (0..k as u32).collect()
+        };
+        let table = options
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        binding.option_table_sha256 = sha256(&[&table]);
+        let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+        let logits = if duplicate {
+            vec![4096, 4096]
+        } else {
+            (0..k as usize)
+                .map(|i| ((k as i64) - i as i64) * 4096)
+                .collect::<Vec<_>>()
+        };
+        let mut position_root = [0u8; 32];
+        let (body, producer_preimage, target_leaf, root, _claimed) = f47_honest_body(
+            &x,
+            &descriptor,
+            position,
+            decision_entry,
+            &table,
+            &logits,
+            wrong_mapping,
+            wrong_duplicate_probability,
+            &mut position_root,
+        );
+        assert_eq!(root, position_root);
+        let roots = f47_document_roots(&f, position, position_root);
+        let (descriptor, created) = f
+            .run_document_with_roots_and_options(&binding, &roots, &table)
+            .await;
+        assert_eq!(descriptor, f.descriptor(&binding, &f.terms_raw, 16));
+        f.finalize(&descriptor, created, position + 1).await;
+        let finalized_doc = f.account(created[0]).await;
+        assert_eq!(&finalized_doc[200..232], f.pt2s.as_ref());
+        assert_eq!(&finalized_doc[232..264], &f.pt2s_sha);
+        assert_eq!(&finalized_doc[OPTION_REGION_AT..], table.as_slice());
+        assert_eq!(
+            &finalized_doc[BINDING_AT_V8 + 164..BINDING_AT_V8 + 196],
+            &sha256(&[&table])
+        );
+
+        let pt1s_data = f.account(f.pt1s_index).await;
+        assert!(dcg_program::pt1_onchain::is_sealed_template(&pt1s_data));
+        let bound_view = dcg_program::unified::plan::view(
+            &f.pt2s_image,
+            &routes,
+            &geometry,
+            &payloads,
+            Some(&pt1s_data[dcg_program::pt1_onchain::OFF_PAYLOAD_INDEX..]),
+        )
+        .unwrap();
+        assert_eq!(
+            bound_view
+                .entry(position, decision_entry)
+                .unwrap()
+                .read_count,
+            2
+        );
+
+        let challenger = f.signer.pubkey();
+        let nonce = 0x4700_0000 + variant as u32;
+        let challenge_key = address::challenge(&f.program, &descriptor, &challenger, nonce).0;
+        let response_key = dcg_program::closure_v2_response::address(&f.program, &challenge_key).0;
+        let mut state = vec![0u8; 8192];
+        state[..4].copy_from_slice(b"DCR1");
+        state[4] = 1;
+        f47_put_u16(&mut state, 6, 5);
+        state[8..40].copy_from_slice(challenger.as_ref());
+        state[40..72].copy_from_slice(f.executor.pubkey().as_ref());
+        state[72..104].copy_from_slice(&descriptor);
+        state[104..136].copy_from_slice(&target_leaf);
+        state[184..216].copy_from_slice(response_key.as_ref());
+        f47_put_u32(
+            &mut state,
+            136,
+            x.coordinate(position, decision_entry).unwrap().local,
+        );
+        f47_put_u32(&mut state, 140, nonce);
+        state[144] = 1;
+        state[145] = registry::MACHINE_SELECTOR_A16;
+        f47_put_u64(&mut state, 148, u64::MAX);
+        f47_put_u32(&mut state, 156, position);
+        f47_put_u16(
+            &mut state,
+            160,
+            x.coordinate(position, decision_entry).unwrap().segment,
+        );
+        f47_put_u32(&mut state, 170, decision_entry);
+        f47_put_u16(&mut state, 174, decision::FORM_ID);
+        f.ctx
+            .set_account(&challenge_key, &shared(owned(&f.program, state)));
+        let mut dru1 = vec![0u8; 128];
+        dru1[..4].copy_from_slice(b"DRU1");
+        f47_put_u16(&mut dru1, 4, 1);
+        f47_put_u16(&mut dru1, 6, 2);
+        dru1[8..40].copy_from_slice(challenge_key.as_ref());
+        dru1[40..72].copy_from_slice(f.executor.pubkey().as_ref());
+        f47_put_u32(&mut dru1, 72, body.len() as u32);
+        f47_put_u32(&mut dru1, 76, body.len() as u32);
+        dru1[80..112].copy_from_slice(&sha256(&[&body]));
+        f47_put_u64(&mut dru1, 112, u64::MAX);
+        dru1.extend_from_slice(&body);
+        f.ctx
+            .set_account(&response_key, &shared(owned(&f.program, dru1)));
+
+        let (pt2s, pt1s_index, routes, geometry, payloads) =
+            (f.pt2s, f.pt1s_index, f.routes, f.geometry, f.payloads);
+        let verify_target = f47_measured_send(
+            &mut f,
+            vec![120],
+            vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new_readonly(response_key, false),
+                AccountMeta::new_readonly(created[0], false),
+                AccountMeta::new_readonly(pt2s, false),
+                AccountMeta::new_readonly(pt1s_index, false),
+                AccountMeta::new_readonly(routes, false),
+                AccountMeta::new_readonly(geometry, false),
+                AccountMeta::new_readonly(payloads, false),
+            ],
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag120"),
+        )
+        .await;
+        let verify_reads = f47_measured_send(
+            &mut f,
+            vec![121, 0, 0, 2, 0],
+            vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new_readonly(response_key, false),
+                AccountMeta::new_readonly(created[0], false),
+                AccountMeta::new_readonly(created[1], false),
+                AccountMeta::new_readonly(routes, false),
+                AccountMeta::new_readonly(geometry, false),
+                AccountMeta::new_readonly(pt2s, false),
+                AccountMeta::new_readonly(created[2], false),
+            ],
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag121"),
+        )
+        .await;
+        let execute = f47_measured_send(
+            &mut f,
+            vec![124],
+            vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new_readonly(response_key, false),
+                AccountMeta::new(created[0], false),
+                AccountMeta::new_readonly(routes, false),
+                AccountMeta::new_readonly(geometry, false),
+                AccountMeta::new_readonly(pt2s, false),
+            ],
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag124"),
+        )
+        .await;
+        let ruled = f.account(challenge_key).await;
+        let malicious = wrong_mapping || wrong_duplicate_probability;
+        if malicious {
+            assert_eq!(
+                (ruled[4], ruled[5]),
+                (3, 2),
+                "form-47 write mismatch convicts at K={k}"
+            );
+            let doc = f.account(created[0]).await;
+            assert_eq!(u16_at(&doc, 6) & FLAG_REFUTED, FLAG_REFUTED);
+            assert_eq!(u32_at(&doc, 132), 1);
+        } else {
+            assert_eq!(
+                (ruled[4], ruled[5]),
+                (3, 1),
+                "honest form-47 response at K={k}"
+            );
+        }
+        let line = format!("role_swapped={role_swapped} K={k} tag120={verify_target} tag121={verify_reads} tag124={execute}");
+        let mode = if std::env::var_os("BASANOS_DCG_V8_SBF").is_some() {
+            "release-SBF"
+        } else {
+            "native"
+        };
+        eprintln!("f47-full-path measured-{mode} {line}");
+        receipt.push(line);
+        if let Some(dir) = &receipt_dir {
+            let role = if role_swapped { "swapped" } else { "default" };
+            std::fs::write(
+                dir.join(format!("producer-preimage-{role}-k{k}.bin")),
+                &producer_preimage,
+            )
+            .unwrap();
+            std::fs::write(dir.join(format!("dgr1-{role}-k{k}.bin")), &body).unwrap();
+        }
+    }
+    if let Some(dir) = &receipt_dir {
+        let role = if role_swapped { "swapped" } else { "default" };
+        std::fs::write(
+            dir.join(format!("full-path-cu-{role}.txt")),
+            receipt.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn f47_honest_dispute_tags_120_121_124_at_owner_boundaries() {
+    for role_swapped in f47_measure_roles() {
+        run_f47_dispute_at_owner_boundaries(role_swapped).await;
+    }
+}
+
+/// Release-SBF baseline for the real form-48 tag-121 handler. This challenges
+/// the gather itself, so the measured reads are its option-to-PXR1 producer
+/// routes, including DGR1 parsing, route and witness checks, Merkle folds, and
+/// DCR1 bitmap writes.
+async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
+    let maybe = if role_swapped {
+        build_f47_with_swapped_roles().await
+    } else {
+        build_f47().await
+    };
+    let Some(mut f) = maybe else { return };
+    if std::env::var_os("BASANOS_DCG_V8_SBF").is_none() {
+        eprintln!("needs_sbf_image: release-SBF tag-121 measurement only");
+        return;
+    }
+    let receipt_dir = std::env::var_os("BASANOS_DCG_F48_RECEIPT").map(PathBuf::from);
+    if let Some(dir) = &receipt_dir {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let (routes, geometry, payloads, pwr1, _) = f47_artifacts().unwrap();
+    let program = pt2p::Program::decode(&pwr1).unwrap();
+    let x = Pt2p::new(&routes, &geometry, &payloads, None, program).unwrap();
+    let position = f47_position();
+    assert!(
+        position < f.k,
+        "the decision position fits the compiler-v1 template"
+    );
+    let decision_entry = x.entry_count(position).unwrap() - 1;
+    let base_decision_entry = x.base_entries - 1;
+    assert_eq!(
+        x.old_to_new(base_decision_entry, position).unwrap(),
+        Some(decision_entry)
+    );
+    let gather_index = f47_gather_before(&x, position, decision_entry);
+    let gather_at = x.coordinate(position, gather_index).unwrap();
+    let mut samples = Vec::new();
+
+    for (variant, k) in [1u8, 2, 47, 48, 64, 80]
+        .into_iter()
+        .enumerate()
+        .filter(|(_, k)| f47_measure_k_filter().is_none_or(|only| *k == only))
+    {
+        let (mut binding, _) = decision_binding_at(
+            &f.executor.pubkey().to_bytes(),
+            position + 1,
+            k,
+            base_decision_entry,
+        );
+        binding.request_id = [180 + variant as u8; 32];
+        // Keep the requested worst shape pinned: each option lands in a
+        // different compiler-v1 PXR1 producer row (token = 1,940 * i).
+        // This matters most at K=80, where the tag-121 CU path has 80
+        // distinct producer leaves to authenticate.
+        let options = (0..k as u32)
+            .map(|i| i * 1_940)
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        binding.option_table_sha256 = sha256(&[&options]);
+        let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+        let mut position_root = [0u8; 32];
+        let (body, target_leaf) = f48_honest_body(
+            &x,
+            &routes,
+            &descriptor,
+            position,
+            gather_index,
+            &options,
+            true,
+            &mut position_root,
+        );
+        let roots = f47_document_roots(&f, position, position_root);
+        let (descriptor, created) = f
+            .run_document_with_roots_and_options(&binding, &roots, &options)
+            .await;
+        f.finalize(&descriptor, created, position + 1).await;
+
+        let challenger = f.signer.pubkey();
+        let nonce = 0x4800_0000 + variant as u32;
+        let challenge_key = address::challenge(&f.program, &descriptor, &challenger, nonce).0;
+        let response_key = dcg_program::closure_v2_response::address(&f.program, &challenge_key).0;
+        let mut state = vec![0u8; 8192];
+        state[..4].copy_from_slice(b"DCR1");
+        state[4] = 1;
+        f47_put_u16(&mut state, 6, 5);
+        state[8..40].copy_from_slice(challenger.as_ref());
+        state[40..72].copy_from_slice(f.executor.pubkey().as_ref());
+        state[72..104].copy_from_slice(&descriptor);
+        state[104..136].copy_from_slice(&target_leaf);
+        state[184..216].copy_from_slice(response_key.as_ref());
+        f47_put_u32(&mut state, 136, gather_at.local);
+        f47_put_u32(&mut state, 140, nonce);
+        state[144] = 1;
+        state[145] = registry::MACHINE_SELECTOR_A16;
+        f47_put_u64(&mut state, 148, u64::MAX);
+        f47_put_u32(&mut state, 156, position);
+        f47_put_u16(&mut state, 160, gather_at.segment);
+        f47_put_u32(&mut state, 170, gather_index);
+        f47_put_u16(&mut state, 174, decision::GATHER_FORM_ID);
+        f.ctx
+            .set_account(&challenge_key, &shared(owned(&f.program, state)));
+        let mut dru1 = vec![0u8; 128];
+        dru1[..4].copy_from_slice(b"DRU1");
+        f47_put_u16(&mut dru1, 4, 1);
+        f47_put_u16(&mut dru1, 6, 2);
+        dru1[8..40].copy_from_slice(challenge_key.as_ref());
+        dru1[40..72].copy_from_slice(f.executor.pubkey().as_ref());
+        f47_put_u32(&mut dru1, 72, body.len() as u32);
+        f47_put_u32(&mut dru1, 76, body.len() as u32);
+        dru1[80..112].copy_from_slice(&sha256(&[&body]));
+        f47_put_u64(&mut dru1, 112, u64::MAX);
+        dru1.extend_from_slice(&body);
+        f.ctx
+            .set_account(&response_key, &shared(owned(&f.program, dru1.clone())));
+
+        let (pt2s, pt1s_index, routes_key, geometry_key, payloads_key) =
+            (f.pt2s, f.pt1s_index, f.routes, f.geometry, f.payloads);
+        let target_ix = Instruction {
+            program_id: f.program,
+            accounts: vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new_readonly(response_key, false),
+                AccountMeta::new_readonly(created[0], false),
+                AccountMeta::new_readonly(pt2s, false),
+                AccountMeta::new_readonly(pt1s_index, false),
+                AccountMeta::new_readonly(routes_key, false),
+                AccountMeta::new_readonly(geometry_key, false),
+                AccountMeta::new_readonly(payloads_key, false),
+            ],
+            data: vec![120],
+        };
+        let target_blockhash = f.ctx.get_new_latest_blockhash().await.unwrap();
+        let target_tx = Transaction::new_signed_with_payer(
+            &[
+                solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+                    f47_compute_limit(),
+                ),
+                solana_compute_budget_interface::ComputeBudgetInstruction::request_heap_frame(
+                    256 * 1024,
+                ),
+                target_ix,
+            ],
+            Some(&f.executor.pubkey()),
+            &[&f.executor],
+            target_blockhash,
+        );
+        let target_result = f
+            .ctx
+            .banks_client
+            .process_transaction_with_metadata(target_tx)
+            .await
+            .unwrap();
+        assert!(
+            target_result.result.is_ok(),
+            "tag 120 form 48 K={k}: {:?}",
+            target_result.result
+        );
+        let tag120_cu = target_result.metadata.unwrap().compute_units_consumed;
+
+        let data = vec![121, 0, 0, k, 0];
+        let ix = Instruction {
+            program_id: f.program,
+            accounts: vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new_readonly(response_key, false),
+                AccountMeta::new_readonly(created[0], false),
+                AccountMeta::new_readonly(created[1], false),
+                AccountMeta::new_readonly(routes_key, false),
+                AccountMeta::new_readonly(geometry_key, false),
+                AccountMeta::new_readonly(pt2s, false),
+                AccountMeta::new_readonly(created[2], false),
+            ],
+            data,
+        };
+        let blockhash = f.ctx.get_new_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[
+                solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+                    f47_compute_limit(),
+                ),
+                solana_compute_budget_interface::ComputeBudgetInstruction::request_heap_frame(
+                    256 * 1024,
+                ),
+                ix.clone(),
+            ],
+            Some(&f.executor.pubkey()),
+            &[&f.executor],
+            blockhash,
+        );
+        let mut tag124_transaction_cu = None;
+        if k == 80 {
+            // Both an out-of-range read mapping and a segment ordinal outside
+            // PT2S geometry refuse atomically; no read bit survives either.
+            let section_at = u32::from_le_bytes(body[28..32].try_into().unwrap()) as usize;
+            let first_witness_len =
+                u32::from_le_bytes(body[section_at..section_at + 4].try_into().unwrap()) as usize;
+            let envelope_at = section_at + 4 + first_witness_len + 1;
+            assert_eq!(
+                body.get(envelope_at..envelope_at + 4),
+                Some(b"F48M".as_slice())
+            );
+            for (name, at) in [
+                ("out-of-range mapping", envelope_at + 12),
+                (
+                    "out-of-range segment ordinal",
+                    envelope_at + 12 + 2 * k as usize,
+                ),
+            ] {
+                let mut malformed_body = body.clone();
+                malformed_body[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+                let mut malformed_dru1 = dru1.clone();
+                f47_put_u32(&mut malformed_dru1, 72, malformed_body.len() as u32);
+                f47_put_u32(&mut malformed_dru1, 76, malformed_body.len() as u32);
+                malformed_dru1[80..112].copy_from_slice(&sha256(&[&malformed_body]));
+                malformed_dru1.truncate(128);
+                malformed_dru1.extend_from_slice(&malformed_body);
+                f.ctx
+                    .set_account(&response_key, &shared(owned(&f.program, malformed_dru1)));
+                let bad_blockhash = f.ctx.get_new_latest_blockhash().await.unwrap();
+                let bad_tx = Transaction::new_signed_with_payer(
+                    &[
+                        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+                            f47_compute_limit(),
+                        ),
+                        solana_compute_budget_interface::ComputeBudgetInstruction::request_heap_frame(
+                            256 * 1024,
+                        ),
+                        ix.clone(),
+                    ],
+                    Some(&f.executor.pubkey()),
+                    &[&f.executor],
+                    bad_blockhash,
+                );
+                let malformed = f
+                    .ctx
+                    .banks_client
+                    .process_transaction_with_metadata(bad_tx)
+                    .await
+                    .unwrap();
+                let code = match malformed.result {
+                    Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => {
+                        code
+                    }
+                    Err(error) => {
+                        panic!("malformed F48M {name} refused with {error:?}, expected custom 734")
+                    }
+                    Ok(()) => panic!("malformed F48M {name} unexpectedly passed"),
+                };
+                assert_eq!(
+                    code, FORM48_PROOF_REFUSAL,
+                    "malformed F48M {name} refusal code"
+                );
+                let after_refusal = f
+                    .ctx
+                    .banks_client
+                    .get_account(challenge_key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data;
+                assert_eq!(
+                    &after_refusal[348..356],
+                    &[0; 8],
+                    "low read bitmap is atomic"
+                );
+                assert_eq!(
+                    &after_refusal[396..404],
+                    &[0; 8],
+                    "high read bitmap is atomic"
+                );
+                f.ctx
+                    .set_account(&response_key, &shared(owned(&f.program, dru1.clone())));
+            }
+        }
+
+        let outcome = f
+            .ctx
+            .banks_client
+            .process_transaction_with_metadata(tx)
+            .await
+            .unwrap();
+        let transaction_cu = outcome
+            .metadata
+            .as_ref()
+            .map_or(0, |m| m.compute_units_consumed);
+        let instruction_cu = outcome.metadata.as_ref().and_then(|metadata| {
+            let prefix = format!("Program {} consumed ", f.program);
+            metadata.log_messages.iter().find_map(|line| {
+                line.strip_prefix(&prefix)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+        });
+        let error = outcome.result.err().map(|error| format!("{error:?}"));
+        if error.is_none() {
+            let execute = f47_measured_send(
+                &mut f,
+                vec![124],
+                vec![
+                    AccountMeta::new(challenge_key, false),
+                    AccountMeta::new_readonly(response_key, false),
+                    AccountMeta::new(created[0], false),
+                    AccountMeta::new_readonly(routes_key, false),
+                    AccountMeta::new_readonly(geometry_key, false),
+                    AccountMeta::new_readonly(pt2s, false),
+                ],
+                &format!("Form 48 K={k} role_swapped={role_swapped} tag124"),
+            )
+            .await;
+            tag124_transaction_cu = Some(execute);
+            let ruled = f.account(challenge_key).await;
+            assert_eq!(
+                (ruled[4], ruled[5]),
+                (3, 2),
+                "false form-48 gather write is convicted at K={k}; role_swapped={role_swapped}"
+            );
+            let doc = f.account(created[0]).await;
+            assert_eq!(u16_at(&doc, 6) & FLAG_REFUTED, FLAG_REFUTED);
+            assert_eq!(u32_at(&doc, 132), 1);
+            assert!(
+                execute < 1_400_000,
+                "tag 124 remains below the instruction limit"
+            );
+        } else {
+            assert_eq!(
+                f47_compute_limit(),
+                1_400_000,
+                "raised-limit runs must complete tag 121"
+            );
+            assert!(
+                transaction_cu >= 1_399_000,
+                "expected tag 121 to exhaust the 1.4M budget: {error:?}, consumed={transaction_cu}"
+            );
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|value| value.contains("ProgramFailedToComplete")
+                        || value.contains("ComputationalBudgetExceeded")),
+                "expected the compute-budget refusal for Form 48 K={k}: {error:?}"
+            );
+        }
+        let sample = serde_json::json!({
+            "options": k, "tag120_transaction_cu": tag120_cu,
+            "tag121_instruction_cu": instruction_cu, "tag121_transaction_cu": transaction_cu,
+            "tag121_success": error.is_none(), "tag121_error": error,
+            "tag124_transaction_cu": tag124_transaction_cu,
+            "proof_bytes": body.len(), "form": 48, "position": position,
+        });
+        eprintln!("f48-gather-full-handler role_swapped={role_swapped} {sample}");
+        samples.push(sample);
+        if let Some(dir) = &receipt_dir {
+            let role = if role_swapped { "swapped" } else { "default" };
+            std::fs::write(dir.join(format!("f48-dgr1-{role}-k{k}.bin")), &body).unwrap();
+        }
+    }
+    if let Some(dir) = &receipt_dir {
+        let role = if role_swapped { "swapped" } else { "default" };
+        let receipt = serde_json::json!({
+            "schema": "basanos/rev8-f-proofs2-form48-tag121-multiproof/1",
+            "identity_order": role,
+            "image_sha256": std::fs::read(std::path::Path::new(&std::env::var("BPF_OUT_DIR").unwrap()).join("dcg_program.so"))
+                .map(|b| format!("{}", sha256(&[&b]).iter().map(|v| format!("{v:02x}")).collect::<String>())).unwrap(),
+            "source_commit": source_commit(),
+            "samples": samples,
+        });
+        std::fs::write(
+            dir.join(format!("form48-tag121-multiproof-{role}.json")),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn f48_gather_tag121_full_handler_at_owner_boundaries() {
+    for role_swapped in f47_measure_roles() {
+        run_f48_gather_at_owner_boundaries(role_swapped).await;
+    }
+}
+
+/// **Decision-mode finalize and attest at K = 1, 7, 8 and 128**, each over a
+/// real `FinalizeDocumentV5` and a real `AttestOutputV5`.
+///
+/// What is real here: the 816 decision branch, the two-case `L = 1 + K`, the
+/// record lengths (`2,182 + 4K` and `416 + 4(1+K) + ceil((1+K)/8)`), the DCR2
+/// writes, the per-cell write route, the flag-2 gate and the index test. What
+/// cannot be real locally: the **proof**, because the only sealed template in
+/// this tree has no 4-byte write lane at all (the rung-D plan's write widths are
+/// 0, 8, 16, 32, 128, 144, 256, 384, 512, 640, 1024, 4096, 8192, 32768, 65536
+/// and 131072, measured over its 28,039 base entries), so clause 5 of the attest
+/// refuses 795 on the width and not on the proof. A decision attest therefore
+/// needs a template compiled with 4-byte lanes, which is stream F's seal work.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_decision_finalize_and_attest_at_k_1_7_8_128() {
+    let Some(mut f) = build().await else { return };
+    let n = 30u32; // prompt_positions: first = 29 is the entry's first live position
+    let roots = f.position_roots[..n as usize].to_vec();
+    for (i, k) in [1u8, 7, 8, 80].iter().enumerate() {
+        let (binding, options) = decision_binding(&f.executor.pubkey().to_bytes(), n, *k);
+        assert_eq!(binding.output_count, 1 + *k as u32, "count = 1 + K");
+        assert_eq!(
+            binding.output_span(n),
+            1 + *k as u32,
+            "L = 1 + K for a decision"
+        );
+        let l = binding.output_span(n);
+        let descriptor = [20u8 + i as u8; 32];
+        let c = f
+            .craft_with(&binding, n, &roots, 1, descriptor, &options)
+            .await;
+        let doc = f.account(c.dcm2).await;
+        assert_eq!(doc.len(), OPTION_REGION_AT + 4 * *k as usize, "2,182 + 4K");
+        assert_eq!(
+            &doc[OPTION_REGION_AT..],
+            &options[..],
+            "the option table is in the record"
+        );
+        assert_eq!(
+            f.account(c.dcr2).await.len(),
+            result::bytes_v8(binding.output_count, 4).unwrap(),
+            "416 + 4(1+K) + bitmap"
+        );
+        // 816's decision branch: `n = prompt_positions`, `first = n - 1`,
+        // `count = 1 + K`, and nothing else. The negatives are the same three
+        // relations with one field moved, so the branch is pinned from both
+        // sides.
+        let metas = f.fin_metas(&c);
+        for bad in [n + 1u32, 0] {
+            assert_eq!(
+                custom(
+                    send(
+                        &mut f.ctx,
+                        &f.executor,
+                        f.program,
+                        finalize_data(&descriptor, bad, &f.family_roots),
+                        metas.clone()
+                    )
+                    .await
+                ),
+                CL_MISSING,
+                "n != positions_complete is 591 first"
+            );
+        }
+        // The honest finalize.
+        send(
+            &mut f.ctx,
+            &f.executor,
+            f.program,
+            finalize_data(&descriptor, n, &f.family_roots),
+            metas.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("decision finalize at K = {k}: {e:?}"));
+        let doc = f.account(c.dcm2).await;
+        assert_eq!(
+            u32_at(&doc, 6) as u16,
+            FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
+            "flag 2 at K = {k}"
+        );
+        assert_eq!(u32_at(&doc, 84), n);
+        let dcr2 = f.account(c.dcr2).await;
+        assert_eq!(u32_at(&dcr2, 212), n, "DCR2 212 is the document length");
+        assert_eq!(
+            u32_at(&dcr2, 196),
+            1 + *k as u32,
+            "the record's count is 1 + K"
+        );
+        assert_eq!(dcr2[208], 4, "the record's width is 4");
+        // The attest. `index = L` is 591 at every K, and `index < L` reaches the
+        // plan, where clause 5 refuses 795 because the lane is 16 bytes wide.
+        let other = f.signer.pubkey();
+        let metas = attest_metas(
+            other,
+            (f.pt2s, f.routes, f.geometry),
+            [c.dcm2, c.dpr2, Pubkey::default(), c.dcr2],
+        );
+        let mut late = vec![TAG_ATTEST_OUTPUT];
+        late.extend_from_slice(&descriptor);
+        late.extend_from_slice(&l.to_le_bytes());
+        late.extend_from_slice(&[0u8; 4]);
+        late.extend_from_slice(&0u16.to_le_bytes());
+        late.push(0);
+        let mut spp1 = Vec::new();
+        spp1.extend_from_slice(&0u16.to_le_bytes());
+        spp1.push(0);
+        spp1.push(0);
+        spp1.extend_from_slice(&[0u8; 32]);
+        late.extend_from_slice(&spp1);
+        assert_eq!(
+            custom(send(&mut f.ctx, &f.signer, f.program, late, metas.clone()).await),
+            CL_MISSING,
+            "index = L = 1 + K is 591 at K = {k}"
+        );
+        let mut seen: Vec<u32> = Vec::new();
+        for index in [0u32, 1, l - 1] {
+            if index >= l || seen.contains(&index) {
+                continue;
+            }
+            seen.push(index);
+            let mut data = vec![TAG_ATTEST_OUTPUT];
+            data.extend_from_slice(&descriptor);
+            data.extend_from_slice(&index.to_le_bytes());
+            data.extend_from_slice(&[0u8; 4]);
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.push(0);
+            data.extend_from_slice(&spp1);
+            // The cell's route is `output_write + index` at one position, so
+            // the width is the only thing the plan refuses, and it refuses 795.
+            assert_eq!(
+                custom(send(&mut f.ctx, &f.signer, f.program, data, metas.clone()).await),
+                OUTPUT_PROOF,
+                "a decision cell over a 16-byte lane is 795 at K = {k}, index = {index}"
+            );
+        }
+    }
+}
+
+/// **§1's one conditional at the handler, 794**: a record that declares a stop
+/// value must be a 16-byte-output record, because the stop rule's comparison
+/// cell is then exactly the 16-byte `(best, token)` pair of §1.7 whose bytes
+/// `8..16` carry the token id. Two cases the review named, both driven through
+/// a real `UnifiedInit` over the real sealed template:
+///
+/// * **a width-4 decision that declares a stop value** -- a typed decision's
+///   cells are 4-byte fixed-point values and have no token id at all, so the
+///   two conditionals are exclusive by construction;
+/// * **a width-8 completion** whose stop rule can never fire.
+///
+/// Both were admitted by the round-2 program while the spec (§1, §1.2's field
+/// table, and the 794 row of `refusals_v1.tsv`), the Python mirror and the
+/// retained golden example's own binding all refuse them. The positive is here
+/// too: the same binding with `stop_plus_one = 0` at width 4 and at width 8
+/// initializes, so the clause is on the stop value and on nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_init_refuses_a_stop_value_that_the_cell_width_cannot_carry() {
+    let Some(mut f) = build().await else { return };
+    // The honest positive first: the fixture's own binding at the template's
+    // width, with a stop value, initializes. This is the golden example's
+    // shape -- `<|im_end|>` plus one against a 16-byte cell -- and it is the
+    // path the retained example and the mirror both admit.
+    let honest = Binding2 {
+        stop_plus_one: 248_047,
+        ..f.binding(29, 50)
+    };
+    assert_eq!(
+        honest.output_width, 16,
+        "the template's output lane is 16 bytes wide"
+    );
+    let (descriptor, created) = f.run_document(&honest, 2).await;
+    let doc = f.account(created[0]).await;
+    assert_eq!(
+        &doc[BINDING_AT_V8 + 156..BINDING_AT_V8 + 160],
+        &248_047u32.to_le_bytes(),
+        "the record init wrote carries the stop value, and the width it admits it with is 16"
+    );
+    assert_eq!(&doc[8..40], &descriptor[..]);
+    // The same binding with the stop value cleared is the same document.
+    let quiet = Binding2 {
+        stop_plus_one: 0,
+        ..honest
+    };
+    assert_eq!(Binding2::decode(&quiet.encode()).unwrap(), quiet);
+    // A variant: a different request id, so the descriptor and the four PDAs
+    // are this attempt's own and the refusal cannot be a collision.
+    let mut variant = 1u8;
+    // **Width 4: a decision that declares a stop value.** The lane is the
+    // template's own 16-byte one, so the only thing that can refuse this is
+    // the width/stop clause; a decision whose locator is honest is refused
+    // 794 on its own terms either way, which is why the *width* is what the
+    // bytes below hold.
+    let (decision, _options) = decision_binding(&f.executor.pubkey().to_bytes(), 30, 1);
+    let decision_with_stop = Binding2 {
+        stop_plus_one: 1,
+        ..decision
+    };
+    assert_eq!(
+        decision_with_stop.output_width, DECISION_WIDTH,
+        "a decision's cells are 4 bytes"
+    );
+    assert_eq!(
+        Binding2::decode(&decision_with_stop.encode()),
+        Err(RUN_BINDING),
+        "the decoder refuses it, which is the mirror's reading"
+    );
+    variant += 1;
+    assert_eq!(
+        f.init_refusal(&decision_with_stop, variant).await,
+        RUN_BINDING,
+        "a width-4 decision that declares a stop value is 794 at init"
+    );
+    // The same decision without the stop value reaches the plan and is refused
+    // on **its own** clause -- the template has no 4-byte write lane -- which
+    // is a different refusal from the one above and pins the difference.
+    assert_eq!(
+        Binding2::decode(&decision.encode()).map(|b| b.output_width),
+        Ok(DECISION_WIDTH)
+    );
+    variant += 1;
+    assert_eq!(
+        f.init_refusal(&decision, variant).await,
+        RUN_BINDING,
+        "and without a stop value it is still 794, on the lane rather than the width"
+    );
+    // **Width 8, and then 4, 2 and 32 for the same reason:** a cell the stop
+    // rule cannot read. The width must also equal the template's own, so the
+    // locator compare would refuse these too -- but the clause under test is
+    // checked at decode, before the plan and the PT2S are read at all, which
+    // is what the decoder's own answer shows.
+    for width in [8u8, 4, 2, 32] {
+        let b = Binding2 {
+            output_width: width,
+            stop_plus_one: 46,
+            ..f.binding(29, 50)
+        };
+        assert_eq!(
+            Binding2::decode(&b.encode()),
+            Err(RUN_BINDING),
+            "width {width} with a stop value"
+        );
+        variant += 1;
+        assert_eq!(
+            f.init_refusal(&b, variant).await,
+            RUN_BINDING,
+            "a width-{width} record that declares a stop value is 794 at init"
+        );
+    }
+    // The clause is on `stop_plus_one != 0` and not on the width by itself: the
+    // same widths with no stop value decode, and width 16 decodes with every
+    // value of the field, `1` and `u32::MAX` included.
+    for (width, stop) in [(4u8, 0u32), (8, 0), (32, 0)] {
+        let b = Binding2 {
+            output_width: width,
+            stop_plus_one: stop,
+            ..f.binding(29, 50)
+        };
+        assert_eq!(
+            Binding2::decode(&b.encode()).map(|d| d.output_width),
+            Ok(width),
+            "width {width} with no stop value is not this clause's business"
+        );
+    }
+    for stop in [1u32, 46, 248_047, u32::MAX] {
+        let b = Binding2 {
+            stop_plus_one: stop,
+            ..f.binding(29, 50)
+        };
+        assert_eq!(
+            Binding2::decode(&b.encode()).map(|d| d.stop_plus_one),
+            Ok(stop),
+            "width 16 admits every stop value, 1 = token id 0 included"
+        );
+    }
+}
+
+/// The malformed-input test for revision 8's one new account, **DTU1**: the
+/// PDA, the record, the state vocabulary and the increment.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_dtu1_malformed_inputs() {
+    let Some(mut f) = build().await else { return };
+    let binding = f.binding(29, 50);
+    let n = 2u32;
+    let (descriptor, created) = f.run_document(&binding, n).await;
+    // The honest increment happened.
+    let use_record = f.account(f.dtu1).await;
+    assert_eq!(use_record.len(), config::DTU1_BYTES);
+    assert_eq!(use_record[6], config::DTU1_STATE_LIVE);
+    assert_eq!(u32_at(&use_record, 8), 1, "documents + 1 at init");
+    // Every variant below is a *different* document, because `init` refuses and
+    // a second init on the same descriptor would collide on the PDAs.
+    let executor_key = f.executor.pubkey().to_bytes();
+    let registry_key = f.drp2.to_bytes();
+    let template_image = f.account(f.dtu1).await;
+    // The five limits at 88 are written here too, because init compares the
+    // document's windows against them (checks 17-20) **before** the counter's
+    // increment, and a zero-limit record would answer 791 where this test wants
+    // the code each variant is about.
+    let good = |state: u8, documents: u32| {
+        let mut out = template_image.clone();
+        out[..4].copy_from_slice(b"DTU1");
+        out[4..6].copy_from_slice(&config::DTU1_VERSION.to_le_bytes());
+        out[6] = state;
+        out[8..12].copy_from_slice(&documents.to_le_bytes());
+        out[16..48].copy_from_slice(&executor_key);
+        out[48..80].copy_from_slice(&registry_key);
+        out[80..88].copy_from_slice(&1u64.to_le_bytes());
+        for (i, limit) in [
+            EXAMPLE_LIMITS.max_challenge_window_slots,
+            EXAMPLE_LIMITS.max_response_window_slots,
+            EXAMPLE_LIMITS.max_document_lifetime_slots,
+            EXAMPLE_LIMITS.max_abandon_after_slots,
+            EXAMPLE_LIMITS.min_abandon_after_slots,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = config::DTU1_MAX_CHALLENGE_AT + 8 * i;
+            out[at..at + 8].copy_from_slice(&limit.to_le_bytes());
+        }
+        out
+    };
+    let mut variant = 0u8;
+    macro_rules! expect_init {
+        ($f:ident, $image:expr, $want:expr, $what:expr) => {{
+            #[allow(unused_mut)]
+            let mut f = &mut $f;
+            let image = $image;
+            variant += 1;
+            let binding = Binding2 {
+                request_id: [variant; 32],
+                ..f.binding(29, 50)
+            };
+            let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+            let created = [
+                address::document(&f.program, &descriptor).0,
+                address::positions(&f.program, &descriptor).0,
+                address::family_slots(&f.program, &descriptor).0,
+                address::result(&f.program, &descriptor).0,
+            ];
+            f.ctx
+                .set_account(&f.dtu1, &shared(owned(&f.program, image)));
+            let metas = f.init_metas(created);
+            let data = init_data(
+                &f.terms_raw,
+                &binding.encode(),
+                &[[1u8; 32], [2u8; 32], [3u8; 32]],
+                16,
+                &f.family_body,
+                &[],
+            );
+            // One slot per attempt, so each transaction is a new one and not a
+            // duplicate of the message the banks client already processed.
+            let slot = f
+                .ctx
+                .banks_client
+                .get_sysvar::<solana_program::clock::Clock>()
+                .await
+                .unwrap()
+                .slot;
+            f.ctx.warp_to_slot(slot + 1).unwrap();
+            let code = match send(&mut f.ctx, &f.executor, f.program, data, metas).await {
+                Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => code,
+                other => panic!("{}: expected a custom refusal, got {other:?}", $what),
+            };
+            assert_eq!(code, $want, "{}", $what);
+        }};
+    }
+    // A record that is not DTU1 at all.
+    let mut wrong_magic = good(config::DTU1_STATE_LIVE, 0);
+    wrong_magic[..4].copy_from_slice(b"DTU2");
+    expect_init!(f, wrong_magic, TEMPLATE_SEAL, "a wrong magic is 793");
+    // A version the program does not know.
+    let mut wrong_version = good(config::DTU1_STATE_LIVE, 0);
+    wrong_version[4..6].copy_from_slice(&config::DTU1_VERSION.wrapping_add(1).to_le_bytes());
+    expect_init!(f, wrong_version, TEMPLATE_SEAL, "version 2 is 793");
+    // The stored use bump at 7 and the reserved run at 12..16 are checked.
+    let mut reserved7 = good(config::DTU1_STATE_LIVE, 0);
+    reserved7[7] ^= 1;
+    expect_init!(
+        f,
+        reserved7,
+        TEMPLATE_SEAL,
+        "a wrong stored use bump is 793"
+    );
+    let mut reserved12 = good(config::DTU1_STATE_LIVE, 0);
+    reserved12[15] = 1;
+    expect_init!(f, reserved12, TEMPLATE_SEAL, "reserved 12..16 is 793");
+    // A short and a long record.
+    let mut short = good(config::DTU1_STATE_LIVE, 0);
+    short.truncate(80);
+    expect_init!(f, short, TEMPLATE_SEAL, "a short record is 793");
+    let mut long = good(config::DTU1_STATE_LIVE, 0);
+    long.push(0);
+    expect_init!(f, long, TEMPLATE_SEAL, "a long record is 793");
+    // State 3 is outside the live/retired/revoked DTU1 vocabulary.
+    let mut invalid_state = good(config::DTU1_STATE_LIVE, 0);
+    invalid_state[6] = 3;
+    expect_init!(f, invalid_state, TEMPLATE_SEAL, "state 3 is malformed, 793");
+    let mut bad_state = good(config::DTU1_STATE_LIVE, 0);
+    bad_state[6] = 4;
+    expect_init!(
+        f,
+        bad_state,
+        TEMPLATE_SEAL,
+        "state 4 is not in the DTU1 vocabulary, 793"
+    );
+    // Retired and revoked: no new document, 793, the DTA1 view's own code.
+    for (state, name) in [
+        (config::DTU1_STATE_RETIRED, "retired"),
+        (config::DTU1_STATE_REVOKED, "revoked"),
+    ] {
+        expect_init!(
+            f,
+            good(state, 0),
+            TEMPLATE_SEAL,
+            if name == "retired" {
+                "a retired template is 793"
+            } else {
+                "a revoked template is 793"
+            }
+        );
+    }
+    // The counter at its maximum: the increment is a checked add, 598.
+    expect_init!(
+        f,
+        good(config::DTU1_STATE_LIVE, u32::MAX),
+        598,
+        "documents = u32::MAX is 598 on the increment"
+    );
+    // An account at the wrong address: the PDA is re-derived from the PT2S and
+    // its digest, so a substituted DTU1 is 793 even when it is well formed.
+    let other = Pubkey::new_unique();
+    f.ctx.set_account(
+        &other,
+        &shared(owned(&f.program, good(config::DTU1_STATE_LIVE, 0))),
+    );
+    let metas: Vec<AccountMeta> = {
+        let mut m = f.init_metas(created);
+        let last = m.len() - 1;
+        m[last] = AccountMeta::new(other, false);
+        m
+    };
+    let data = init_data(
+        &f.terms_raw,
+        &binding.encode(),
+        &[[1u8; 32], [2u8; 32], [3u8; 32]],
+        16,
+        &f.family_body,
+        &[],
+    );
+    f.ctx
+        .warp_to_slot(
+            f.ctx
+                .banks_client
+                .get_sysvar::<solana_program::clock::Clock>()
+                .await
+                .unwrap()
+                .slot
+                + 1,
+        )
+        .unwrap();
+    assert_eq!(
+        custom(send(&mut f.ctx, &f.executor, f.program, data.clone(), metas).await),
+        TEMPLATE_SEAL,
+        "a DTU1 at another address is 793"
+    );
+    // A missing meta is the account-count refusal, 580.
+    let metas = f.init_metas(created);
+    f.ctx
+        .warp_to_slot(
+            f.ctx
+                .banks_client
+                .get_sysvar::<solana_program::clock::Clock>()
+                .await
+                .unwrap()
+                .slot
+                + 1,
+        )
+        .unwrap();
+    assert_eq!(
+        custom(
+            send(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                data,
+                metas[..13].to_vec()
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "thirteen metas is 580"
+    );
+    assert!(variant >= 8, "every DTU1 variant was refused");
+    let _ = (descriptor, created);
+}
+
+/// **The per-template limits, driven from real instructions** (spec §1.1's
+/// checks 17-20 and §1.3's clamp, the user's decision of 2026-09-26).
+///
+/// Four things, in one test because they are one rule seen from four sides:
+///
+/// 1. **At the limit is admitted and one slot over is refused, 791.** The
+///    document's own terms are moved to each template's maximum in turn, so the
+///    refusal is shown to be the *comparison* and not a constant somewhere.
+/// 2. **Two templates with different limits admit the same terms differently**:
+///    the golden's own 5,184,000-slot grace is inside the example template's
+///    range and outside the short-lived one's, and the second template's
+///    lifetime makes the same landing clamp where the first would not.
+/// 3. **The clamp reads the template, not a constant**: a landing under the
+///    short template writes `init_slot + 4,096,000`.
+/// 4. A **retired** template still lets its live document land and finalize,
+///    because `state` is deliberately not read by the two deadline writers.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ() {
+    let Some(mut f) = build().await else { return };
+    let n = 2u32;
+    let roots = f.position_roots[..n as usize].to_vec();
+    let authority = f.executor.pubkey();
+    let registry = f.drp2;
+    let fixture_dtu1 = f.account(f.dtu1).await;
+    let with_limits = |limits: &TemplateLimits| {
+        let mut out = fixture_dtu1.clone();
+        out[16..48].copy_from_slice(authority.as_ref());
+        out[48..80].copy_from_slice(registry.as_ref());
+        for (i, limit) in [
+            limits.max_challenge_window_slots,
+            limits.max_response_window_slots,
+            limits.max_document_lifetime_slots,
+            limits.max_abandon_after_slots,
+            limits.min_abandon_after_slots,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = config::DTU1_MAX_CHALLENGE_AT + 8 * i;
+            out[at..at + 8].copy_from_slice(&limit.to_le_bytes());
+        }
+        out
+    };
+    let mut variant = 0u8;
+    // A real init with the fixture's DTU1 replaced by `image`, and the code.
+    macro_rules! init_with {
+        ($f:ident, $image:expr, $terms:expr) => {{
+            let image = $image;
+            let terms = $terms;
+            variant += 1;
+            let binding = Binding2 {
+                request_id: [variant; 32],
+                ..$f.binding(29, 50)
+            };
+            let descriptor = $f.descriptor(&binding, &terms, 16);
+            let created = [
+                address::document(&$f.program, &descriptor).0,
+                address::positions(&$f.program, &descriptor).0,
+                address::family_slots(&$f.program, &descriptor).0,
+                address::result(&$f.program, &descriptor).0,
+            ];
+            for key in created {
+                fund(&mut $f.ctx, key).await;
+            }
+            $f.ctx
+                .set_account(&$f.dtu1, &shared(owned(&$f.program, image)));
+            let metas = $f.init_metas(created);
+            let data = init_data(
+                &terms,
+                &binding.encode(),
+                &[[1u8; 32], [2u8; 32], [3u8; 32]],
+                16,
+                &$f.family_body,
+                &[],
+            );
+            let slot = $f
+                .ctx
+                .banks_client
+                .get_sysvar::<solana_program::clock::Clock>()
+                .await
+                .unwrap()
+                .slot;
+            $f.ctx.warp_to_slot(slot + 1).unwrap();
+            // `None` is an admitted init and `Some(code)` is the refusal it
+            // refused with, so one shape covers "at the limit is admitted" and
+            // "one slot over is 791".
+            (
+                binding,
+                descriptor,
+                created,
+                match send(&mut $f.ctx, &$f.executor, $f.program, data, metas).await {
+                    Ok(()) => None,
+                    Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => {
+                        Some(code)
+                    }
+                    other => panic!("expected a success or a custom refusal, got {other:?}"),
+                },
+            )
+        }};
+    }
+    let base = Terms2::decode(&f.terms_raw).unwrap();
+    // (1) The grace at the example template's ceiling, and one slot over it.
+    let at_max = Terms2 {
+        abandon_after_slots: EXAMPLE_LIMITS.max_abandon_after_slots,
+        ..base
+    };
+    let (_, _, _, code) = init_with!(f, with_limits(&EXAMPLE_LIMITS), at_max.encode().to_vec());
+    assert_eq!(
+        code, None,
+        "a document AT its template's grace maximum is admitted"
+    );
+    let over = Terms2 {
+        abandon_after_slots: EXAMPLE_LIMITS.max_abandon_after_slots + 1,
+        ..base
+    };
+    let (_, _, _, code) = init_with!(f, with_limits(&EXAMPLE_LIMITS), over.encode().to_vec());
+    assert_eq!(code, Some(DISPUTE_TERMS), "one slot OVER it is 791");
+    // One slot under the template's **floor**, the same code: the grace is the
+    // owner's in both directions, which is the whole of check 17.
+    let under = Terms2 {
+        abandon_after_slots: EXAMPLE_LIMITS.min_abandon_after_slots - 1,
+        ..base
+    };
+    let (_, _, _, code) = init_with!(f, with_limits(&EXAMPLE_LIMITS), under.encode().to_vec());
+    assert_eq!(code, Some(DISPUTE_TERMS), "one under the floor is 791 too");
+    // (2) Two templates, the same terms. The golden's grace is inside the wide
+    // one and over the short one's ceiling.
+    let short_grace = Terms2 {
+        abandon_after_slots: SHORT_LIMITS.max_abandon_after_slots + 1,
+        ..base
+    };
+    let (_, _, _, code) = init_with!(f, with_limits(&SHORT_LIMITS), short_grace.encode().to_vec());
+    assert_eq!(
+        code,
+        Some(DISPUTE_TERMS),
+        "the short-lived template refuses what the wide one admits"
+    );
+    // A document sized to the short template -- its grace at the short
+    // template's own maximum -- is admitted, and because the ceiling is
+    // `init_slot + 4,096,000` the very first landing is already past it.
+    let small = Terms2 {
+        challenge_window_slots: 900_000,
+        response_window_slots: 40_000,
+        abandon_after_slots: SHORT_LIMITS.max_abandon_after_slots,
+        ..base
+    };
+    let small_raw = small.encode().to_vec();
+    let (binding, descriptor, _, code) =
+        init_with!(f, with_limits(&SHORT_LIMITS), small_raw.clone());
+    assert_eq!(
+        code, None,
+        "a document at the short template's grace maximum is admitted"
+    );
+    // `craft` builds the record from the fixture's own terms, so they are set to
+    // the document's: the record under test must be the one init admitted.
+    f.terms_raw = small_raw.clone();
+    let c = f.craft(&binding, n, &roots, 0, descriptor).await;
+    let slot = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    assert!(
+        slot > 0,
+        "the document is created at slot 0, so this landing is past its init"
+    );
+    let (metas, data) = (
+        f.land_metas(&c),
+        land_data(
+            &c.descriptor,
+            n,
+            &f.position_roots[n as usize..n as usize + 1],
+        ),
+    );
+    send(&mut f.ctx, &f.executor, f.program, data, metas)
+        .await
+        .expect("a landing under the short template");
+    let doc = f.account(c.dcm2).await;
+    assert_eq!(
+        u64_at(&doc, document::ABANDON_DEADLINE_AT),
+        SHORT_LIMITS.max_document_lifetime_slots,
+        "THE CLAMP READS THE TEMPLATE: the ceiling is init_slot + 4,096,000"
+    );
+    assert!(
+        slot + small.abandon_after_slots > SHORT_LIMITS.max_document_lifetime_slots,
+        "and the forward value {} would have been larger, so the clamp bound",
+        slot + small.abandon_after_slots
+    );
+    // The same document, the same slot, under the **wide** template: the same
+    // program writes the plain forward value, because that template's ceiling is
+    // 134,217,728 away. This is the user's decision in two assertions.
+    let (binding, descriptor2, _, code) = init_with!(f, with_limits(&EXAMPLE_LIMITS), small_raw);
+    assert_eq!(code, None, "and the same document under the wide template");
+    let c2 = f.craft(&binding, n, &roots, 0, descriptor2).await;
+    let (metas, data) = (
+        f.land_metas(&c2),
+        land_data(
+            &c2.descriptor,
+            n,
+            &f.position_roots[n as usize..n as usize + 1],
+        ),
+    );
+    send(&mut f.ctx, &f.executor, f.program, data, metas)
+        .await
+        .expect("a landing under the wide template");
+    let doc = f.account(c2.dcm2).await;
+    // The landing's own slot, which is one past the first landing's: each
+    // transaction advances the clock, and the write is `slot + abandon`.
+    let slot2 = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    assert_eq!(
+        u64_at(&doc, document::ABANDON_DEADLINE_AT),
+        slot2 + small.abandon_after_slots,
+        "the wide template's ceiling is 134,217,728 away, so the write is the plain forward value"
+    );
+    // (4) A **retired** template: `state` is not read by the two deadline
+    // writers, or a retirement would strand the rent it was meant to protect.
+    let mut retired = with_limits(&EXAMPLE_LIMITS);
+    retired[6] = config::DTU1_STATE_RETIRED;
+    f.ctx
+        .set_account(&f.dtu1, &shared(owned(&f.program, retired)));
+    let (metas, data) = (
+        f.land_metas(&c2),
+        land_data(
+            &c2.descriptor,
+            n + 1,
+            &f.position_roots[n as usize + 1..n as usize + 2],
+        ),
+    );
+    send(&mut f.ctx, &f.executor, f.program, data, metas)
+        .await
+        .expect("a retired template's live document still lands");
+    // And the recorded worst case, the number a reader of the DTU1 computes.
+    assert_eq!(EXAMPLE_LIMITS.worst_case_hold_slots(), 285_212_672);
+    assert_eq!(SHORT_LIMITS.worst_case_hold_slots(), 5_505_600);
+}
+
+// -------------------------------------------- the 39-byte PT2S seal, by itself
+
+/// tag 145's own test, over the real retained emission: the 39-byte seal
+/// writes the locator at 426..432, `write = 0` is legal, the width is bounded
+/// and nothing else about the locator is.
+///
+/// The review's High 2 was invisible because **no test sent a 39-byte seal at
+/// all**: the fixture laid the six bytes down in the PT2S image itself. This
+/// sends it, and the honest locator it carries is `(28_037, write 0, width 16)`
+/// -- the retained rung-D template's own, the same one the golden example
+/// binding and the v7 golden declare. The program used to refuse `write == 0`
+/// with no rule behind it (the spec's §1.7 bounds the width and says nothing
+/// about the write, and the mirror's `OutputLocator` admits 0), which made the
+/// only real template in this tree unsealable.
+///
+/// The negatives are on their own PT2S accounts, because the seal is
+/// write-once: a second seal on a sealed account would be refused for the
+/// wrong reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_seal_writes_the_locator_and_bounds_only_the_width() {
+    let Some((routes, geometry, payloads, pwr1, clause12)) = artifacts() else {
+        eprintln!("needs_local_artifacts: the retained PT2P emission is absent");
+        return;
+    };
+    let program = Pubkey::new_unique();
+    let executor = Keypair::new();
+    let (routes_key, geometry_key, payloads_key) = (
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    );
+    let mut test = ProgramTest::new(
+        "dcg_program",
+        program,
+        processor!(dcg_program::process_instruction),
+    );
+    test.prefer_bpf(false);
+    for key in [executor.pubkey(), routes_key, geometry_key, payloads_key] {
+        test.add_account(key, system_funded());
+    }
+    test.add_account(routes_key, owned(&program, routes.clone()));
+    test.add_account(geometry_key, owned(&program, geometry.clone()));
+    test.add_account(payloads_key, owned(&program, payloads.clone()));
+    // One fresh, unsealed PT2S per case, all with the real emission's own bytes.
+    let cases = 6u8;
+    let mut pt2s_keys = Vec::new();
+    for _ in 0..cases {
+        let key = Pubkey::new_unique();
+        test.add_account(
+            key,
+            owned(
+                &program,
+                hashing_pt2s(
+                    &routes,
+                    &geometry,
+                    &payloads,
+                    &pwr1,
+                    executor.pubkey(),
+                    [routes_key, geometry_key, payloads_key],
+                ),
+            ),
+        );
+        pt2s_keys.push(key);
+    }
+    let mut ctx = test.start_with_context().await;
+    let data = |base_entry: u32, write: u8, width: u8| {
+        let mut d = vec![S::TAG_SEAL];
+        d.extend_from_slice(&[9u8; 32]);
+        d.extend_from_slice(&base_entry.to_le_bytes());
+        d.push(write);
+        d.push(width);
+        d
+    };
+    let seal = |pt2s: Pubkey| {
+        vec![
+            AccountMeta::new(pt2s, false),
+            AccountMeta::new_readonly(routes_key, false),
+            AccountMeta::new_readonly(geometry_key, false),
+            AccountMeta::new_readonly(payloads_key, false),
+            AccountMeta::new(executor.pubkey(), true),
+        ]
+    };
+    // (1) **The honest locator: `write = 0`.**
+    send(
+        &mut ctx,
+        &executor,
+        program,
+        data(28_037, 0, 16),
+        seal(pt2s_keys[0]),
+    )
+    .await
+    .expect("write 0 seals");
+    let sealed = ctx
+        .banks_client
+        .get_account(pt2s_keys[0])
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(sealed[S::OFF_STATE], S::STATE_SEALED);
+    assert_eq!(
+        &sealed[S::OFF_LOCATOR..S::OFF_LOCATOR + 4],
+        &28_037u32.to_le_bytes()
+    );
+    assert_eq!(
+        sealed[S::OFF_LOCATOR + 4],
+        0,
+        "write ordinal 0 is the first write at the entry"
+    );
+    assert_eq!(sealed[S::OFF_LOCATOR + 5], 16);
+    assert_eq!(
+        &sealed[S::OFF_CLAUSE12..S::OFF_CLAUSE12 + 43],
+        &clause12[..],
+        "the seal recomputed the retained clause-12 v4 from the plan"
+    );
+    assert_eq!(
+        &sealed[S::OFF_DEFINITION..S::OFF_DEFINITION + 32],
+        &[9u8; 32][..]
+    );
+    assert_eq!(
+        sealed.len(),
+        S::OFF_PWR1 + pwr1.len(),
+        "the locator costs no account growth"
+    );
+    assert_eq!(&sealed[S::OFF_PWR1..], &pwr1[..], "the PWR1 is untouched");
+    // The locator the document side then reads is the seal's own bytes, and
+    // they are the template's honest lane.
+    assert_eq!(
+        Locator::read(&sealed, RUN_BINDING).unwrap(),
+        Locator {
+            base_entry: 28_037,
+            write: 0,
+            width: 16
+        }
+    );
+    // (2) A write ordinal at the top of the `u8` is legal too: the seal does
+    // not bound it, and whether that lane exists is `Binding2::check`'s
+    // question at init, against the plan, where it is 794.
+    send(
+        &mut ctx,
+        &executor,
+        program,
+        data(28_037, 255, 4),
+        seal(pt2s_keys[1]),
+    )
+    .await
+    .expect("write 255 seals");
+    let sealed = ctx
+        .banks_client
+        .get_account(pt2s_keys[1])
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(
+        (sealed[S::OFF_LOCATOR + 4], sealed[S::OFF_LOCATOR + 5]),
+        (255, 4)
+    );
+    // (3) **The width is the only bound: 0 and 33 are refused**, and the
+    // refusal is the instruction's own `InvalidInstructionData` rather than a
+    // DCG code, because the seal is tag 145 and predates the C refusal table.
+    for (i, width) in [(2usize, 0u8), (3, 33), (4, 255)] {
+        let got = send(
+            &mut ctx,
+            &executor,
+            program,
+            data(28_037, 0, width),
+            seal(pt2s_keys[i]),
+        )
+        .await;
+        assert_eq!(
+            refusal(got),
+            "InvalidInstructionData",
+            "width {width} is out of 1..=32"
+        );
+        // The refused seal wrote nothing at all: the state is still HASHING and
+        // 426..432 is still the six dead bytes the revision-7 layout left.
+        let s = ctx
+            .banks_client
+            .get_account(pt2s_keys[i])
+            .await
+            .unwrap()
+            .unwrap()
+            .data;
+        assert_eq!(
+            s[S::OFF_STATE],
+            S::STATE_HASHING,
+            "a refused seal is not a seal"
+        );
+        assert_eq!(&s[S::OFF_LOCATOR..S::OFF_PWR1], &[0u8; 6][..]);
+    }
+    // (4) **A 33-byte seal is revision 7's seal**, and it leaves 426..432 zero:
+    // the six bytes were dead state, so a revision-8 PT2S with no locator is
+    // byte for byte the revision-7 image and a revision-7 document over it is
+    // unaffected.
+    let short = {
+        let mut d = vec![S::TAG_SEAL];
+        d.extend_from_slice(&[9u8; 32]);
+        d
+    };
+    assert_eq!(short.len(), 33);
+    send(&mut ctx, &executor, program, short, seal(pt2s_keys[5]))
+        .await
+        .expect("the 33-byte seal");
+    let sealed = ctx
+        .banks_client
+        .get_account(pt2s_keys[5])
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(sealed[S::OFF_STATE], S::STATE_SEALED);
+    assert_eq!(
+        &sealed[S::OFF_LOCATOR..S::OFF_PWR1],
+        &[0u8; 6][..],
+        "426..432 is left zero by a 33-byte seal"
+    );
+    assert_eq!(
+        &sealed[S::OFF_CLAUSE12..S::OFF_CLAUSE12 + 43],
+        &clause12[..]
+    );
+    assert_eq!(
+        Locator::read(&sealed, RUN_BINDING).unwrap(),
+        Locator {
+            base_entry: 0,
+            write: 0,
+            width: 0
+        },
+        "and so reads as zeros, which no revision-8 binding can equal: the width is 0"
+    );
+    // The lengths either side of 33 and 39 are not instruction data at all, and
+    // the length check is the first statement of the handler, so a sealed
+    // account is the right one to send them to.
+    for total in [1usize, 32, 34, 38, 40] {
+        let mut d = vec![S::TAG_SEAL];
+        d.resize(total, 0);
+        assert_eq!(
+            refusal(send(&mut ctx, &executor, program, d, seal(pt2s_keys[0])).await),
+            "InvalidInstructionData",
+            "a {total}-byte seal argument"
+        );
+    }
+    // The write-once property, on an account that has already sealed. A
+    // different definition digest, so this is a new transaction and not a
+    // duplicate of the one the banks client already processed.
+    let mut again = data(28_037, 0, 16);
+    again[1..33].copy_from_slice(&[8u8; 32]);
+    assert_eq!(
+        refusal(send(&mut ctx, &executor, program, again, seal(pt2s_keys[0])).await),
+        "InvalidAccountData",
+        "a second seal on a sealed PT2S"
+    );
+    // And the five-account list is frozen: four is not enough.
+    assert_eq!(
+        refusal(
+            send(
+                &mut ctx,
+                &executor,
+                program,
+                data(28_037, 0, 16),
+                seal(pt2s_keys[1])[..4].to_vec()
+            )
+            .await
+        ),
+        "InvalidInstructionData",
+        "four metas"
+    );
+}
+
+/// A `ProgramError` -- as opposed to a DCG refusal code -- read as the name the
+/// runtime reports it under. tag 145 predates the C refusal table, so its
+/// refusals are `ProgramError`s and not `Custom(_)`.
+fn refusal(result: Result<(), TransactionError>) -> String {
+    match result {
+        Err(TransactionError::InstructionError(_, e)) => format!("{e:?}"),
+        other => panic!("expected an instruction refusal, got {other:?}"),
+    }
+}
+
+// ------------------------------------- tag 178: the resolve, `L` and the stop rule
+
+/// The Qwen chat stop token the design note names (248046), plus one, and the
+/// four-byte decision cell width the same note names.
+const STOP_PLUS_ONE: u32 = 248_047;
+
+/// A cell carrying `token` in its bytes `8..16` and `-1` in `0..8`, the shape a
+/// real `(best, token)` output cell has.
+fn cell_with_token(token: u32) -> Vec<u8> {
+    let mut cell = vec![0u8; 16];
+    cell[0..8].copy_from_slice(&(-1i64).to_le_bytes());
+    cell[8..16].copy_from_slice(&(token as u64).to_le_bytes());
+    cell
+}
+
+impl Fix {
+    /// The same CUSTOM terms of §1.1 with a **chosen challenge window**, whose
+    /// floor is one slot. The FINAL condition needs `now > dispute_deadline`
+    /// and finalize writes `dispute_deadline = finalize_slot +
+    /// challenge_window_slots`, so a one-slot window is what makes that one
+    /// slot of warping away instead of 90,001. Nothing else moves: the terms
+    /// are committed in the descriptor exactly as the fixture's own are.
+    fn terms_window(&self, window: u64) -> Vec<u8> {
+        let mut t = Terms2::decode(&self.terms_raw).unwrap();
+        t.challenge_window_slots = window;
+        t.response_window_slots = window;
+        t.encode().to_vec()
+    }
+
+    /// The fixture's completion binding with a **declared stop value**. Every
+    /// other field is the one the seal committed, so the only thing that
+    /// changes against `binding` is the one number the stop rule reads.
+    fn binding_stop(&self, first: u32, count: u32, stop_plus_one: u32) -> Binding2 {
+        Binding2 {
+            stop_plus_one,
+            ..self.binding(first, count)
+        }
+    }
+
+    /// tag 178's two metas: DCM2 read-only and DCR2 writable, which is
+    /// revision 7's list and §1.6's "accounts unchanged". The conviction
+    /// branch is the one path that needs DCM2 writable, and the negative for
+    /// that is its own test.
+    fn resolve_metas(&self, c: &Crafted) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new_readonly(c.dcm2, false),
+            AccountMeta::new(c.dcr2, false),
+        ]
+    }
+}
+
+/// One resolve sent against a crafted record, returning the code and asserting
+/// that a **refused** resolve wrote nothing to the record. Every 796 and 580
+/// below is checked against the account's bytes before and after, so a refusal
+/// that half-applied would fail here rather than pass.
+async fn refused_resolve(f: &mut Fix, dcr2: Pubkey, data: Vec<u8>, metas: Vec<AccountMeta>) -> u32 {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let before = f.account(dcr2).await;
+    let code = match send_fresh(&mut f.ctx, &f.signer, f.program, data, metas).await {
+        Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => code,
+        other => panic!("refusal #{seq}: expected a custom refusal, got {other:?}"),
+    };
+    let after = f.account(dcr2).await;
+    assert_eq!(
+        before, after,
+        "refusal #{seq}: a refused resolve wrote nothing"
+    );
+    code
+}
+
+/// `send` with a **fresh blockhash**, which is what a run of otherwise
+/// identical instructions needs: two resolves of the same document in the same
+/// blockhash window are the same transaction, and the banks client answers
+/// `AlreadyProcessed` rather than a DCG code. The blockhash is part of the
+/// message, so a fresh one is a fresh signature and the refusals below are the
+/// handler's own. Same compute budget, same CU print.
+async fn send_fresh(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+) -> Result<(), TransactionError> {
+    send_fresh_with(ctx, signer, program, data, metas).await
+}
+
+/// [`send_fresh`] with an explicit signing keypair, for a case whose metas name
+/// a **different** signer from the fixture's second keypair (the seal's role can
+/// be rotated, and then the rotated key signs).
+async fn send_fresh_with(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+) -> Result<(), TransactionError> {
+    // The signing key must be the metas' signer, and the message says so rather
+    // than the runtime's `NotEnoughSigners` -- which names neither the tag nor
+    // the index and cost an hour once.
+    for (i, m) in metas.iter().enumerate() {
+        if m.is_signer && m.pubkey != signer.pubkey() {
+            panic!(
+                "tag {}: the signing key is not the metas' signer at index {i}",
+                data.first().unwrap_or(&0)
+            );
+        }
+    }
+    let tag = *data.first().unwrap_or(&0);
+    let len = data.len();
+    // The label is set by the case that is about to send, so a CU figure names
+    // the row it was measured on -- four runs of twenty numbers is not a receipt.
+    let case = current_label();
+    let blockhash = ctx
+        .get_new_latest_blockhash()
+        .await
+        .expect("a fresh blockhash");
+    let ixs = vec![
+        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+            1_400_000,
+        ),
+        Instruction {
+            program_id: program,
+            accounts: metas,
+            data,
+        },
+    ];
+    let make_transaction = |blockhash| {
+        Transaction::new_signed_with_payer(&ixs, Some(&signer.pubkey()), &[signer], blockhash)
+    };
+    let mut out = ctx
+        .banks_client
+        .process_transaction_with_metadata(make_transaction(blockhash))
+        .await;
+    if matches!(&out, Ok(inner) if matches!(inner.result, Err(TransactionError::AlreadyProcessed)))
+    {
+        // The PoH worker can return the previous working bank's blockhash even
+        // after get_new_latest_blockhash. Give this test-only retry a new slot
+        // so an identical instruction reaches the handler instead of surfacing
+        // the bank's duplicate-transaction guard as if it were a program error.
+        let slot = ctx
+            .banks_client
+            .get_sysvar::<solana_program::clock::Clock>()
+            .await
+            .unwrap()
+            .slot;
+        ctx.warp_to_slot(slot + 1).unwrap();
+        let retry_blockhash = ctx
+            .get_new_latest_blockhash()
+            .await
+            .expect("a retry blockhash");
+        out = ctx
+            .banks_client
+            .process_transaction_with_metadata(make_transaction(retry_blockhash))
+            .await;
+    }
+    if let Ok(meta) = &out {
+        let mode = if std::env::var_os("BASANOS_DCG_V8_SBF").is_some() {
+            "SBF"
+        } else {
+            "native"
+        };
+        eprintln!(
+            "CU tag {tag} data {len} cu {} mode {mode} label {case}",
+            meta.metadata
+                .as_ref()
+                .map(|m| m.compute_units_consumed)
+                .unwrap_or(0)
+        );
+    }
+    match out {
+        Ok(inner) => inner.result,
+        Err(error) => panic!("the banks client refused the transaction: {error:?}"),
+    }
+}
+
+/// Install a deliberately malformed account after obtaining the transaction's
+/// blockhash, then send against that same working bank. This avoids a
+/// background PoH tick moving the test to a child bank between `set_account`
+/// and the transaction, which would hide the mutation from the handler.
+async fn send_fresh_with_account_override(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+    key: Pubkey,
+    account: Account,
+) -> Result<(), TransactionError> {
+    let _ = ctx
+        .get_new_latest_blockhash()
+        .await
+        .expect("a fresh blockhash");
+    ctx.set_account(&key, &shared(account));
+    let blockhash = ctx
+        .banks_client
+        .get_latest_blockhash()
+        .await
+        .expect("the overridden working bank");
+    let ixs = vec![
+        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+            1_400_000,
+        ),
+        Instruction {
+            program_id: program,
+            accounts: metas,
+            data,
+        },
+    ];
+    let tx = Transaction::new_signed_with_payer(&ixs, Some(&signer.pubkey()), &[signer], blockhash);
+    match ctx.banks_client.process_transaction_with_metadata(tx).await {
+        Ok(inner) => inner.result,
+        Err(error) => panic!("the banks client refused the transaction: {error:?}"),
+    }
+}
+
+/// Send a fresh instruction and return its decoded `Program data:` events.
+/// Close-refund regressions must check the DLE1 body as well as balances: C1
+/// corrupted the event field while the actual rent transfer still succeeded.
+async fn send_fresh_events(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+) -> Result<Vec<Vec<u8>>, TransactionError> {
+    for (i, m) in metas.iter().enumerate() {
+        if m.is_signer && m.pubkey != signer.pubkey() {
+            panic!(
+                "tag {}: the signing key is not the metas' signer at index {i}",
+                data.first().unwrap_or(&0)
+            );
+        }
+    }
+    let blockhash = ctx
+        .get_new_latest_blockhash()
+        .await
+        .expect("a fresh blockhash");
+    let ixs = vec![
+        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+            1_400_000,
+        ),
+        Instruction {
+            program_id: program,
+            accounts: metas,
+            data,
+        },
+    ];
+    let tx = Transaction::new_signed_with_payer(&ixs, Some(&signer.pubkey()), &[signer], blockhash);
+    // On this ProgramTest runtime the committed transaction metadata omits
+    // `sol_log_data` entries, though they are printed to the test log. Simulate
+    // the same signed message first so the C1 regression can inspect the DLE1
+    // refund field, then commit it once.
+    let simulated = ctx
+        .banks_client
+        .simulate_transaction(tx.clone())
+        .await
+        .expect("close event simulation");
+    let events = simulated
+        .simulation_details
+        .map(|details| {
+            details
+                .logs
+                .into_iter()
+                .filter_map(|line| {
+                    line.rsplit_once("data: ")
+                        .map(|(_, encoded)| decode_base64(encoded))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let out = ctx.banks_client.process_transaction_with_metadata(tx).await;
+    match out {
+        Ok(inner) => inner.result.map(|()| events),
+        Err(error) => panic!("the banks client refused the transaction: {error:?}"),
+    }
+}
+
+fn decode_base64(text: &str) -> Vec<u8> {
+    let val = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => panic!("invalid base64 event"),
+    };
+    let clean: Vec<u8> = text.bytes().filter(|&c| c != b'=').collect();
+    let mut out = Vec::new();
+    for chunk in clean.chunks(4) {
+        let mut acc = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            acc |= (val(c) as u32) << (18 - 6 * i);
+        }
+        for i in 0..chunk.len() * 6 / 8 {
+            out.push((acc >> (16 - 8 * i)) as u8);
+        }
+    }
+    out
+}
+
+fn close_event_refund(events: &[Vec<u8>]) -> Option<u64> {
+    events
+        .iter()
+        .find(|event| {
+            event.len() == 120
+                && &event[..4] == b"DLE1"
+                && u16_at(event, 4) == 3
+                && event[6] == events::CLOSE
+        })
+        .map(|event| u64_at(event, 80))
+}
+
+fn assert_close_event_refund(events: &[Vec<u8>], expected: u64) {
+    let refund = close_event_refund(events);
+    if std::env::var_os("BASANOS_DCG_V8_SBF").is_some() {
+        assert_eq!(
+            refund,
+            Some(expected),
+            "the SBF CLOSE event records the exact drain"
+        );
+    } else if let Some(refund) = refund {
+        assert_eq!(
+            refund, expected,
+            "the native CLOSE event records the exact drain"
+        );
+    }
+}
+
+/// The two metas of §1.6's account list, for a named pair of accounts.
+fn pair(dcm2: Pubkey, dcr2: Pubkey) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(dcm2, false),
+        AccountMeta::new(dcr2, false),
+    ]
+}
+
+fn resolve_data(descriptor: &[u8; 32]) -> Vec<u8> {
+    let mut out = vec![TAG_RESOLVE_RESULT];
+    out.extend_from_slice(descriptor);
+    out
+}
+
+/// A real revision-8 completion document, initialized, landed, finalized and
+/// then **attested at every index of `[0, l)` through the handler** with a
+/// chosen token id per output.
+///
+/// `tokens[i]` is the token id written into output `i`'s cell; an index the
+/// slice does not name gets a non-stop token. `n` and `l` are the document's
+/// own, and the caller has to pass a document the 816 relations admit, so this
+/// asserts them rather than assuming them.
+///
+/// `variant` names the document: the descriptor is a function of the binding,
+/// the terms and the family count and **not** of `n`, so two runs at different
+/// `n` over one binding would be the same document and the second `init` would
+/// be a duplicate at the same PDA. `request_id` carries the variant, exactly as
+/// `init_refusal` does.
+async fn attest_all(
+    f: &mut Fix,
+    binding: &Binding2,
+    n: u32,
+    tokens: &[(u32, u32)],
+    variant: u8,
+) -> ([u8; 32], [Pubkey; 4], Vec<Rekeyed>) {
+    let binding = Binding2 {
+        request_id: [variant.max(1); 32],
+        ..*binding
+    };
+    let first = binding.output_first_position;
+    let l = binding.output_span(n);
+    assert!(
+        l >= 1 && l <= binding.output_count,
+        "the document declares L = {l}"
+    );
+    assert!(
+        first + 2 <= n && n <= first + binding.output_count + 1,
+        "816 at n = {n}: first = {first}, count = {}",
+        binding.output_count
+    );
+    let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+    // One re-keyed proof per output, each with its own value.
+    let proofs: Vec<Rekeyed> = (0..l)
+        .map(|i| {
+            rekey_with(
+                f,
+                &descriptor,
+                i,
+                first + i,
+                cell_with_token(
+                    tokens
+                        .iter()
+                        .find(|(j, _)| *j == i)
+                        .map(|(_, t)| *t)
+                        .unwrap_or(0x_00ff_fffe),
+                ),
+            )
+        })
+        .collect();
+    let mut roots = f.position_roots[..n as usize].to_vec();
+    for p in &proofs {
+        roots[p.p as usize] = p.root;
+    }
+    let created = [
+        address::document(&f.program, &descriptor).0,
+        address::positions(&f.program, &descriptor).0,
+        address::family_slots(&f.program, &descriptor).0,
+        address::result(&f.program, &descriptor).0,
+    ];
+    for key in created {
+        fund(&mut f.ctx, key).await;
+    }
+    let (data, metas) = (
+        init_data(
+            &f.terms_raw,
+            &binding.encode(),
+            &[[1u8; 32], [2u8; 32], [3u8; 32]],
+            16,
+            &f.family_body,
+            &[],
+        ),
+        f.init_metas(created),
+    );
+    send(&mut f.ctx, &f.executor, f.program, data, metas)
+        .await
+        .expect("init");
+    // Both writers take DTU1 as their fourth meta on revision 8 (spec §1.6):
+    // the clamp's ceiling is the template's own lifetime limit.
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        land_data(&descriptor, 0, &roots),
+        vec![
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(created[1], false),
+            AccountMeta::new_readonly(f.dtu1, false),
+        ],
+    )
+    .await
+    .expect("land");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        finalize_data(&descriptor, n, &f.family_roots),
+        vec![
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(created[3], false),
+            AccountMeta::new_readonly(f.dtu1, false),
+        ],
+    )
+    .await
+    .expect("finalize");
+    // The attest is permissionless, so the fixture's second keypair signs every
+    // one of them: a challenger proving the outputs is the honest shape.
+    let metas = attest_metas(f.signer.pubkey(), (f.pt2s, f.routes, f.geometry), created);
+    for p in &proofs {
+        send(
+            &mut f.ctx,
+            &f.signer,
+            f.program,
+            p.data.clone(),
+            metas.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("attest of output {}: {e:?}", u32_at(&p.data, 33)));
+    }
+    let dcr2 = f.account(created[3]).await;
+    assert_eq!(u32_at(&dcr2, 204), l, "every output of [0, L) is attested");
+    (descriptor, created, proofs)
+}
+
+/// Put the clock one slot past the document's own `dispute_deadline`, which is
+/// the first slot at which the FINAL condition can be asked.
+///
+/// **The clock is set rather than warped**, for the reason the file header
+/// gives: `warp_to_slot` roots the bank and a root verifies the accounts hash
+/// across the skipped slots, which a fixture that installs accounts with
+/// `set_account` cannot then satisfy. `set_sysvar` moves the same clock with no
+/// root, and it is read back through the runtime's sysvar cache, so the
+/// program's own `Clock::get()` sees it. Every other field of the clock is the
+/// bank's, and the document's deadline is the one its finalize wrote, so the
+/// resolve is answering a real question about a real deadline.
+async fn past_deadline(f: &mut Fix, dcm2: Pubkey) -> u64 {
+    let deadline = u64_at(&f.account(dcm2).await, 144);
+    let mut clock = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap();
+    // Idempotent: a second call for a document whose deadline the clock is
+    // already past leaves the clock where it is and still reports the slot the
+    // resolve will read.
+    let target = clock.slot.max(deadline + 1);
+    if target != clock.slot {
+        clock.slot = target;
+        f.ctx.set_sysvar(&clock);
+    }
+    let seen = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    assert_eq!(
+        seen, target,
+        "the bank clock is where the resolve will read it"
+    );
+    assert!(seen > deadline, "{seen} is past the deadline {deadline}");
+    seen
+}
+
+/// **The honest FINAL path, at three `n` and therefore three `L`.** A real
+/// init, a real landing of the re-keyed position roots, a real finalize, `L`
+/// real `AttestOutputV5` calls that discharge the proof, and a real
+/// `ResolveResultV5` that writes FINAL.
+///
+/// The document declares `stop_plus_one`, so every one of these is a
+/// *stop-rule* case and not only a counting case: the run carries
+/// `first = 29`, `count = 50` over the 80-position template, and `L` runs from
+/// `n - 1 - first = 1` (`n = 31`, the 816 minimum) to `L = 10` (`n = 40`).
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_resolve_is_final_on_an_honest_completion_at_several_n() {
+    let Some(mut f) = build().await else { return };
+    // A one-slot challenge window, so `now > dispute_deadline` is two slots.
+    f.terms_raw = f.terms_window(1);
+    for (i, (n, l)) in [(31u32, 1u32), (33, 3), (40, 10)].into_iter().enumerate() {
+        let first = 29u32;
+        let binding = f.binding_stop(first, 50, STOP_PLUS_ONE);
+        // A document that **stopped early**: the stop token at output `L-1`
+        // and nowhere before it, which is clause 2 met and clause 1 holding.
+        let tokens: Vec<(u32, u32)> = vec![(l - 1, STOP_PLUS_ONE - 1)];
+        let (descriptor, created, _) = attest_all(&mut f, &binding, n, &tokens, 30 + i as u8).await;
+        let c = Crafted {
+            dcm2: created[0],
+            dpr2: created[1],
+            dcr2: created[3],
+            descriptor,
+        };
+        let before = past_deadline(&mut f, c.dcm2).await;
+        let metas = f.resolve_metas(&c);
+        send_fresh(
+            &mut f.ctx,
+            &f.signer,
+            f.program,
+            resolve_data(&descriptor),
+            metas.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("resolve at n = {n}, L = {l}: {e:?}"));
+        let dcr2 = f.account(created[3]).await;
+        assert_eq!(
+            dcr2[6],
+            result::STATUS_FINAL,
+            "status 1 FINAL at n = {n}, L = {l}"
+        );
+        assert_eq!(u64_at(&dcr2, 184), before, "status_slot := now");
+        assert_eq!(
+            u32_at(&dcr2, 192),
+            0,
+            "challenger_wins stays 0 on an honest FINAL"
+        );
+        assert_eq!(
+            dcr2[6] != result::STATUS_REFUTED,
+            true,
+            "and it is not REFUTED"
+        );
+        // **The stop value landed where the rule looks for it**, in the cell
+        // the attest wrote and in the position's own bytes 8..16.
+        let cell =
+            &dcr2[result::HEADER_V6 + (l as usize - 1) * 16..result::HEADER_V6 + l as usize * 16];
+        assert_eq!(&cell[8..16], &(STOP_PLUS_ONE as u64 - 1).to_le_bytes());
+        // And DCM2 is untouched apart from nothing: flag 4 is clear, so a later
+        // close takes the honest branch.
+        let doc = f.account(created[0]).await;
+        assert_eq!(
+            u16_at(&doc, 6) & FLAG_REFUTED,
+            0,
+            "an honest resolve sets no flag 4"
+        );
+        assert_eq!(u32_at(&doc, 132), 0, "and no challenger win");
+    }
+}
+
+/// **A completion that stops early is FINAL, and one that ran past its stop is
+/// convicted.** Both documents are real and both are attested by the handler;
+/// they differ in one number — output `L-1`'s token — which is the whole
+/// content of clause 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_resolve_convicts_a_stop_rule_violation_at_each_clause() {
+    let Some(mut f) = build().await else { return };
+    f.terms_raw = f.terms_window(1);
+    let first = 29u32;
+    let (n, l) = (40u32, 10u32);
+    // (1) **Clause 1, `ran long`**: a stop value at output 4, which is in
+    // `[0, L-2) = [0, 9)`. The document claims L = 10, so it says it kept
+    // generating after it had already stopped.
+    let binding = f.binding_stop(first, 50, STOP_PLUS_ONE);
+    let tokens = vec![(4u32, STOP_PLUS_ONE - 1), (l - 1, STOP_PLUS_ONE - 1)];
+    let (descriptor, created, _) = attest_all(&mut f, &binding, n, &tokens, 21).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    let now = past_deadline(&mut f, c.dcm2).await;
+    let metas = f.resolve_metas(&c);
+    // The read-only DCM2 of §1.6's list cannot carry the conviction, which is
+    // the account-list note on `resolve_v8`: **580**, and the record is
+    // untouched.
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                metas.clone()
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "a read-only DCM2 cannot convict"
+    );
+    let dcr2 = f.account(created[3]).await;
+    assert_eq!(
+        dcr2[6],
+        result::STATUS_PENDING,
+        "the refused resolve wrote no status"
+    );
+    let doc = f.account(created[0]).await;
+    assert_eq!(u16_at(&doc, 6) & FLAG_REFUTED, 0, "and no flag 4");
+    assert_eq!(u32_at(&doc, 132), 0, "and no challenger win");
+    // With DCM2 writable, as `RULE` requires, the same packet convicts.
+    let writable = vec![
+        AccountMeta::new(c.dcm2, false),
+        AccountMeta::new(c.dcr2, false),
+    ];
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        writable.clone(),
+    )
+    .await
+    .expect("the conviction");
+    let dcr2 = f.account(created[3]).await;
+    let doc = f.account(created[0]).await;
+    assert_eq!(
+        dcr2[6],
+        result::STATUS_REFUTED,
+        "status 2 REFUTED on a stop-rule violation"
+    );
+    assert_eq!(u64_at(&dcr2, 184), now, "status_slot := now");
+    assert_eq!(u32_at(&dcr2, 192), 1, "DCR2 challenger_wins := 1");
+    assert_eq!(
+        u16_at(&doc, 6) & FLAG_REFUTED,
+        FLAG_REFUTED,
+        "DCM2 flag 4 is set"
+    );
+    assert_eq!(u32_at(&doc, 132), 1, "DCM2 challenger_wins += 1");
+    // **`conviction_winner` is untouched**: a stop-rule conviction names nobody,
+    // so DCR2 352 is 32 zero bytes and the tombstone carries no winner.
+    assert_eq!(
+        &dcr2[result::WINNER_AT_V6..result::WINNER_AT_V6 + 32],
+        &[0u8; 32],
+        "a stop-rule conviction records no winner"
+    );
+    assert_eq!(
+        &doc[document::WINNER_AT_V8..document::WINNER_AT_V8 + 32],
+        &[0u8; 32],
+        "and DCM2 530 is still zero: nothing named anybody"
+    );
+    // A second resolve is 796 and changes nothing: the "two stop violations on
+    // one fault" case, which the status is not PENDING.
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                writable.clone()
+            )
+            .await
+        ),
+        RESULT_STATE,
+        "a second resolve is 796"
+    );
+    let dcr2 = f.account(created[3]).await;
+    let doc = f.account(created[0]).await;
+    assert_eq!(u32_at(&dcr2, 192), 1, "challenger_wins stays at 1");
+    assert_eq!(u32_at(&doc, 132), 1, "on DCM2 too");
+
+    // (2) **Clause 2, `stopped early`**: `L = 10 < count = 50` and output 9 is
+    // not the stop value. Nothing before it is a stop value either, so clause
+    // 1 holds and clause 2 is the only one that can fire.
+    let tokens = vec![(l - 1, 0x_00ff_fffeu32)];
+    let (descriptor, created, _) = attest_all(&mut f, &binding, n, &tokens, 11).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    past_deadline(&mut f, c.dcm2).await;
+    let writable = vec![
+        AccountMeta::new(c.dcm2, false),
+        AccountMeta::new(c.dcr2, false),
+    ];
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        writable,
+    )
+    .await
+    .expect("the conviction");
+    let dcr2 = f.account(created[3]).await;
+    assert_eq!(dcr2[6], result::STATUS_REFUTED, "clause 2 convicts too");
+    assert_eq!(u32_at(&dcr2, 192), 1);
+    assert_eq!(
+        &dcr2[result::WINNER_AT_V6..result::WINNER_AT_V6 + 32],
+        &[0u8; 32]
+    );
+}
+
+/// **The opt-out and clause 2's escape**, both through the handler and both
+/// with real attestations: a document that declares **no** stop value is FINAL
+/// with any tokens at all, and a document that used every output it asked for
+/// (`L = count`) is FINAL with no stop value in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_resolve_honours_the_opt_out_and_the_l_equals_count_escape() {
+    let Some(mut f) = build().await else { return };
+    f.terms_raw = f.terms_window(1);
+    let first = 29u32;
+    // (1) `stop_plus_one = 0`: the rule is off, so the stop token appearing in
+    // the middle of the outputs convicts nothing. `n = 33` gives `L = 3`.
+    let off = f.binding_stop(first, 50, 0);
+    let tokens = vec![(1u32, STOP_PLUS_ONE - 1)];
+    let (descriptor, created, _) = attest_all(&mut f, &off, 33, &tokens, 12).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    past_deadline(&mut f, c.dcm2).await;
+    let metas = f.resolve_metas(&c);
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        metas,
+    )
+    .await
+    .expect("the opt-out resolves FINAL");
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_FINAL);
+
+    // (2) `L = count = 50` at `n = 80`: clause 2's escape, so the last output
+    // need not be the stop value. The document declares one, and does not use
+    // it anywhere.
+    let full = f.binding_stop(first, 50, STOP_PLUS_ONE);
+    let (descriptor, created, _) = attest_all(&mut f, &full, 80, &[], 13).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    past_deadline(&mut f, c.dcm2).await;
+    let metas = f.resolve_metas(&c);
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        metas,
+    )
+    .await
+    .expect("L = count resolves FINAL");
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_FINAL);
+    // The escape is the escape and not a gap: **the same document with
+    // `L = 49 < count` is convicted**, because then output 48 has to be the stop
+    // value and is not.
+    let short = f.binding_stop(first, 50, STOP_PLUS_ONE);
+    let (descriptor, created, _) = attest_all(&mut f, &short, 79, &[], 14).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    past_deadline(&mut f, c.dcm2).await;
+    let writable = vec![
+        AccountMeta::new(c.dcm2, false),
+        AccountMeta::new(c.dcr2, false),
+    ];
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        writable,
+    )
+    .await
+    .expect("the conviction");
+    assert_eq!(
+        f.account(created[3]).await[6],
+        result::STATUS_REFUTED,
+        "one output short of count, the last output is not the stop value"
+    );
+}
+
+/// **The decision document resolves FINAL at `L = 1 + option_count`**, over a
+/// crafted record because the only sealed template in this tree has no 4-byte
+/// write lane (the file header says so, and C1 measured it). Everything the
+/// resolve reads is the program's own: the DRB1 v2 block, `positions_complete`,
+/// the DCR2 v6 header, the five 4-byte cells and the five bitmap bits.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_resolve_is_final_on_a_decision_document() {
+    let Some(mut f) = build().await else { return };
+    f.terms_raw = f.terms_window(1);
+    for k in [1u8, 4, 8, 80] {
+        // `n = 30` is `first = 29` plus one, the smallest prompt this template's
+        // own output lane can be a decision over; `L = 1 + K` does not move it.
+        let n = 30u32;
+        let (binding, options) = decision_binding(&f.executor.pubkey().to_bytes(), n, k);
+        let l = binding.output_span(n);
+        assert_eq!(l, 1 + k as u32, "L = 1 + option_count for a decision");
+        assert_eq!(binding.output_count, l, "and count = L by 816");
+        let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+        let roots = f.position_roots[..n as usize].to_vec();
+        let c = f
+            .craft_with(&binding, n, &roots, 1, descriptor, &options)
+            .await;
+        // **A real `FinalizeDocumentV5`**, because the resolve's FINAL branch
+        // reads DCM2 flag 2 and a crafted record does not carry it. 816's
+        // decision branch is therefore exercised here too, over the real
+        // handler: `n = prompt_positions`, `first = n - 1`, `count = 1 + K`.
+        let fin = f.fin_metas(&c);
+        send(
+            &mut f.ctx,
+            &f.executor,
+            f.program,
+            finalize_data(&descriptor, n, &f.family_roots),
+            fin,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a decision finalize at K = {k}: {e:?}"));
+        assert_eq!(
+            u16_at(&f.account(c.dcm2).await, 6) as u16,
+            FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
+            "flag 2 at K = {k}"
+        );
+        // **The five cells, the five bits and the counter**, written the way
+        // `attest_v8` writes them. A decision's cells are 4-byte
+        // fixed-point values, so there is no token field in them at all and
+        // the stop rule has nothing to read — which is why it is not run.
+        let mut res = f.account(c.dcr2).await;
+        assert_eq!(
+            res.len(),
+            result::bytes_v8(binding.output_count, DECISION_WIDTH).unwrap(),
+            "416 + 4(1+K) + ceil((1+K)/8)"
+        );
+        for i in 0..l {
+            let at = result::HEADER_V6 + i as usize * DECISION_WIDTH as usize;
+            res[at..at + 4].copy_from_slice(&(1_000_000u32 + i).to_le_bytes());
+            res[result::HEADER_V6
+                + binding.output_count as usize * DECISION_WIDTH as usize
+                + i as usize / 8] |= 1 << (i % 8);
+        }
+        res[204..208].copy_from_slice(&l.to_le_bytes());
+        f.ctx.set_account(&c.dcr2, &shared(owned(&f.program, res)));
+        past_deadline(&mut f, c.dcm2).await;
+        let metas = pair(c.dcm2, c.dcr2);
+        send_fresh(
+            &mut f.ctx,
+            &f.signer,
+            f.program,
+            resolve_data(&descriptor),
+            metas,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a decision at K = {k} resolves: {e:?}"));
+        let res = f.account(c.dcr2).await;
+        assert_eq!(
+            res[6],
+            result::STATUS_FINAL,
+            "a decision at K = {k} is FINAL at L = {l}"
+        );
+        // **One output short is a refusal, not a conviction.** A decision has
+        // no clause to fall through to, so an incomplete one is 796.
+        let mut res = f.account(c.dcr2).await;
+        res[204..208].copy_from_slice(&(l - 1).to_le_bytes());
+        f.ctx.set_account(&c.dcr2, &shared(owned(&f.program, res)));
+        assert_eq!(
+            custom(
+                send_fresh(
+                    &mut f.ctx,
+                    &f.signer,
+                    f.program,
+                    resolve_data(&descriptor),
+                    pair(c.dcm2, c.dcr2)
+                )
+                .await
+            ),
+            RESULT_STATE,
+            "a decision with L-1 outputs attested is 796"
+        );
+        let _ = c;
+    }
+}
+
+/// **Every new refusal of the revision-8 resolve, with its code**, over one
+/// real document: a real init, landing, finalize and a full attestation at
+/// `L = 3 < count = 50`, so each case below is a refusal *of a document that
+/// otherwise resolves FINAL*.
+///
+/// The 796s are the clause's own: the FINAL condition is not met. The 580s are
+/// the two accounts being something other than what the handler needs. The 794
+/// is the DRB1 v2 block, which the resolve decodes with the same call init
+/// does. The 598 is the checked `challenger_wins + 1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_resolve_refusals() {
+    let Some(mut f) = build().await else { return };
+    f.terms_raw = f.terms_window(1);
+    let first = 29u32;
+    let binding = f.binding_stop(first, 50, STOP_PLUS_ONE);
+    let (n, l) = (33u32, 3u32);
+    let tokens = vec![(l - 1, STOP_PLUS_ONE - 1)];
+    let (descriptor, created, _) = attest_all(&mut f, &binding, n, &tokens, 11).await;
+    let (dcm2, dcr2) = (created[0], created[3]);
+    let base = pair(dcm2, dcr2);
+
+    // **796, the window is not open**, in the order the handler reads them:
+    // not past `dispute_deadline`, then a challenge still open, then DCM2
+    // flag 2 clear (an unfinalized document, whose `positions_complete` is `n`
+    // but whose FINAL condition is not the handler's to answer).
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        RESULT_STATE,
+        "now <= dispute_deadline is 796"
+    );
+    let good_doc = f.account(dcm2).await;
+    assert_eq!(
+        u16_at(&good_doc, 6) & FLAG_FINAL,
+        FLAG_FINAL,
+        "the fixture's document is finalized"
+    );
+    let mut doc = good_doc.clone();
+    doc[128..132].copy_from_slice(&1u32.to_le_bytes());
+    f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        RESULT_STATE,
+        "an open challenge is 796"
+    );
+    let mut doc = good_doc.clone();
+    doc[128..132].copy_from_slice(&0u32.to_le_bytes());
+    doc[6..8].copy_from_slice(&(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED).to_le_bytes());
+    f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        RESULT_STATE,
+        "an unfinalized document is 796"
+    );
+    // And `L` really is a function of `n`: moving `first` forward in the
+    // binding makes `L = 1` while the record has 3 attested outputs, which the
+    // partial-bitmap clause refuses rather than resolving.
+    let mut doc = good_doc.clone();
+    doc[document::BINDING_AT_V8 + 136..document::BINDING_AT_V8 + 140]
+        .copy_from_slice(&30u32.to_le_bytes());
+    f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
+    past_deadline(&mut f, dcm2).await;
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        RESULT_STATE,
+        "L = 1 with three attested outputs is 796"
+    );
+    f.ctx
+        .set_account(&dcm2, &shared(owned(&f.program, good_doc.clone())));
+
+    // **796, the partial bitmap**: the counter in both directions, and a bit
+    // that disagrees with it inside `[0, L)`. The clause's load-bearing case:
+    // with `stop_plus_one = 1` an **unattested** cell is 16 zero bytes whose
+    // token is 0, which *is* the declared stop value, so without the bitmap
+    // clause the stop rule would read an unattested cell and convict an honest
+    // document. This document is exactly that: `stop_plus_one = 1`, the stop
+    // value at `L-1`, and no other cell.
+    let stop_one = f.binding_stop(first, 50, 1);
+    let (d1, k1, _) = attest_all(&mut f, &stop_one, n, &[(l - 1, 0u32)], 15).await;
+    let (m1, r1) = (k1[0], k1[3]);
+    let m1_pair = pair(m1, r1);
+    past_deadline(&mut f, m1).await;
+    // **The honest record, read before any of the four manglings below**, so
+    // the "and it still resolves" at the end restores exactly what the attest
+    // wrote rather than the last refusal's version of it.
+    let honest_res = f.account(r1).await;
+    let seen = past_deadline(&mut f, m1).await;
+    assert_eq!(
+        honest_res[204..208],
+        l.to_le_bytes(),
+        "the attest wrote L outputs"
+    );
+    assert_eq!(
+        u64_at(&f.account(m1).await, 144) + 1,
+        seen,
+        "the deadline this document's finalize wrote, and the slot the resolve reads"
+    );
+    let bitmap_at = result::HEADER_V6 + 50 * 16;
+    for (attested, label) in [
+        (l - 1, "attested = L-1"),
+        (l + 1, "attested = L+1"),
+        (0, "attested = 0"),
+        (50, "attested = count"),
+    ] {
+        let mut res = f.account(r1).await;
+        res[204..208].copy_from_slice(&attested.to_le_bytes());
+        f.ctx.set_account(&r1, &shared(owned(&f.program, res)));
+        assert_eq!(
+            refused_resolve(&mut f, r1, resolve_data(&d1), m1_pair.clone()).await,
+            RESULT_STATE,
+            "{label} is 796"
+        );
+    }
+    let mut res = f.account(r1).await;
+    res[bitmap_at] &= !(1 << 1);
+    f.ctx.set_account(&r1, &shared(owned(&f.program, res)));
+    assert_eq!(
+        refused_resolve(&mut f, r1, resolve_data(&d1), m1_pair.clone()).await,
+        RESULT_STATE,
+        "an unattested output inside [0, L) is 796, not a conviction"
+    );
+    let mut res = f.account(r1).await;
+    res[bitmap_at + 2] |= 1 << 0;
+    res[204..208].copy_from_slice(&(l + 1).to_le_bytes());
+    f.ctx.set_account(&r1, &shared(owned(&f.program, res)));
+    assert_eq!(
+        refused_resolve(&mut f, r1, resolve_data(&d1), m1_pair.clone()).await,
+        RESULT_STATE,
+        "a set bit at L is 796"
+    );
+    let mut res = f.account(r1).await;
+    res[bitmap_at + 6] |= 0b1000_0000;
+    f.ctx.set_account(&r1, &shared(owned(&f.program, res)));
+    assert_eq!(
+        refused_resolve(&mut f, r1, resolve_data(&d1), m1_pair.clone()).await,
+        RESULT_STATE,
+        "a nonzero padding bit is 796"
+    );
+    // **And the same document with its honest bitmap still resolves**, so the
+    // five 796s above were the clause and not a broken fixture.
+    f.ctx
+        .set_account(&r1, &shared(owned(&f.program, honest_res.clone())));
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&d1),
+        m1_pair.clone(),
+    )
+    .await
+    .expect("the honest record still resolves");
+    assert_eq!(f.account(r1).await[6], result::STATUS_FINAL);
+
+    // **598, the checked add.** The record is convicted (a stop value in the
+    // middle, put back into the cell the attest wrote) and DCM2's
+    // `challenger_wins` is at `u32::MAX`, so the conviction's increment
+    // overflows and the whole instruction fails with nothing written.
+    let mut violating = honest_res.clone();
+    // Output 1 of this document is 16 zero bytes, whose token is 0, which is
+    // the **declared** stop value (`stop_plus_one = 1`). Putting it at output 1
+    // — inside `[0, L-2) = [0, 2)` — is exactly a clause-1 violation, and the
+    // count and the bitmap still say `[0, L)`, so only the stop rule convicts.
+    violating[result::HEADER_V6 + 16 + 8..result::HEADER_V6 + 16 + 16]
+        .copy_from_slice(&0u64.to_le_bytes());
+    let mut doc = f.account(m1).await;
+    assert_eq!(
+        u16_at(&doc, 6) & FLAG_REFUTED,
+        0,
+        "the honest document is not refuted"
+    );
+    f.ctx
+        .set_account(&r1, &shared(owned(&f.program, violating)));
+    doc[132..136].copy_from_slice(&u32::MAX.to_le_bytes());
+    f.ctx.set_account(&m1, &shared(owned(&f.program, doc)));
+    let before_doc = f.account(m1).await;
+    let before_res = f.account(r1).await;
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&d1),
+                vec![AccountMeta::new(m1, false), AccountMeta::new(r1, false)]
+            )
+            .await
+        ),
+        CL_OVERFLOW,
+        "challenger_wins + 1 is a checked add"
+    );
+    assert_eq!(
+        f.account(m1).await,
+        before_doc,
+        "the refused add wrote nothing to DCM2"
+    );
+    assert_eq!(f.account(r1).await, before_res, "and nothing to the record");
+    assert_eq!(
+        u16_at(&f.account(m1).await, 6) & FLAG_REFUTED,
+        0,
+        "and no flag 4"
+    );
+    assert_eq!(
+        f.account(r1).await[6],
+        result::STATUS_PENDING,
+        "and no status"
+    );
+    // With the count one lower the same packet convicts, so the 598 was the
+    // arithmetic and not the record.
+    let mut doc = f.account(m1).await;
+    doc[132..136].copy_from_slice(&(u32::MAX - 1).to_le_bytes());
+    f.ctx.set_account(&m1, &shared(owned(&f.program, doc)));
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&d1),
+        vec![AccountMeta::new(m1, false), AccountMeta::new(r1, false)],
+    )
+    .await
+    .expect("the conviction at u32::MAX - 1");
+    assert_eq!(
+        u32_at(&f.account(r1).await, 192),
+        u32::MAX,
+        "the last representable count"
+    );
+
+    // **580 on DCM2**: the reader split (a revision-6 record), a wrong magic, a
+    // header descriptor the account is not derived from, the ROOT_ONLY and
+    // SEALED bits, a truncated record, and the same well-formed record at
+    // another address.
+    let good_doc = f.account(dcm2).await;
+    assert_eq!(
+        good_doc[4..6],
+        7u16.to_le_bytes(),
+        "the fixture's DCM2 is a v7"
+    );
+    let mut v6 = good_doc.clone();
+    v6[4..6].copy_from_slice(&6u16.to_le_bytes());
+    v6.truncate(document::DCM2_V6_BYTES);
+    f.ctx.set_account(&dcm2, &shared(owned(&f.program, v6)));
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        CL_MALFORMED,
+        "a DCM2 v6 is 580 at the reader split"
+    );
+    let mut not_doc = good_doc.clone();
+    not_doc[..4].copy_from_slice(b"XXXX");
+    f.ctx
+        .set_account(&dcm2, &shared(owned(&f.program, not_doc)));
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        CL_MALFORMED,
+        "a wrong magic is 580"
+    );
+    let mut wrong_desc = good_doc.clone();
+    wrong_desc[8..40].copy_from_slice(&[9u8; 32]);
+    f.ctx
+        .set_account(&dcm2, &shared(owned(&f.program, wrong_desc)));
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        CL_MALFORMED,
+        "a header descriptor the account is not derived from is 580"
+    );
+    let mut cleared = good_doc.clone();
+    cleared[6..8].copy_from_slice(&FLAG_FINAL.to_le_bytes());
+    f.ctx
+        .set_account(&dcm2, &shared(owned(&f.program, cleared)));
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        CL_MALFORMED,
+        "a record without ROOT_ONLY|SEALED is 580"
+    );
+    let mut short = good_doc.clone();
+    short.truncate(document::OPTION_REGION_AT - 1);
+    f.ctx.set_account(&dcm2, &shared(owned(&f.program, short)));
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        CL_MALFORMED,
+        "a truncated DCM2 is 580"
+    );
+    f.ctx
+        .set_account(&dcm2, &shared(owned(&f.program, good_doc.clone())));
+    let elsewhere = address::document(&f.program, &[7u8; 32]).0;
+    f.ctx
+        .set_account(&elsewhere, &shared(owned(&f.program, good_doc.clone())));
+    let mut metas = base.clone();
+    metas[0] = AccountMeta::new_readonly(elsewhere, false);
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), metas).await,
+        CL_MALFORMED,
+        "the account's key is PDA(descriptor)"
+    );
+    // **794, the DRB1 v2 block**, which the resolve decodes with the same call
+    // init does — so a block init would have refused reaches the resolve as
+    // 794 rather than being read.
+    for (at, bytes, label) in [
+        (4usize, 1u16.to_le_bytes().to_vec(), "a version"),
+        (149, vec![8u8], "a width the stop rule's cell cannot carry"),
+        (
+            150,
+            vec![DECISION_MODE],
+            "decision_flags bit 0 with option_count = 0",
+        ),
+    ] {
+        let mut doc = good_doc.clone();
+        doc[document::BINDING_AT_V8 + at..document::BINDING_AT_V8 + at + bytes.len()]
+            .copy_from_slice(&bytes);
+        f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
+        assert_eq!(
+            refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+            RUN_BINDING,
+            "a DRB1 v2 block with {label} is 794"
+        );
+    }
+    f.ctx
+        .set_account(&dcm2, &shared(owned(&f.program, good_doc)));
+
+    // **580 on DCR2**: a revision-7 DCR2 v5, a record shorter than the v6
+    // header, one longer than its own `count` allows, a wrong magic, a nonzero
+    // reserved run at 411, a header descriptor the account is not derived from,
+    // and a read-only meta.
+    let good_res = f.account(dcr2).await;
+    assert_eq!(
+        good_res[4..6],
+        6u16.to_le_bytes(),
+        "the fixture's DCR2 is a v6"
+    );
+    let mut v5 = good_res.clone();
+    v5[4..6].copy_from_slice(&5u16.to_le_bytes());
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, v5),
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "a DCR2 v5 is 580 at the reader split"
+    );
+    let mut short_res = good_res.clone();
+    short_res.truncate(result::HEADER_V6 - 1);
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, short_res),
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "a DCR2 shorter than the v6 header is 580"
+    );
+    let mut long_res = good_res.clone();
+    long_res.push(0);
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, long_res),
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "a DCR2 longer than its own count allows is 580"
+    );
+    let mut wrong_magic = good_res.clone();
+    wrong_magic[..4].copy_from_slice(b"XXXX");
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, wrong_magic),
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "a wrong magic is 580"
+    );
+    let mut reserved = good_res.clone();
+    reserved[411] = 1;
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, reserved),
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "a nonzero 411..416 is 580"
+    );
+    let mut wrong_desc = good_res.clone();
+    wrong_desc[8..40].copy_from_slice(&[9u8; 32]);
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, wrong_desc),
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "a DCR2 for another document is 580"
+    );
+    // **796 on DCR2's state**, which is not a malformed record: closed, not
+    // PENDING, and a record the attest has not finished growing — the clause
+    // reads the whole bitmap, so a half-grown record has no answer.
+    let mut closed = good_res.clone();
+    closed[7] = 1;
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, closed),
+            )
+            .await
+        ),
+        RESULT_STATE,
+        "a closed record is 796"
+    );
+    for status in [
+        result::STATUS_FINAL,
+        result::STATUS_REFUTED,
+        result::STATUS_SETTLED,
+    ] {
+        let mut settled = good_res.clone();
+        settled[6] = status;
+        assert_eq!(
+            custom(
+                send_fresh_with_account_override(
+                    &mut f.ctx,
+                    &f.signer,
+                    f.program,
+                    resolve_data(&descriptor),
+                    base.clone(),
+                    dcr2,
+                    owned(&f.program, settled),
+                )
+                .await
+            ),
+            RESULT_STATE,
+            "a record at status {status} is 796"
+        );
+    }
+    let mut partial = good_res.clone();
+    partial.truncate(partial.len() - 1);
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, partial),
+            )
+            .await
+        ),
+        RESULT_STATE,
+        "a half-grown record is 796"
+    );
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                vec![
+                    AccountMeta::new_readonly(dcm2, false),
+                    AccountMeta::new_readonly(dcr2, false)
+                ],
+                dcr2,
+                owned(&f.program, good_res.clone()),
+            )
+            .await
+        ),
+        CL_MALFORMED,
+        "a read-only DCR2 is 580 at view_v8"
+    );
+
+    // **The data and the account list are the frozen ones**: 33 bytes, two
+    // accounts, and the descriptor.
+    assert_eq!(resolve_data(&descriptor).len(), 33);
+    let mut long_data = resolve_data(&descriptor);
+    long_data.push(0);
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, long_data, base.clone()).await,
+        CL_MALFORMED,
+        "34 bytes is 580"
+    );
+    let mut wrong = resolve_data(&descriptor);
+    wrong[1] ^= 1;
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, wrong, base.clone()).await,
+        CL_MALFORMED,
+        "a wrong descriptor is 580"
+    );
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, vec![TAG_RESOLVE_RESULT], base.clone()).await,
+        CL_MALFORMED,
+        "an empty data buffer is 580"
+    );
+    let one = base[0].clone();
+    let two = base[1].clone();
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), vec![one.clone()]).await,
+        CL_MALFORMED,
+        "one account is 580"
+    );
+    assert_eq!(
+        refused_resolve(
+            &mut f,
+            dcr2,
+            resolve_data(&descriptor),
+            vec![one.clone(), two.clone(), two.clone()]
+        )
+        .await,
+        CL_MALFORMED,
+        "three accounts is 580"
+    );
+    // And the untouched record resolves FINAL, which is what makes every 796
+    // and 580 above a refusal of a resolvable document.
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        base,
+    )
+    .await
+    .expect("the honest record resolves");
+    assert_eq!(f.account(dcr2).await[6], result::STATUS_FINAL);
+}
+
+/// **The skip the close needs, over real accounts.** A document that a separate
+/// `ResolveResultV5` has already resolved FINAL is **not re-evaluated** by the
+/// clause: the status is FINAL, so `resolve_check` answers `AlreadyFinal`
+/// without reading a cell — including on a record whose cells have *since* been
+/// made inconsistent, which is the strongest form of the claim.
+///
+/// The same record, taken back to PENDING, is convicted by the identical
+/// clause, so the skip is the skip and not a weaker test.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_resolve_skips_a_record_that_is_already_final() {
+    let Some(mut f) = build().await else { return };
+    f.terms_raw = f.terms_window(1);
+    let first = 29u32;
+    let binding = f.binding_stop(first, 50, STOP_PLUS_ONE);
+    let (n, l) = (33u32, 3u32);
+    let tokens = vec![(l - 1, STOP_PLUS_ONE - 1)];
+    let (descriptor, created, _) = attest_all(&mut f, &binding, n, &tokens, 41).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    past_deadline(&mut f, c.dcm2).await;
+    let metas = f.resolve_metas(&c);
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        metas.clone(),
+    )
+    .await
+    .expect("the honest resolve");
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_FINAL);
+
+    // The clause, read straight off the landed record, says `AlreadyFinal`.
+    let res = f.account(created[3]).await;
+    let b = Binding2::decode(
+        &f.account(created[0]).await
+            [document::BINDING_AT_V8..document::BINDING_AT_V8 + BINDING_BYTES_V8],
+    )
+    .unwrap();
+    assert_eq!(
+        result::resolve_check(&b, n, u32_at(&res, 196), u32_at(&res, 204), res[6], &res),
+        Ok(result::Verdict::AlreadyFinal)
+    );
+
+    // Now break the record in the way that would convict it, and ask again.
+    // The handler refuses a non-PENDING record with 796, so the claim under
+    // test is the **clause's**, which is what the close calls.
+    let mut broken = res.clone();
+    broken[result::HEADER_V6 + 8..result::HEADER_V6 + 16]
+        .copy_from_slice(&(STOP_PLUS_ONE as u64 - 1).to_le_bytes());
+    assert_eq!(
+        result::resolve_check(
+            &b,
+            n,
+            u32_at(&broken, 196),
+            u32_at(&broken, 204),
+            broken[6],
+            &broken
+        ),
+        Ok(result::Verdict::AlreadyFinal),
+        "the skip reads nothing, so a broken cell does not matter"
+    );
+    let mut pending = broken.clone();
+    pending[6] = result::STATUS_PENDING;
+    assert_eq!(
+        result::resolve_check(
+            &b,
+            n,
+            u32_at(&pending, 196),
+            u32_at(&pending, 204),
+            pending[6],
+            &pending
+        ),
+        Ok(result::Verdict::Violated),
+        "the same bytes, PENDING, are convicted"
+    );
+    // And the handler still refuses the already-FINAL record, so nothing here
+    // opens a second status write.
+    f.ctx
+        .set_account(&c.dcr2, &shared(owned(&f.program, broken)));
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                metas
+            )
+            .await
+        ),
+        RESULT_STATE,
+        "a second resolve of a FINAL record is 796"
+    );
+}
+
+/// **The resolve at the capacity ceiling, `L = 10,240`, measured.** This is the
+/// number §9.10's C1 Medium asks for: at `L = 10,240` the close pays the whole
+/// of `ResolveResultV5` on top of its own work, and a fully attested document
+/// that can never close has no exit at all (row 3 does not apply to it, because
+/// row 3 is `outputs_attested < L`).
+///
+/// The record is **crafted**, and labelled: the honest attest of 10,240 outputs
+/// is 10,240 transactions and 10,240 re-keyed proofs, which is not this slice.
+/// Everything the resolve reads is the program's own and is the value the attest
+/// would have left — `count = L = 10,240`, 16-byte cells, all `10,240` bitmap
+/// bits, `outputs_attested = 10,240`, and a DRB1 v2 with `first = 29` and
+/// `stop_plus_one` declared. `L = count`, so clause 2's escape applies and the
+/// honest answer is FINAL; clause 1 still scans the whole `[0, L-1)`, which is
+/// the term the arithmetic below is about.
+///
+/// **The CU this test reports has a run-to-run band, and only its differences
+/// are stable.** One instruction is the first in its bank, so it pays the
+/// program load, the account-data serialization and the blockhash work, and
+/// those move with machine load: four runs of one image gave the `L = 10,240`
+/// row as 235,333 / 238,333 / 233,833 / 236,833 CU. The **same-record** rows are
+/// the measurement — one 165,536-byte record, one bitmap, only `L` varying — and
+/// the clause's two terms come out of them exactly: **20.378 CU per 16-byte cell
+/// compared** in all eight quotients, and **227,916 CU** for the whole clause at
+/// the ceiling in all four runs. The `L = 1` and `L = 5,120` rows are there to
+/// make that isolation possible, and the last row is the skip on the same
+/// record. Design note §9.12 has the four runs and the arithmetic.
+///
+/// `send_fresh` prints the CU with the mode it was measured in, so the same test
+/// is the native figure and — under `BASANOS_DCG_V8_SBF=1` with `BPF_OUT_DIR`
+/// naming an SBF image — the SBF one.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_resolve_cu_at_l_10240() {
+    let Some(mut f) = build().await else { return };
+    f.terms_raw = f.terms_window(1);
+    let first = 29u32;
+    // Two families of cases, because a single instruction is the first in its
+    // bank and so pays the program load and the account serialization: only a
+    // **same-record** pair isolates the clause. `(1, 10240)` and `(10240,
+    // 10240)` share one 165,536-byte record, so the difference between them is
+    // the stop-rule scan and nothing else. The smaller counts sweep the bitmap
+    // term. The last case is the **already-FINAL skip** on the same record: the
+    // figure a close pays when a separate `ResolveResultV5` has already run.
+    for (l, count) in [
+        (1u32, 1u32),
+        (1, 10),
+        (1, 100),
+        (1, 1_000),
+        (1, 10_240),
+        (5_120, 10_240),
+        (10_240, 10_240),
+    ] {
+        let binding = f.binding_stop(first, count, STOP_PLUS_ONE);
+        // `L = n - 1 - first`, so `n` is the document's own length.
+        let n = first + l + 1;
+        assert_eq!(binding.output_span(n), l, "L = n - 1 - first");
+        let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+        // A DCM2 v7 with the fields the resolve reads: flag 2, `n` at 84, no
+        // open challenge at 128, and a `dispute_deadline` of 0 so the clock is
+        // past it without a warp.
+        let terms = Terms2::decode(&f.terms_raw).unwrap();
+        let doc = dcm2_v7(
+            &f.program,
+            &descriptor,
+            &f.executor.pubkey().to_bytes(),
+            f.k,
+            n,
+            FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
+            &f.terms_raw,
+            &binding.encode(),
+            &f.pt2s.to_bytes(),
+            &f.pt2s_sha,
+            &f.dea2.to_bytes(),
+            &f.drp2.to_bytes(),
+            &f.reg_root,
+            16,
+            0,
+            0,
+        );
+        let dcm2 = address::document(&f.program, &descriptor).0;
+        let dcr2 = address::result(&f.program, &descriptor).0;
+        f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
+        // The DCR2 v6 as `attest_v8` would have left it: `L` cells, `L` bits,
+        // and the counter. The trailing cells of `[L, count)` stay zero, which
+        // is the consumer's invariant and is asserted below.
+        let mut res = dcr2_v6(&f.program, &descriptor, &binding, &terms);
+        assert_eq!(res.len(), result::bytes_v8(count, 16).unwrap());
+        let bitmap_at = result::HEADER_V6 + count as usize * 16;
+        for i in 0..l as usize {
+            let at = result::HEADER_V6 + i * 16;
+            res[at..at + 8].copy_from_slice(&(-1i64).to_le_bytes());
+            // **The declared stop value at `L-1` and nowhere else**, so the
+            // document is honest: with `L < count` clause 2 wants it there, and
+            // with `L = count` clause 2 is escaped and it makes no difference.
+            let token = if i == l as usize - 1 {
+                STOP_PLUS_ONE as u64 - 1
+            } else {
+                0x_00ff_fffe
+            };
+            res[at + 8..at + 16].copy_from_slice(&token.to_le_bytes());
+            res[bitmap_at + i / 8] |= 1 << (i % 8);
+        }
+        res[204..208].copy_from_slice(&l.to_le_bytes());
+        f.ctx.set_account(&dcr2, &shared(owned(&f.program, res)));
+        let read = f.account(dcr2).await;
+        for i in l as usize..count as usize {
+            assert!(
+                read[result::HEADER_V6 + i * 16..result::HEADER_V6 + (i + 1) * 16]
+                    .iter()
+                    .all(|b| *b == 0),
+                "the trailing cell {i} of [L, count) is zero"
+            );
+        }
+        let clock = f
+            .ctx
+            .banks_client
+            .get_sysvar::<solana_program::clock::Clock>()
+            .await
+            .unwrap()
+            .slot;
+        assert!(clock > 0, "past the deadline of 0");
+        let before = read.len();
+        send_fresh(
+            &mut f.ctx,
+            &f.signer,
+            f.program,
+            resolve_data(&descriptor),
+            pair(dcm2, dcr2),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("resolve at L = {l}, count = {count}: {e:?}"));
+        let after = f.account(dcr2).await;
+        assert_eq!(
+            after[6],
+            result::STATUS_FINAL,
+            "L = {l} at count = {count} is FINAL"
+        );
+        assert_eq!(after.len(), before, "the record did not change size");
+        eprintln!(
+            "RESOLVE-CU L={l} count={count} width=16 record={before} cells={} bitmap={} skip=false",
+            count as usize * 16,
+            count.div_ceil(8)
+        );
+    }
+    // **A record that is already FINAL, re-sent: the cost of a resolve the
+    // handler REFUSES.** The handler's first test is "not PENDING", so this
+    // instruction stops with 796 **before `resolve_check` runs at all** -- the
+    // figure below is a refused resolve on the same 165,536-byte record, *not* a
+    // measurement of the clause's `AlreadyFinal` skip. The clause's own answer on
+    // these bytes is asserted immediately afterwards by calling `resolve_check`
+    // directly (it is `AlreadyFinal`, on one compare, with no cell and no bitmap
+    // byte read), and **the skip's cost inside a close is still unmeasured**:
+    // pricing it needs a close, which is stream C4's slice. Design note §9.12
+    // carries the correction and what it does and does not move.
+    let (l, count) = (10_240u32, 10_240u32);
+    let binding = f.binding_stop(first, count, STOP_PLUS_ONE);
+    let n = first + l + 1;
+    let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+    let terms = Terms2::decode(&f.terms_raw).unwrap();
+    let doc = dcm2_v7(
+        &f.program,
+        &descriptor,
+        &f.executor.pubkey().to_bytes(),
+        f.k,
+        n,
+        FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
+        &f.terms_raw,
+        &binding.encode(),
+        &f.pt2s.to_bytes(),
+        &f.pt2s_sha,
+        &f.dea2.to_bytes(),
+        &f.drp2.to_bytes(),
+        &f.reg_root,
+        16,
+        0,
+        0,
+    );
+    let dcm2 = address::document(&f.program, &descriptor).0;
+    let dcr2 = address::result(&f.program, &descriptor).0;
+    f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
+    let mut res = dcr2_v6(&f.program, &descriptor, &binding, &terms);
+    let bitmap_at = result::HEADER_V6 + count as usize * 16;
+    for i in 0..l as usize {
+        let at = result::HEADER_V6 + i * 16;
+        res[at + 8..at + 16].copy_from_slice(&(STOP_PLUS_ONE as u64 - 1).to_le_bytes());
+        res[bitmap_at + i / 8] |= 1 << (i % 8);
+    }
+    res[204..208].copy_from_slice(&l.to_le_bytes());
+    res[6] = result::STATUS_FINAL;
+    f.ctx.set_account(&dcr2, &shared(owned(&f.program, res)));
+    let before = f.account(dcr2).await;
+    // The handler refuses a non-PENDING record with 796, which is correct, so
+    // **the figure above is that refusal** and the clause's verdict is read off
+    // the same bytes by calling it directly, which is the assertion below.
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                pair(dcm2, dcr2)
+            )
+            .await
+        ),
+        RESULT_STATE,
+        "a FINAL record is not re-resolved"
+    );
+    let raw = f.account(dcr2).await;
+    assert_eq!(
+        result::resolve_check(&binding, n, count, l, raw[6], &raw),
+        Ok(result::Verdict::AlreadyFinal)
+    );
+    eprintln!(
+        "RESOLVE-CU L={l} count={count} width=16 record={} cells={} bitmap={} skip=true",
+        before.len(),
+        count as usize * 16,
+        count.div_ceil(8)
+    );
+}
+
+// ============================ tag 176 and tag 172: the seal's new work and the close
+
+/// The four new refusals this slice answers, and the three that are new codes
+/// on an old instruction.
+const CL_CLOSE: u32 = 599;
+const CAUSE_CONVICTION: u8 = 4;
+const CAUSE_WITHHELD: u8 = 5;
+const REGISTRY_ACCOUNT: u32 = 770;
+/// The revision-8 seal's actions, as this file drives them.
+const SEAL_REVOKED: u8 = 2;
+const SEAL_RETIRED: u8 = 3;
+
+fn close_data(descriptor: &[u8; 32]) -> Vec<u8> {
+    let mut out = vec![TAG_CLOSE_DOCUMENT];
+    out.extend_from_slice(descriptor);
+    out
+}
+
+macro_rules! refused_here {
+    ($f:ident, $data:expr, $metas:expr, $want:expr) => {
+        match send_fresh(&mut $f.ctx, &$f.signer, $f.program, $data, $metas).await {
+            Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => {
+                assert_eq!(code, $want, "the wrong refusal code")
+            }
+            other => panic!("expected a custom refusal at {}, got {other:?}", line!()),
+        }
+    };
+}
+
+/// tag 172's **42-byte action-1** seal data, the five limits in the order
+/// DTU1 stores them.
+fn seal_data(action: u8, limits: &TemplateLimits) -> Vec<u8> {
+    let mut out = vec![TAG_TEMPLATE_SEAL, action];
+    if action == config::SEAL_APPROVED {
+        out.extend_from_slice(&limits.encode());
+        assert_eq!(out.len(), config::SEAL_DATA_APPROVE);
+    } else {
+        assert_eq!(out.len(), config::SEAL_DATA_ADMIN);
+    }
+    out
+}
+
+impl Fix {
+    /// A tiny sealed PT2S used only to derive a different DTU1 address in a
+    /// malformed-close case. It never passes a protocol handler.
+    fn sealed_pt2s(
+        &self,
+        routes: &Pubkey,
+        payloads: &Pubkey,
+        capacity: u32,
+        width: u8,
+    ) -> (Pubkey, Vec<u8>) {
+        let mut image = vec![0u8; S::OFF_PWR1];
+        image[..4].copy_from_slice(S::MAGIC);
+        image[S::OFF_STATE] = S::STATE_SEALED;
+        image[S::OFF_AUTHORITY..S::OFF_AUTHORITY + 32]
+            .copy_from_slice(self.executor.pubkey().as_ref());
+        for (i, key) in [routes, &self.geometry, payloads].into_iter().enumerate() {
+            image[S::OFF_KEYS + 32 * i..S::OFF_KEYS + 32 * (i + 1)].copy_from_slice(key.as_ref());
+        }
+        image[S::OFF_CLAUSE12..S::OFF_CLAUSE12 + 43]
+            .copy_from_slice(&crate::pt2p::encode_clause12_v4(capacity, 7, &[3u8; 32]));
+        image[S::OFF_PT1S..S::OFF_PT1S + 32].copy_from_slice(self.pt1s_index.as_ref());
+        image[S::OFF_LOCATOR..S::OFF_LOCATOR + 4].copy_from_slice(&28_037u32.to_le_bytes());
+        image[S::OFF_LOCATOR + 5] = width;
+        (Pubkey::new_unique(), image)
+    }
+
+    /// The DFS2 the close checks (`owner`, derived key, writable) and nothing
+    /// else: the close reads no family table. The honest image is built anyway,
+    /// from the fixture's own body.
+    async fn install_dfs2(&mut self, c: &Crafted) {
+        let key = address::family_slots(&self.program, &c.descriptor).0;
+        let mut fam = vec![0u8; document::DFS2_HEADER];
+        fam[..4].copy_from_slice(b"DFS2");
+        fam[4..6].copy_from_slice(&1u16.to_le_bytes());
+        fam[8..40].copy_from_slice(&c.descriptor);
+        fam[40..42].copy_from_slice(&16u16.to_le_bytes());
+        fam[42] = 7;
+        fam[44..48].copy_from_slice(&(self.family_body.len() as u32).to_le_bytes());
+        fam.extend_from_slice(&self.family_body);
+        self.ctx
+            .set_account(&key, &shared(owned(&self.program, fam)));
+    }
+
+    /// tag 172's nine metas under the **CUSTOM** kind: the two kind-dependent
+    /// metas are the bond escrow and the system program, and the payer is DCM2
+    /// 40..72 (the fixture's executor, which is also the init signer).
+    fn close_metas(&self, c: &Crafted, signer: Pubkey) -> Vec<AccountMeta> {
+        let escrow = address::bond_escrow(&self.program, &c.descriptor).0;
+        self.close_metas_slots(
+            c,
+            signer,
+            AccountMeta::new(escrow, false),
+            AccountMeta::new_readonly(SYSTEM, false),
+        )
+    }
+
+    /// tag 172's nine metas with the two kind-dependent slots given as whole
+    /// `AccountMeta`s, because **their writability differs by kind**: under
+    /// CUSTOM the tail is the system program (read-only) and under STANDARD it
+    /// is the remainder destination (writable), and a read-only destination is
+    /// refused 580 by the credit rule; a read-only CUSTOM escrow is 798.
+    fn close_metas_slots(
+        &self,
+        c: &Crafted,
+        signer: Pubkey,
+        aux: AccountMeta,
+        tail: AccountMeta,
+    ) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new(signer, true),
+            AccountMeta::new(c.dcm2, false),
+            AccountMeta::new(c.dpr2, false),
+            AccountMeta::new(address::family_slots(&self.program, &c.descriptor).0, false),
+            AccountMeta::new(c.dcr2, false),
+            AccountMeta::new(self.executor.pubkey(), false),
+            AccountMeta::new(self.dtu1, false),
+            aux,
+            tail,
+            AccountMeta::new(incinerator::ID, false),
+        ]
+    }
+
+    async fn lamports(&mut self, key: Pubkey) -> u64 {
+        self.ctx
+            .banks_client
+            .get_account(key)
+            .await
+            .unwrap()
+            .map(|a| a.lamports)
+            .unwrap_or(0)
+    }
+}
+
+/// Set the bank clock to an explicit slot, the way [`past_deadline`] sets it to
+/// a computed one. The clock is a sysvar, so this moves it with no root and the
+/// program's own `Clock::get()` sees it.
+async fn clock_to(f: &mut Fix, slot: u64) -> u64 {
+    let mut clock = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap();
+    if clock.slot != slot {
+        clock.slot = slot;
+        f.ctx.set_sysvar(&clock);
+    }
+    f.ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot
+}
+
+/// A crafted document with the pot **funded on top of the rent**, which is the
+/// shape `UnifiedInit` leaves (it transfers `executor_bond_lamports` over the
+/// rent-exempt minimum), plus its DFS2.
+async fn closable(
+    f: &mut Fix,
+    binding: &Binding2,
+    n: u32,
+    roots: &[[u8; 32]],
+    variant: u8,
+) -> Crafted {
+    let binding = Binding2 {
+        request_id: [variant; 32],
+        ..*binding
+    };
+    let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+    let c = f.craft(&binding, n, roots, 0, descriptor).await;
+    let pot = Terms2::decode(&f.terms_raw).unwrap().executor_bond_lamports;
+    let doc = f.account(c.dcm2).await;
+    f.ctx.set_account(
+        &c.dcm2,
+        &shared(Account {
+            lamports: (128 + doc.len() as u64) * 6_960 + pot + 7,
+            data: doc,
+            owner: f.program,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+    f.install_dfs2(&c).await;
+    // A real `UnifiedInit` incremented the counter and no real close has run, so
+    // a crafted document a close can act on is at one, not zero.
+    let mut use_record = f.account(f.dtu1).await;
+    use_record[8..12].copy_from_slice(&1u32.to_le_bytes());
+    f.ctx
+        .set_account(&f.dtu1, &shared(owned(&f.program, use_record)));
+    c
+}
+
+/// **The four honest closes, one per row of §1.3's table, each signed by a
+/// stranger** — the fixture's second keypair, which is not the executor, not the
+/// payer and not the template's authority. Every one of them pays the **recorded
+/// payer** (DCM2 40..72) and not the closer, drops `DTU1.documents` by one, and
+/// leaves DCR2 `document_closed = 1` with the retention clock started.
+///
+/// | row | document | status written | bond |
+/// |---|---|---|---|
+/// | 1 | finalized, the FINAL condition met | `SETTLED` (3) | returned |
+/// | 1 | finalized, the stop rule violated | `REFUTED` (2) | the policy, `cause = 4` |
+/// | 2 | unfinalized, past `abandon_deadline` | unchanged (`PENDING`) | returned |
+/// | 3 | finalized, `outputs_attested < L` | **`WITHHELD` (4)** | the policy, `cause = 5` |
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_close_pays_the_payer_and_drops_the_counter_on_every_row() {
+    let Some(mut f) = build().await else { return };
+    let stranger = f.signer.pubkey();
+    let payer = f.executor.pubkey();
+    let first = 29u32;
+    let binding = f.binding_stop(first, 50, STOP_PLUS_ONE);
+    // --- Row 1, the FINAL condition met. A real document: real init, land,
+    // finalize and three real attestations, with the stop token at `L-1` and
+    // nowhere before it.
+    let tokens: Vec<(u32, u32)> = vec![(2, STOP_PLUS_ONE - 1)];
+    let (descriptor, created, _) = attest_all(&mut f, &binding, 33, &tokens, 61).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    f.install_dfs2(&c).await;
+    assert_eq!(
+        u32_at(&f.account(f.dtu1).await, 8),
+        1,
+        "the real init incremented the counter"
+    );
+    let slot = past_deadline(&mut f, c.dcm2).await;
+    let before = f.lamports(payer).await;
+    let in_three = f.lamports(c.dcm2).await
+        + f.lamports(c.dpr2).await
+        + f.lamports(address::family_slots(&f.program, &descriptor).0)
+            .await;
+    let metas = f.close_metas(&c, stranger);
+    label("row1-settled-check");
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&descriptor),
+        metas.clone(),
+    )
+    .await
+    .expect("row 1: a stranger closes an honest FINAL document");
+    let dcr2 = f.account(c.dcr2).await;
+    assert_eq!(dcr2[6], result::STATUS_SETTLED, "row 1 writes SETTLED");
+    assert_eq!(dcr2[7], 1, "document_closed");
+    assert_eq!(
+        u64_at(&dcr2, result::RETENTION_START_AT_V6),
+        slot,
+        "retention_start := now"
+    );
+    assert_eq!(
+        u64_at(&dcr2, result::RETENTION_DEADLINE_AT_V6),
+        slot + 2_592_000
+    );
+    assert_eq!(
+        dcr2[result::WINNER_AT_V6..result::WINNER_AT_V6 + 32],
+        [0u8; 32],
+        "no winner"
+    );
+    assert_eq!(
+        dcr2[result::BOND_STATE_AT_V6],
+        BOND_RETURNED,
+        "a SETTLED close returns the bond"
+    );
+    assert_eq!(
+        dcr2[result::BOND_CAUSE_AT_V6],
+        0,
+        "and the policy did not run"
+    );
+    assert_eq!(
+        u32_at(&f.account(f.dtu1).await, 8),
+        0,
+        "DTU1.documents fell by one"
+    );
+    assert_eq!(
+        f.lamports(payer).await,
+        before + in_three,
+        "every lamport of DCM2, DPR2 and DFS2 came back to the payer"
+    );
+    assert!(
+        f.ctx
+            .banks_client
+            .get_account(address::bond_escrow(&f.program, &descriptor).0)
+            .await
+            .unwrap()
+            .is_none(),
+        "a SETTLED close creates no escrow"
+    );
+    assert!(
+        f.ctx
+            .banks_client
+            .get_account(c.dcm2)
+            .await
+            .unwrap()
+            .is_none(),
+        "DCM2 was drained to zero and the runtime removed it"
+    );
+    // A second close is 599 on the surviving DCR2, whatever else is gone -- and
+    // DCM2 *is* gone, which is why this one cannot compare the records before
+    // and after: the whole instruction refuses before it reads anything.
+    let metas = f.close_metas(&c, stranger);
+    refused_here!(f, close_data(&descriptor), metas, CL_CLOSE);
+
+    // --- Row 1, the stop rule violated by clause 1: the stop value inside
+    // `[0, L-2)`. The close convicts in its own transaction, and the observable
+    // record of that is DCR2's status and the escrow.
+    let tokens: Vec<(u32, u32)> = vec![(0, STOP_PLUS_ONE - 1)];
+    let (descriptor, created, _) = attest_all(&mut f, &binding, 33, &tokens, 63).await;
+    let c2 = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    f.install_dfs2(&c2).await;
+    let slot = past_deadline(&mut f, c2.dcm2).await;
+    let payer_before = f.lamports(payer).await;
+    let in_three = f.lamports(c2.dcm2).await
+        + f.lamports(c2.dpr2).await
+        + f.lamports(address::family_slots(&f.program, &c2.descriptor).0)
+            .await;
+    let metas = f.close_metas(&c2, stranger);
+    label("row1-convicted-escrow");
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&descriptor),
+        metas,
+    )
+    .await
+    .expect("row 1: the close convicts a stop-rule violation");
+    let dcr2 = f.account(c2.dcr2).await;
+    assert_eq!(
+        dcr2[6],
+        result::STATUS_REFUTED,
+        "a violation convicts inside the close"
+    );
+    assert_eq!(
+        dcr2[result::BOND_STATE_AT_V6],
+        document::BOND_ESCROWED,
+        "the pot is escrowed"
+    );
+    assert_eq!(
+        dcr2[result::BOND_CAUSE_AT_V6],
+        CAUSE_CONVICTION,
+        "cause 4, a conviction"
+    );
+    assert_eq!(u64_at(&dcr2, result::RETENTION_START_AT_V6), slot);
+    let pot = Terms2::decode(&f.terms_raw).unwrap().executor_bond_lamports;
+    let escrow = address::bond_escrow(&f.program, &descriptor).0;
+    assert_eq!(
+        f.lamports(escrow).await,
+        pot,
+        "the whole pot arrived in the escrow"
+    );
+    assert_eq!(
+        f.lamports(payer).await,
+        payer_before + in_three - pot,
+        "the payer received the rent and not one lamport of the pot"
+    );
+    assert_eq!(u32_at(&f.account(f.dtu1).await, 8), 0);
+
+    // --- Row 2: unfinalized and past its own production deadline. The status is
+    // left exactly as revision 7 leaves it, and the bond returns.
+    let roots = f.position_roots[..33].to_vec();
+    let c3 = {
+        let b = f.binding_stop(first, 50, STOP_PLUS_ONE);
+        closable(&mut f, &b, 33, &roots, 64).await
+    };
+    clock_to(&mut f, 6_000_000).await;
+    let payer_before = f.lamports(payer).await;
+    let in_three = f.lamports(c3.dcm2).await
+        + f.lamports(c3.dpr2).await
+        + f.lamports(address::family_slots(&f.program, &c3.descriptor).0)
+            .await;
+    let metas = f.close_metas(&c3, stranger);
+    label("row2-unfinalized-returned");
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&c3.descriptor),
+        metas,
+    )
+    .await
+    .expect("row 2: anyone closes an abandoned document");
+    let dcr2 = f.account(c3.dcr2).await;
+    assert_eq!(
+        dcr2[6],
+        result::STATUS_PENDING,
+        "row 2 leaves the status alone"
+    );
+    assert_eq!(dcr2[7], 1);
+    assert_eq!(
+        dcr2[result::BOND_STATE_AT_V6],
+        BOND_RETURNED,
+        "N10: the bond returns"
+    );
+    assert_eq!(dcr2[result::BOND_CAUSE_AT_V6], 0);
+    assert_eq!(
+        f.lamports(payer).await,
+        payer_before + in_three,
+        "every lamport came back"
+    );
+    assert_eq!(u32_at(&f.account(f.dtu1).await, 8), 0);
+
+    // --- Row 3: finalized, unrefuted, and never fully attested. `WITHHELD`,
+    // the policy, and cause 5.
+    let c4 = {
+        let b = f.binding_stop(first, 50, STOP_PLUS_ONE);
+        closable(&mut f, &b, 33, &roots, 65).await
+    };
+    let mut doc = f.account(c4.dcm2).await;
+    doc[6..8]
+        .copy_from_slice(&(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL).to_le_bytes());
+    {
+        let lamports = f.lamports(c4.dcm2).await;
+        f.ctx.set_account(
+            &c4.dcm2,
+            &shared(Account {
+                lamports,
+                data: doc,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    clock_to(&mut f, 6_000_001).await;
+    let payer_before = f.lamports(payer).await;
+    let in_three = f.lamports(c4.dcm2).await
+        + f.lamports(c4.dpr2).await
+        + f.lamports(address::family_slots(&f.program, &c4.descriptor).0)
+            .await;
+    let metas = f.close_metas(&c4, stranger);
+    label("row3-withheld-escrow");
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&c4.descriptor),
+        metas.clone(),
+    )
+    .await
+    .expect("row 3: a withheld document is closable");
+    let dcr2 = f.account(c4.dcr2).await;
+    assert_eq!(
+        dcr2[6],
+        result::STATUS_WITHHELD,
+        "row 3 writes WITHHELD, never SETTLED"
+    );
+    assert_eq!(dcr2[result::BOND_STATE_AT_V6], document::BOND_ESCROWED);
+    assert_eq!(
+        dcr2[result::BOND_CAUSE_AT_V6],
+        CAUSE_WITHHELD,
+        "cause 5, a withholding"
+    );
+    assert_eq!(
+        dcr2[result::WINNER_AT_V6..result::WINNER_AT_V6 + 32],
+        [0u8; 32],
+        "a document nobody attested was never convicted"
+    );
+    let pot = Terms2::decode(&f.terms_raw).unwrap().executor_bond_lamports;
+    assert_eq!(
+        f.lamports(address::bond_escrow(&f.program, &c4.descriptor).0)
+            .await,
+        pot
+    );
+    assert_eq!(
+        f.lamports(payer).await,
+        payer_before + in_three - pot,
+        "the pot does not reach the payer"
+    );
+    assert_eq!(u32_at(&f.account(f.dtu1).await, 8), 0);
+    refused_here!(f, close_data(&c4.descriptor), metas, CL_CLOSE);
+}
+
+/// One instruction sent with explicit metas, returning the custom code it
+/// refused with. The file's other `refusal` helper renders a `ProgramError` by
+/// name, which is what tag 145 needs and what a `Custom(_)` does not.
+async fn refused_with(f: &mut Fix, data: Vec<u8>, metas: Vec<AccountMeta>) -> u32 {
+    match send_fresh(&mut f.ctx, &f.signer, f.program, data, metas).await {
+        Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => code,
+        other => panic!("expected a custom refusal, got {other:?}"),
+    }
+}
+
+/// The same, with the expectation in the message, so a failure names the case
+/// (the panic carries the callee's line, which is not the call's).
+async fn refused_as(f: &mut Fix, data: Vec<u8>, metas: Vec<AccountMeta>, want: u32) {
+    match send_fresh(&mut f.ctx, &f.signer, f.program, data, metas).await {
+        Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => {
+            assert_eq!(code, want, "the wrong refusal code")
+        }
+        other => panic!("expected a custom refusal, got {other:?}"),
+    }
+}
+
+/// One close sent against a crafted document, returning the code it refused
+/// with. **A refused close must write nothing**, so the two records the close
+/// touches are compared before and after.
+async fn refused_close(f: &mut Fix, c: &Crafted, signer: Pubkey, variant: u8) -> u32 {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let _ = variant;
+    let (dcm2_before, dcr2_before, dtu1_before) = (
+        f.account(c.dcm2).await,
+        f.account(c.dcr2).await,
+        f.account(f.dtu1).await,
+    );
+    let metas = f.close_metas(c, signer);
+    let code = match send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&c.descriptor),
+        metas,
+    )
+    .await
+    {
+        Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => code,
+        other => panic!("refusal #{seq}: expected a custom refusal, got {other:?}"),
+    };
+    assert_eq!(
+        dcm2_before,
+        f.account(c.dcm2).await,
+        "refusal #{seq}: DCM2 is untouched"
+    );
+    assert_eq!(
+        dcr2_before,
+        f.account(c.dcr2).await,
+        "refusal #{seq}: DCR2 is untouched"
+    );
+    assert_eq!(
+        dtu1_before,
+        f.account(f.dtu1).await,
+        "refusal #{seq}: the counter is untouched"
+    );
+    code
+}
+
+/// **The skip, and what it is worth.** A record that a real
+/// `ResolveResultV5` has already made FINAL is closed with one output's cell
+/// rewritten into a *violation* — which a re-evaluation would convict. The close
+/// writes `SETTLED` anyway, because the clause's first statement is
+/// `status == FINAL ⇒ AlreadyFinal` and no cell is read (spec §1.3 (iv)).
+///
+/// The comparison the clause's soundness rests on, stated as the test states it:
+/// `L` is a function of `n` and of the DRB1 v2 block, finalize is refused 592
+/// after flag 2 is set, and an attest only sets bits below `L` — so a record
+/// that reached FINAL cannot stop satisfying the condition.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_close_skips_a_record_that_is_already_final() {
+    let Some(mut f) = build().await else { return };
+    f.terms_raw = f.terms_window(1);
+    let binding = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let tokens: Vec<(u32, u32)> = vec![(2, STOP_PLUS_ONE - 1)];
+    let (descriptor, created, _) = attest_all(&mut f, &binding, 33, &tokens, 71).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    f.install_dfs2(&c).await;
+    // A real resolve first: the challenger's route, and the only thing that
+    // writes `status = 1`.
+    let slot = past_deadline(&mut f, c.dcm2).await;
+    let metas = f.resolve_metas(&c);
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        metas,
+    )
+    .await
+    .expect("resolve");
+    assert_eq!(f.account(c.dcr2).await[6], result::STATUS_FINAL);
+    // Now forge a violation into an **attested** cell: output 0 becomes the stop
+    // value, which is clause 1 (a stop value in `[0, L-2)` = `[0, 2)`).
+    let mut dcr2 = f.account(c.dcr2).await;
+    let cell = result::HEADER_V6;
+    dcr2[cell + 8..cell + 16].copy_from_slice(&((STOP_PLUS_ONE - 1) as u64).to_le_bytes());
+    {
+        let lamports = f.lamports(c.dcr2).await;
+        f.ctx.set_account(
+            &c.dcr2,
+            &shared(Account {
+                lamports,
+                data: dcr2.clone(),
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    // Without the skip this record convicts, which is the control: the same
+    // clause over the same fields on a PENDING status.
+    assert_eq!(
+        result::resolve_check(&binding, 33, 50, 3, result::STATUS_PENDING, &dcr2),
+        Ok(result::Verdict::Violated),
+        "the control: a PENDING record with this cell convicts"
+    );
+    assert_eq!(
+        result::resolve_check(&binding, 33, 50, 3, result::STATUS_FINAL, &dcr2),
+        Ok(result::Verdict::AlreadyFinal),
+        "and a FINAL one does not look at the cell"
+    );
+    let payer = f.executor.pubkey();
+    let before = f.lamports(payer).await;
+    let metas = f.close_metas(&c, f.signer.pubkey());
+    label("row1-skip");
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&descriptor),
+        metas,
+    )
+    .await
+    .expect("the close of a FINAL record");
+    let after = f.account(c.dcr2).await;
+    assert_eq!(
+        after[6],
+        result::STATUS_SETTLED,
+        "the skip, and SETTLED for a FINAL record"
+    );
+    assert_eq!(after[7], 1);
+    assert_eq!(after[result::BOND_STATE_AT_V6], BOND_RETURNED);
+    assert_eq!(u64_at(&after, result::RETENTION_START_AT_V6), slot);
+    assert!(f.lamports(payer).await > before, "the rent came back");
+    eprintln!("CLOSE-CU skip=true status=final");
+}
+
+/// **The STANDARD split, the credit rule's skip arm, and no escrow at all.**
+///
+/// The document is CUSTOM in every other test in this file, so the built-in
+/// route would otherwise be unexercised. Here the terms are STANDARD with a
+/// 1 basis-point slasher share and a recorded winner, and the two destinations are chosen
+/// so that **one credit is payable and one is skipped**: the remainder
+/// destination is pre-funded to the 0-byte rent-exempt minimum, and the winner
+/// destination does not exist, so its 50,000-lamport share is below
+/// `minimum_balance(0) = 890,880` and the credit rule skips it. The skipped
+/// share joins the remainder payment.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_close_splits_a_standard_pot_and_skips_a_sub_floor_share() {
+    let Some(mut f) = build().await else { return };
+    let base = Terms2::decode(&f.terms_raw).unwrap();
+    let remainder_key = Pubkey::new_unique();
+    let pot = 50_000_000;
+    f.terms_raw = Terms2 {
+        bond_policy_kind: 1,
+        bond_slasher_bps: 1,
+        settlement_program: [0u8; 32],
+        custom_settle_window_slots: 0,
+        bond_remainder: remainder_key.to_bytes(),
+        executor_bond_lamports: pot,
+        ..base
+    }
+    .encode()
+    .to_vec();
+    let winner_key = Pubkey::new_unique();
+    // The remainder destination exists and is rent-exempt; the winner's does not.
+    f.ctx.set_account(
+        &remainder_key,
+        &shared(Account {
+            lamports: ESCROW_FLOOR,
+            data: vec![],
+            owner: SYSTEM,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+    // (the winner destination is deliberately left non-existent)
+    let roots = f.position_roots[..33].to_vec();
+    let c = {
+        let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+        closable(&mut f, &b, 33, &roots, 81).await
+    };
+    // A conviction: flag 4, and the recorded winner the slasher share is paid to.
+    let mut doc = f.account(c.dcm2).await;
+    doc[6..8].copy_from_slice(
+        &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
+    );
+    doc[document::WINNER_AT_V8..document::WINNER_AT_V8 + 32].copy_from_slice(winner_key.as_ref());
+    {
+        let lamports = f.lamports(c.dcm2).await;
+        f.ctx.set_account(
+            &c.dcm2,
+            &shared(Account {
+                lamports,
+                data: doc,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    clock_to(&mut f, 6_000_002).await;
+    let payer = f.executor.pubkey();
+    let payer_before = f.lamports(payer).await;
+    let in_three = f.lamports(c.dcm2).await
+        + f.lamports(c.dpr2).await
+        + f.lamports(address::family_slots(&f.program, &c.descriptor).0)
+            .await;
+    let metas = f.close_metas_slots(
+        &c,
+        f.signer.pubkey(),
+        AccountMeta::new(winner_key, false),
+        AccountMeta::new(remainder_key, false),
+    );
+    label("standard-split");
+    let events = send_fresh_events(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&c.descriptor),
+        metas,
+    )
+    .await
+    .expect("a STANDARD close");
+    let dcr2 = f.account(c.dcr2).await;
+    assert_eq!(
+        dcr2[6],
+        result::STATUS_REFUTED,
+        "a refuted document closes REFUTED"
+    );
+    assert_eq!(
+        dcr2[result::BOND_STATE_AT_V6],
+        2,
+        "BOND_PAID: the built-in route paid"
+    );
+    assert_eq!(dcr2[result::BOND_CAUSE_AT_V6], CAUSE_CONVICTION);
+    assert_eq!(
+        dcr2[result::WINNER_AT_V6..result::WINNER_AT_V6 + 32],
+        winner_key.to_bytes(),
+        "the close copies the recorded winner into DCR2, where tag 187 reads it"
+    );
+    assert_eq!(
+        f.lamports(remainder_key).await,
+        ESCROW_FLOOR + pot,
+        "the remainder receives the skipped winner share too"
+    );
+    assert_eq!(
+        f.lamports(winner_key).await,
+        0,
+        "the sub-floor winner share was skipped"
+    );
+    assert!(
+        pot > in_three - pot,
+        "the convicted pot is larger than the combined rent"
+    );
+    assert_eq!(
+        f.lamports(payer).await,
+        payer_before + in_three - pot,
+        "the payer receives exactly the rent left after the bond left DCM2"
+    );
+    assert_close_event_refund(&events, in_three - pot);
+    assert!(
+        f.ctx
+            .banks_client
+            .get_account(address::bond_escrow(&f.program, &c.descriptor).0)
+            .await
+            .unwrap()
+            .is_none(),
+        "a STANDARD close never creates the escrow"
+    );
+    // C3's shared direct-lamport credit reaches the runtime's writable-account
+    // guard: a read-only remainder is rejected atomically as
+    // `UnbalancedInstruction`. CUSTOM escrow shape is checked by C3's validator
+    // and retains its 798 refusal.
+    let roots = f.position_roots[..33].to_vec();
+    let b3 = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c3 = closable(&mut f, &b3, 33, &roots, 83).await;
+    let mut doc = f.account(c3.dcm2).await;
+    doc[6..8].copy_from_slice(
+        &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
+    );
+    doc[document::WINNER_AT_V8..document::WINNER_AT_V8 + 32].copy_from_slice(winner_key.as_ref());
+    {
+        let lamports = f.lamports(c3.dcm2).await;
+        f.ctx.set_account(
+            &c3.dcm2,
+            &shared(Account {
+                lamports,
+                data: doc,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    let ro = f.close_metas_slots(
+        &c3,
+        f.signer.pubkey(),
+        AccountMeta::new(winner_key, false),
+        AccountMeta::new_readonly(remainder_key, false),
+    );
+    assert!(
+        matches!(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                close_data(&c3.descriptor),
+                ro
+            )
+            .await,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::UnbalancedInstruction | InstructionError::ReadonlyLamportChange
+            ))
+        ),
+        "the runtime rejects a read-only remainder destination atomically"
+    );
+    // The no-winner row: with `conviction_winner` zero the slasher share is zero
+    // and the whole pot is the remainder, and the `winner` meta must be the
+    // incinerator rather than a destination of the caller's choosing.
+    let roots = f.position_roots[..33].to_vec();
+    let c2 = {
+        let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+        closable(&mut f, &b, 33, &roots, 82).await
+    };
+    let mut doc = f.account(c2.dcm2).await;
+    doc[6..8].copy_from_slice(
+        &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
+    );
+    {
+        let lamports = f.lamports(c2.dcm2).await;
+        f.ctx.set_account(
+            &c2.dcm2,
+            &shared(Account {
+                lamports,
+                data: doc,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    let bad = f.close_metas_slots(
+        &c2,
+        f.signer.pubkey(),
+        AccountMeta::new(remainder_key, false),
+        AccountMeta::new(remainder_key, false),
+    );
+    assert_eq!(
+        refused_with(&mut f, close_data(&c2.descriptor), bad).await,
+        CL_AUTHORITY,
+        "a no-winner close may not name its own destination"
+    );
+    let good = f.close_metas_slots(
+        &c2,
+        f.signer.pubkey(),
+        AccountMeta::new(incinerator::ID, false),
+        AccountMeta::new(remainder_key, false),
+    );
+    let remainder_before = f.lamports(remainder_key).await;
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&c2.descriptor),
+        good,
+    )
+    .await
+    .expect("the no-winner close");
+    assert_eq!(
+        f.lamports(remainder_key).await,
+        remainder_before + pot,
+        "the whole pot"
+    );
+    assert_eq!(
+        f.lamports(incinerator::ID).await,
+        0,
+        "and nothing at all to the slasher"
+    );
+}
+
+/// A CUSTOM conviction also seizes a bond larger than the combined rent. The
+/// close event's refund is the lamports actually drained after the pot moves to
+/// escrow; it does not subtract the pot a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_custom_close_refund_is_the_exact_post_escrow_drain() {
+    let Some(mut f) = build().await else { return };
+    let base = Terms2::decode(&f.terms_raw).unwrap();
+    let pot = 50_000_000;
+    f.terms_raw = Terms2 {
+        executor_bond_lamports: pot,
+        ..base
+    }
+    .encode()
+    .to_vec();
+    let roots = f.position_roots[..33].to_vec();
+    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &b, 33, &roots, 119).await;
+    let mut doc = f.account(c.dcm2).await;
+    doc[6..8].copy_from_slice(
+        &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
+    );
+    {
+        let lamports = f.lamports(c.dcm2).await;
+        f.ctx.set_account(
+            &c.dcm2,
+            &shared(Account {
+                lamports,
+                data: doc,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    clock_to(&mut f, 6_000_020).await;
+    let payer = f.executor.pubkey();
+    let before = f.lamports(payer).await;
+    let total = f.lamports(c.dcm2).await
+        + f.lamports(c.dpr2).await
+        + f.lamports(address::family_slots(&f.program, &c.descriptor).0)
+            .await;
+    assert!(
+        pot > total - pot,
+        "the committed bond exceeds all three accounts' rent"
+    );
+    let metas = f.close_metas(&c, f.signer.pubkey());
+    let events = send_fresh_events(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&c.descriptor),
+        metas,
+    )
+    .await
+    .expect("the custom close");
+    assert_eq!(
+        f.lamports(payer).await,
+        before + total - pot,
+        "the payer's exact increase is the post-escrow rent drain"
+    );
+    assert_close_event_refund(&events, total - pot);
+    assert_eq!(
+        f.lamports(address::bond_escrow(&f.program, &c.descriptor).0)
+            .await,
+        pot,
+        "the full bond went to escrow"
+    );
+}
+
+/// A STANDARD close never sends an uncreditable remainder back to the convict.
+/// The policy destination is a data account whose rent floor exceeds the pot,
+/// so C3's shared payout sends the full residual to the real incinerator.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_standard_close_burns_an_uncreditable_remainder() {
+    let Some(mut f) = build().await else { return };
+    let base = Terms2::decode(&f.terms_raw).unwrap();
+    let pot = 50_000_000;
+    let remainder = Pubkey::new_unique();
+    f.terms_raw = Terms2 {
+        bond_policy_kind: 1,
+        bond_slasher_bps: 2_500,
+        settlement_program: [0; 32],
+        custom_settle_window_slots: 0,
+        bond_remainder: remainder.to_bytes(),
+        executor_bond_lamports: pot,
+        ..base
+    }
+    .encode()
+    .to_vec();
+    f.ctx.set_account(
+        &remainder,
+        &shared(Account {
+            lamports: 1,
+            data: vec![0; 10_000],
+            owner: f.program,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+    let roots = f.position_roots[..33].to_vec();
+    let binding = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &binding, 33, &roots, 120).await;
+    let mut doc = f.account(c.dcm2).await;
+    doc[6..8].copy_from_slice(
+        &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
+    );
+    {
+        let lamports = f.lamports(c.dcm2).await;
+        f.ctx.set_account(
+            &c.dcm2,
+            &shared(Account {
+                lamports,
+                data: doc,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    clock_to(&mut f, 6_000_021).await;
+    let payer = f.executor.pubkey();
+    let payer_before = f.lamports(payer).await;
+    let burn_before = f.lamports(incinerator::ID).await;
+    let total = f.lamports(c.dcm2).await
+        + f.lamports(c.dpr2).await
+        + f.lamports(address::family_slots(&f.program, &c.descriptor).0)
+            .await;
+    let metas = f.close_metas_slots(
+        &c,
+        f.signer.pubkey(),
+        AccountMeta::new(incinerator::ID, false),
+        AccountMeta::new(remainder, false),
+    );
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&c.descriptor),
+        metas,
+    )
+    .await
+    .expect("the uncreditable remainder does not block close");
+    assert_eq!(
+        f.lamports(remainder).await,
+        1,
+        "an uncreditable destination receives nothing"
+    );
+    assert_eq!(
+        f.lamports(incinerator::ID).await,
+        burn_before + pot,
+        "all uncreditable bond lamports reach incinerator::ID"
+    );
+    assert_eq!(
+        f.lamports(payer).await,
+        payer_before + total - pot,
+        "the convicted executor receives rent only"
+    );
+}
+
+/// Both STANDARD destinations are uncreditable: the winner share is below the
+/// empty-account floor and the remainder is a rent-heavy program account. The
+/// skipped share joins the remainder attempt, then the entire unpaid pot burns
+/// to the real incinerator. The convict receives only the rent refund.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_standard_close_burns_every_uncreditable_share_away_from_the_convict() {
+    let Some(mut f) = build().await else { return };
+    let base = Terms2::decode(&f.terms_raw).unwrap();
+    let pot = 500_000;
+    let remainder = Pubkey::new_unique();
+    let winner = Pubkey::new_unique();
+    f.terms_raw = Terms2 {
+        bond_policy_kind: 1,
+        bond_slasher_bps: 2_500,
+        settlement_program: [0; 32],
+        custom_settle_window_slots: 0,
+        bond_remainder: remainder.to_bytes(),
+        executor_bond_lamports: pot,
+        ..base
+    }
+    .encode()
+    .to_vec();
+    f.ctx.set_account(
+        &remainder,
+        &shared(Account {
+            lamports: 1,
+            data: vec![0; 10_000],
+            owner: f.program,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+    let roots = f.position_roots[..33].to_vec();
+    let binding = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &binding, 33, &roots, 121).await;
+    let mut doc = f.account(c.dcm2).await;
+    doc[6..8].copy_from_slice(
+        &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
+    );
+    doc[document::WINNER_AT_V8..document::WINNER_AT_V8 + 32].copy_from_slice(winner.as_ref());
+    {
+        let lamports = f.lamports(c.dcm2).await;
+        f.ctx.set_account(
+            &c.dcm2,
+            &shared(Account {
+                lamports,
+                data: doc,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    clock_to(&mut f, 6_000_030).await;
+
+    let payer = f.executor.pubkey();
+    let payer_before = f.lamports(payer).await;
+    let burn_before = f.lamports(incinerator::ID).await;
+    let remainder_before = f.lamports(remainder).await;
+    let total = f.lamports(c.dcm2).await
+        + f.lamports(c.dpr2).await
+        + f.lamports(address::family_slots(&f.program, &c.descriptor).0)
+            .await;
+    assert!(
+        total - pot > pot,
+        "the rent exceeds this bond, isolating the payout rule"
+    );
+    let metas = f.close_metas_slots(
+        &c,
+        f.signer.pubkey(),
+        AccountMeta::new(winner, false),
+        AccountMeta::new(remainder, false),
+    );
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&c.descriptor),
+        metas,
+    )
+    .await
+    .expect("an uncreditable STANDARD split still closes");
+
+    assert_eq!(
+        f.lamports(payer).await,
+        payer_before + total - pot,
+        "the executor gets the document rent only"
+    );
+    assert_eq!(
+        f.lamports(winner).await,
+        0,
+        "the sub-floor winner share was skipped"
+    );
+    assert_eq!(
+        f.lamports(remainder).await,
+        remainder_before,
+        "the rent-heavy remainder could not receive the combined remainder"
+    );
+    assert_eq!(
+        f.lamports(incinerator::ID).await,
+        burn_before + pot,
+        "the uncreditable residual is burned instead of being returned to the convict"
+    );
+}
+
+/// **The refusals, one document each.** Every code the close can answer with on
+/// a revision-8 record, and the shape that produces it. A refused close writes
+/// nothing, which [`refused_close`] asserts for all of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_close_refusals() {
+    let Some(mut f) = build().await else { return };
+    let stranger = f.signer.pubkey();
+    let roots = f.position_roots[..33].to_vec();
+    let mut variant = 90u8;
+    let mut next = move || {
+        variant += 1;
+        variant
+    };
+    // (1) **599, an early close.** The document is unfinalized and nowhere near
+    // its production deadline, and revision 7's own code answers it.
+    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    assert_eq!(
+        refused_close(&mut f, &c, stranger, next()).await,
+        CL_CLOSE,
+        "before the deadline"
+    );
+    // (2) **582, the wrong rent recipient.** Anyone may close, but the rent goes
+    // to DCM2 40..72 and the meta must be that account -- a stranger may not pay
+    // the rent to itself.
+    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let payer = f.executor.pubkey();
+    let payer_before = f.lamports(payer).await;
+    let stranger_before = f.lamports(stranger).await;
+    let mut metas = f.close_metas(&c, stranger);
+    metas[5] = AccountMeta::new(stranger, false);
+    clock_to(&mut f, 6_000_010).await;
+    refused_here!(f, close_data(&c.descriptor), metas, CL_AUTHORITY);
+    assert_eq!(
+        f.lamports(payer).await,
+        payer_before,
+        "and the rent did not move"
+    );
+    // The caller paid its own transaction fee and nothing else: a permissionless
+    // close never pays the closer.
+    let stranger_after = f.lamports(stranger).await;
+    assert!(
+        stranger_after < stranger_before && stranger_before - stranger_after < 10_000,
+        "the caller paid fees only: {stranger_before} -> {stranger_after}"
+    );
+    // (3) **793, a substituted DTU1.** The counter is validated at the PDA
+    // derived from DCM2's own PT2S and its digest, so another template's
+    // counter is refused rather than decremented.
+    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let other = {
+        let (pt2s, image) = f.sealed_pt2s(&f.routes, &f.payloads, f.k, 16);
+        f.ctx.set_account(&pt2s, &shared(owned(&f.program, image)));
+        let sealed = f
+            .ctx
+            .banks_client
+            .get_account(pt2s)
+            .await
+            .unwrap()
+            .unwrap()
+            .data;
+        address::template_use(&f.program, &pt2s, &sha256(&[&sealed])).0
+    };
+    let mut metas = f.close_metas(&c, stranger);
+    metas[6] = AccountMeta::new(other, false);
+    refused_here!(f, close_data(&c.descriptor), metas, TEMPLATE_SEAL);
+    // (4) **598, a counter that reads zero.** Unreachable on program-written
+    // state, and refused rather than wrapped to `u32::MAX`.
+    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let mut use_record = f.account(f.dtu1).await;
+    use_record[8..12].copy_from_slice(&0u32.to_le_bytes());
+    f.ctx
+        .set_account(&f.dtu1, &shared(owned(&f.program, use_record)));
+    assert_eq!(
+        refused_close(&mut f, &c, stranger, next()).await,
+        CL_OVERFLOW,
+        "documents = 0"
+    );
+    // Put the counter back: the rest of this test is about other refusals, and a
+    // crafted document at zero would answer every one of them 598.
+    let mut use_record = f.account(f.dtu1).await;
+    use_record[8..12].copy_from_slice(&1u32.to_le_bytes());
+    f.ctx
+        .set_account(&f.dtu1, &shared(owned(&f.program, use_record)));
+    // (5) **580, a short account list.** Six metas is revision 7's shape and a
+    // revision-8 record refuses it; eight and ten are not nine.
+    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    for take in [6usize, 8] {
+        let metas = f.close_metas(&c, stranger);
+        refused_here!(
+            f,
+            close_data(&c.descriptor),
+            metas[..take].to_vec(),
+            CL_MALFORMED
+        );
+    }
+    let mut extra = f.close_metas(&c, stranger);
+    extra.push(AccountMeta::new(Pubkey::new_unique(), false));
+    refused_here!(f, close_data(&c.descriptor), extra, CL_MALFORMED);
+    // (6) **580, a wrong descriptor**, and **599** on a result account that is
+    // already closed.
+    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let foreign = f.close_metas(&c, stranger);
+    refused_here!(f, close_data(&[9u8; 32]), foreign, CL_MALFORMED);
+    let mut dcr2 = f.account(c.dcr2).await;
+    dcr2[7] = 1;
+    {
+        let lamports = f.lamports(c.dcr2).await;
+        f.ctx.set_account(
+            &c.dcr2,
+            &shared(Account {
+                lamports,
+                data: dcr2,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    assert_eq!(
+        refused_close(&mut f, &c, stranger, next()).await,
+        CL_CLOSE,
+        "already closed"
+    );
+    // (7) **582 on the two kind-dependent metas.** A CUSTOM document handed a
+    // tail that is neither its escrow nor the system program. The count is ten
+    // either way, which is the re-review's Medium 6: the key checks are what
+    // catch a client that handed the wrong list.
+    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    // A **conviction**, so the policy runs and the two key checks are reached at
+    // all: on a row that does not escrow (1-on-SETTLED, 2) the close does not
+    // look at the two kind-dependent metas, and that is deliberate and named.
+    let mut doc = f.account(c.dcm2).await;
+    doc[6..8].copy_from_slice(
+        &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
+    );
+    {
+        let lamports = f.lamports(c.dcm2).await;
+        f.ctx.set_account(
+            &c.dcm2,
+            &shared(Account {
+                lamports,
+                data: doc,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
+    let good = f.close_metas(&c, stranger);
+    let mut wrong = good.clone();
+    wrong[7] = AccountMeta::new(Pubkey::new_unique(), false);
+    refused_here!(f, close_data(&c.descriptor), wrong, CL_AUTHORITY);
+    let mut wrong = good.clone();
+    wrong[8] = AccountMeta::new_readonly(Pubkey::new_unique(), false);
+    refused_here!(f, close_data(&c.descriptor), wrong, CL_AUTHORITY);
+    // (8) A read-only escrow has C3's validator refusal, 798. The close-side
+    // 582 remains for a substituted escrow key, checked before shape validation.
+    let mut ro = good.clone();
+    ro[7] = AccountMeta::new_readonly(good[7].pubkey, false);
+    refused_here!(f, close_data(&c.descriptor), ro, SETTLEMENT_PROGRAM);
+    // And the honest list, once, on the same convicted document: it closes, and
+    // the escrow is the document's own PDA.
+    let pot = Terms2::decode(&f.terms_raw).unwrap().executor_bond_lamports;
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&c.descriptor),
+        good,
+    )
+    .await
+    .expect("the honest tail on a conviction");
+    assert_eq!(
+        f.lamports(address::bond_escrow(&f.program, &c.descriptor).0)
+            .await,
+        pot
+    );
+}
+
+/// **A pre-funded escrow is a gift, not a lock.** Anyone may transfer lamports
+/// to the public PDA address; the close reads its current balance and tops it
+/// up with the pot. External callers cannot allocate or assign the PDA because
+/// those system instructions require its signature, which only DCG can provide.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_close_escrows_past_a_prefunded_address() {
+    let Some(mut f) = build().await else { return };
+    let base = Terms2::decode(&f.terms_raw).unwrap();
+    let pot = 50_000_000;
+    f.terms_raw = Terms2 {
+        executor_bond_lamports: pot,
+        ..base
+    }
+    .encode()
+    .to_vec();
+    let roots = f.position_roots[..33].to_vec();
+    let payer = f.executor.pubkey();
+    for (i, gift) in [1u64, ESCROW_FLOOR].into_iter().enumerate() {
+        let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
+        let c = closable(&mut f, &b, 33, &roots, 95 + i as u8).await;
+        let escrow = address::bond_escrow(&f.program, &c.descriptor).0;
+        // A plain lamport deposit into a system-owned 0-byte account: what any
+        // third party can do with a public address and a transfer.
+        f.ctx.set_account(
+            &escrow,
+            &shared(Account {
+                lamports: gift,
+                data: vec![],
+                owner: SYSTEM,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+        let mut doc = f.account(c.dcm2).await;
+        doc[6..8].copy_from_slice(
+            &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
+        );
+        {
+            let lamports = f.lamports(c.dcm2).await;
+            f.ctx.set_account(
+                &c.dcm2,
+                &shared(Account {
+                    lamports,
+                    data: doc,
+                    owner: f.program,
+                    executable: false,
+                    rent_epoch: 0,
+                }),
+            );
+        }
+        clock_to(&mut f, 6_000_100 + i as u64).await;
+        let payer_before = f.lamports(payer).await;
+        let in_three = f.lamports(c.dcm2).await
+            + f.lamports(c.dpr2).await
+            + f.lamports(address::family_slots(&f.program, &c.descriptor).0)
+                .await;
+        assert!(
+            pot > in_three - pot,
+            "the CUSTOM bond is larger than all three rents"
+        );
+        let metas = f.close_metas(&c, f.signer.pubkey());
+        let events = send_fresh_events(
+            &mut f.ctx,
+            &f.signer,
+            f.program,
+            close_data(&c.descriptor),
+            metas,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a pre-funded escrow of {gift} lamports: {e:?}"));
+        assert_eq!(
+            f.lamports(escrow).await,
+            pot + gift,
+            "the pot arrived and the gift stayed"
+        );
+        assert_eq!(
+            f.account(c.dcr2).await[result::BOND_STATE_AT_V6],
+            document::BOND_ESCROWED
+        );
+        assert_close_event_refund(&events, in_three - pot);
+        assert!(
+            f.lamports(payer).await > payer_before,
+            "the rent was still refunded"
+        );
+    }
+}
+
+/// **Tag 176 on revision 8: what the seal creates, the three actions, the
+/// re-approval equality, and the capacity bound.** Every case is a **fresh
+/// PT2S**, because the two counters and the DTA1 are write-once per template and
+/// a second approve on the same one is a different case (the re-approval).
+///
+/// The PT2S images here are laid down already sealed, with a **chosen capacity**
+/// in their own clause-12 v4 block, because tag 145 recomputes that block from
+/// the plan and the plan's capacity is 80: the CU bound is about the capacity,
+/// and a plan of 80 positions can only ever be far under it.
+/// Tag 186 requires the recorded authority in every DTU1 state and returns each
+/// rent balance to the payee recorded for that resource.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_close_template_drains_single_base_and_refunds_recorded_payers() {
+    let Some(mut f) = build().await else { return };
+
+    let authority = f.executor.pubkey();
+    let pt1x = f.pt1s_index;
+    let pt2s = f.pt2s;
+    let dta1 = f.dta1;
+    let dtu1 = f.dtu1;
+    let admission_data = f.account(f.dea2).await;
+    let admission_payer = Pubkey::new_from_array(d32(&admission_data, 160));
+    let sources = [
+        dtu1, dta1, pt2s, pt1x, f.routes, f.geometry, f.payloads, f.dea2,
+    ];
+    let rent: u64 = {
+        let mut sum = 0;
+        for key in sources {
+            sum += f.lamports(key).await;
+        }
+        sum
+    };
+    let mut metas = vec![AccountMeta::new(authority, true)];
+    metas.extend(
+        [dtu1, dta1, pt2s, pt1x, f.routes, f.geometry, f.payloads]
+            .into_iter()
+            .map(|key| AccountMeta::new(key, false)),
+    );
+    metas.extend(
+        [authority, authority, authority]
+            .into_iter()
+            .map(|key| AccountMeta::new(key, false)),
+    );
+    metas.push(AccountMeta::new_readonly(f.drp2, false));
+    metas.push(AccountMeta::new(f.dea2, false));
+    metas.push(AccountMeta::new(admission_payer, false));
+    metas.push(AccountMeta::new_readonly(SYSTEM, false));
+    assert_eq!(metas.len(), 15);
+
+    // A valid DEA2 under another registry cannot be created for this DTU1.
+    let foreign_registry = Pubkey::new_unique();
+    let foreign_admission = address::admission(&f.program, &foreign_registry, &pt2s, f.k).0;
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![159],
+                vec![
+                    AccountMeta::new(f.executor.pubkey(), true),
+                    AccountMeta::new(foreign_admission, false),
+                    AccountMeta::new_readonly(foreign_registry, false),
+                    AccountMeta::new_readonly(pt2s, false),
+                    AccountMeta::new_readonly(f.routes, false),
+                    AccountMeta::new_readonly(f.geometry, false),
+                    AccountMeta::new_readonly(SYSTEM, false),
+                    AccountMeta::new_readonly(dtu1, false),
+                ],
+            )
+            .await
+        ),
+        TEMPLATE_SEAL,
+        "tag 159 refuses admission rent under a registry outside DTU1"
+    );
+    assert!(f
+        .ctx
+        .banks_client
+        .get_account(foreign_admission)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Recipient substitutions are refused even when the recorded authority
+    // closes. The failure is atomic and leaves all template rent in place.
+    let mut attacker_metas = metas.clone();
+    attacker_metas[8] = AccountMeta::new(f.signer.pubkey(), false);
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![TAG_CLOSE_TEMPLATE],
+                attacker_metas
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "the caller cannot redirect the PT1X rent"
+    );
+
+    let stranger = f.signer.pubkey();
+    let stranger_before = f.lamports(stranger).await;
+    let mut stranger_metas = metas.clone();
+    stranger_metas[0] = AccountMeta::new(stranger, true);
+    let snapshot: Vec<(Pubkey, Vec<u8>, u64)> = {
+        let mut before = Vec::new();
+        for key in sources {
+            before.push((key, f.account(key).await, f.lamports(key).await));
+        }
+        before
+    };
+    assert_eq!(
+        custom(
+            send_with_signers(
+                &mut f.ctx,
+                &f.executor,
+                &[&f.signer],
+                f.program,
+                vec![TAG_CLOSE_TEMPLATE],
+                stranger_metas.clone(),
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "a stranger cannot close a LIVE template"
+    );
+    for (key, data, lamports) in &snapshot {
+        assert_eq!(
+            f.account(*key).await,
+            *data,
+            "a LIVE refusal preserves {key}"
+        );
+        assert_eq!(
+            f.lamports(*key).await,
+            *lamports,
+            "a LIVE refusal preserves {key} rent"
+        );
+    }
+
+    let config_key = address::config(&f.program).0;
+    let admin_metas = || {
+        vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new_readonly(config_key, false),
+            AccountMeta::new(dta1, false),
+            AccountMeta::new(pt2s, false),
+            AccountMeta::new(dtu1, false),
+        ]
+    };
+    send_fresh(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![TAG_TEMPLATE_SEAL, config::SEAL_REVOKED],
+        admin_metas(),
+    )
+    .await
+    .expect("the recorded authority revokes the template");
+    assert_eq!(f.account(dtu1).await[6], config::DTU1_STATE_REVOKED);
+    assert_eq!(
+        custom(
+            send_with_signers(
+                &mut f.ctx,
+                &f.executor,
+                &[&f.signer],
+                f.program,
+                vec![TAG_CLOSE_TEMPLATE],
+                stranger_metas.clone(),
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "a stranger cannot close a REVOKED template"
+    );
+
+    let mut approve = vec![TAG_TEMPLATE_SEAL, config::SEAL_APPROVED];
+    let use_record = f.account(dtu1).await;
+    approve.extend_from_slice(&use_record[config::DTU1_MAX_CHALLENGE_AT..128]);
+    let approve_metas = vec![
+        AccountMeta::new(authority, true),
+        AccountMeta::new_readonly(config_key, false),
+        AccountMeta::new(dta1, false),
+        AccountMeta::new(pt2s, false),
+        AccountMeta::new(dtu1, false),
+        AccountMeta::new_readonly(pt1x, false),
+        AccountMeta::new_readonly(f.geometry, false),
+        AccountMeta::new_readonly(f.routes, false),
+        AccountMeta::new_readonly(f.payloads, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+        AccountMeta::new_readonly(f.drp2, false),
+    ];
+    send_fresh(&mut f.ctx, &f.executor, f.program, approve, approve_metas)
+        .await
+        .expect("the authority re-approves the revoked template");
+    send_fresh(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![TAG_TEMPLATE_SEAL, config::SEAL_RETIRED],
+        admin_metas(),
+    )
+    .await
+    .expect("the recorded authority retires the template");
+    assert_eq!(f.account(dtu1).await[6], config::DTU1_STATE_RETIRED);
+    assert_eq!(
+        custom(
+            send_with_signers(
+                &mut f.ctx,
+                &f.executor,
+                &[&f.signer],
+                f.program,
+                vec![TAG_CLOSE_TEMPLATE],
+                stranger_metas,
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "a stranger cannot close a RETIRED template"
+    );
+
+    let pt1x_and_bytes_rent = f.lamports(pt1x).await
+        + f.lamports(f.routes).await
+        + f.lamports(f.geometry).await
+        + f.lamports(f.payloads).await;
+    let payee_refunds = [
+        (metas[8].pubkey, pt1x_and_bytes_rent),
+        (metas[9].pubkey, f.lamports(pt2s).await),
+        (
+            metas[10].pubkey,
+            f.lamports(dta1).await + f.lamports(dtu1).await,
+        ),
+        (metas[13].pubkey, f.lamports(f.dea2).await),
+    ];
+    let mut payee_before = Vec::new();
+    for (payee, _) in &payee_refunds {
+        payee_before.push((*payee, f.lamports(*payee).await));
+    }
+    let before = f.lamports(authority).await;
+    send_fresh(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![TAG_CLOSE_TEMPLATE],
+        metas,
+    )
+    .await
+    .expect("the recorded authority closes a RETIRED template");
+    for key in sources {
+        assert!(
+            f.ctx.banks_client.get_account(key).await.unwrap().is_none(),
+            "closed template account {key} is drained"
+        );
+    }
+    assert!(
+        f.lamports(authority).await >= before + rent - 20_000,
+        "PT1X, base, PT2S, DTA1, DTU1 and DEA2 rent return to their recorded payers"
+    );
+    for (index, (payee, expected)) in payee_refunds.iter().enumerate() {
+        assert!(
+            f.lamports(*payee).await >= payee_before[index].1 + (*expected).saturating_sub(20_000),
+            "recorded payee {payee} receives its template rent"
+        );
+    }
+    assert_eq!(
+        f.lamports(stranger).await,
+        stranger_before,
+        "the stranger's balance receives no template rent"
+    );
+}
+
+/// Tag 197 form (i) only releases a zero-length allocation to its own signed
+/// address. PT1X byte accounts have nonzero size and are assigned only after
+/// tag 140 binds them, so an all-zero payload prefix cannot make a live
+/// resource eligible for this form or redirect its rent.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_tag197_zero_length_form_pins_refund_and_refuses_bound_payload() {
+    let Some(mut f) = build().await else { return };
+    let payer = f.executor.pubkey();
+
+    let payload_before = f.account(f.payloads).await;
+    let payload_lamports = f.lamports(f.payloads).await;
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![config::TAG_CLOSE_UNPUBLISHED_TEMPLATE],
+                vec![
+                    AccountMeta::new(payer, true),
+                    AccountMeta::new(f.payloads, false),
+                    AccountMeta::new(payer, false),
+                ],
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "a live PT1X payload is never a zero-length orphan"
+    );
+    assert_eq!(f.account(f.payloads).await, payload_before);
+    assert_eq!(f.lamports(f.payloads).await, payload_lamports);
+
+    // C3's original self-key attack: even when the live template's own
+    // payload key signs as the proposed closer/payee, a nonempty bound payload
+    // is not an orphan and tag 197 cannot drain it.
+    let payload_before = f.account(f.payloads).await;
+    let payload_lamports = f.lamports(f.payloads).await;
+    let payload_key = f.payload_key.pubkey();
+    assert_eq!(
+        custom(
+            send_with_signers(
+                &mut f.ctx,
+                &f.executor,
+                &[&f.payload_key],
+                f.program,
+                vec![config::TAG_CLOSE_UNPUBLISHED_TEMPLATE],
+                vec![
+                    AccountMeta::new(payload_key, true),
+                    AccountMeta::new(f.payloads, false),
+                    AccountMeta::new(payload_key, false),
+                ],
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "the live template payload's own key cannot authorize a drain"
+    );
+    assert_eq!(f.account(f.payloads).await, payload_before);
+    assert_eq!(f.lamports(f.payloads).await, payload_lamports);
+
+    let four_zero = Pubkey::new_unique();
+    f.ctx
+        .set_account(&four_zero, &shared(owned(&f.program, vec![0; 4])));
+    let four_zero_before = f.account(four_zero).await;
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![config::TAG_CLOSE_UNPUBLISHED_TEMPLATE],
+                vec![
+                    AccountMeta::new(payer, true),
+                    AccountMeta::new(four_zero, false),
+                    AccountMeta::new(payer, false),
+                ],
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "a four-byte zero prefix is not proof that an allocation is unbound"
+    );
+    assert_eq!(f.account(four_zero).await, four_zero_before);
+
+    let wrong_refund = Pubkey::new_unique();
+    let empty = Keypair::new();
+    f.ctx
+        .set_account(&empty.pubkey(), &shared(owned(&f.program, vec![])));
+    let empty_before = f.lamports(empty.pubkey()).await;
+    assert_eq!(
+        custom(
+            send_with_signers(
+                &mut f.ctx,
+                &f.executor,
+                &[&empty],
+                f.program,
+                vec![config::TAG_CLOSE_UNPUBLISHED_TEMPLATE],
+                vec![
+                    AccountMeta::new(empty.pubkey(), true),
+                    AccountMeta::new(empty.pubkey(), false),
+                    AccountMeta::new(wrong_refund, false),
+                ],
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "form (i) cannot redirect an orphan's rent"
+    );
+    assert_eq!(f.lamports(empty.pubkey()).await, empty_before);
+
+    let good_empty = Keypair::new();
+    f.ctx
+        .set_account(&good_empty.pubkey(), &shared(owned(&f.program, vec![])));
+    let good_rent = f.lamports(good_empty.pubkey()).await;
+    let good_owner_before = f.account(good_empty.pubkey()).await;
+    send_with_signers(
+        &mut f.ctx,
+        &f.executor,
+        &[&good_empty],
+        f.program,
+        vec![config::TAG_CLOSE_UNPUBLISHED_TEMPLATE],
+        vec![
+            AccountMeta::new(good_empty.pubkey(), true),
+            AccountMeta::new(good_empty.pubkey(), false),
+            AccountMeta::new(good_empty.pubkey(), false),
+        ],
+    )
+    .await
+    .expect("the zero-length allocation returns to its own recorded key");
+    assert_eq!(f.lamports(good_empty.pubkey()).await, good_rent);
+    assert_eq!(f.account(good_empty.pubkey()).await, good_owner_before);
+    let account = f
+        .ctx
+        .banks_client
+        .get_account(good_empty.pubkey())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        account.owner, SYSTEM,
+        "released zero-data account returns to System"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_template_retirement_is_irreversible() {
+    let Some(mut f) = build().await else { return };
+    let config_key = address::config(&f.program).0;
+    let (executor, dta1, pt2s, dtu1) = (f.executor.pubkey(), f.dta1, f.pt2s, f.dtu1);
+    let admin_metas = || {
+        vec![
+            AccountMeta::new(executor, true),
+            AccountMeta::new_readonly(config_key, false),
+            AccountMeta::new(dta1, false),
+            AccountMeta::new(pt2s, false),
+            AccountMeta::new(dtu1, false),
+        ]
+    };
+    send_fresh(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![TAG_TEMPLATE_SEAL, SEAL_RETIRED],
+        admin_metas(),
+    )
+    .await
+    .expect("the configured authority retires the template");
+    assert_eq!(f.account(f.dtu1).await[6], config::DTU1_STATE_RETIRED);
+
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![TAG_TEMPLATE_SEAL, SEAL_REVOKED],
+                admin_metas(),
+            )
+            .await
+        ),
+        TEMPLATE_SEAL,
+        "retirement cannot transition into revocation"
+    );
+    assert_eq!(f.account(f.dtu1).await[6], config::DTU1_STATE_RETIRED);
+
+    let mut approve = vec![TAG_TEMPLATE_SEAL, config::SEAL_APPROVED];
+    let use_record = f.account(f.dtu1).await;
+    approve.extend_from_slice(&use_record[config::DTU1_MAX_CHALLENGE_AT..128]);
+    let approve_metas = vec![
+        AccountMeta::new(f.executor.pubkey(), true),
+        AccountMeta::new_readonly(config_key, false),
+        AccountMeta::new(f.dta1, false),
+        AccountMeta::new(f.pt2s, false),
+        AccountMeta::new(f.dtu1, false),
+        AccountMeta::new_readonly(f.pt1s_index, false),
+        AccountMeta::new_readonly(f.geometry, false),
+        AccountMeta::new_readonly(f.routes, false),
+        AccountMeta::new_readonly(f.payloads, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+        AccountMeta::new_readonly(f.drp2, false),
+    ];
+    assert_eq!(
+        custom(send_fresh(&mut f.ctx, &f.executor, f.program, approve, approve_metas).await),
+        TEMPLATE_SEAL,
+        "retirement cannot be undone by approval"
+    );
+    assert_eq!(f.account(f.dtu1).await[6], config::DTU1_STATE_RETIRED);
+}
+
+/// An abandoned upload is reclaimable before PT2S publication. An attacker
+/// cannot redirect rent, while the uploader can close the base and all 3 bytes.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_close_unpublished_pt1x_refuses_attacker_and_refunds_owner() {
+    let Some(mut f) = build().await else { return };
+    let authority = f.executor.pubkey();
+    let pt1x = Keypair::new();
+    let routes = Keypair::new();
+    let geometry = Keypair::new();
+    let payloads = Keypair::new();
+    let state_bytes = dcg_program::pt1_onchain::OFF_PAYLOAD_INDEX + 4;
+    let allocations = [
+        (&pt1x, state_bytes, f.program),
+        // Tag 140 takes ownership of the byte allocations itself. Each starts
+        // as a zero-filled System-owned account with its keypair present.
+        (&routes, 4, SYSTEM),
+        (&geometry, 4, SYSTEM),
+        (&payloads, 4, SYSTEM),
+    ];
+    let mut total_rent = 0u64;
+    for (account, bytes, owner) in allocations {
+        let rent = solana_program::rent::Rent::default().minimum_balance(bytes);
+        total_rent += rent;
+        let blockhash = f.ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let create = solana_program::system_instruction::create_account(
+            &authority,
+            &account.pubkey(),
+            rent,
+            bytes as u64,
+            &owner,
+        );
+        let tx = Transaction::new_signed_with_payer(
+            &[create],
+            Some(&authority),
+            &[&f.executor, account],
+            blockhash,
+        );
+        f.ctx
+            .banks_client
+            .process_transaction(tx)
+            .await
+            .expect("real System Program allocation for abandoned PT1X setup");
+    }
+    let init_metas = vec![
+        AccountMeta::new(pt1x.pubkey(), true),
+        AccountMeta::new(routes.pubkey(), true),
+        AccountMeta::new(geometry.pubkey(), true),
+        AccountMeta::new(payloads.pubkey(), true),
+        AccountMeta::new_readonly(authority, true),
+        AccountMeta::new_readonly(SYSTEM, false),
+    ];
+    send_with_signers(
+        &mut f.ctx,
+        &f.executor,
+        &[&pt1x, &routes, &geometry, &payloads],
+        f.program,
+        vec![140],
+        init_metas,
+    )
+    .await
+    .expect("real tag 140 creates the abandonable PT1X binding");
+    assert_eq!(f.account(pt1x.pubkey()).await[4], 1);
+    let stranger = Keypair::new();
+    fund_system(&mut f.ctx, &f.executor, stranger.pubkey(), 1_000_000).await;
+    let mut metas = vec![
+        AccountMeta::new(stranger.pubkey(), true),
+        AccountMeta::new(pt1x.pubkey(), false),
+        AccountMeta::new(routes.pubkey(), false),
+        AccountMeta::new(geometry.pubkey(), false),
+        AccountMeta::new(payloads.pubkey(), false),
+    ];
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &stranger,
+                f.program,
+                vec![config::TAG_CLOSE_UNPUBLISHED_TEMPLATE],
+                metas.clone()
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "the in-progress authority alone can abandon and close PT1X"
+    );
+    let before = f.lamports(authority).await;
+    metas[0] = AccountMeta::new(authority, true);
+    send_fresh(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![config::TAG_CLOSE_UNPUBLISHED_TEMPLATE],
+        metas,
+    )
+    .await
+    .expect("uploader closes abandoned base");
+    assert!(
+        f.lamports(authority).await >= before + total_rent - 20_000,
+        "the uploader receives every abandoned account balance"
+    );
+    for key in [
+        pt1x.pubkey(),
+        routes.pubkey(),
+        geometry.pubkey(),
+        payloads.pubkey(),
+    ] {
+        assert!(f.ctx.banks_client.get_account(key).await.unwrap().is_none());
+    }
+}
+
+/// Tag 197's nine-account abandonment form also recovers a PT2S that was
+/// initialized and bound before setup was abandoned. The account images here
+/// are explicit program-owned close fixtures; the full PT1X/PT2S setup and
+/// authority transitions are exercised without account overrides by the
+/// K=10,240 honest-path test above.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_close_unpublished_bound_pt1x_and_pt2s_refunds_owner() {
+    let Some(mut f) = build().await else { return };
+    let authority = f.executor.pubkey();
+    let pt1x = Keypair::new();
+    let routes = Keypair::new();
+    let geometry = Keypair::new();
+    let payloads = Keypair::new();
+    let pt2s = Keypair::new();
+    let keys = [routes.pubkey(), geometry.pubkey(), payloads.pubkey()];
+    let lengths = [4u32; 3];
+    let pwr1 = f.pt2s_image[S::OFF_PWR1..].to_vec();
+    let allocations = [
+        (&pt1x, dcg_program::pt1_onchain::OFF_PAYLOAD_INDEX + 4),
+        (&routes, 4),
+        (&geometry, 4),
+        (&payloads, 4),
+        (&pt2s, S::OFF_PWR1 + pwr1.len()),
+    ];
+    for (account, bytes) in allocations {
+        allocate_program_account(&mut f.ctx, &f.executor, account, f.program, bytes).await;
+    }
+
+    let mut pt1x_data = vec![0u8; dcg_program::pt1_onchain::OFF_PAYLOAD_INDEX + 4];
+    pt1x_data[..4].copy_from_slice(dcg_program::pt1_onchain::PT1X_MAGIC);
+    pt1x_data[4] = 6;
+    pt1x_data[5..37].copy_from_slice(authority.as_ref());
+    for (i, key) in keys.into_iter().enumerate() {
+        pt1x_data[37 + 32 * i..69 + 32 * i].copy_from_slice(key.as_ref());
+        pt1x_data[133 + 4 * i..137 + 4 * i].copy_from_slice(&lengths[i].to_le_bytes());
+    }
+    pt1x_data[dcg_program::pt1_onchain::PT1X_BOUND_PT2S_AT
+        ..dcg_program::pt1_onchain::PT1X_BOUND_PT2S_AT + 32]
+        .copy_from_slice(pt2s.pubkey().as_ref());
+
+    let mut pt2s_data = vec![0u8; S::OFF_PWR1 + pwr1.len()];
+    pt2s_data[..4].copy_from_slice(S::MAGIC);
+    pt2s_data[S::OFF_STATE] = S::STATE_HASHING;
+    pt2s_data[S::OFF_AUTHORITY..S::OFF_AUTHORITY + 32].copy_from_slice(authority.as_ref());
+    pt2s_data[S::OFF_PT1S..S::OFF_PT1S + 32].copy_from_slice(pt1x.pubkey().as_ref());
+    for (i, key) in keys.into_iter().enumerate() {
+        pt2s_data[S::OFF_KEYS + 32 * i..S::OFF_KEYS + 32 * (i + 1)].copy_from_slice(key.as_ref());
+        pt2s_data[S::OFF_LENGTHS + 4 * i..S::OFF_LENGTHS + 4 * (i + 1)]
+            .copy_from_slice(&lengths[i].to_le_bytes());
+    }
+    pt2s_data[S::OFF_PWR1_LEN..S::OFF_PWR1_LEN + 2]
+        .copy_from_slice(&(pwr1.len() as u16).to_le_bytes());
+    pt2s_data[S::OFF_PWR1..].copy_from_slice(&pwr1);
+    let digest = sha256(&[&pt2s_data]);
+    let (approval, _) = address::template_seal(&f.program, &pt2s.pubkey(), &digest);
+    let (use_record, _) = address::template_use(&f.program, &pt2s.pubkey(), &digest);
+
+    for (key, data) in [(pt1x.pubkey(), pt1x_data), (pt2s.pubkey(), pt2s_data)] {
+        let mut account = f.ctx.banks_client.get_account(key).await.unwrap().unwrap();
+        account.data = data;
+        account.owner = f.program;
+        f.ctx.set_account(&key, &shared(account));
+    }
+    for key in keys {
+        let mut account = f.ctx.banks_client.get_account(key).await.unwrap().unwrap();
+        account.data = vec![key.to_bytes()[0]; 4];
+        account.owner = f.program;
+        f.ctx.set_account(&key, &shared(account));
+    }
+    let pda_rent = solana_program::rent::Rent::default().minimum_balance(0);
+    for pda in [approval, use_record] {
+        fund_system(&mut f.ctx, &f.executor, pda, pda_rent).await;
+    }
+    let sources = [
+        pt1x.pubkey(),
+        routes.pubkey(),
+        geometry.pubkey(),
+        payloads.pubkey(),
+        pt2s.pubkey(),
+        approval,
+        use_record,
+    ];
+    let mut refund = 0u64;
+    for key in sources {
+        refund += f.lamports(key).await;
+    }
+
+    let mut metas = vec![
+        AccountMeta::new(authority, true),
+        AccountMeta::new(pt1x.pubkey(), false),
+        AccountMeta::new(routes.pubkey(), false),
+        AccountMeta::new(geometry.pubkey(), false),
+        AccountMeta::new(payloads.pubkey(), false),
+        AccountMeta::new(pt2s.pubkey(), false),
+        AccountMeta::new(approval, false),
+        AccountMeta::new(use_record, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+    ];
+    let attacker = Keypair::new();
+    fund_system(&mut f.ctx, &f.executor, attacker.pubkey(), 1_000_000).await;
+    metas[0] = AccountMeta::new(attacker.pubkey(), true);
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &attacker,
+                f.program,
+                vec![config::TAG_CLOSE_UNPUBLISHED_TEMPLATE],
+                metas.clone()
+            )
+            .await
+        ),
+        CL_AUTHORITY,
+        "a stranger cannot cancel a bound PT1X/PT2S setup"
+    );
+    metas[0] = AccountMeta::new(authority, true);
+    let before = f.lamports(authority).await;
+    send_fresh(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![config::TAG_CLOSE_UNPUBLISHED_TEMPLATE],
+        metas,
+    )
+    .await
+    .expect("recorded authority closes the unpublished bound pair");
+    let after = f.lamports(authority).await;
+    assert!(after >= before + refund - 20_000,
+        "PT1X, PT2S, all three base accounts and empty seal/use rent return to the uploader: before={before}, after={after}, refund={refund}");
+    for key in [
+        pt1x.pubkey(),
+        routes.pubkey(),
+        geometry.pubkey(),
+        payloads.pubkey(),
+        pt2s.pubkey(),
+    ] {
+        assert!(f.ctx.banks_client.get_account(key).await.unwrap().is_none());
+    }
+    assert_eq!(
+        f.lamports(approval).await + f.lamports(use_record).await,
+        0,
+        "seal/use PDAs are emptied after their rent is returned"
+    );
+}
+
+/// Exercise the envelope registry's extended PT1X account form using the real
+/// sealed K=10,240 pair. The old seven-account form remains for PT1S v3.
+async fn envelope_pt1x_admission_binding(f: &mut Fix) {
+    let authority = Keypair::new_from_array([0xE5; 32]);
+    assert_eq!(
+        Some(authority.pubkey().to_bytes()),
+        envelope::AUTHORITY,
+        "the local test authority matches envelope_seal's compiled authority"
+    );
+    fund_system(&mut f.ctx, &f.executor, authority.pubkey(), 100_000_000).await;
+    let registry_id = 0x5054_3158;
+    let registry_key = envelope::registry_address(&f.program, registry_id).0;
+    let admission_key = envelope::admission_address(&f.program, &registry_key, &f.pt1s_index).0;
+    let census = [0x42; 32];
+    let (respond_path, witness_kind) = envelope::compiled_capability(1);
+    let row = envelope::Row {
+        form_id: 1,
+        respond_path,
+        witness_kind,
+        max_reads: u16::MAX,
+        max_writes: u16::MAX,
+        max_read_bytes: u32::MAX,
+        max_write_bytes: u32::MAX,
+        max_payload_bytes: u32::MAX,
+        execute_cu: 1,
+        respond_cu: 1,
+        measured_position: 0,
+        measured_entry: 0,
+    };
+    let mut create = vec![envelope::TAG_REGISTRY_CREATE];
+    create.extend_from_slice(&registry_id.to_le_bytes());
+    create.extend_from_slice(&1u32.to_le_bytes());
+    create.extend_from_slice(&census);
+    send_with_signers(
+        &mut f.ctx,
+        &f.executor,
+        &[&authority],
+        f.program,
+        create,
+        vec![
+            AccountMeta::new(authority.pubkey(), true),
+            AccountMeta::new(registry_key, false),
+            AccountMeta::new_readonly(SYSTEM, false),
+        ],
+    )
+    .await
+    .expect("create PT1X envelope registry");
+    let mut write = vec![envelope::TAG_REGISTRY_WRITE];
+    write.extend_from_slice(&registry_id.to_le_bytes());
+    write.extend_from_slice(&0u32.to_le_bytes());
+    write.extend_from_slice(&row.encode());
+    send_with_signers(
+        &mut f.ctx,
+        &f.executor,
+        &[&authority],
+        f.program,
+        write,
+        vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(registry_key, false),
+        ],
+    )
+    .await
+    .expect("write PT1X envelope registry row");
+    let mut freeze = vec![envelope::TAG_REGISTRY_FREEZE];
+    freeze.extend_from_slice(&registry_id.to_le_bytes());
+    send_with_signers(
+        &mut f.ctx,
+        &f.executor,
+        &[&authority],
+        f.program,
+        freeze,
+        vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(registry_key, false),
+        ],
+    )
+    .await
+    .expect("freeze PT1X envelope registry");
+
+    let payer = f.executor.pubkey();
+    let (state_key, routes_key, geometry_key, payload_key) =
+        (f.pt1s_index, f.routes, f.geometry, f.payloads);
+    let begin_metas = |include_pair: bool, pt2s: Pubkey| {
+        let mut metas = vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(admission_key, false),
+            AccountMeta::new_readonly(registry_key, false),
+            AccountMeta::new_readonly(state_key, false),
+            AccountMeta::new_readonly(routes_key, false),
+            AccountMeta::new_readonly(geometry_key, false),
+            AccountMeta::new_readonly(SYSTEM, false),
+        ];
+        if include_pair {
+            metas.push(AccountMeta::new_readonly(payload_key, false));
+            metas.push(AccountMeta::new_readonly(pt2s, false));
+        }
+        metas
+    };
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![envelope::TAG_ADMISSION_BEGIN],
+                begin_metas(false, f.pt2s)
+            )
+            .await
+        ),
+        PLAN_BINDING,
+        "PT1X cannot use the legacy PT1S account form"
+    );
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![envelope::TAG_ADMISSION_BEGIN],
+                begin_metas(true, Pubkey::new_unique())
+            )
+            .await
+        ),
+        PLAN_BINDING,
+        "a different PT2S cannot admit the PT1X"
+    );
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![envelope::TAG_ADMISSION_BEGIN],
+                begin_metas(true, f.pt2s),
+            )
+            .await
+        ),
+        PLAN_BINDING,
+        "revision 8 refuses DEA1 creation because tag 186 closes DTU1-bound DEA2"
+    );
+    assert!(f
+        .ctx
+        .banks_client
+        .get_account(admission_key)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// Complete compiler-v1 PT1X flow against the retained K=10,240 emission:
+/// upload/seal the real base, seal PT2S, admit documents, then reach rulings
+/// through both position and leaf challenge paths. This deliberately uses real
+/// System Program transfers for account funding and real program instructions
+/// for state; it never replaces protocol accounts through `set_account`.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_pt1x_full_honest_path_reaches_challenge_ruling() {
+    if std::env::var_os("BASANOS_PT1X_FULL_E2E").is_none() {
+        eprintln!("needs_local_artifacts: set BASANOS_PT1X_FULL_E2E=1 with the retained K=10,240 compiler-v1 bundle");
+        return;
+    }
+    let Some(mut f) = build_honest_pt1x().await else {
+        panic!("the retained K=10,240 compiler-v1 bundle is required");
+    };
+    assert_eq!(f.k, 10_240);
+    // The extracted SBF image has no legacy tag-150 envelope dispatcher. This
+    // copied harness skips that Basanos-only preflight and keeps the real 159/160
+    // PT1X registry admission completed by build_honest_pt1x above.
+    let binding = f.binding(29, 50);
+    // The completion binding starts its output range at position 29, so the
+    // shortest valid document has 31 positions (first + 2).
+    let document_length = 31;
+    assert!(f.position_roots.len() >= document_length as usize);
+    let (descriptor, created) = f.run_document(&binding, document_length).await;
+    let doc = f.finalize(&descriptor, created, document_length).await;
+    assert_ne!(
+        u16_at(&doc, 6) & FLAG_FINAL,
+        0,
+        "the real admission path finalized one document"
+    );
+
+    let nonce = 0x5054_3158;
+    let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), nonce).0;
+    let open_data = challenge_position_data(&descriptor, 0, nonce);
+    let open_metas = challenge_position_metas(&f, created, record);
+    send(&mut f.ctx, &f.signer, f.program, open_data, open_metas)
+        .await
+        .expect("PT1X-backed admission opens a position dispute");
+    let opened = f.account(record).await;
+    assert_eq!(opened[4], challenge::PHASE_POSITION_REVEAL);
+    let response_deadline = u64_at(&opened, 148);
+    clock_to(&mut f, response_deadline + 1).await;
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await
+    .expect("timeout reaches the ruling handler");
+
+    let ruled = f.account(record).await;
+    assert_eq!(ruled[4], challenge::PHASE_RULED);
+    assert_eq!(ruled[5], 2, "challenger wins when executor does not reveal");
+    assert_eq!(ruled[178], events::CAUSE_TIMEOUT);
+    let doc = f.account(created[0]).await;
+    assert_eq!(u16_at(&doc, 6) & FLAG_REFUTED, FLAG_REFUTED);
+
+    // A second, distinct document reaches the leaf-open/fix-point path, which
+    // binds the PT1X payload index as part of challenge admission.
+    let leaf_binding = f.binding(29, 50);
+    let (leaf_descriptor, leaf_created, proofs) =
+        attest_all(&mut f, &leaf_binding, document_length, &[], 0x59).await;
+    assert_eq!(proofs.len(), 1);
+    let leaf_nonce = nonce + 1;
+    let leaf_record =
+        address::challenge(&f.program, &leaf_descriptor, &f.signer.pubkey(), leaf_nonce).0;
+    let leaf_packet = challenge_leaf_packet(&f, &leaf_descriptor, &proofs[0], leaf_nonce);
+    let leaf_metas = challenge_leaf_metas(&f, leaf_created, leaf_record);
+    send(&mut f.ctx, &f.signer, f.program, leaf_packet, leaf_metas)
+        .await
+        .expect("PT1X-backed leaf proof passes challenge admission");
+    let leaf_opened = f.account(leaf_record).await;
+    assert_eq!(leaf_opened[4], challenge::PHASE_RESPOND);
+    let leaf_deadline = u64_at(&leaf_opened, 148);
+    clock_to(&mut f, leaf_deadline + 1).await;
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(leaf_record, false),
+            AccountMeta::new(leaf_created[0], false),
+        ],
+    )
+    .await
+    .expect("leaf challenge timeout reaches the ruling handler");
+    assert_eq!(
+        f.account(leaf_record).await[4],
+        challenge::PHASE_RULED,
+        "the PT1X-backed leaf challenge reaches a ruling"
+    );
+}
+
+fn retained_payload_index(payloads: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    let mut expected = 0u32;
+    while at < payloads.len() {
+        assert_eq!(u32_at(payloads, at), expected, "retained payload row order");
+        out.extend_from_slice(&(at as u32).to_le_bytes());
+        let row_len = 6 + u16_at(payloads, at + 4) as usize;
+        at = at.checked_add(row_len).expect("payload row offset");
+        assert!(at <= payloads.len(), "retained payload row is in bounds");
+        expected += 1;
+    }
+    out.extend_from_slice(&(at as u32).to_le_bytes());
+    out
+}
+
+/// The record-only decision count relation is the cheapest init check: it runs
+/// before template-account binding, and a document with the wrong count can
+/// never pass tag 165's decision branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_init_refuses_an_over_cap_decision_before_plan_binding() {
+    let Some(mut f) = build().await else { return };
+    let mut wrong = f.binding(29, 128);
+    wrong.output_width = DECISION_WIDTH;
+    wrong.decision_flags = DECISION_MODE;
+    wrong.option_count = 81;
+    wrong.output_count = 82;
+    wrong.option_table_offset = OPTION_REGION_AT as u16;
+    wrong.option_table_sha256 = [1; 32];
+    // A malformed template would be a plan-binding refusal if init reached it.
+    // The 80-option cap is enforced by the binding's 794 before plan binding.
+    f.ctx.set_account(
+        &f.routes,
+        &shared(Account {
+            lamports: 1_000_000_000,
+            data: vec![],
+            owner: SYSTEM,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+    assert_eq!(f.init_refusal(&wrong, 73).await, document::RUN_BINDING);
+}
+
+/// A self-consistent duplicate-last segment tree used to drive the real
+/// challenge descent. Its leaves are arbitrary committed values; the one
+/// adversarial fact is the coordinate's class, which the on-chain fix-point
+/// checks against the template's frozen DRP2 row.
+#[derive(Clone, Copy)]
+struct ChallengeNode {
+    digest: [u8; 32],
+    first: u32,
+    end: u32,
+}
+
+fn challenge_tree(
+    descriptor: &[u8; 32],
+    position: u32,
+    segment: u16,
+    entries: u32,
+) -> Vec<Vec<ChallengeNode>> {
+    let mut level: Vec<ChallengeNode> = (0..entries)
+        .map(|local| ChallengeNode {
+            digest: h::hash(
+                b"c5-challenge-leaf",
+                &[
+                    descriptor,
+                    &position.to_le_bytes(),
+                    &segment.to_le_bytes(),
+                    &local.to_le_bytes(),
+                ],
+            ),
+            first: local,
+            end: local + 1,
+        })
+        .collect();
+    let mut levels = vec![level.clone()];
+    let mut height = 0u8;
+    while level.len() > 1 {
+        height += 1;
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for pair in level.chunks(2) {
+            let left = pair[0];
+            let right = *pair.get(1).unwrap_or(&left);
+            next.push(ChallengeNode {
+                digest: h::hash(
+                    b"node/2",
+                    &[
+                        descriptor,
+                        &[1],
+                        &position.to_le_bytes(),
+                        &left.first.to_le_bytes(),
+                        &right.end.to_le_bytes(),
+                        &[height, 1],
+                        &left.digest,
+                        &right.digest,
+                    ],
+                ),
+                first: left.first,
+                end: right.end,
+            });
+        }
+        level = next;
+        levels.push(level.clone());
+    }
+    levels
+}
+
+/// A locally committed segment tree on the retained rung-D plan. Its root is
+/// landed into a real revision-8 document before the challenge is opened; the
+/// leaves are mechanics fixtures and do not claim an inference result.
+async fn commit_challenge_tree(
+    f: &mut Fix,
+    binding: &Binding2,
+    p: u32,
+    ordinal: usize,
+) -> (
+    [u8; 32],
+    [Pubkey; 4],
+    Vec<[u8; 32]>,
+    u16,
+    u32,
+    Vec<Vec<ChallengeNode>>,
+) {
+    let descriptor = f.descriptor(binding, &f.terms_raw, 16);
+    let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
+    let x = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        None,
+        pt2p::Program::decode(&pwr1).unwrap(),
+    )
+    .unwrap();
+    let (segment, entries) = x.segment_row(p, ordinal).unwrap();
+    let levels = challenge_tree(&descriptor, p, segment, entries);
+    let tree = levels.last().unwrap()[0].digest;
+    let segment_root = h::hash(
+        b"segment-root/2",
+        &[
+            &descriptor,
+            &p.to_le_bytes(),
+            &segment.to_le_bytes(),
+            &entries.to_le_bytes(),
+            &tree,
+            &[1],
+        ],
+    );
+    let table = x.segment_table_root(p).unwrap();
+    let mut roots = (0..f.segments)
+        .map(|i| {
+            h::hash(
+                b"c5-unselected-segment",
+                &[&descriptor, &p.to_le_bytes(), &i.to_le_bytes()],
+            )
+        })
+        .collect::<Vec<_>>();
+    roots[ordinal] = segment_root;
+    let position_root = h::position_root(&descriptor, p, &table, &roots).unwrap();
+    let mut positions = f.position_roots[..f.k as usize].to_vec();
+    positions[p as usize] = position_root;
+    let (actual_descriptor, created) = f.run_document_with_roots(binding, &positions).await;
+    assert_eq!(actual_descriptor, descriptor);
+    f.finalize(&descriptor, created, f.k).await;
+    (descriptor, created, roots, segment, entries - 1, levels)
+}
+
+fn challenge_position_data(descriptor: &[u8; 32], p: u32, nonce: u32) -> Vec<u8> {
+    let mut data = vec![TAG_CHALLENGE_POSITION];
+    data.extend_from_slice(descriptor);
+    data.extend_from_slice(&p.to_le_bytes());
+    data.extend_from_slice(&nonce.to_le_bytes());
+    data
+}
+
+fn challenge_position_metas(f: &Fix, c: [Pubkey; 4], record: Pubkey) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(record, false),
+        AccountMeta::new(f.signer.pubkey(), true),
+        AccountMeta::new(c[0], false),
+        AccountMeta::new_readonly(c[1], false),
+        AccountMeta::new_readonly(SYSTEM, false),
+        AccountMeta::new_readonly(f.pt2s, false),
+        AccountMeta::new_readonly(f.routes, false),
+        AccountMeta::new_readonly(f.geometry, false),
+        AccountMeta::new_readonly(f.drp2, false),
+    ]
+}
+
+/// Drive the on-chain tag-163/164/168/169 position dispute through its final
+/// fix-point, taking the tree branch containing `target_local` each time.
+/// Returns the DCR1 PDA. Every normal round reads the real DCM2 v7; the final
+/// tag 169 also reads the sealed plan and DRP2 class table.
+async fn descend_position_challenge(
+    f: &mut Fix,
+    c: [Pubkey; 4],
+    descriptor: &[u8; 32],
+    roots: &[[u8; 32]],
+    p: u32,
+    ordinal: u16,
+    segment: u16,
+    target_local: u32,
+    levels: &[Vec<ChallengeNode>],
+    nonce: u32,
+    stop_before_fixpoint: bool,
+) -> Pubkey {
+    let record = address::challenge(&f.program, descriptor, &f.signer.pubkey(), nonce).0;
+    let open_metas = challenge_position_metas(f, c, record);
+    label("challenge-open-position-167");
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        challenge_position_data(descriptor, p, nonce),
+        open_metas,
+    )
+    .await
+    .expect("tag 167 opens revision-8 challenge");
+
+    let mut reveal_position = vec![TAG_REVEAL_POSITION, 0, 0, roots.len() as u8];
+    for root in roots {
+        reveal_position.extend_from_slice(root);
+    }
+    label("challenge-round-reveal-position-163");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        reveal_position,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new_readonly(c[0], false),
+            AccountMeta::new_readonly(c[1], false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+        ],
+    )
+    .await
+    .expect("tag 163 reveals roots");
+
+    let mut select = vec![TAG_SELECT_SEGMENT];
+    select.extend_from_slice(&ordinal.to_le_bytes());
+    label("challenge-round-select-segment-164");
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        select,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.signer.pubkey(), true),
+            AccountMeta::new_readonly(c[0], false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+        ],
+    )
+    .await
+    .expect("tag 164 selects segment");
+
+    let entries = levels[0].len() as u32;
+    let mut first = 0u32;
+    let mut end = entries;
+    let mut height = (levels.len() - 1) as u8;
+    let mut opening = true;
+    loop {
+        let steps = height.min(4);
+        let child_height = height - steps;
+        let span = 1u32 << child_height;
+        let count = end.div_ceil(span) - first / span;
+        let children = &levels[child_height as usize]
+            [(first / span) as usize..(first / span + count) as usize];
+        let mut reveal = vec![TAG_REVEAL, count as u8];
+        if opening {
+            reveal.extend_from_slice(&levels.last().unwrap()[0].digest);
+        }
+        for child in children {
+            reveal.extend_from_slice(&child.digest);
+        }
+        label("challenge-round-reveal-168");
+        send(
+            &mut f.ctx,
+            &f.executor,
+            f.program,
+            reveal,
+            vec![
+                AccountMeta::new(record, false),
+                AccountMeta::new(f.executor.pubkey(), true),
+                AccountMeta::new_readonly(c[0], false),
+            ],
+        )
+        .await
+        .expect("tag 168 reveals a descent round");
+
+        if stop_before_fixpoint && child_height == 0 {
+            assert_eq!(f.account(record).await[4], challenge::PHASE_DESCEND);
+            break;
+        }
+        let choice = (target_local - first) / span;
+        let fix = child_height == 0;
+        let mut descend = vec![TAG_DESCEND, choice as u8];
+        let mut metas = vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.signer.pubkey(), true),
+            AccountMeta::new(c[0], false),
+        ];
+        if fix {
+            metas.extend([
+                AccountMeta::new_readonly(f.pt2s, false),
+                AccountMeta::new_readonly(f.routes, false),
+                AccountMeta::new_readonly(f.geometry, false),
+                AccountMeta::new_readonly(f.drp2, false),
+                AccountMeta::new_readonly(f.pt1s_index, false),
+            ]);
+        }
+        label("challenge-round-descend-rule-169");
+        send(
+            &mut f.ctx,
+            &f.signer,
+            f.program,
+            std::mem::take(&mut descend),
+            metas,
+        )
+        .await
+        .expect("tag 169 descends; the final round also runs RULE");
+        if fix {
+            break;
+        }
+        first += choice * span;
+        end = end.min(first + span);
+        height = child_height;
+        opening = false;
+    }
+    assert_eq!(
+        segment,
+        u16_at(&f.account(record).await, 160),
+        "challenge segment stayed bound"
+    );
+    record
+}
+
+fn final_position_choice(levels: &[Vec<ChallengeNode>], target: u32) -> u8 {
+    let mut first = 0u32;
+    let mut height = (levels.len() - 1) as u8;
+    loop {
+        let child_height = height - height.min(4);
+        let span = 1u32 << child_height;
+        if child_height == 0 {
+            return ((target - first) / span) as u8;
+        }
+        let choice = (target - first) / span;
+        first += choice * span;
+        height = child_height;
+    }
+}
+
+fn challenge_leaf_packet(f: &Fix, descriptor: &[u8; 32], proof: &Rekeyed, nonce: u32) -> Vec<u8> {
+    let packet = &proof.data;
+    assert_eq!(packet[0], TAG_ATTEST_OUTPUT);
+    let width = f.output_width as usize;
+    let tail_len = u16_at(packet, 37 + width) as usize;
+    let tail_at = 39 + width;
+    let tail = &packet[tail_at..tail_at + tail_len];
+    let height_at = tail_at + tail_len;
+    let height = packet[height_at] as usize;
+    let path_at = height_at + 1;
+    let path = &packet[path_at..path_at + 32 * height];
+    let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
+    let x = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        None,
+        pt2p::Program::decode(&pwr1).unwrap(),
+    )
+    .unwrap();
+    let t = x
+        .old_to_new(f.base_entry, proof.p)
+        .unwrap()
+        .expect("output base entry");
+    let coordinate = x.coordinate(proof.p, t).unwrap();
+    let leaf_coordinate = h::Coordinate {
+        position: proof.p,
+        segment: coordinate.segment,
+        entry: coordinate.local,
+    };
+    let mut leaf = Vec::new();
+    leaf.extend_from_slice(LEAF_DOMAIN);
+    leaf.extend_from_slice(descriptor);
+    leaf.extend_from_slice(&leaf_coordinate.bytes());
+    leaf.extend_from_slice(tail);
+    let leaf_hash = leaf_hash_of(&leaf);
+    let spp1_at = path_at + 32 * height;
+    let (_, _, _, spp1_len) = challenge::decode_spp1(&packet[spp1_at..]).unwrap();
+    let mut out = vec![TAG_CHALLENGE_LEAF];
+    out.extend_from_slice(descriptor);
+    out.extend_from_slice(&proof.p.to_le_bytes());
+    out.extend_from_slice(&coordinate.segment.to_le_bytes());
+    out.extend_from_slice(&coordinate.local.to_le_bytes());
+    out.extend_from_slice(&leaf_hash);
+    out.push(height as u8);
+    out.extend_from_slice(path);
+    out.extend_from_slice(&packet[spp1_at..spp1_at + spp1_len]);
+    out.extend_from_slice(&nonce.to_le_bytes());
+    out
+}
+
+fn challenge_leaf_metas(f: &Fix, c: [Pubkey; 4], record: Pubkey) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(record, false),
+        AccountMeta::new(f.signer.pubkey(), true),
+        AccountMeta::new(c[0], false),
+        AccountMeta::new_readonly(c[1], false),
+        AccountMeta::new_readonly(SYSTEM, false),
+        AccountMeta::new_readonly(f.pt2s, false),
+        AccountMeta::new_readonly(f.routes, false),
+        AccountMeta::new_readonly(f.geometry, false),
+        AccountMeta::new_readonly(f.drp2, false),
+        AccountMeta::new_readonly(f.pt1s_index, false),
+    ]
+}
+
+/// A real retained-rung-D output proof opens a revision-8 leaf challenge, and
+/// the executor can answer the family-table round. A challenger that corrupts
+/// the Merkle path is refused 586 before DCR1 creation or bond transfer.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_honest_leaf_challenge_uses_v7_document_reader_and_refuses_a_cheating_challenger() {
+    let Some(mut f) = build().await else { return };
+    let binding = f.binding(29, 50);
+    let (descriptor, created, proofs) = attest_all(&mut f, &binding, 31, &[], 81).await;
+    assert_eq!(proofs.len(), 1);
+    let honest = challenge_leaf_packet(&f, &descriptor, &proofs[0], 11);
+    let mut cheat = challenge_leaf_packet(&f, &descriptor, &proofs[0], 12);
+    cheat[76] ^= 1; // the first segment-path sibling no longer opens the landed root
+    let rejected = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), 12).0;
+    let rejected_metas = challenge_leaf_metas(&f, created, rejected);
+    label("challenge-open-leaf-malformed-166");
+    assert_eq!(
+        custom(send_fresh(&mut f.ctx, &f.signer, f.program, cheat, rejected_metas).await),
+        CL_PATH,
+        "a false path is rejected before an open challenge is recorded"
+    );
+    assert!(f
+        .ctx
+        .banks_client
+        .get_account(rejected)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        u32_at(&f.account(created[0]).await, 128),
+        0,
+        "the refusal does not increment DCM2"
+    );
+
+    let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), 11).0;
+    let honest_metas = challenge_leaf_metas(&f, created, record);
+    label("challenge-open-leaf-166");
+    send(&mut f.ctx, &f.signer, f.program, honest, honest_metas)
+        .await
+        .expect("the retained attestation opens a challenge against DCM2 v7");
+    let dcr1 = f.account(record).await;
+    assert_eq!(
+        dcr1[4],
+        challenge::PHASE_RESPOND,
+        "the honest class is admitted at fix-point"
+    );
+    assert_eq!(u32_at(&dcr1, 140), 11, "the v8 record keeps the open nonce");
+    assert_eq!(u32_at(&f.account(created[0]).await, 128), 1);
+
+    // Executor-side response, using the family-table round's real v8 reader.
+    let mut reveal = vec![TAG_REVEAL_FAMILY_TABLE, 0, f.family_roots.len() as u8];
+    for root in &f.family_roots {
+        reveal.extend_from_slice(root);
+    }
+    label("challenge-round-family-table-173");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        reveal,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new_readonly(created[0], false),
+        ],
+    )
+    .await
+    .expect("executor family-table response");
+    let dcr1 = f.account(record).await;
+    assert_eq!(
+        dcr1[challenge::FTR_AT],
+        1,
+        "tag 173 verified the DCM2 v7 family digest"
+    );
+    assert_eq!(
+        u16_at(&dcr1, challenge::FTR_AT + 2),
+        f.family_roots.len() as u16
+    );
+}
+
+/// The revision-8 opener rejects a malformed DCM2 and a real revision-7 DCM2
+/// v6 account before creating the challenge record or escrowing a bond.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_challenge_open_refuses_malformed_and_revision7_documents() {
+    let Some(mut f) = build().await else { return };
+    let binding = f.binding(29, 50);
+    let (descriptor, created) = f.run_document(&binding, f.k).await;
+    f.finalize(&descriptor, created, f.k).await;
+    let data = challenge_position_data(&descriptor, 79, 31);
+    let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), 31).0;
+    let metas = challenge_position_metas(&f, created, record);
+    let v8_doc = f.account(created[0]).await;
+
+    let mut v7_doc = unhex(v7_golden()["dcm2_v6"]["finalized"].as_str().unwrap());
+    v7_doc[8..40].copy_from_slice(&descriptor);
+    f.ctx
+        .set_account(&created[0], &shared(owned(&f.program, v7_doc)));
+    assert_eq!(
+        custom(send_fresh(&mut f.ctx, &f.signer, f.program, data, metas).await),
+        731,
+        "the revision-8 image refuses a genuine DCM2 v6 document"
+    );
+    assert!(f
+        .ctx
+        .banks_client
+        .get_account(record)
+        .await
+        .unwrap()
+        .is_none());
+
+    f.ctx
+        .set_account(&created[0], &shared(owned(&f.program, v8_doc.clone())));
+    let mut malformed = v8_doc;
+    malformed.truncate(31);
+    f.ctx
+        .set_account(&created[0], &shared(owned(&f.program, malformed)));
+    let bad_record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), 32).0;
+    let bad_metas = challenge_position_metas(&f, created, bad_record);
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                challenge_position_data(&descriptor, 79, 32),
+                bad_metas,
+            )
+            .await
+        ),
+        731,
+        "a short DCM2 is refused by the same v8 reader"
+    );
+    assert!(f
+        .ctx
+        .banks_client
+        .get_account(bad_record)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// Tag 167's coordinate is a landed position, bounded by this finalized
+/// document's n at DCM2 84, not the template capacity K at DCM2 72.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_position_challenge_uses_document_length_not_capacity() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let binding = f.binding(29, 50);
+    let (descriptor, created, _) = attest_all(&mut f, &binding, 31, &[], 81).await;
+    let doc = f.account(created[0]).await;
+    let (n, k) = (u32_at(&doc, 84), u32_at(&doc, 72));
+    assert_eq!((n, k), (31, 80), "the fixture separates n from K");
+
+    // The review's p=79 probe is the critical regression: it used to open,
+    // leave the executor unable to reveal a landed root, and permit conviction.
+    let probe_nonce = 55;
+    let probe_record =
+        address::challenge(&f.program, &descriptor, &f.signer.pubkey(), probe_nonce).0;
+    let probe_metas = challenge_position_metas(&f, created, probe_record);
+    assert_eq!(
+        custom_or_zero(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                challenge_position_data(&descriptor, 79, probe_nonce),
+                probe_metas
+            )
+            .await
+        ),
+        CL_COORDINATE
+    );
+    assert!(f
+        .ctx
+        .banks_client
+        .get_account(probe_record)
+        .await
+        .unwrap()
+        .is_none());
+
+    let last_nonce = 56;
+    let last_record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), last_nonce).0;
+    let last_metas = challenge_position_metas(&f, created, last_record);
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        challenge_position_data(&descriptor, n - 1, last_nonce),
+        last_metas,
+    )
+    .await
+    .expect("p = n - 1 opens");
+    assert_eq!(
+        f.account(last_record).await[4],
+        challenge::PHASE_POSITION_REVEAL
+    );
+
+    for (position, nonce) in [(n, 57), (k, 58)] {
+        let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), nonce).0;
+        let metas = challenge_position_metas(&f, created, record);
+        assert_eq!(
+            custom_or_zero(
+                send_fresh(
+                    &mut f.ctx,
+                    &f.signer,
+                    f.program,
+                    challenge_position_data(&descriptor, position, nonce),
+                    metas
+                )
+                .await
+            ),
+            CL_COORDINATE,
+            "p={position} is outside n={n}"
+        );
+        assert!(f
+            .ctx
+            .banks_client
+            .get_account(record)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+/// Permanent revision-8 refusal coverage for the opener and its first round.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_challenge_opener_refuses_wrong_phase_role_and_deadlines() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let binding = f.binding(29, 50);
+    let (descriptor, created) = f.run_document(&binding, 31).await;
+
+    let before_finalize_nonce = 61;
+    let before_finalize = address::challenge(
+        &f.program,
+        &descriptor,
+        &f.signer.pubkey(),
+        before_finalize_nonce,
+    )
+    .0;
+    let before_finalize_metas = challenge_position_metas(&f, created, before_finalize);
+    assert_eq!(
+        custom_or_zero(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                challenge_position_data(&descriptor, 30, before_finalize_nonce),
+                before_finalize_metas
+            )
+            .await
+        ),
+        DCR1_AUTH_REFUSAL
+    );
+
+    f.finalize(&descriptor, created, 31).await;
+
+    let executor_nonce = 62;
+    let executor_record = address::challenge(
+        &f.program,
+        &descriptor,
+        &f.executor.pubkey(),
+        executor_nonce,
+    )
+    .0;
+    let mut executor_metas = challenge_position_metas(&f, created, executor_record);
+    executor_metas[1] = AccountMeta::new(f.executor.pubkey(), true);
+    assert_eq!(
+        custom_or_zero(
+            send_fresh(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                challenge_position_data(&descriptor, 30, executor_nonce),
+                executor_metas
+            )
+            .await
+        ),
+        DCR1_AUTH_REFUSAL
+    );
+
+    let valid_nonce = 63;
+    let valid_record =
+        address::challenge(&f.program, &descriptor, &f.signer.pubkey(), valid_nonce).0;
+    let valid_metas = challenge_position_metas(&f, created, valid_record);
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        challenge_position_data(&descriptor, 3, valid_nonce),
+        valid_metas,
+    )
+    .await
+    .expect("valid tag 167 opens");
+
+    assert_eq!(
+        custom_or_zero(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+                vec![
+                    AccountMeta::new(valid_record, false),
+                    AccountMeta::new(created[0], false)
+                ]
+            )
+            .await
+        ),
+        CL_DEADLINE,
+        "tag 132 is early before the response deadline"
+    );
+
+    let mut wrong_actor_reveal = vec![TAG_REVEAL_POSITION, 0, 0, f.segments as u8];
+    for i in 0..f.segments {
+        wrong_actor_reveal.extend_from_slice(&[i as u8 + 1; 32]);
+    }
+    let wrong_actor_metas = vec![
+        AccountMeta::new(valid_record, false),
+        AccountMeta::new(f.signer.pubkey(), true),
+        AccountMeta::new_readonly(created[0], false),
+        AccountMeta::new_readonly(created[1], false),
+        AccountMeta::new_readonly(f.pt2s, false),
+        AccountMeta::new_readonly(f.routes, false),
+        AccountMeta::new_readonly(f.geometry, false),
+    ];
+    assert_eq!(
+        custom_or_zero(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                wrong_actor_reveal,
+                wrong_actor_metas
+            )
+            .await
+        ),
+        DCR1_AUTH_REFUSAL,
+        "the challenger cannot sign the executor's tag 163"
+    );
+
+    let dispute_deadline = u64_at(&f.account(created[0]).await, 144);
+    clock_to(&mut f, dispute_deadline + 1).await;
+    let late_nonce = 64;
+    let late_record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), late_nonce).0;
+    let late_metas = challenge_position_metas(&f, created, late_record);
+    assert_eq!(
+        custom_or_zero(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                challenge_position_data(&descriptor, 3, late_nonce),
+                late_metas
+            )
+            .await
+        ),
+        CL_DEADLINE
+    );
+    assert!(f
+        .ctx
+        .banks_client
+        .get_account(late_record)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// Replaying tag 164 after its first transition is a phase refusal (733).
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_replayed_segment_selection_refuses_phase() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let binding = f.binding(29, 50);
+    let (descriptor, created, roots, _, _, _) =
+        commit_challenge_tree(&mut f, &binding, 79, 0).await;
+    let nonce = 65;
+    let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), nonce).0;
+    let open_metas = challenge_position_metas(&f, created, record);
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        challenge_position_data(&descriptor, 79, nonce),
+        open_metas,
+    )
+    .await
+    .expect("tag 167 opens");
+
+    let mut reveal = vec![TAG_REVEAL_POSITION, 0, 0, roots.len() as u8];
+    for root in &roots {
+        reveal.extend_from_slice(root);
+    }
+    let reveal_metas = vec![
+        AccountMeta::new(record, false),
+        AccountMeta::new(f.executor.pubkey(), true),
+        AccountMeta::new_readonly(created[0], false),
+        AccountMeta::new_readonly(created[1], false),
+        AccountMeta::new_readonly(f.pt2s, false),
+        AccountMeta::new_readonly(f.routes, false),
+        AccountMeta::new_readonly(f.geometry, false),
+    ];
+    send(&mut f.ctx, &f.executor, f.program, reveal, reveal_metas)
+        .await
+        .expect("tag 163 reveals roots");
+
+    let select = vec![dcg_program::unified::TAG_SELECT_SEGMENT, 0, 0];
+    let select_metas = vec![
+        AccountMeta::new(record, false),
+        AccountMeta::new(f.signer.pubkey(), true),
+        AccountMeta::new_readonly(created[0], false),
+        AccountMeta::new_readonly(f.pt2s, false),
+        AccountMeta::new_readonly(f.routes, false),
+        AccountMeta::new_readonly(f.geometry, false),
+    ];
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        select.clone(),
+        select_metas.clone(),
+    )
+    .await
+    .expect("first tag 164 selects the segment");
+    assert_eq!(f.account(record).await[4], challenge::PHASE_REVEAL);
+    let slot = f
+        .ctx
+        .banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .slot;
+    f.ctx.warp_to_slot(slot + 1).unwrap();
+    assert_eq!(
+        custom_or_zero(send_fresh(&mut f.ctx, &f.signer, f.program, select, select_metas).await),
+        DCR1_PHASE_REFUSAL
+    );
+}
+
+/// A silent revision-8 executor loses after a position challenge. The executor's
+/// STANDARD bond is smaller than an empty account's rent floor, so the
+/// uncreditable remainder goes to the incinerator and never to the convict.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_position_challenge_rounds_convict_executor_and_burn_uncreditable_bond() {
+    let Some(mut f) = build().await else { return };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.executor_bond_lamports = 500_000;
+    terms.bond_policy_kind = dcg_program::unified::terms::BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
+
+    let binding = f.binding(29, 50);
+    let (descriptor, created) = f.run_document(&binding, f.k).await;
+    f.finalize(&descriptor, created, f.k).await;
+
+    let nonce = 19u32;
+    let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), nonce).0;
+    let open_metas = challenge_position_metas(&f, created, record);
+    label("challenge-open-position-167");
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        challenge_position_data(&descriptor, 79, nonce),
+        open_metas,
+    )
+    .await
+    .expect("the position challenge opens against the real DCM2 v7");
+    assert_eq!(f.account(record).await[4], challenge::PHASE_POSITION_REVEAL);
+    let response_deadline = u64_at(&f.account(record).await, 148);
+    clock_to(&mut f, response_deadline + 1).await;
+    label("challenge-timeout-executor-132");
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await
+    .expect("tag 132 rules for the challenger after executor silence");
+    let dcr1 = f.account(record).await;
+    assert_eq!(
+        dcr1[4],
+        challenge::PHASE_RULED,
+        "the missed reveal reached RULE"
+    );
+    assert_eq!(dcr1[5], 2, "the challenger wins against a silent executor");
+    assert_eq!(dcr1[178], events::CAUSE_TIMEOUT);
+    let doc = f.account(created[0]).await;
+    assert_eq!(u16_at(&doc, 6) & FLAG_REFUTED, FLAG_REFUTED);
+    assert_eq!(u32_at(&doc, 132), 1);
+    assert_eq!(
+        &doc[document::WINNER_AT_V8..document::WINNER_AT_V8 + 32],
+        f.signer.pubkey().as_ref()
+    );
+
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let remainder = Pubkey::new_from_array(terms.bond_remainder);
+    let before_challenger = f.lamports(f.signer.pubkey()).await;
+    let record_rent_and_bond = f.lamports(record).await;
+    let before_executor = f.lamports(f.executor.pubkey()).await;
+    let before_doc = f.lamports(created[0]).await;
+    let before_burn = f.lamports(incinerator::ID).await;
+    label("challenge-rule-and-standard-settle-131");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_SETTLE],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(response, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(f.executor.pubkey(), false),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(incinerator::ID, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(remainder, false),
+        ],
+    )
+    .await
+    .expect("tag 131 settles the convicted challenge");
+    assert_eq!(
+        f.lamports(f.signer.pubkey()).await,
+        before_challenger + record_rent_and_bond,
+        "the challenge rent and its own bond return to the challenger who funded the record"
+    );
+    assert_eq!(
+        f.lamports(record).await,
+        0,
+        "the challenge record is drained"
+    );
+    assert_eq!(
+        f.lamports(incinerator::ID).await,
+        before_burn + terms.executor_bond_lamports,
+        "the uncreditable policy remainder is incinerated"
+    );
+    assert_eq!(
+        f.lamports(created[0]).await,
+        before_doc - terms.executor_bond_lamports
+    );
+    assert!(
+        f.lamports(f.executor.pubkey()).await <= before_executor,
+        "the convict receives none of the challenged bond"
+    );
+    assert_eq!(f.account(created[0]).await[529], document::BOND_PAID);
+
+    // A third party may close the refuted document after its challenge window;
+    // there are no open challenge records left after settle.
+    let third_party = Keypair::new();
+    f.ctx.set_account(
+        &third_party.pubkey(),
+        &shared(Account {
+            lamports: 1_000_000_000,
+            data: vec![],
+            owner: SYSTEM,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    let close_metas = f.close_metas_slots(
+        &c,
+        third_party.pubkey(),
+        AccountMeta::new(incinerator::ID, false),
+        AccountMeta::new(remainder, false),
+    );
+    let rent_to_executor =
+        f.lamports(created[0]).await + f.lamports(created[1]).await + f.lamports(created[2]).await;
+    let before_close_executor = f.lamports(f.executor.pubkey()).await;
+    let close_deadline = u64_at(&f.account(created[0]).await, 144) + 1;
+    clock_to(&mut f, close_deadline).await;
+    send(
+        &mut f.ctx,
+        &third_party,
+        f.program,
+        close_data(&descriptor),
+        close_metas,
+    )
+    .await
+    .expect("anyone may close the refuted document after the deadline");
+    assert_eq!(
+        f.lamports(f.executor.pubkey()).await,
+        before_close_executor + rent_to_executor,
+        "document, position and family-record rent return to their recorded payer, not the closer"
+    );
+    for account in &created[..3] {
+        assert_eq!(
+            f.lamports(*account).await,
+            0,
+            "the rent-bearing account was drained"
+        );
+    }
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_REFUTED);
+}
+
+/// Both signing roles complete the position-reveal and segment-bisection
+/// rounds on a committed revision-8 document, reaching an admitted fix-point.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_position_challenge_rounds_reach_an_admitted_fixpoint() {
+    let Some(mut f) = build().await else { return };
+    let binding = f.binding(29, 50);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_challenge_tree(&mut f, &binding, 79, 0).await;
+    let record = descend_position_challenge(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        0,
+        segment,
+        target,
+        &levels,
+        20,
+        false,
+    )
+    .await;
+    let dcr1 = f.account(record).await;
+    assert_eq!(dcr1[4], challenge::PHASE_RESPOND);
+    assert_eq!(dcr1[5], 0, "an admitted fix-point does not select a winner");
+    assert_eq!(
+        u32_at(&dcr1, challenge::DEV2_AT + 8),
+        0,
+        "the frozen class admits the instance"
+    );
+    assert_eq!(u32_at(&f.account(created[0]).await, 128), 1);
+}
+
+/// The extracted SBF app replays the terminal Form-256 fix-point through its
+/// static ByteSum manifest. The executor then cheats by going silent; tag 132
+/// rules against it, tag 131 settles the STANDARD bond, and tag 172 refunds
+/// the document rent to the original payer.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_bytesum_fixpoint_silence_settles_and_closes_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.executor_bond_lamports = 500_000;
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
+
+    let binding = f.binding(29, 50);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_challenge_tree(&mut f, &binding, 79, 0).await;
+    let nonce = 90;
+    let record = descend_position_challenge(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        0,
+        segment,
+        target,
+        &levels,
+        nonce,
+        true,
+    )
+    .await;
+    let choice = final_position_choice(&levels, target);
+    let descend_data = vec![TAG_DESCEND, choice];
+    let mut wrong_role = vec![
+        AccountMeta::new(record, false),
+        AccountMeta::new(f.signer.pubkey(), true),
+        AccountMeta::new(created[0], false),
+        AccountMeta::new_readonly(f.pt2s, false),
+        AccountMeta::new_readonly(f.routes, false),
+        AccountMeta::new(f.geometry, false),
+        AccountMeta::new_readonly(f.drp2, false),
+        AccountMeta::new_readonly(f.pt1s_index, false),
+    ];
+    label("challenge-fixpoint-wrong-writable-geometry");
+    assert_eq!(
+        custom(
+            send_fresh(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                descend_data.clone(),
+                wrong_role.clone()
+            )
+            .await
+        ),
+        DCR1_AUTH_REFUSAL,
+        "tag 169 rejects a writable account where the manifest requires read-only"
+    );
+    wrong_role[5] = AccountMeta::new_readonly(f.geometry, false);
+    label("challenge-round-descend-rule-169");
+    send(&mut f.ctx, &f.signer, f.program, descend_data, wrong_role)
+        .await
+        .expect("the exact read-only spans reach ByteSum replay");
+    let dcr1 = f.account(record).await;
+    assert_eq!(dcr1[4], challenge::PHASE_RESPOND);
+    assert_eq!(dcr1[5], 0);
+    assert_eq!(
+        u32_at(&dcr1, challenge::DEV2_AT + 8),
+        0,
+        "manifest ByteSum replay admitted the step"
+    );
+
+    let response_deadline = u64_at(&dcr1, 148);
+    clock_to(&mut f, response_deadline + 1).await;
+    label("challenge-timeout-executor-132");
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await
+    .expect("tag 132 rules for the silent executor");
+    assert_eq!(f.account(record).await[4], challenge::PHASE_RULED);
+    assert_eq!(f.account(record).await[5], 2);
+    assert_eq!(
+        u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
+        FLAG_REFUTED
+    );
+
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let remainder = Pubkey::new_from_array(terms.bond_remainder);
+    let record_rent_and_bond = f.lamports(record).await;
+    let before_challenger = f.lamports(f.signer.pubkey()).await;
+    let before_doc = f.lamports(created[0]).await;
+    label("challenge-rule-and-standard-settle-131");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_SETTLE],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(response, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(f.executor.pubkey(), false),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(incinerator::ID, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(remainder, false),
+        ],
+    )
+    .await
+    .expect("tag 131 settles against the cheating executor");
+    assert_eq!(
+        f.lamports(f.signer.pubkey()).await,
+        before_challenger + record_rent_and_bond
+    );
+    assert_eq!(f.lamports(record).await, 0);
+    assert_eq!(
+        f.lamports(created[0]).await,
+        before_doc - terms.executor_bond_lamports
+    );
+    assert_eq!(f.account(created[0]).await[529], document::BOND_PAID);
+
+    let third_party = Keypair::new();
+    f.ctx.set_account(
+        &third_party.pubkey(),
+        &shared(Account {
+            lamports: 1_000_000_000,
+            data: vec![],
+            owner: SYSTEM,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    let close_metas = f.close_metas_slots(
+        &c,
+        third_party.pubkey(),
+        AccountMeta::new(incinerator::ID, false),
+        AccountMeta::new(remainder, false),
+    );
+    let rent_to_executor =
+        f.lamports(created[0]).await + f.lamports(created[1]).await + f.lamports(created[2]).await;
+    let before_close_executor = f.lamports(f.executor.pubkey()).await;
+    let close_deadline = u64_at(&f.account(created[0]).await, 144) + 1;
+    clock_to(&mut f, close_deadline).await;
+    label("document-close-refuted-172");
+    send(
+        &mut f.ctx,
+        &third_party,
+        f.program,
+        close_data(&descriptor),
+        close_metas,
+    )
+    .await
+    .expect("tag 172 closes the settled refuted document");
+    assert_eq!(
+        f.lamports(f.executor.pubkey()).await,
+        before_close_executor + rent_to_executor
+    );
+    assert_eq!(f.lamports(created[0]).await, 0);
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_REFUTED);
+}
+
+/// Build only the real K=10,240 PT1X/PT2S registry and admission path. This
+/// isolates tags 159 and 160 from Basanos-only tag 150, so every measured
+/// admission instruction is a DCG SBF instruction.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_pt1x_registry_and_admission_sbf() {
+    let Some(mut f) = build_honest_pt1x().await else {
+        panic!("retained K=10,240 artifacts absent")
+    };
+    assert_eq!(f.k, 10_240);
+    let admission = f.account(f.dea2).await;
+    assert_eq!(&admission[..4], b"DEA2");
+    assert_eq!(u32_at(&admission, 136), f.k);
+}
+
+/// Full real admission to final result on the extracted SBF image: actual
+/// PT1X/PT2S setup, registry and tag-159/160 admission, then tags 161/162/165,
+/// 177, and 178 on the same K=10,240 template.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_pt1x_real_admission_to_resolve_sbf() {
+    let Some(mut f) = build_honest_pt1x().await else {
+        panic!("retained K=10,240 artifacts absent")
+    };
+    assert_eq!(f.k, 10_240);
+    let binding = f.binding(29, 50);
+    let (descriptor, created, proofs) = attest_all(&mut f, &binding, 31, &[], 0x77).await;
+    assert_eq!(proofs.len(), 1);
+    past_deadline(&mut f, created[0]).await;
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        pair(created[0], created[3]),
+    )
+    .await
+    .expect("tag 178 resolves the fully attested K=10,240 document");
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_FINAL);
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    let close_metas = f.close_metas(&c, f.signer.pubkey());
+    let before_payer = f.lamports(f.executor.pubkey()).await;
+    let rent_refund =
+        f.lamports(created[0]).await + f.lamports(created[1]).await + f.lamports(created[2]).await;
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&descriptor),
+        close_metas,
+    )
+    .await
+    .expect("tag 172 closes the final document");
+    assert_eq!(
+        f.lamports(f.executor.pubkey()).await,
+        before_payer + rent_refund
+    );
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_SETTLED);
+}
+
+/// A challenger who abandons the last descendant choice loses to the executor
+/// under tag 132. This exercises the timeout after the executor has answered
+/// every preceding position and tree round.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_timeout_refutes_a_challenger_who_stalls_in_descent() {
+    let Some(mut f) = build().await else { return };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
+    let binding = f.binding(29, 50);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_challenge_tree(&mut f, &binding, 79, 0).await;
+    let nonce = 21;
+    let record = descend_position_challenge(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        0,
+        segment,
+        target,
+        &levels,
+        nonce,
+        true,
+    )
+    .await;
+    let open_record = f.account(record).await;
+    assert_eq!(open_record[4], challenge::PHASE_DESCEND);
+    clock_to(&mut f, u64_at(&open_record, 148) + 1).await;
+    label("challenge-timeout-stalled-challenger-132");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await
+    .expect("the timeout rules for the executor after the challenger's missed descent");
+    let dcr1 = f.account(record).await;
+    assert_eq!(dcr1[4], challenge::PHASE_RULED);
+    assert_eq!(dcr1[5], 1);
+    assert_eq!(dcr1[178], events::CAUSE_TIMEOUT);
+    let doc = f.account(created[0]).await;
+    assert_eq!(u32_at(&doc, 132), 0);
+    assert_eq!(u16_at(&doc, 6) & FLAG_REFUTED, 0);
+
+    // Executor wins the round, so tag 131 returns the challenger's bond to
+    // the executor and the challenge record's rent to its recorded payer.
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let remainder = Pubkey::new_from_array(terms.bond_remainder);
+    let record_lamports = f.lamports(record).await;
+    let challenge_rent = record_lamports
+        .checked_sub(terms.challenger_bond_lamports)
+        .unwrap();
+    let before_executor = f.lamports(f.executor.pubkey()).await;
+    let before_challenger = f.lamports(f.signer.pubkey()).await;
+    let settler = Keypair::new();
+    fund(&mut f.ctx, settler.pubkey()).await;
+    let settle_metas = vec![
+        AccountMeta::new(record, false),
+        AccountMeta::new(response, false),
+        AccountMeta::new(f.executor.pubkey(), false),
+        AccountMeta::new(f.executor.pubkey(), false),
+        AccountMeta::new(created[0], false),
+        AccountMeta::new(incinerator::ID, false),
+        AccountMeta::new(f.signer.pubkey(), false),
+        AccountMeta::new(incinerator::ID, false),
+        AccountMeta::new(remainder, false),
+    ];
+    send(
+        &mut f.ctx,
+        &settler,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_SETTLE],
+        settle_metas,
+    )
+    .await
+    .expect("tag 131 settles the executor win");
+    assert_eq!(
+        f.lamports(f.executor.pubkey()).await,
+        before_executor + terms.challenger_bond_lamports,
+        "the challenger's bond is paid to the executor"
+    );
+    assert_eq!(
+        f.lamports(f.signer.pubkey()).await,
+        before_challenger + challenge_rent,
+        "the record rent returns to the challenger who funded it"
+    );
+    assert_eq!(f.lamports(record).await, 0, "the settled record is drained");
+}

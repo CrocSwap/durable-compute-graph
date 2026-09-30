@@ -76,10 +76,28 @@ dynamic loading path; `AccountInfo` is confined to the SVM adapter.
 
 The included `ByteSum` test kernel exercises the compiled manifest and
 authenticated-span replay in focused tests. The optional
-`sbf-real-lifecycle-test` feature adds a test-only binding for retained Form
-256 and lets the revision-8 SBF harness replay through that manifest. It is a
-mechanics test, not a model-capability demonstration. The feature must not be
-used for a production image.
+`sbf-real-lifecycle-test` feature adds a test-only Form-256 binding and a
+small stateful counter app. Its ProgramTest targets run against the feature
+SBF image; they are mechanics tests, not model-capability demonstrations. The
+feature must not be used for a production image.
+
+## Stateful workloads
+
+The versioned local prototype in
+[`docs/stateful-workloads-v1.md`](docs/stateful-workloads-v1.md) adds a
+session-owned indexed/append input stream, schema-bound state spans, output
+views and scratch spans, explicit optional anchors, bounded step resources,
+and authority-directed account close. The adapter supports split state without
+serializing runtime pointers. Tags 230–239 are only dispatched by the
+feature-built test application; the default revision-8 entrypoint and goldens
+are unchanged.
+
+The SBF counter test advances multiple one-byte commands per transaction,
+publishes two outputs from one state cursor, exercises refusal atomicity, and
+closes all session accounts with rent refunds. The real revision-8
+ProgramTest driver, including the round-5 patch, is also retained in the
+repository behind `sbf-real-lifecycle-test`; reproducing its retained K=80
+and K=10,240 cases still needs the documented local compiler-v1 artifacts.
 
 ## Checks and standalone SBF image
 
@@ -103,11 +121,11 @@ The canary uses bespoke test-only tags 240–250 and its own compact account
 layout. It does not exercise registry/admission, document init/roots/finalize,
 attest/resolve, challenge descent, or the extracted close handlers. Round 5
 also ran those real revision-8 stages against the standalone SBF image with
-ByteSum replay through the feature-gated Form-256 manifest binding. The run
-used a temporary copy of Basanos's retained-fixture ProgramTest harness; the
-standalone repository does not include that fixture builder. The exact tags,
-CU measurements, image digest, test counts, and harness limitation are
-recorded in the experiment note linked above.
+ByteSum replay through the feature-gated Form-256 manifest binding. Its
+retained-fixture ProgramTest source and harness patch are now permanent
+feature-gated targets in this repository. The fixtures remain local inputs.
+The exact tags, CU measurements, image digest, test counts, and artifact
+requirements are recorded in the experiment note linked above.
 
 The earlier canary image, built with `cargo-build-sbf 3.0.15` and platform-tools
 v1.51, was 792,056 bytes with SHA-256
