@@ -246,10 +246,12 @@ SBF execution has not verified them.
 Round 4 corrects the selected-route rule: a manifest's one declared route
 selects one plan read ordinal that becomes the replay kernel's input span. A
 plan may contain additional reads; they are not inputs to this app replay
-contract and remain independently challengeable at their own coordinates.
-Admission and fix-point support both check that the selected ordinal exists at
-every instance of the bound form. This change is needed by the retained
-K=10,240 Form-22 route, whose selected ordinal is 7 in a multi-read form.
+contract. Challenging those reads' producers separately does not verify how
+the consumer used them; a future multi-input version must bind every read on
+which replay depends. Admission and fix-point support both check that the
+selected ordinal exists at every instance of the bound form. This change is
+needed by the retained K=10,240 Form-22 route, whose selected ordinal is 7 in
+a multi-read form.
 
 The focused app-bound SBF image was rebuilt with
 `cargo-build-sbf 3.0.15` / platform-tools v1.51 and the pinned SDK:
@@ -276,9 +278,9 @@ manifest cap is now `1,400,000 - 45,573 - 25,000 = 1,329,427` CU; the 25,000
 CU margin is designed. The K=10,240 adapter test uses the retained plan and
 its full 10,240-position geometry, while the committed completion lands the
 retained executor's 80 available position roots. The separate real admission
-test uses `EMPTY_APPLICATION`; full application-aware K=10,240 tag-160
-admission remains unverified because the first app-image attempt exhausted its
-transaction budget during tag 160 before reaching tag 184.
+test uses `EMPTY_APPLICATION`. Round 5 reproduced the app-image tag-160
+transaction-budget failure on the final source; it is a measured known limit,
+not a successful app-aware admission. See the Round 5 receipt below.
 
 The K=10,240 measurement uses a pre-admitted DEA2 fixture to isolate the
 tag-184 adapter cost from tag-160 admission. It measures routed replay and the
@@ -301,4 +303,78 @@ observed transition. A K=10,240 app-image attempt at full application-aware
 tag-160 admission still hit the transaction CU ceiling before tag 184; the
 successful tag-160 run used the empty application image, and the 900-byte
 adapter test used a pre-admitted K=10,240 DEA2 fixture. Full app-aware
-K=10,240 admission is therefore **unverified**.
+K=10,240 admission failed its measured tag-160 transaction-budget check in
+Round 5; the retained Round 5 log records the failure and source/image hashes.
+
+## Round 5 final source and seam regressions (2026-09-30)
+
+The final program source is commit
+`db4004a7dc7988b00bed71717bb7914eef9c83b5`; the source tree hash for
+`crates/dcg-program/src` is
+`f930379cdc403091a6e4070164ee4a4de76debd9`. The three fresh SBF images below
+were built from that same program source with `cargo-build-sbf 3.0.15`,
+platform-tools v1.51, and SDK
+`/private/tmp/basanos-sbf-sdk-v151-20260920`.
+
+| Image | Feature | Bytes | ELF SHA-256 | Program source tree hash |
+| --- | --- | ---: | --- | --- |
+| App lifecycle | `sbf-real-lifecycle-test` | 1,409,384 | `35550c81e59aac52381223f8ac871debbb7ac7e290d112975ea50bc618176de2` | `f930379cdc403091a6e4070164ee4a4de76debd9` |
+| Empty compatibility | `revision-8` | 801,544 | `b8d046c881d1fbcdca63c0d7fc90a78bf11de75189d141cef70b7bdc1c08da47` | `f930379cdc403091a6e4070164ee4a4de76debd9` |
+| Unbound admission | `sbf-unbound-form-test` | 1,233,872 | `d931c5763fa3a8813be3bbbe783a3c6465380487259390a1ce7f0c521b55ea40` | `f930379cdc403091a6e4070164ee4a4de76debd9` |
+
+The app-aware K=10,240 admission was rerun with the app lifecycle image and
+the retained compiler-v1 fixture at
+`out/runs/rev8-k10240-template-2026-09-30/fixture/pt2p`. The first tag-160
+instruction represented a 16-class batch (`first = 0`, `count = 16`). It
+failed with `ComputationalBudgetExceeded`: the SBF program consumed the full
+1,387,789 CU budget remaining after the 150-CU Compute Budget instruction.
+This is a **measured failure** of that app-aware batch, not a successful
+admission or an unverified outcome. The raw log is retained as
+`app-k10240-admission-failure-sbf.log`; it ends before tag 184. The successful
+empty-application K=10,240 admission is a separate mechanics result: it
+passed tags 159/160, with a maximum measured tag-160 chunk of 720,384 CU.
+
+**Known limit and follow-up.** Tag 160 currently walks every instance of each
+class synchronously. This measured 16-class batch exceeds the transaction
+budget in the app-aware image. Whether smaller class batches fit was not
+measured. Add a resumable admission cursor that can stop and resume within a
+class, then measure the K=10,240 app-aware walk under the transaction limit.
+
+The final focused SBF cases were:
+
+| Test | Image / fixture | Result |
+| --- | --- | --- |
+| `rev8_bytesum_` | App lifecycle; K=80 | 5 passed |
+| `rev8_app_respond_full_900_witness_k10240_sbf` | App lifecycle; K=10,240 | 1 passed |
+| `rev8_multi_read_form_admits_selected_route_tag160_sbf` | App lifecycle; K=80, Form 22 route ordinal 7 | 1 passed; tag 160 used 748,119 CU |
+| `rev8_multi_read_form_with_unresolved_opening_stays_in_respond_sbf` | App lifecycle; K=80 | 1 passed; DCR1 stays pending in RESPOND |
+| `rev8_two_challengers_can_contest_the_same_app_leaf_sbf` | App lifecycle; K=80 | 1 passed |
+| `rev8_app_respond_rejects_bad_openings_and_timeout_favors_challenger_sbf` | App lifecycle; K=80 | 1 passed |
+| `rev8_app_identity_change_during_respond_is_neutral_sbf` | App lifecycle; K=80 | 1 passed |
+| `rev8_non_arw1_committed_leaf_executor_timeout_favors_challenger_sbf` | App lifecycle; K=80 | 1 passed |
+| `rev8_empty_application_refuses_witness_tails_for_166_168_169_sbf` | Empty compatibility; K=80 | 1 passed |
+| `rev8_pt1x_registry_and_admission_sbf` | Empty compatibility; K=10,240 | 1 passed; see measured CU above |
+| `rev8_pt1x_real_admission_to_resolve_sbf` | Empty compatibility; K=10,240 | 1 passed; tags 159/160, 161/162/165, 177/178, and 172 completed |
+| `rev8_unbound_form_refuses_admission_on_sbf` | Unbound admission; K=80 | 1 passed |
+| `rev8_stale_manifest_neutralizes_non_app_fixpoint_on_sbf` | Unbound admission; K=80 | 1 passed; neutral ruling at tag 169 |
+| `rev8_removed_app_binding_after_admission_is_neutral_on_sbf` | Unbound admission; K=80 | 1 passed; executor remains unrefuted |
+
+The revision-8 neutrality policy is now: a saved admission digest mismatch is
+neutral even if the current image removed the challenged form; a saved
+identity with no current manifest is neutral; with no saved identity,
+neutrality requires a current binding. The app-binding removal case uses a
+previous-image Form-256 manifest and an honest committed ByteSum leaf. An
+unresolved Form-22 multi-read opening remains in RESPOND for the executor.
+The replay adapter's default now calls
+`replay(&[], &[], claimed_output, &[])` when the kernel opts into empty input
+spans; admission refuses zero-span bindings at instances with plan reads
+unless that opt-in is explicit.
+
+The default offline `dcg-program` suite and
+`revision_8_portable_vectors_match_the_frozen_bytes` passed after the final
+test edits. `test-kernel` also passed both
+`manifest_rejects_zero_span_binding_without_explicit_replay_support` and
+`manifest_rejects_route_length_outside_input_alignment`. All Round 5 build and
+test receipts, including each ELF and the app-aware admission failure, are
+retained under `out/runs/dcg-seam-fix-5-2026-09-30/`; its README records the
+source hashes, test names, and log names.

@@ -12217,6 +12217,11 @@ async fn settle_and_close_neutral_app_challenge(
     let remainder_before_close = f.lamports(remainder).await;
     let incinerator_before_close = f.lamports(incinerator::ID).await;
     let document = f.account(created[0]).await;
+    assert_eq!(
+        &document[40..72],
+        f.executor.pubkey().as_ref(),
+        "the closed document's recorded payer is the executor"
+    );
     let close_deadline =
         u64_at(&document, 144).max(u64_at(&document, document::ABANDON_DEADLINE_AT)) + 1;
     clock_to(f, close_deadline).await;
@@ -13533,11 +13538,11 @@ async fn rev8_bytesum_fake_input_against_predecessor_loses_sbf() {
     );
 }
 
-/// Form 22 has multiple graph reads in the retained K80 plan, beyond the
-/// single route supported by the revision-8 adapter. An app-bound document
-/// with that unsupported provenance therefore rules neutrally.
+/// Form 22 selects route ordinal 7 from a multi-read plan entry. If the
+/// challenger's opening does not reach a terminal replay ruling, the app-bound
+/// challenge remains in RESPOND for the executor instead of being neutralized.
 #[tokio::test(flavor = "multi_thread")]
-async fn rev8_unsupported_multi_read_form_is_neutral_at_fixpoint_sbf() {
+async fn rev8_multi_read_form_with_unresolved_opening_stays_in_respond_sbf() {
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
     };
@@ -13567,12 +13572,17 @@ async fn rev8_unsupported_multi_read_form_is_neutral_at_fixpoint_sbf() {
     )
     .await;
     let ruling = f.account(record).await;
-    assert_eq!(ruling[4], challenge::PHASE_RULED);
-    assert_eq!(ruling[5], 0, "unsupported app provenance is neutral");
-    assert_eq!(ruling[178], events::CAUSE_APP_IDENTITY_CHANGED);
+    assert_eq!(ruling[4], challenge::PHASE_RESPOND);
+    assert_eq!(u16_at(&ruling, 6), challenge::APP_REPLAY_VERSION);
+    assert_eq!(ruling[5], 0);
     assert_eq!(
         u32_at(&ruling, challenge::DEV2_AT + 8),
-        challenge::OUTCOME_IDENTITY_CHANGED as u32
+        challenge::OUTCOME_PENDING as u32
+    );
+    assert_eq!(
+        u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
+        0,
+        "an unbound non-app coordinate does not refute the document"
     );
 }
 
@@ -14488,6 +14498,14 @@ async fn rev8_removed_app_binding_after_admission_is_neutral_on_sbf() {
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
     };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.executor_bond_lamports = 500_000;
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
+
     let prior_app = &PREVIOUS_APP_MANIFEST;
     let current_app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
     assert!(prior_app.resolve_legacy_form(1, 256).is_some());
@@ -14539,7 +14557,6 @@ async fn rev8_removed_app_binding_after_admission_is_neutral_on_sbf() {
         0,
         "a correct app-format leaf remains unrefuted after binding removal"
     );
-    let terms = Terms2::decode(&f.terms_raw).unwrap();
     settle_and_close_neutral_app_challenge(&mut f, record, created, descriptor, &terms).await;
 }
 
