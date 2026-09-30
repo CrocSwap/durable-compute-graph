@@ -110,3 +110,101 @@ CARGO_TARGET_DIR=/private/tmp/basanos-dcg-stateful-3-target \
 The cold build target remained below the dispatch's 5 GB ceiling. Build target,
 SBF image, and logs were moved to `/private/tmp/trash-dcg-stateful-3` after
 verification.
+
+## Follow-up fixes and measurements (2026-09-30)
+
+**Result: measured mechanics demonstration.** The expanded focused SBF
+ProgramTest run passed 8 tests, 0 failed, in 142.30 seconds. It uses the
+`sbf-real-lifecycle-test` image built with `cargo-build-sbf` 3.0.15,
+platform-tools v1.51, and rustc 1.84.1. The image is 1,180,240 bytes with
+SHA-256
+`18f2030484494e6961cd71493fb755d916dbd7ade60734d37ba53bf15b1d339c`.
+
+The run covers the previous primary-state and default-headered workloads plus
+forged-session rejection, failed-initialization recovery, cross-session
+account rejection, workspace and scratch provenance, phase cursor rejection,
+halt outcomes, and anchor cleanup. `HaltBefore` mutation is refused with
+state/session/stream unchanged for bounded state; larger state still relies on
+the kernel's documented obligation. `BEGIN_PHASE` zeroes workspace. Resource
+identity is proved by chunk and copied once into a sealed program-owned
+account. Anchor work uses the phase-locked `dcg/state-anchor/3` commitment;
+`ADVANCE` is refused while that phase is open. The feature-only test kernels
+advertise v1, v2, and v3 mode identifiers through separate manifests.
+
+### Measured scaled paths
+
+| Workload | Measured result |
+|---|---:|
+| 4,400,000-byte resource allocation | 537 calls; 13,361–30,892 CU/call; 11,890,538 CU total |
+| 4,400,000-byte resource upload | 68 proof-checked chunks; 17,137–45,672 CU/chunk; 3,076,724 CU total |
+| 10,000,000-byte state anchor | 153 chunks; 38,518–52,024 CU/chunk; 7,946,015 CU chunk total |
+| Anchor begin and finish | 22,199 + 7,535 CU; lifecycle total 7,975,750 CU across separate instructions |
+| Close finished anchor after halt | 21,375 CU |
+
+The resource test changes the source account after upload and verifies that
+initialization still reads the committed bytes from the sealed copy. The 4.4
+MB input is synthetic, not the Doom WAD. The anchor is a multi-transaction
+mechanics path; these measurements do not establish deployed-chain fit or
+Doom correctness.
+
+### Focused test names
+
+- `stateful_v3_default_layout_remains_headered`
+- `stateful_v3_failed_initialization_can_halt_and_recover_rent`
+- `stateful_v3_forged_session_and_other_primary_are_refused`
+- `stateful_v3_halt_outcomes_are_atomic_and_close_input_after_halt`
+- `stateful_v3_halt_with_view_phase_open_still_allows_closing_children`
+- `stateful_v3_primary_and_headered_spans_advance_twice`
+- `stateful_v3_primary_prefix_halt_resource_views_and_phased_init`
+- `stateful_v3_sealed_resource_accepts_4_4mb_chunks_once`
+
+The forged-session test attempts `CLOSE_ACCOUNT`, `ADVANCE`, and
+`RUN_INITIALIZE` through session-shaped primary bytes and expects refusal. It
+also substitutes another session's program-owned primary at index zero and
+checks that state remains unchanged. Cross-session workspace and scratch
+accounts, closing a primary through another session, and a correctly ordered
+primary plus headered span are exercised.
+
+### Compatibility build
+
+The default revision-8 image built from this tree is SHA-256
+`eb578084cf1947b1c53c3dbf7f494dd2bc213cbd685736a2cb9dc7b6068aaa4a`.
+The requested `9bd8fe5c` prefix did not match. A clean archive of the stated
+base commit `22bb914a2c49adc64682b5c5372e8288f4e3d210`, built with the same
+pinned SDK/toolchain, produced the same 752,656-byte image and exact hash. This
+confirms the branch leaves the revision-8 image unchanged under this build;
+the requested prefix is not reproducible from the stated base and toolchain.
+
+The focused commands were:
+
+```sh
+DCG_CARGO_BUILD_SBF=/Users/colkitt/.local/share/solana/install/active_release/bin/cargo-build-sbf \
+DCG_SBF_SDK=/private/tmp/basanos-sbf-sdk-v151-20260920 \
+DCG_SBF_TOOLS_VERSION=v1.51 \
+DCG_SBF_STAGING_NAME=dcg-stateful-3-fix-staging \
+CARGO_TARGET_DIR=/private/tmp/basanos-dcg-stateful-3-fix-target \
+  crates/dcg-program/scripts/build-sbf-reproducible.sh \
+  --features sbf-real-lifecycle-test \
+  --sbf-out-dir /private/tmp/dcg-stateful-3-fix-sbf
+
+RUST_LOG=error \
+BPF_OUT_DIR=/private/tmp/dcg-stateful-3-fix-sbf \
+SBF_OUT_DIR=/private/tmp/dcg-stateful-3-fix-sbf \
+CARGO_TARGET_DIR=/private/tmp/basanos-dcg-stateful-3-fix-target \
+  cargo test --locked --offline --profile fasttest -p dcg-program \
+  --features sbf-real-lifecycle-test \
+  --test stateful_v3_sbf_workload -- --nocapture --test-threads=1
+```
+
+The brief also cited `docs/spec/settlement-pilot-contract.md` (including the
+“Address provenance gate”) and `docs/spec/referee-laws.md`, law 3. Those files
+are absent from this DCG checkout and its sibling source checkout, so the
+implementation used the supplied review and brief; it re-derives session
+addresses from an independent authority signer or supplied refund destination
+where available, and from the session's stored authority where the instruction
+has no independent source. Authority-bearing handlers also validate signer
+status.
+
+The feature SBF image, default revision-8 images, clean base archive, target,
+and ProgramTest logs were moved under `/private/tmp/trash-dcg-stateful-3-fix`
+after verification. No validator or deployed chain was used.

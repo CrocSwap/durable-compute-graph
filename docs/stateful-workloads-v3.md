@@ -8,11 +8,13 @@ revision-8 entrypoint does not dispatch app-owned stateful tags. The SBF
 ProgramTest evidence is a mechanics demonstration, not an engine capability
 claim.
 
-V3 is selected by wire version byte `3`. The existing tag range 230–239 is
-retained. Existing session, stream, state, view, scratch, and workspace
-accounts use `DSS3`, `DSB3`, `DSE3`, `DVW3`, and versioned v3 PDA seeds. The
-stateful processor routes only those tags to a selected static kernel; the
-application composes the helper with its existing instruction handler.
+V3 is selected by wire version byte `3`. Tags 230–239 retain the stateful
+session surface; tag 240 carries resource-copy growth and chunk upload. Session,
+stream, state, view, scratch, workspace, resource, and anchor accounts use
+`DSS3`, `DSB3`, `DSE3`, `DVW3`, `DRS3`, and `DAN3` records with versioned v3
+PDA seeds. The stateful processor routes these instructions to a selected
+static kernel; the application composes the helper with its existing
+instruction handler.
 
 ## V3 additions
 
@@ -27,7 +29,8 @@ application composes the helper with its existing instruction handler.
 | 236 | `BEGIN_PHASE`, `RUN_PHASE`, `COMMIT_PHASE`, `ABORT_PHASE` | The renderer receives the authenticated resource read-only, the state at the bound state version, and the writable renderer workspace. Output staging remains separately committed atomically. |
 | 237 | `HALT_SESSION` | Retains explicit session halt. |
 | 238 | `CLOSE_ACCOUNT` | Retains child/session account closure and refund behavior. |
-| 239 | `ANCHOR` | Supports the primary layout when constructing a state/input anchor. Whole-state hashing may exceed the default transaction compute budget for large state. |
+| 239 | `ANCHOR` | Supports one-shot anchors up to 65,536 bytes and phase-locked chunked anchors for larger state under `dcg/state-anchor/3`. |
+| 240 | `RESOURCE_COPY` | `RESOURCE_GROW` increases the program-owned copy by at most 8,192 bytes. `RESOURCE_CHUNK` verifies one Merkle proof and copies one source chunk; the copy is sealed once every chunk is present. |
 
 Stateful tag payloads begin with the v3 version byte. V3 preserves v2's
 existing bounds: at most eight state spans, 10,000,000 aggregate engine-state
@@ -35,8 +38,10 @@ bytes, at most eight transitions per `ADVANCE`, at most 64 input slots in the
 active write window, and state growth in 8,192-byte increments. Views support
 up to 16 outputs; publication scratch is capped at 4,000,000 bytes. A renderer
 workspace has a kernel-declared maximum. Kernel phase declarations are checked
-against the 1,400,000-CU runtime declaration bound. These are designed limits,
-not measured cost promises.
+against the shared `MAX_DECLARED_KERNEL_COMPUTE_UNITS` constant. The test
+kernel declares initialization at 90% of that constant, below the
+1,289,567-CU compatibility target for the seam-fix work. These are designed
+limits, not measured cost promises.
 
 ### Primary state and instruction account order
 
@@ -54,6 +59,16 @@ span. The callback-local `StateSpanMut::data_address()` therefore points at
 the first application byte. Application code still must bind and clear any
 engine context around every callback; no pointer is serialized.
 
+Every checked session decodes its stored `(authority, id, bump)` and
+re-derives the PDA under `dcg-session-v3`, then checks that the derived address
+matches both the account key and stored `self_key`. Instructions with an
+independent authority signer or refund destination use that supplied key as
+the authority seed; instructions without one derive from the session's stored
+authority. State,
+stream, resource, view, workspace, scratch, and anchor readers also check the
+PDA derived from the session account key. The headerless primary must be the
+derived state PDA at index zero in both state access and close.
+
 ### Prefix halt semantics
 
 The v3 transition callback returns `Continue`, `HaltBefore { reason }`, or
@@ -63,7 +78,10 @@ unconsumed; `HaltAfter` consumes and commits that command. In either case, the
 session enters the halted state and records the reason and resulting cursor.
 Thus the stream cursor agrees with the committed prefix. Ordinary refusal
 paths continue to use transaction rollback, so state, stream, and session
-remain unchanged on refusal.
+remain unchanged on refusal. For aggregate state at or below 65,536 bytes the
+adapter snapshots state and refuses a `HaltBefore` callback that changed it.
+For larger state, leaving state unchanged on `HaltBefore` remains a kernel
+obligation.
 
 ### Phased initialization and rendering
 
@@ -76,6 +94,11 @@ forward until every declared byte has been initialized. Transition and render
 state use refuse before completion. A stale phase cursor or mismatched session
 schema refuses without changing state, session, or cursor.
 
+`HALT_SESSION` is allowed during initialization and clears any open phase, so
+a permanently failing phase can be halted and its children closed for rent
+recovery. A one-call initializer cannot run after phased initialization has
+started or completed.
+
 For rendering, the kernel receives read-only resource bytes that are checked
 against the session-bound key/schema/commitment, read-only state spans, and a
 separate writable workspace account. The workspace is session-bound and
@@ -83,44 +106,49 @@ versioned alongside the state cursor. The view output remains staged in the
 existing publication scratch until `COMMIT_PHASE`; workspace changes alone do
 not publish output.
 
+At `OPEN_SESSION`, the caller names a read-only source account and commits a
+Merkle root over its 65,536-byte chunks. The program creates a `DRS3`
+program-owned copy, initially allocating at most 8,192 data bytes. Tag 240
+grows it in at most 8,192-byte steps; each step is a separate instruction.
+`RESOURCE_CHUNK` verifies a proof under `dcg/resource-chunk/1`, copies the
+proved chunk, and sets its one-time bitmap bit. Leaves bind chunk index, total
+resource length, and bytes; internal nodes use `dcg/resource-node/1` and
+duplicate the last node at odd widths. Initialization and rendering use the
+sealed copy and check its program ownership, structure, and bitmap count
+without re-hashing the entire resource on each callback. The copy is immutable
+through the stateful API after it is sealed.
+
+`BEGIN_PHASE` zeros the workspace payload before each publication. `ANCHOR`
+creates a session-bound `DAN3` account and processes 65,536-byte state slices
+under the phase lock. The accumulator uses `dcg/state-anchor/3`; `ADVANCE`
+refuses while the anchor phase is open. A small state can still use the
+one-shot v3 anchor path. After the session halts, a finished or abandoned
+anchor can be closed as a child account to recover its rent.
+
 ## Scaled SBF mechanics demonstration
 
 `tests/stateful_v3_sbf_workload.rs` runs the feature-built SBF image in
-ProgramTest. One test confirms that layout selector `0` keeps a headered
-state. The primary-layout workload declares a 10,000,000-byte headerless
-state and grows it in 1,220 bounded instructions, initializes it in 153
-phases, and uses a 4,096-byte committed test resource plus separate renderer
-workspace and publication scratch. A small fixed-address guard in the test
-kernel checks that primary state begins at the expected account-0 data
-address. The workload then performs a four-step `ADVANCE` whose third command
-halts before execution: it commits two steps, records the halt reason and
-cursor 2, and leaves the third command unconsumed.
+ProgramTest. The measured workload grows a 10,000,000-byte headerless primary
+state in 1,220 bounded instructions and initializes it in 153 phases. A
+chunked anchor over all 10 MB completes in 153 slices. The suite also covers a
+4.4 MB synthetic resource, a permanently failing initialization, forged
+session-shaped primary bytes, another session's primary at index zero,
+two-advance primary-plus-headered spans, view cleanup, and prefix halt cases.
+A small fixed-address test kernel still says nothing about Doom engine quality.
 
-The SBF test covers these exact instructions and controls:
+The 4.4 MB synthetic resource required 537 separate 8,192-byte allocation
+steps and 68 proof-checked upload chunks. Measured resource growth cost was
+13,361–30,892 CU per step; chunk upload cost was 17,137–45,672 CU per chunk.
+The source account was changed after upload, and initialization still read the
+original bytes from the sealed program-owned copy. This is mechanics evidence
+for content binding and storage scale, not a Doom WAD importer result.
 
-- `OPEN_SESSION` (both primary and default layout), `CREATE_STREAM`,
-  `WRITE_INPUT` (four primary-layout slots), `CREATE_STATE`, and 1,220
-  `GROW_STATE` calls.
-- `BEGIN_INITIALIZE` and 153 `RUN_INITIALIZE` phases, including wrong session
-  schema, advance before initialization completes, and stale phase cursor
-  refusals.
-- `CREATE_VIEW` for output, renderer workspace, and publication scratch;
-  `BEGIN_PHASE`, `RUN_PHASE`, and `COMMIT_PHASE` for a view that reads the
-  authenticated resource and writes the workspace.
-- `ADVANCE` with a substituted primary account, stale cursor, and a
-  halt-before command after two committed steps.
-- `ANCHOR` on the 10 MB primary state, which reaches the default ProgramTest
-  200,000-CU budget and fails with `ComputationalBudgetExceeded`; the test
-  confirms the anchor cursor and hash remain unchanged.
-
-This test is a mechanics demonstration. The 4 KB resource and fixed test
-kernel do not implement a WAD importer, Doom renderer, or useful engine
-capability. In particular, rechecking the entire committed resource in each
-initialization callback does not measure importing Doom's 4.4 MB WAD into its
-9.7 MB context. The 10 MB state is exercised through initialization and
-transition; the whole-state anchor is not successful at the default 200,000
-CU ProgramTest budget. The test did not raise the compute budget to the runtime
-ceiling, so the higher-budget anchor result remains open.
+The 10 MB anchor completed with 153 chunk calls at 38,518–52,024 CU each.
+Chunk work totaled 7,946,015 CU; begin and finish brought the lifecycle total
+to 7,975,750 CU across separate instructions. Closing the finished anchor cost
+21,375 CU. These are measured SBF
+transactions, not one transaction and not a claim about Doom's 9.7 MB state
+cost or chain compute limits.
 
 Per-instruction and per-phase measurements and reproduction commands are in
 [`experiments/stateful-sbf-workload-v3-2026-09-30.md`](experiments/stateful-sbf-workload-v3-2026-09-30.md).
@@ -129,10 +157,8 @@ Per-instruction and per-phase measurements and reproduction commands are in
 
 The Doom adapter still needs to select v3 explicitly, bind its actual state
 schema and 9,734,160-byte context, and verify each transition against the
-retained SIM/2 boundaries. It must pass the real WAD resource and authenticate
-it efficiently across initialization phases, then implement deterministic
-renderer chunks using the new workspace and measure each phase on the final
-SBF image. The 4 KB fixture says nothing about WAD-to-context throughput or
-render quality. If Doom requires a successful whole-context anchor, the
-adapter also needs a measured anchor strategy or a state commitment design
-that fits the relevant compute budget.
+retained SIM/2 boundaries. The 4.4 MB synthetic resource does not contain or
+validate the actual WAD, and this test kernel does not import it into Doom's
+context or render Doom frames. The adapter must measure those operations on
+the final SBF image. The chunked 10 MB anchor is a mechanics path; it does not
+establish chain fit, Doom correctness, or renderer quality.

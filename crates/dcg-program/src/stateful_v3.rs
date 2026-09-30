@@ -46,8 +46,18 @@ pub const VIEW_STRIP_7: u8 = 8;
 pub const SCRATCH_ROLE: u8 = u8::MAX;
 pub const WORKSPACE_ROLE: u8 = u8::MAX - 1;
 pub const KIND_WORKSPACE: u8 = 5;
+pub const KIND_RESOURCE: u8 = 6;
+pub const KIND_ANCHOR: u8 = 7;
 pub const STATE_OP_BEGIN_INITIALIZE: u8 = 0xFC;
 pub const STATE_OP_RUN_INITIALIZE: u8 = 0xFD;
+pub const ANCHOR_OP_BEGIN: u8 = 0xFE;
+pub const ANCHOR_OP_CHUNK: u8 = 0xFD;
+pub const ANCHOR_OP_FINISH: u8 = 0xFC;
+pub const ANCHOR_OP_ABORT: u8 = 0xFB;
+pub const RESOURCE_CHUNK_TAG: u8 = 240;
+pub const RESOURCE_GROW_OP: u8 = 0xFE;
+pub const RESOURCE_CHUNK_BYTES: u32 = 65_536;
+pub const ANCHOR_CHUNK_BYTES: u32 = 65_536;
 
 pub const REFUSAL_MALFORMED: u32 = 2_321;
 pub const REFUSAL_AUTHORITY: u32 = 2_322;
@@ -90,10 +100,21 @@ const POLICY_APPEND: u8 = 1;
 const PHASE_NONE: u8 = 0;
 const PHASE_VIEW_PUBLICATION: u8 = 1;
 const PHASE_INITIALIZATION: u8 = 2;
+const PHASE_STATE_ANCHOR: u8 = 3;
+const RESOURCE_SEED: &[u8] = b"dcg-resource-v3";
+const ANCHOR_SEED: &[u8] = b"dcg-anchor-v3";
+const RESOURCE_HEADER_BYTES: usize = 128;
+const ANCHOR_ACCOUNT_BYTES: usize = 160;
+const RESOURCE_MAGIC: &[u8; 4] = b"DRS3";
+const ANCHOR_MAGIC: &[u8; 4] = b"DAN3";
+const RESOURCE_BITMAP_AT: usize = 88;
+const RESOURCE_ALLOCATED_AT: usize = 112;
+const HALT_BEFORE_RUNTIME_CHECK_BYTES: usize = 65_536;
 
 #[derive(Debug)]
 struct Session {
     id: u64,
+    bump: u8,
     status: u8,
     policy: u8,
     command_width: u8,
@@ -135,6 +156,7 @@ struct Session {
     state_lengths: Vec<u32>,
     halt_reason: u32,
     halt_cursor: u32,
+    last_advance_start: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +177,24 @@ struct ViewMeta {
     source_offset: u32,
     len: u32,
     source_cursor: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResourceMeta {
+    len: u32,
+    chunks: u32,
+    received: u32,
+    allocated: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AnchorMeta {
+    open: bool,
+    cursor: u32,
+    total: u32,
+    progress: u32,
+    input_root: [u8; 32],
+    accumulator: [u8; 32],
 }
 
 struct PublicationAccounts<'a> {
@@ -227,6 +267,280 @@ fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
 fn session_pda(program: &Pubkey, authority: &Pubkey, id: u64) -> (Pubkey, u8) {
     let id = id.to_le_bytes();
     Pubkey::find_program_address(&[SESSION_SEED, authority.as_ref(), &id], program)
+}
+
+fn resource_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[RESOURCE_SEED, session.as_ref()], program)
+}
+
+fn anchor_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[ANCHOR_SEED, session.as_ref()], program)
+}
+
+fn resource_chunks(len: u32) -> u32 {
+    len.div_ceil(RESOURCE_CHUNK_BYTES)
+}
+
+fn resource_leaf(index: u32, total_len: u32, bytes: &[u8]) -> [u8; 32] {
+    crate::hash::sha256(&[
+        b"dcg/resource-chunk/1",
+        &index.to_le_bytes(),
+        &total_len.to_le_bytes(),
+        bytes,
+    ])
+}
+
+fn verify_resource_proof(
+    mut node: [u8; 32],
+    mut index: u32,
+    mut width: u32,
+    proof: &[[u8; 32]],
+    expected_root: &[u8; 32],
+) -> bool {
+    let mut proof_index = 0usize;
+    while width > 1 {
+        let sibling = index ^ 1;
+        let sibling_hash = if sibling < width {
+            let Some(value) = proof.get(proof_index) else {
+                return false;
+            };
+            proof_index += 1;
+            *value
+        } else {
+            node
+        };
+        node = if index & 1 == 0 {
+            crate::hash::sha256(&[b"dcg/resource-node/1", &node, &sibling_hash])
+        } else {
+            crate::hash::sha256(&[b"dcg/resource-node/1", &sibling_hash, &node])
+        };
+        index >>= 1;
+        width = width.div_ceil(2);
+    }
+    proof_index == proof.len() && &node == expected_root
+}
+
+fn checked_resource(
+    program: &Pubkey,
+    account: &AccountInfo,
+    session_account: &AccountInfo,
+    session: &Session,
+    require_sealed: bool,
+    writable: bool,
+) -> Result<ResourceMeta, ProgramError> {
+    check_program_owned(account, program, writable)?;
+    let (expected, _) = resource_pda(program, session_account.key);
+    let raw = account.try_borrow_data()?;
+    if session.resource_key == Pubkey::default()
+        || account.key != &expected
+        || account.key != &session.resource_key
+        || raw.len() < RESOURCE_HEADER_BYTES
+        || &raw[..4] != RESOURCE_MAGIC
+        || u16_at(&raw, 4) != WIRE_VERSION as u16
+        || raw[6] != KIND_RESOURCE
+        || raw[7] != 0
+        || raw[8..40] != session_account.key.to_bytes()
+        || raw[40..72] != session.resource_commitment
+        || raw[88..RESOURCE_BITMAP_AT].iter().any(|byte| *byte != 0)
+    {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let len = u32_at(&raw, 72);
+    let chunk_size = u32_at(&raw, 76);
+    let chunks = u32_at(&raw, 80);
+    let received = u32_at(&raw, 84);
+    let allocated = u32_at(&raw, RESOURCE_ALLOCATED_AT);
+    let expected_chunks = resource_chunks(len);
+    let bitmap_bytes = chunks.div_ceil(8) as usize;
+    let bitmap_end = RESOURCE_BITMAP_AT + bitmap_bytes;
+    if len == 0
+        || len as usize > ACCOUNT_MAX_BYTES - RESOURCE_HEADER_BYTES
+        || chunk_size != RESOURCE_CHUNK_BYTES
+        || chunks == 0
+        || chunks != expected_chunks
+        || bitmap_bytes > RESOURCE_HEADER_BYTES - RESOURCE_BITMAP_AT
+        || allocated == 0
+        || allocated > len
+        || raw.len() != RESOURCE_HEADER_BYTES + allocated as usize
+        || raw[bitmap_end..RESOURCE_ALLOCATED_AT]
+            .iter()
+            .any(|byte| *byte != 0)
+        || raw[RESOURCE_ALLOCATED_AT + 4..RESOURCE_HEADER_BYTES]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let bitmap = &raw[RESOURCE_BITMAP_AT..RESOURCE_BITMAP_AT + bitmap_bytes];
+    let mut bit_count = 0u32;
+    for index in 0..chunks {
+        if bitmap[index as usize / 8] & (1 << (index & 7)) != 0 {
+            bit_count += 1;
+        }
+    }
+    if bit_count != received || (require_sealed && received != chunks) {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    Ok(ResourceMeta {
+        len,
+        chunks,
+        received,
+        allocated,
+    })
+}
+
+fn initialize_resource_header(
+    account: &AccountInfo,
+    session_account: &AccountInfo,
+    commitment: &[u8; 32],
+    len: u32,
+    allocated: u32,
+) -> ProgramResult {
+    let chunks = resource_chunks(len);
+    let mut raw = account.try_borrow_mut_data()?;
+    raw.fill(0);
+    raw[..4].copy_from_slice(RESOURCE_MAGIC);
+    put_u16(&mut raw, 4, WIRE_VERSION as u16);
+    raw[6] = KIND_RESOURCE;
+    raw[8..40].copy_from_slice(session_account.key.as_ref());
+    raw[40..72].copy_from_slice(commitment);
+    put_u32(&mut raw, 72, len);
+    put_u32(&mut raw, 76, RESOURCE_CHUNK_BYTES);
+    put_u32(&mut raw, 80, chunks);
+    put_u32(&mut raw, RESOURCE_ALLOCATED_AT, allocated);
+    Ok(())
+}
+
+fn grow_resource(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    kernel: &dyn StatefulKernel,
+) -> ProgramResult {
+    exact_data(data, 7)?;
+    let [payer, authority, session_account, resource, system] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    check_unique(accounts)?;
+    if data[1] != WIRE_VERSION
+        || data[2] != RESOURCE_GROW_OP
+        || !payer.is_signer
+        || !payer.is_writable
+        || !authority.is_signer
+        || *system.key != system_program::id()
+    {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let session =
+        checked_session_from(program, session_account, false, kernel, Some(authority.key))?;
+    if session.status != STATUS_ACTIVE
+        || session.phase != PHASE_NONE
+        || session.state_initialized
+        || authority.key != &session.authority
+        || session.resource_key == Pubkey::default()
+    {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let meta = checked_resource(program, resource, session_account, &session, false, true)?;
+    let next = meta
+        .allocated
+        .saturating_add(CHILD_GROW_BYTES)
+        .min(meta.len);
+    if next <= meta.allocated || u32_at(data, 3) != next {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let old_len = resource.data_len();
+    let new_len = RESOURCE_HEADER_BYTES + next as usize;
+    if old_len != RESOURCE_HEADER_BYTES + meta.allocated as usize
+        || new_len - old_len > CHILD_GROW_BYTES as usize
+    {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let required = Rent::get()?.minimum_balance(new_len);
+    let top_up = required.saturating_sub(resource.lamports());
+    if top_up != 0 {
+        invoke(
+            &system_instruction::transfer(payer.key, resource.key, top_up),
+            &[payer.clone(), resource.clone(), system.clone()],
+        )?;
+    }
+    resource.realloc(new_len, true)?;
+    let mut raw = resource.try_borrow_mut_data()?;
+    raw[old_len..new_len].fill(0);
+    put_u32(&mut raw, RESOURCE_ALLOCATED_AT, next);
+    Ok(())
+}
+
+fn upload_resource_chunk(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    kernel: &dyn StatefulKernel,
+) -> ProgramResult {
+    if data.len() < 7 || data[1] != WIRE_VERSION {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let [authority, session_account, resource, source] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    check_unique(accounts)?;
+    if !authority.is_signer || source.is_writable {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    if session.status != STATUS_ACTIVE
+        || session.phase != PHASE_NONE
+        || session.state_initialized
+        || session.resource_key == Pubkey::default()
+    {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let meta = checked_resource(program, resource, session_account, &session, false, true)?;
+    if meta.received == meta.chunks {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let index = u32_at(data, 2);
+    let proof_count = data[6] as usize;
+    if index >= meta.chunks || data.len() != 7 + proof_count * 32 {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let offset = index
+        .checked_mul(RESOURCE_CHUNK_BYTES)
+        .ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
+    let chunk_len = (meta.len - offset).min(RESOURCE_CHUNK_BYTES) as usize;
+    let source_raw = source.try_borrow_data()?;
+    let source_end = (offset as usize)
+        .checked_add(chunk_len)
+        .ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
+    if source_raw.len() < source_end || meta.allocated < source_end as u32 {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let proof: Vec<[u8; 32]> = data[7..]
+        .chunks_exact(32)
+        .map(|chunk| chunk.try_into().expect("fixed width"))
+        .collect();
+    let leaf = resource_leaf(index, meta.len, &source_raw[offset as usize..source_end]);
+    if !verify_resource_proof(
+        leaf,
+        index,
+        meta.chunks,
+        &proof,
+        &session.resource_commitment,
+    ) {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    let mut raw = resource.try_borrow_mut_data()?;
+    let bitmap_byte = RESOURCE_BITMAP_AT + index as usize / 8;
+    let mask = 1u8 << (index & 7);
+    if raw[bitmap_byte] & mask != 0 {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    raw[RESOURCE_HEADER_BYTES + offset as usize..RESOURCE_HEADER_BYTES + source_end]
+        .copy_from_slice(&source_raw[offset as usize..source_end]);
+    raw[bitmap_byte] |= mask;
+    put_u32(&mut raw, 84, meta.received + 1);
+    Ok(())
 }
 
 fn stream_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, u8) {
@@ -326,10 +640,15 @@ fn encode_session(account: &AccountInfo, session: &Session) -> ProgramResult {
     }
     put_u32(&mut raw, 1254, session.halt_reason);
     put_u32(&mut raw, 1258, session.halt_cursor);
+    raw[1262] = session.bump;
+    put_u32(&mut raw, 1263, session.last_advance_start);
     Ok(())
 }
 
 fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
+    if raw.len() != SESSION_BYTES {
+        return Err(refusal(REFUSAL_SESSION));
+    }
     let view_keys: Vec<Pubkey> = (0..MAX_VIEW_OUTPUTS)
         .map(|index| {
             let at = 548 + index * 32;
@@ -345,10 +664,10 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || u16_at(raw, 4) != WIRE_VERSION as u16
         || raw[1130..1132] != [0; 2]
         || raw[1165] != 0
-        || raw[1164] > PHASE_INITIALIZATION
+        || raw[1164] > PHASE_STATE_ANCHOR
         || raw[1182] > 1
         || raw[1189] > 1
-        || raw[1262..].iter().any(|byte| *byte != 0)
+        || raw[1267..].iter().any(|byte| *byte != 0)
         || !matches!(raw[6], STATUS_ACTIVE | STATUS_HALTED)
         || !matches!(raw[7], POLICY_INDEXED | POLICY_APPEND)
         || raw[8] == 0
@@ -361,6 +680,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || raw[123] as usize != view_count
         || raw[123] as usize > MAX_VIEW_OUTPUTS
         || u32_at(raw, 112) > u32_at(raw, 116)
+        || u32_at(raw, 1263) > u32_at(raw, 112)
         || u32_at(raw, 116) > u32_at(raw, 10)
         || u32_at(raw, 188) > u32_at(raw, 112)
         || u32_at(raw, 224) > MAX_ENGINE_STATE_BYTES
@@ -417,6 +737,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
     }
     Ok(Session {
         id: u64_at(raw, 14),
+        bump: raw[1262],
         status: raw[6],
         policy: raw[7],
         command_width: raw[8],
@@ -466,6 +787,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         state_lengths,
         halt_reason: u32_at(raw, 1254),
         halt_cursor: u32_at(raw, 1258),
+        last_advance_start: u32_at(raw, 1263),
     })
 }
 
@@ -475,10 +797,30 @@ fn checked_session(
     writable: bool,
     kernel: &dyn StatefulKernel,
 ) -> Result<Session, ProgramError> {
+    checked_session_from(program, account, writable, kernel, None)
+}
+
+fn checked_session_from(
+    program: &Pubkey,
+    account: &AccountInfo,
+    writable: bool,
+    kernel: &dyn StatefulKernel,
+    independent_authority: Option<&Pubkey>,
+) -> Result<Session, ProgramError> {
     check_program_owned(account, program, writable)?;
     let raw = account.try_borrow_data()?;
     let session = decode_session(&raw)?;
-    if account.key != &session.self_key
+    let authority = independent_authority.unwrap_or(&session.authority);
+    if independent_authority.is_some_and(|key| key != &session.authority) {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let id = session.id.to_le_bytes();
+    let bump = [session.bump];
+    let expected =
+        Pubkey::create_program_address(&[SESSION_SEED, authority.as_ref(), &id, &bump], program)
+            .map_err(|_| refusal(REFUSAL_SESSION))?;
+    if account.key != &expected
+        || account.key != &session.self_key
         || session.kernel_id != kernel.manifest().id
         || session.semantic_version != kernel.manifest().semantic_version
         || session.abi_version != kernel.manifest().abi_version
@@ -540,6 +882,7 @@ fn open_session(
     data: &[u8],
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
+    check_unique(accounts)?;
     exact_data(data, 178)?;
     if data[1] != WIRE_VERSION {
         return Err(ProgramError::InvalidInstructionData);
@@ -554,15 +897,25 @@ fn open_session(
         version: u16_at(data, 143),
     };
     let resource_commitment: [u8; 32] = data[145..177].try_into().expect("fixed width");
-    let (payer, authority, session_account, resource_account, system) = match accounts {
-        [payer, authority, session, system] if resource_key == Pubkey::default() => {
-            (payer, authority, session, None, system)
-        }
-        [payer, authority, session, resource, system] if resource_key != Pubkey::default() => {
-            (payer, authority, session, Some(resource), system)
-        }
-        _ => return Err(ProgramError::NotEnoughAccountKeys),
-    };
+    let (payer, authority, session_account, resource_account, resource_copy, system) =
+        match accounts {
+            [payer, authority, session, system] if resource_key == Pubkey::default() => {
+                (payer, authority, session, None, None, system)
+            }
+            [payer, authority, session, resource, copy, system]
+                if resource_key != Pubkey::default() =>
+            {
+                (
+                    payer,
+                    authority,
+                    session,
+                    Some(resource),
+                    Some(copy),
+                    system,
+                )
+            }
+            _ => return Err(ProgramError::NotEnoughAccountKeys),
+        };
     if !payer.is_signer
         || !payer.is_writable
         || !authority.is_signer
@@ -570,8 +923,15 @@ fn open_session(
     {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    if let Some(resource) = resource_account {
-        if resource.key != &resource_key || resource.is_writable || resource.data_is_empty() {
+    if let (Some(resource), Some(copy)) = (resource_account, resource_copy) {
+        let (expected_copy, _) = resource_pda(program, session_account.key);
+        if resource.key != &resource_key
+            || resource.is_writable
+            || resource.data_is_empty()
+            || resource.data_len() > ACCOUNT_MAX_BYTES - RESOURCE_HEADER_BYTES
+            || copy.key != &expected_copy
+            || *system.key != system_program::id()
+        {
             return Err(refusal(REFUSAL_RESOURCE));
         }
     } else if resource_commitment != [0; 32]
@@ -647,10 +1007,26 @@ fn open_session(
         bump,
         SESSION_BYTES,
     )?;
+    if let (Some(resource), Some(copy)) = (resource_account, resource_copy) {
+        let len = resource.data_len() as u32;
+        let allocated = len.min(CHILD_GROW_BYTES);
+        create_pda(
+            program,
+            payer,
+            copy,
+            system,
+            &[RESOURCE_SEED, session_account.key.as_ref()],
+            resource_pda(program, session_account.key).1,
+            RESOURCE_HEADER_BYTES + allocated as usize,
+        )?;
+        initialize_resource_header(copy, session_account, &resource_commitment, len, allocated)?;
+    }
+    let resource_key = resource_copy.map_or(Pubkey::default(), |account| *account.key);
     encode_session(
         session_account,
         &Session {
             id,
+            bump,
             status: STATUS_ACTIVE,
             policy,
             command_width: width,
@@ -664,12 +1040,12 @@ fn open_session(
             mode,
             cursor: 0,
             frontier: 0,
-            child_count: 0,
+            child_count: u16::from(resource_key != Pubkey::default()),
             state_span_count: 0,
             state_initialized: false,
             view_count: 0,
             stream_root,
-            input_root: [0; 32],
+            input_root: stream_root,
             anchor_cursor: 0,
             state_anchor: [0; 32],
             state_bytes: 0,
@@ -692,6 +1068,7 @@ fn open_session(
             workspace_key: Pubkey::default(),
             halt_reason: 0,
             halt_cursor: 0,
+            last_advance_start: 0,
         },
     )
 }
@@ -705,8 +1082,10 @@ fn stream_pda_check(
 ) -> ProgramResult {
     check_program_owned(account, program, writable)?;
     let raw = account.try_borrow_data()?;
+    let (derived_key, _) = stream_pda(program, session_account.key);
     let expected_len = CHILD_HEADER_BYTES + session.capacity as usize * SLOT_BYTES;
-    if account.key != &session.stream_key
+    if account.key != &derived_key
+        || account.key != &session.stream_key
         || raw.len() != expected_len
         || &raw[..4] != STREAM_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
@@ -867,10 +1246,7 @@ fn create_state(
     }
     if resource_count == 1 {
         let resource = &resource_accounts[0];
-        if resource.key != &session.resource_key || resource.is_writable || resource.data_is_empty()
-        {
-            return Err(refusal(REFUSAL_RESOURCE));
-        }
+        checked_resource(program, resource, session_account, &session, false, false)?;
     } else if session.resource_key != Pubkey::default() {
         return Err(refusal(REFUSAL_RESOURCE));
     }
@@ -1100,11 +1476,13 @@ fn initialize_state(
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     check_unique(accounts)?;
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     let count = session.state_span_count as usize;
     let resource_count = usize::from(session.resource_key != Pubkey::default());
     if !authority.is_signer
         || authority.key != &session.authority
+        || primary_layout != session.primary_state
         || session.status != STATUS_ACTIVE
         || session.state_initialized
         || session.phase != PHASE_NONE
@@ -1124,13 +1502,18 @@ fn initialize_state(
     if state_accounts.len() != count {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
-    if resource_count == 1
-        && (resource_accounts[0].key != &session.resource_key
-            || resource_accounts[0].is_writable
-            || resource_accounts[0].data_is_empty())
-    {
-        return Err(refusal(REFUSAL_RESOURCE));
-    }
+    let resource_meta = if resource_count == 1 {
+        Some(checked_resource(
+            program,
+            &resource_accounts[0],
+            session_account,
+            &session,
+            true,
+            false,
+        )?)
+    } else {
+        None
+    };
     let schema = validate_kernel(kernel)?;
     let mut offset = 0u32;
     for (index, account) in state_accounts.iter().enumerate() {
@@ -1166,14 +1549,15 @@ fn initialize_state(
     let resource_spans: Vec<AccountSpan<'_>> = resource_accounts
         .iter()
         .zip(resource_guards.iter())
-        .map(|(account, raw)| AccountSpan {
+        .zip(resource_meta.iter())
+        .map(|((account, raw), meta)| AccountSpan {
             key: account.key.to_bytes(),
             owner: account.owner.to_bytes(),
             is_signer: account.is_signer,
             is_writable: account.is_writable,
             schema: session.resource_schema,
             offset: 0,
-            data: raw,
+            data: &raw[RESOURCE_HEADER_BYTES..RESOURCE_HEADER_BYTES + meta.len as usize],
         })
         .collect();
     let mut guards = state_accounts
@@ -1249,7 +1633,8 @@ fn begin_initialization(
     if data[1] != WIRE_VERSION || data[2] != STATE_OP_BEGIN_INITIALIZE || !authority.is_signer {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     let declared = u32_at(data, 7);
     initialization_declaration(kernel, declared)?;
     if session.status != STATUS_ACTIVE
@@ -1294,7 +1679,8 @@ fn run_initialization(
     if data[1] != WIRE_VERSION || data[2] != STATE_OP_RUN_INITIALIZE || !authority.is_signer {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     if primary_layout != session.primary_state {
         return Err(refusal(REFUSAL_STATE));
     }
@@ -1330,13 +1716,18 @@ fn run_initialization(
     if state_accounts.len() != count {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
-    if resource_count == 1
-        && (resource_accounts[0].key != &session.resource_key
-            || resource_accounts[0].is_writable
-            || resource_accounts[0].data_is_empty())
-    {
-        return Err(refusal(REFUSAL_RESOURCE));
-    }
+    let resource_meta = if resource_count == 1 {
+        Some(checked_resource(
+            program,
+            &resource_accounts[0],
+            session_account,
+            &session,
+            true,
+            false,
+        )?)
+    } else {
+        None
+    };
     let schema = validate_kernel(kernel)?;
     let mut offset = 0u32;
     for (index, account) in state_accounts.iter().enumerate() {
@@ -1372,14 +1763,15 @@ fn run_initialization(
     let resource_spans: Vec<AccountSpan<'_>> = resource_accounts
         .iter()
         .zip(resource_guards.iter())
-        .map(|(account, raw)| AccountSpan {
+        .zip(resource_meta.iter())
+        .map(|((account, raw), meta)| AccountSpan {
             key: account.key.to_bytes(),
             owner: account.owner.to_bytes(),
             is_signer: account.is_signer,
             is_writable: account.is_writable,
             schema: session.resource_schema,
             offset: 0,
-            data: raw,
+            data: &raw[RESOURCE_HEADER_BYTES..RESOURCE_HEADER_BYTES + meta.len as usize],
         })
         .collect();
     let mut guards = state_accounts
@@ -1539,7 +1931,11 @@ fn state_meta(
 ) -> Result<StateSpanMeta, ProgramError> {
     check_program_owned(account, program, writable)?;
     let raw = account.try_borrow_data()?;
-    if index >= MAX_STATE_SPANS || account.key != &session.state_keys[index] {
+    if index >= MAX_STATE_SPANS {
+        return Err(refusal(REFUSAL_STATE));
+    }
+    let (derived_key, _) = state_pda(program, session_account.key, index as u8);
+    if account.key != &derived_key || account.key != &session.state_keys[index] {
         return Err(refusal(REFUSAL_STATE));
     }
     if session.primary_state && index == 0 {
@@ -1553,7 +1949,7 @@ fn state_meta(
             count: session.state_span_count,
             offset: 0,
             len,
-            before_cursor: session.cursor,
+            before_cursor: session.last_advance_start,
             after_cursor: session.cursor,
             total_len: session.state_bytes,
         });
@@ -1894,7 +2290,9 @@ fn view_meta(
     } else {
         return Err(refusal(REFUSAL_VIEW));
     };
+    let (derived_key, _) = view_pda(program, session_account.key, role);
     if expected_key == Pubkey::default()
+        || account.key != &derived_key
         || account.key != &expected_key
         || raw.len() < CHILD_HEADER_BYTES
         || &raw[..4] != VIEW_MAGIC
@@ -2068,12 +2466,16 @@ fn advance(
     if data[1] != WIRE_VERSION || !actor.is_signer {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(actor.key))?;
     if primary_layout != session.primary_state {
         return Err(refusal(REFUSAL_STATE));
     }
     if session.status != STATUS_ACTIVE || actor.key != &session.authority {
         return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    if session.phase != PHASE_NONE {
+        return Err(refusal(REFUSAL_LIVE));
     }
     let expected_cursor = u32_at(data, 2);
     let steps = data[6];
@@ -2142,10 +2544,24 @@ fn advance(
     let bind = kernel.bind_invocation_state(&mut spans);
     let mut committed_steps = 0u8;
     let mut halt_reason = None;
+    let state_bytes = spans
+        .iter()
+        .try_fold(0usize, |total, span| total.checked_add(span.data.len()))
+        .ok_or_else(|| refusal(REFUSAL_STATE))?;
     let transition_result = if bind.is_ok() {
         (|| {
             let mut output = vec![0u8; output_len];
             for command in &commands {
+                // For bounded spans the adapter enforces the HaltBefore
+                // obligation. Larger spans rely on the kernel contract so
+                // this guard never copies an unbounded state value.
+                let before_halt_guard =
+                    (state_bytes <= HALT_BEFORE_RUNTIME_CHECK_BYTES).then(|| {
+                        spans
+                            .iter()
+                            .map(|span| span.data.to_vec())
+                            .collect::<Vec<_>>()
+                    });
                 output.fill(0);
                 let outcome = kernel
                     .transition_spans_with_outcome(command, &mut spans, &mut output)
@@ -2157,6 +2573,14 @@ fn advance(
                     TransitionDisposition::Continue => committed_steps += 1,
                     TransitionDisposition::HaltBefore { reason } => {
                         if reason == 0 {
+                            return Err(refusal(REFUSAL_KERNEL));
+                        }
+                        if before_halt_guard.as_ref().is_some_and(|before| {
+                            before
+                                .iter()
+                                .zip(spans.iter())
+                                .any(|(old, span)| old.as_slice() != span.data)
+                        }) {
                             return Err(refusal(REFUSAL_KERNEL));
                         }
                         halt_reason = Some(reason);
@@ -2184,6 +2608,7 @@ fn advance(
     let final_cursor = expected_cursor
         .checked_add(committed_steps as u32)
         .ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
+    session.last_advance_start = expected_cursor;
     for (index, account) in state_accounts.iter().enumerate() {
         let mut raw = account.try_borrow_mut_data()?;
         if !(session.primary_state && index == 0) {
@@ -2199,6 +2624,21 @@ fn advance(
         put_u32(&mut raw, 76, final_cursor);
     }
     session.cursor = final_cursor;
+    let mut input_root = if session.input_root == [0; 32] {
+        session.stream_root
+    } else {
+        session.input_root
+    };
+    for (index, command) in commands.iter().take(committed_steps as usize).enumerate() {
+        let sequence = expected_cursor + index as u32;
+        input_root = crate::hash::sha256(&[
+            b"dcg/input-chain/2",
+            &input_root,
+            &sequence.to_le_bytes(),
+            command,
+        ]);
+    }
+    session.input_root = input_root;
     if let Some(reason) = halt_reason {
         session.status = STATUS_HALTED;
         session.halt_reason = reason;
@@ -2274,10 +2714,14 @@ fn parse_publication_accounts<'a>(
     }
     if let Some(index) = resource_index {
         let resource = &accounts[index];
-        if resource.key != &session.resource_key || resource.is_writable || resource.data_is_empty()
-        {
-            return Err(refusal(REFUSAL_RESOURCE));
-        }
+        checked_resource(
+            program,
+            resource,
+            &accounts[session_index],
+            session,
+            true,
+            false,
+        )?;
     }
     let state_metas = validate_state_set(
         program,
@@ -2419,7 +2863,8 @@ fn begin_view_phase(
     if !authority.is_signer {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     if primary_layout != session.primary_state
         || session.status != STATUS_ACTIVE
         || authority.key != &session.authority
@@ -2445,11 +2890,11 @@ fn begin_view_phase(
     {
         return Err(refusal(REFUSAL_VIEW));
     }
-    put_u32(
-        &mut accounts[parsed.workspace_index].try_borrow_mut_data()?,
-        112,
-        expected_cursor,
-    );
+    {
+        let mut workspace = accounts[parsed.workspace_index].try_borrow_mut_data()?;
+        workspace[CHILD_HEADER_BYTES..].fill(0);
+        put_u32(&mut workspace, 112, expected_cursor);
+    }
     session.phase = PHASE_VIEW_PUBLICATION;
     session.phase_state_cursor = expected_cursor;
     session.phase_cursor = 0;
@@ -2558,7 +3003,8 @@ fn run_view_phase(
     if !authority.is_signer {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     if primary_layout != session.primary_state
         || session.status != STATUS_ACTIVE
         || authority.key != &session.authority
@@ -2606,7 +3052,7 @@ fn run_view_phase(
             is_writable: accounts[index].is_writable,
             schema: session.resource_schema,
             offset: 0,
-            data: raw,
+            data: &raw[RESOURCE_HEADER_BYTES..RESOURCE_HEADER_BYTES + u32_at(raw, 72) as usize],
         }],
         _ => Vec::new(),
     };
@@ -2663,7 +3109,8 @@ fn commit_view_phase(
     if !authority.is_signer {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     if primary_layout != session.primary_state
         || session.status != STATUS_ACTIVE
         || authority.key != &session.authority
@@ -2732,7 +3179,8 @@ fn abort_view_phase(
     if data[1] != WIRE_VERSION || !authority.is_signer {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     if session.status != STATUS_ACTIVE
         || authority.key != &session.authority
         || session.phase != PHASE_VIEW_PUBLICATION
@@ -2760,19 +3208,18 @@ fn halt_session(
     if data[1] != WIRE_VERSION || !authority.is_signer {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     if authority.key != &session.authority {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
-    if session.status != STATUS_ACTIVE
-        || u32_at(data, 2) != session.cursor
-        || session.phase != PHASE_NONE
-    {
+    if session.status != STATUS_ACTIVE || u32_at(data, 2) != session.cursor {
         return Err(refusal(REFUSAL_CURSOR));
     }
     session.status = STATUS_HALTED;
     session.halt_reason = 0;
     session.halt_cursor = session.cursor;
+    clear_phase(&mut session);
     store_session(session_account, &session)
 }
 
@@ -2799,7 +3246,8 @@ fn close_child(
     refund: &AccountInfo,
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
-    let mut session = checked_session(program, session_account, true, kernel)?;
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(refund.key))?;
     if session.status != STATUS_HALTED {
         return Err(refusal(REFUSAL_LIVE));
     }
@@ -2807,15 +3255,21 @@ fn close_child(
         return Err(refusal(REFUSAL_REFUND));
     }
     check_program_owned(target, program, true)?;
+    let (primary_pda, _) = state_pda(program, session_account.key, 0);
+    let (anchor_address, _) = anchor_pda(program, session_account.key);
     let is_headerless_primary = session.primary_state
         && session.state_span_count > 0
+        && target.key == &primary_pda
         && target.key == &session.state_keys[0];
+    let is_anchor = target.key == &anchor_address;
     let raw = target.try_borrow_data()?;
     let (kind, role, state_index, authority_bound) = if is_headerless_primary {
         if raw.len() != session.state_lengths[0] as usize {
             return Err(refusal(REFUSAL_SESSION));
         }
         (KIND_STATE, 0, 0, true)
+    } else if is_anchor {
+        (KIND_ANCHOR, 0, 0, true)
     } else {
         if raw.len() < CHILD_HEADER_BYTES || raw[8..40] != session_account.key.to_bytes() {
             return Err(refusal(REFUSAL_SESSION));
@@ -2823,19 +3277,66 @@ fn close_child(
         let kind = raw[6];
         let role = raw[7];
         let state_index = raw[78] as usize;
-        let authority_bound = if kind == KIND_STREAM {
-            raw[40..72] == session.stream_root && raw[88..120] == session.writer.to_bytes()
-        } else {
-            raw[40..72] == session.authority.to_bytes()
+        let authority_bound = match kind {
+            KIND_STREAM => {
+                raw[40..72] == session.stream_root && raw[88..120] == session.writer.to_bytes()
+            }
+            KIND_RESOURCE => raw[40..72] == session.resource_commitment,
+            KIND_ANCHOR => true,
+            _ => raw[40..72] == session.authority.to_bytes(),
         };
         (kind, role, state_index, authority_bound)
     };
     let expected = match kind {
-        KIND_STREAM => session.stream_key,
-        KIND_STATE if state_index < MAX_STATE_SPANS => session.state_keys[state_index],
-        KIND_VIEW if (role as usize) < MAX_VIEW_OUTPUTS => session.view_keys[role as usize],
-        KIND_SCRATCH => session.scratch_key,
-        KIND_WORKSPACE => session.workspace_key,
+        KIND_STREAM => {
+            let (key, _) = stream_pda(program, session_account.key);
+            if session.stream_key == key {
+                key
+            } else {
+                Pubkey::default()
+            }
+        }
+        KIND_STATE if state_index < MAX_STATE_SPANS => {
+            let (key, _) = state_pda(program, session_account.key, state_index as u8);
+            if session.state_keys[state_index] == key {
+                key
+            } else {
+                Pubkey::default()
+            }
+        }
+        KIND_VIEW if (role as usize) < MAX_VIEW_OUTPUTS => {
+            let (key, _) = view_pda(program, session_account.key, role);
+            if session.view_keys[role as usize] == key {
+                key
+            } else {
+                Pubkey::default()
+            }
+        }
+        KIND_SCRATCH => {
+            let (key, _) = view_pda(program, session_account.key, SCRATCH_ROLE);
+            if session.scratch_key == key {
+                key
+            } else {
+                Pubkey::default()
+            }
+        }
+        KIND_WORKSPACE => {
+            let (key, _) = view_pda(program, session_account.key, WORKSPACE_ROLE);
+            if session.workspace_key == key {
+                key
+            } else {
+                Pubkey::default()
+            }
+        }
+        KIND_RESOURCE => {
+            let (key, _) = resource_pda(program, session_account.key);
+            if session.resource_key == key {
+                key
+            } else {
+                Pubkey::default()
+            }
+        }
+        KIND_ANCHOR => anchor_pda(program, session_account.key).0,
         _ => return Err(refusal(REFUSAL_SESSION)),
     };
     if target.key != &expected
@@ -2846,6 +3347,9 @@ fn close_child(
         return Err(refusal(REFUSAL_SESSION));
     }
     drop(raw);
+    if kind == KIND_ANCHOR {
+        checked_anchor(program, target, session_account, true)?;
+    }
     match kind {
         KIND_STREAM => session.stream_key = Pubkey::default(),
         KIND_STATE => {
@@ -2865,6 +3369,12 @@ fn close_child(
         }
         KIND_SCRATCH => session.scratch_key = Pubkey::default(),
         KIND_WORKSPACE => session.workspace_key = Pubkey::default(),
+        KIND_RESOURCE => {
+            session.resource_key = Pubkey::default();
+            session.resource_schema = VersionedId { id: 0, version: 0 };
+            session.resource_commitment = [0; 32];
+        }
+        KIND_ANCHOR => {}
         _ => unreachable!(),
     }
     session.child_count = session
@@ -2881,7 +3391,7 @@ fn close_session(
     refund: &AccountInfo,
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
-    let session = checked_session(program, session_account, true, kernel)?;
+    let session = checked_session_from(program, session_account, true, kernel, Some(refund.key))?;
     if session.status != STATUS_HALTED
         || session.child_count != 0
         || session.stream_key != Pubkey::default()
@@ -2889,6 +3399,7 @@ fn close_session(
         || session.view_count != 0
         || session.scratch_key != Pubkey::default()
         || session.workspace_key != Pubkey::default()
+        || session.resource_key != Pubkey::default()
         || session.phase != PHASE_NONE
     {
         return Err(refusal(REFUSAL_LIVE));
@@ -2922,33 +3433,393 @@ fn close_account(
         };
         check_unique(accounts)?;
         let primary_state = kind == KIND_STATE
-            && checked_session(program, session, false, kernel)
+            && checked_session_from(program, session, false, kernel, Some(refund.key))
                 .is_ok_and(|decoded| decoded.primary_state && target.key == &decoded.state_keys[0]);
-        if !primary_state && target.try_borrow_data()?.get(6).copied() != Some(kind) {
+        let anchor_account =
+            kind == KIND_ANCHOR && checked_anchor(program, target, session, false).is_ok();
+        if !primary_state
+            && !anchor_account
+            && target.try_borrow_data()?.get(6).copied() != Some(kind)
+        {
             return Err(refusal(REFUSAL_SESSION));
         }
         close_child(program, session, target, refund, kernel)
     }
 }
 
-fn anchor(
+fn checked_anchor(
+    program: &Pubkey,
+    account: &AccountInfo,
+    session_account: &AccountInfo,
+    writable: bool,
+) -> Result<AnchorMeta, ProgramError> {
+    check_program_owned(account, program, writable)?;
+    let (expected, _) = anchor_pda(program, session_account.key);
+    let raw = account.try_borrow_data()?;
+    if account.key != &expected
+        || raw.len() != ANCHOR_ACCOUNT_BYTES
+        || &raw[..4] != ANCHOR_MAGIC
+        || u16_at(&raw, 4) != WIRE_VERSION as u16
+        || !matches!(raw[6], 0 | 1)
+        || raw[7] != 0
+        || raw[8..40] != session_account.key.to_bytes()
+        || raw[116..].iter().any(|byte| *byte != 0)
+    {
+        return Err(refusal(REFUSAL_SESSION));
+    }
+    Ok(AnchorMeta {
+        open: raw[6] == 1,
+        cursor: u32_at(&raw, 40),
+        total: u32_at(&raw, 44),
+        progress: u32_at(&raw, 48),
+        input_root: raw[52..84].try_into().expect("fixed width"),
+        accumulator: raw[84..116].try_into().expect("fixed width"),
+    })
+}
+
+fn write_anchor(
+    account: &AccountInfo,
+    session_account: &AccountInfo,
+    meta: AnchorMeta,
+) -> ProgramResult {
+    let mut raw = account.try_borrow_mut_data()?;
+    raw.fill(0);
+    raw[..4].copy_from_slice(ANCHOR_MAGIC);
+    put_u16(&mut raw, 4, WIRE_VERSION as u16);
+    raw[6] = u8::from(meta.open);
+    raw[8..40].copy_from_slice(session_account.key.as_ref());
+    put_u32(&mut raw, 40, meta.cursor);
+    put_u32(&mut raw, 44, meta.total);
+    put_u32(&mut raw, 48, meta.progress);
+    raw[52..84].copy_from_slice(&meta.input_root);
+    raw[84..116].copy_from_slice(&meta.accumulator);
+    Ok(())
+}
+
+fn begin_anchor(
     program: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
-    exact_data(data, 6)?;
-    if data[1] != WIRE_VERSION {
-        return Err(ProgramError::InvalidInstructionData);
+    exact_data(data, 7)?;
+    if accounts.len() < 7 {
+        return Err(ProgramError::NotEnoughAccountKeys);
     }
+    let [payer, authority, session_account, stream, anchor_account, rest @ ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    check_unique(accounts)?;
+    let state_count = accounts.len().saturating_sub(6);
+    if !payer.is_signer
+        || !payer.is_writable
+        || !authority.is_signer
+        || *rest.last().unwrap().key != system_program::id()
+    {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let system = rest.last().unwrap();
+    let state_accounts = &rest[..rest.len() - 1];
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    let cursor = u32_at(data, 3);
+    if session.status != STATUS_ACTIVE
+        || session.phase != PHASE_NONE
+        || !session.state_initialized
+        || cursor != session.cursor
+        || session.anchor_cursor > cursor
+        || state_accounts.len() != state_count
+    {
+        return Err(refusal(REFUSAL_CURSOR));
+    }
+    stream_pda_check(program, stream, session_account, &session, false)?;
+    let schema = validate_kernel(kernel)?;
+    validate_state_set(
+        program,
+        session_account,
+        &session,
+        state_accounts,
+        schema,
+        false,
+        cursor,
+    )?;
+    let input_root = if session.input_root == [0; 32] {
+        session.stream_root
+    } else {
+        session.input_root
+    };
+    let schema_id = schema.id.id.to_le_bytes();
+    let schema_version = schema.id.version.to_le_bytes();
+    let cursor_bytes = cursor.to_le_bytes();
+    let total_bytes = session.state_bytes.to_le_bytes();
+    let mut initial = crate::hash::Parts::new();
+    initial
+        .push(b"dcg/state-anchor-init/3")
+        .push(&session.state_anchor)
+        .push(&input_root)
+        .push(&session.kernel_id.0)
+        .push(&schema_id)
+        .push(&schema_version)
+        .push(&cursor_bytes)
+        .push(&total_bytes);
+    let (expected, bump) = anchor_pda(program, session_account.key);
+    if anchor_account.key != &expected || *system.key != system_program::id() {
+        return Err(refusal(REFUSAL_SESSION));
+    }
+    if anchor_account.owner == &system_program::id()
+        && anchor_account.lamports() == 0
+        && anchor_account.data_is_empty()
+    {
+        create_pda(
+            program,
+            payer,
+            anchor_account,
+            system,
+            &[ANCHOR_SEED, session_account.key.as_ref()],
+            bump,
+            ANCHOR_ACCOUNT_BYTES,
+        )?;
+        session.child_count = session
+            .child_count
+            .checked_add(1)
+            .ok_or_else(|| refusal(REFUSAL_SESSION))?;
+    } else {
+        let previous = checked_anchor(program, anchor_account, session_account, true)?;
+        if previous.open {
+            return Err(refusal(REFUSAL_LIVE));
+        }
+    }
+    write_anchor(
+        anchor_account,
+        session_account,
+        AnchorMeta {
+            open: true,
+            cursor,
+            total: session.state_bytes,
+            progress: 0,
+            input_root,
+            accumulator: initial.finish(),
+        },
+    )?;
+    session.phase = PHASE_STATE_ANCHOR;
+    session.phase_state_cursor = cursor;
+    session.phase_cursor = 0;
+    session.phase_total = session.state_bytes;
+    session.phase_compute_units = ANCHOR_CHUNK_BYTES;
+    store_session(session_account, &session)
+}
+
+fn run_anchor_chunk(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    kernel: &dyn StatefulKernel,
+) -> ProgramResult {
+    exact_data(data, 11)?;
+    if accounts.len() < 5 {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let [authority, session_account, stream, anchor_account, state_accounts @ ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    check_unique(accounts)?;
+    if !authority.is_signer {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    let cursor = u32_at(data, 3);
+    let offset = u32_at(data, 7);
+    if session.status != STATUS_ACTIVE
+        || session.phase != PHASE_STATE_ANCHOR
+        || cursor != session.phase_state_cursor
+        || session.cursor != cursor
+        || offset != session.phase_cursor
+    {
+        return Err(refusal(REFUSAL_PHASE_CURSOR));
+    }
+    stream_pda_check(program, stream, session_account, &session, false)?;
+    let anchor = checked_anchor(program, anchor_account, session_account, true)?;
+    if !anchor.open
+        || anchor.cursor != cursor
+        || anchor.total != session.phase_total
+        || anchor.progress != offset
+        || anchor.progress >= anchor.total
+    {
+        return Err(refusal(REFUSAL_PHASE_CURSOR));
+    }
+    let schema = validate_kernel(kernel)?;
+    let metas = validate_state_set(
+        program,
+        session_account,
+        &session,
+        state_accounts,
+        schema,
+        false,
+        cursor,
+    )?;
+    let count = (anchor.total - offset).min(ANCHOR_CHUNK_BYTES);
+    let end = offset
+        .checked_add(count)
+        .ok_or_else(|| refusal(REFUSAL_STATE))?;
+    let guards = state_accounts
+        .iter()
+        .map(AccountInfo::try_borrow_data)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut digest = crate::hash::Parts::new();
+    let offset_bytes = offset.to_le_bytes();
+    digest
+        .push(b"dcg/state-anchor-chunk/3")
+        .push(&anchor.accumulator)
+        .push(&offset_bytes);
+    let mut covered = 0u32;
+    for (index, (raw, meta)) in guards.iter().zip(metas.iter()).enumerate() {
+        let span_end = meta
+            .offset
+            .checked_add(meta.len)
+            .ok_or_else(|| refusal(REFUSAL_STATE))?;
+        let from = offset.max(meta.offset);
+        let to = end.min(span_end);
+        if from < to {
+            let header_len = if session.primary_state && index == 0 {
+                0
+            } else {
+                CHILD_HEADER_BYTES
+            };
+            let local_from = header_len + (from - meta.offset) as usize;
+            let local_to = local_from + (to - from) as usize;
+            digest.push(&raw[local_from..local_to]);
+            covered += to - from;
+        }
+    }
+    if covered != count {
+        return Err(refusal(REFUSAL_STATE));
+    }
+    write_anchor(
+        anchor_account,
+        session_account,
+        AnchorMeta {
+            progress: end,
+            accumulator: digest.finish(),
+            ..anchor
+        },
+    )?;
+    session.phase_cursor = end;
+    store_session(session_account, &session)
+}
+
+fn finish_anchor(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    kernel: &dyn StatefulKernel,
+) -> ProgramResult {
+    exact_data(data, 7)?;
+    let [authority, session_account, anchor_account] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    check_unique(accounts)?;
+    if !authority.is_signer {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    let cursor = u32_at(data, 3);
+    if session.status != STATUS_ACTIVE
+        || session.phase != PHASE_STATE_ANCHOR
+        || session.cursor != cursor
+        || session.phase_state_cursor != cursor
+        || session.phase_cursor != session.phase_total
+    {
+        return Err(refusal(REFUSAL_PHASE_CURSOR));
+    }
+    let anchor = checked_anchor(program, anchor_account, session_account, true)?;
+    if !anchor.open
+        || anchor.cursor != cursor
+        || anchor.total != session.phase_total
+        || anchor.progress != anchor.total
+    {
+        return Err(refusal(REFUSAL_PHASE_CURSOR));
+    }
+    let schema = validate_kernel(kernel)?;
+    let schema_id = schema.id.id.to_le_bytes();
+    let schema_version = schema.id.version.to_le_bytes();
+    session.state_anchor = crate::hash::sha256(&[
+        b"dcg/state-anchor/3",
+        &anchor.accumulator,
+        &anchor.input_root,
+        &session.kernel_id.0,
+        &schema_id,
+        &schema_version,
+        &cursor.to_le_bytes(),
+        &anchor.total.to_le_bytes(),
+    ]);
+    session.input_root = anchor.input_root;
+    session.anchor_cursor = cursor;
+    clear_phase(&mut session);
+    write_anchor(
+        anchor_account,
+        session_account,
+        AnchorMeta {
+            open: false,
+            ..anchor
+        },
+    )?;
+    store_session(session_account, &session)
+}
+
+fn abort_anchor(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    kernel: &dyn StatefulKernel,
+) -> ProgramResult {
+    exact_data(data, 7)?;
+    let [authority, session_account, anchor_account] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    check_unique(accounts)?;
+    if !authority.is_signer {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    if session.status != STATUS_ACTIVE
+        || session.phase != PHASE_STATE_ANCHOR
+        || u32_at(data, 3) != session.phase_state_cursor
+    {
+        return Err(refusal(REFUSAL_LIVE));
+    }
+    let anchor = checked_anchor(program, anchor_account, session_account, true)?;
+    if !anchor.open || anchor.progress != session.phase_cursor {
+        return Err(refusal(REFUSAL_PHASE_CURSOR));
+    }
+    write_anchor(
+        anchor_account,
+        session_account,
+        AnchorMeta {
+            open: false,
+            ..anchor
+        },
+    )?;
+    clear_phase(&mut session);
+    store_session(session_account, &session)
+}
+
+fn anchor_one_shot(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    kernel: &dyn StatefulKernel,
+) -> ProgramResult {
     if accounts.len() < 3 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     check_unique(accounts)?;
     let session_zero = checked_session(program, &accounts[0], false, kernel).ok();
     let session_one = checked_session(program, &accounts[1], false, kernel).ok();
-    let (session_account, stream, state_accounts, primary_layout) = if session_zero.is_some() {
-        (&accounts[0], &accounts[1], accounts[2..].to_vec(), false)
+    let (session_account, stream, state_accounts) = if session_zero.is_some() {
+        (&accounts[0], &accounts[1], accounts[2..].to_vec())
     } else if session_one.is_some() {
         (
             &accounts[1],
@@ -2956,18 +3827,20 @@ fn anchor(
             core::iter::once(accounts[0].clone())
                 .chain(accounts[3..].iter().cloned())
                 .collect::<Vec<_>>(),
-            true,
         )
     } else {
         return Err(refusal(REFUSAL_SESSION));
     };
     let mut session = checked_session(program, session_account, true, kernel)?;
-    if primary_layout != session.primary_state {
-        return Err(refusal(REFUSAL_STATE));
+    if session.phase != PHASE_NONE || !session.state_initialized {
+        return Err(refusal(REFUSAL_LIVE));
     }
     let cursor = u32_at(data, 2);
-    if cursor != session.cursor || session.anchor_cursor > cursor {
-        return Err(refusal(REFUSAL_CURSOR));
+    if cursor != session.cursor
+        || session.anchor_cursor > cursor
+        || session.state_bytes > ANCHOR_CHUNK_BYTES
+    {
+        return Err(refusal(REFUSAL_RESOURCE));
     }
     stream_pda_check(program, stream, session_account, &session, false)?;
     let schema = validate_kernel(kernel)?;
@@ -2980,20 +3853,6 @@ fn anchor(
         false,
         cursor,
     )?;
-    let mut input_root = if session.input_root == [0; 32] {
-        session.stream_root
-    } else {
-        session.input_root
-    };
-    for sequence in session.anchor_cursor..cursor {
-        let command = read_slot(stream, &session, sequence)?;
-        input_root = crate::hash::sha256(&[
-            b"dcg/input-chain/2",
-            &input_root,
-            &sequence.to_le_bytes(),
-            &command,
-        ]);
-    }
     let guards = state_accounts
         .iter()
         .map(AccountInfo::try_borrow_data)
@@ -3003,11 +3862,12 @@ fn anchor(
     let schema_version = schema.id.version.to_le_bytes();
     let cursor_bytes = cursor.to_le_bytes();
     parts
-        .push(b"dcg/state-anchor/2")
+        .push(b"dcg/state-anchor/3")
         .push(&session.kernel_id.0)
         .push(&schema_id)
         .push(&schema_version)
-        .push(&cursor_bytes);
+        .push(&cursor_bytes)
+        .push(&session.input_root);
     for (index, (raw, meta)) in guards.iter().zip(metas.iter()).enumerate() {
         let header_len = if session.primary_state && index == 0 {
             0
@@ -3016,10 +3876,33 @@ fn anchor(
         };
         parts.push(&raw[header_len..header_len + meta.len as usize]);
     }
-    session.input_root = input_root;
     session.anchor_cursor = cursor;
     session.state_anchor = parts.finish();
     store_session(session_account, &session)
+}
+
+fn anchor(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    kernel: &dyn StatefulKernel,
+) -> ProgramResult {
+    if data[1] != WIRE_VERSION {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if data.len() == 6 {
+        return anchor_one_shot(program, accounts, data, kernel);
+    }
+    let Some(operation) = data.get(2).copied() else {
+        return Err(ProgramError::InvalidInstructionData);
+    };
+    match operation {
+        ANCHOR_OP_BEGIN => begin_anchor(program, accounts, data, kernel),
+        ANCHOR_OP_CHUNK => run_anchor_chunk(program, accounts, data, kernel),
+        ANCHOR_OP_FINISH => finish_anchor(program, accounts, data, kernel),
+        ANCHOR_OP_ABORT => abort_anchor(program, accounts, data, kernel),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
 }
 
 /// Process stateful wire v3 using one statically linked application kernel.
@@ -3034,6 +3917,13 @@ pub fn process_with_kernel(
     };
     if data.get(1) != Some(&WIRE_VERSION) {
         return Err(ProgramError::InvalidInstructionData);
+    }
+    if tag == RESOURCE_CHUNK_TAG {
+        return if data.get(2) == Some(&RESOURCE_GROW_OP) {
+            grow_resource(program, accounts, data, kernel)
+        } else {
+            upload_resource_chunk(program, accounts, data, kernel)
+        };
     }
     match tag {
         crate::stateful::TAG_OPEN_SESSION => open_session(program, accounts, data, kernel),

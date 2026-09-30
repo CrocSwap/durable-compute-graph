@@ -1682,10 +1682,9 @@ pub fn process_with_kernel_or_else<F>(
 where
     F: FnOnce(&Pubkey, &[AccountInfo], &[u8]) -> ProgramResult,
 {
-    if data
-        .first()
-        .is_some_and(|tag| (TAG_OPEN_SESSION..=TAG_ANCHOR).contains(tag))
-    {
+    if data.first().is_some_and(|tag| {
+        (TAG_OPEN_SESSION..=TAG_ANCHOR).contains(tag) || *tag == v3::RESOURCE_CHUNK_TAG
+    }) {
         process_with_kernel(program, accounts, data, kernel)
     } else {
         existing_handlers(program, accounts, data)
