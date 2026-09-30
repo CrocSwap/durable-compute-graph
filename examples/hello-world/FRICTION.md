@@ -29,18 +29,28 @@ run, and the example does not define a new kernel.
    transaction sequencer sends caller-built messages; it does not build DCG
    instructions or know session policy. A user looking for “increment this”
    must first translate it into DCG's account protocol. It also reads the
-   output by slicing raw account bytes; there is no typed output object. The
-   smallest fix is a typed Python counter/session builder that owns this
-   boilerplate and exposes a single `run(input)` call. **Owner:
-   client/sequencer.**
+   output by slicing raw account bytes; there is no typed output object.
+   **Status: addressed for the stateful counter path.** `python/dcg/session/`
+   now provides `KernelRef`, a versioned account-layout module, one instruction
+   encoder, signer-role handling, typed `CounterState` reads, and a journaled
+   `Session.open() / write_input() / advance() / read_state() / close()` flow.
+   `run_session.py` is 20 physical lines and targets the SBF local validator.
+   Its integration test is written but remains unrun: the pinned SBF build had
+   reduced free space to 5.3 GiB after 30 seconds, so it was stopped before
+   crossing the dispatch's 5 GB floor. The original
+   ProgramTest `run.py` remains unchanged for byte and execution-model
+   comparison. The example's existing manifest is stateful wire v1; v2 seeds
+   and shared instruction forms are supported, but this counter example does
+   not claim the separate v2 scaled workload.
+   **Owner: client/sequencer.**
 
-4. **The working path is the native Rust handler, not SBF.** This uses
-   `ProgramTest` with `processor!(dcg_program::process_instruction)`. It proves
-   the handler accepted the input and wrote state in ProgramTest's bank; it
-   does not prove the built SBF image or a validator deployment behaves the
-   same way. The smallest fix is a maintained ProgramTest SBF target for this
-   example, with the pinned SDK and image build hidden behind one documented
-   command. **Owner: program/tooling/docs.**
+4. **The original working path uses the native Rust handler, not SBF.** It
+   runs `ProgramTest` with `processor!(dcg_program::process_instruction)`.
+   `run_session.py` now targets the built SBF image on a local validator, but
+   that integration test remains unrun in this worktree because the pinned
+   build reached 5.3 GiB of free disk and was stopped before the 5 GB floor.
+   The smallest fix is a maintained SBF target with the pinned SDK hidden
+   behind one documented command. **Owner: program/tooling/docs.**
 
 5. **Several protocol concepts come before the first result.** Even this
    counter binds a kernel ID, semantic version, ABI version, state schema and
@@ -61,10 +71,15 @@ run, and the example does not define a new kernel.
 7. **Program refusals are hard to diagnose.** During the first attempt, the
    advance instruction had a read-only input stream. The program returned
    `Custom(2304)`; the number did not say that the account's writable role was
-   wrong or how to fix it. The example now labels each transaction, but the
-   caller still needs source knowledge to map the numeric refusal. The smallest
-   fix is a stable refusal-code table and client errors that name the failed
-   account role and expected signer/writable flags. **Owner: program/client.**
+   wrong or how to fix it. **Status: addressed for stateful v1/v2 refusals.**
+   The Python client maps custom codes to named exceptions with a next step.
+   Its table is checked against both Rust constant bands; `Custom(2304)` is
+   included, and a read-only account role is named with the writable fix. The
+   local-validator regression is written to exercise that refusal before a
+   successful advance, but remains unrun because the SBF build was stopped at
+   the disk-space bound. Other instruction families still need their own error
+   maps.
+   **Owner: program/client.**
 
 8. **The current getting-started guide is a contract tour, not a short first
    run.** It begins with implementing a Rust `Kernel`, writing a static app
