@@ -75,8 +75,11 @@ versions are independent of kernel, ABI, and mode versions. The core has no
 dynamic loading path; `AccountInfo` is confined to the SVM adapter.
 
 The included `ByteSum` test kernel exercises the compiled manifest and
-authenticated-span replay in focused tests. It is a mechanics test, not a
-model-capability demonstration.
+authenticated-span replay in focused tests. The optional
+`sbf-real-lifecycle-test` feature adds a test-only binding for retained Form
+256 and lets the revision-8 SBF harness replay through that manifest. It is a
+mechanics test, not a model-capability demonstration. The feature must not be
+used for a production image.
 
 ## Checks and standalone SBF image
 
@@ -98,11 +101,16 @@ invocation and passed one test; its measured CU by instruction and image identit
 
 The canary uses bespoke test-only tags 240–250 and its own compact account
 layout. It does not exercise registry/admission, document init/roots/finalize,
-attest/resolve, challenge descent, or the extracted close handlers. Full SBF
-execution of that real handler sequence remains open.
+attest/resolve, challenge descent, or the extracted close handlers. Round 5
+also ran those real revision-8 stages against the standalone SBF image with
+ByteSum replay through the feature-gated Form-256 manifest binding. The run
+used a temporary copy of Basanos's retained-fixture ProgramTest harness; the
+standalone repository does not include that fixture builder. The exact tags,
+CU measurements, image digest, test counts, and harness limitation are
+recorded in the experiment note linked above.
 
-Measured lifecycle test image built with `cargo-build-sbf 3.0.15` and
-platform-tools v1.51: 792,056 bytes, SHA-256
+The earlier canary image, built with `cargo-build-sbf 3.0.15` and platform-tools
+v1.51, was 792,056 bytes with SHA-256
 `860a3cb1a97555ac1fcbd423cb3a0f6188e2bc9a2233c45c2e21fc92df098b5b`. This is
 the standalone DCG test image with `ByteSum` and a feature-gated lifecycle
 canary; it does not reproduce the Basanos revision-8 image. The portable v8

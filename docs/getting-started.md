@@ -1,9 +1,9 @@
 # Getting started with DCG
 
 This first-hour path follows the static kernel contract and app manifest, then
-runs tests against the extracted revision-8 handlers. It does not claim a full
-SBF document lifecycle: the only existing SBF lifecycle harness is the
-isolated, test-feature canary described at the end.
+runs tests against the extracted revision-8 handlers. The optional real-SBF
+path at the end is a test-only mechanics demonstration using retained
+Basanos fixtures; it does not establish model quality or ship-ready behavior.
 
 ## 1. Define a kernel
 
@@ -101,6 +101,17 @@ retry. Its test records are deliberately crafted for those handler slices; it
 does not exercise registry/admission, document initialization, or a complete
 document lifecycle.
 
+The optional real-lifecycle binding is checked with:
+
+```sh
+CARGO_TARGET_DIR=/private/tmp/dcg-target cargo test --locked --offline --profile fasttest -p dcg-program --features sbf-real-lifecycle-test --lib kernel
+
+CARGO_TARGET_DIR=/private/tmp/dcg-target cargo test --locked --offline --profile fasttest -p dcg-program --features sbf-real-lifecycle-test --lib kernel_svm
+```
+
+These host tests cover exact kernel identity and version lookup, the Form-256
+span declaration, account roles, and alias refusal. They do not report SBF CU.
+
 ## 5. Optional isolated SBF canary
 
 The canary is test-only behind `sbf-lifecycle-test`; it is not linked into the
@@ -130,5 +141,42 @@ cargo test --locked --profile fasttest -p dcg-program \
 
 The canary uses private tags 240–250 and a bespoke template, document, bond,
 and Merkle layout. It demonstrates SBF mechanics only. It does not replace a
-ProgramTest run through the revision-8 registry/admission, document,
-challenge/response, settlement, resolution, and close handlers.
+ProgramTest run through the revision-8 handlers.
+
+## 6. Optional real revision-8 SBF lifecycle
+
+Build a separate test image with the feature-gated ByteSum bindings:
+
+```sh
+export CARGO_TARGET_DIR=/private/tmp/dcg-target
+export DCG_SBF_SDK=/path/to/platform-tools-sdk
+export DCG_SBF_TOOLS_VERSION=v1.51
+export DCG_SBF_STAGING_NAME=dcg-sbf-real-lifecycle
+
+crates/dcg-program/scripts/build-sbf-reproducible.sh --features sbf-real-lifecycle-test --sbf-out-dir /private/tmp/dcg-sbf-real
+```
+
+The measured image on 2026-09-30 was 751,280 bytes with SHA-256
+`80cbc43ba99da10cabf071fa4d6769b546dad73f8431f7bcce9a32a2e6fad2bf`.
+The feature binds retained machine selector 1 / Form 256 to ByteSum with exact
+semantic version 1, ABI version 1, optimistic mode 1, and two authenticated
+read-only spans. These bindings and the extra form are absent from the default
+image.
+
+The real SBF transaction driver uses the retained revision-8 fixture builders
+in a Basanos checkout because those large fixture builders are not included in
+this extraction. Point `BASANOS_CHECKOUT` at that checkout and set
+`BASANOS_PT2P_ROOT` to the retained K=80 fixture, then run a focused ProgramTest
+case against the image:
+
+```sh
+BASANOS_DCG_V8_SBF=1 BPF_OUT_DIR=/private/tmp/dcg-sbf-real BASANOS_PT2P_ROOT="$PT2P_ROOT_K80" CARGO_TARGET_DIR=/private/tmp/basanos-test-target cargo test --locked --offline --profile fasttest --manifest-path "$BASANOS_CHECKOUT/chain/dcg-program/Cargo.toml" --test unified_v8_document rev8_position_challenge_rounds_reach_an_admitted_fixpoint -- --nocapture
+```
+
+That existing test reaches the ByteSum fix-point replay. The measured round-5
+run also used temporary focused tests for the K=10,240 registry/admission and
+honest resolve/close path, plus a ByteSum replay, wrong-role refusal, executor
+timeout, settlement, and close path. The temporary test driver and its exact
+measurements are documented in the experiment note. No Basanos source was
+changed. Treat all results as mechanics demonstrations; the input stream,
+engine-state accounts, views, and session close remain open stateful features.

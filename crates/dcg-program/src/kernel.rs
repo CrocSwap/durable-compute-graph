@@ -842,11 +842,58 @@ pub mod test_kernel {
         input_span_count: 1,
         spans: &BYTE_SUM_SPANS,
     }];
+    // The extracted real-handler SBF fixture descends into the retained
+    // compiler-v1 Form-256 row. Its three-byte PT2S cursor and eight-byte
+    // geometry reserved field are both zero, so the same ByteSum replay has
+    // a byte-exact honest answer without changing the retained plan artifact.
+    // This second binding exists only in the dedicated SBF lifecycle image.
+    #[cfg(feature = "sbf-real-lifecycle-test")]
+    pub static BYTE_SUM_FORM_256_SPANS: [AccountSpanBinding; 2] = [
+        AccountSpanBinding {
+            account_index: 0,
+            key: None,
+            owner: SpanOwner::Program,
+            is_signer: false,
+            is_writable: false,
+            schema: VersionedId { id: 1, version: 1 },
+            offset: 184,
+            length: 3,
+        },
+        AccountSpanBinding {
+            account_index: 2,
+            key: None,
+            owner: SpanOwner::Program,
+            is_signer: false,
+            is_writable: false,
+            schema: VersionedId { id: 2, version: 1 },
+            offset: 9,
+            length: 8,
+        },
+    ];
+    #[cfg(feature = "sbf-real-lifecycle-test")]
+    pub static BYTE_SUM_FORM_256_BINDING: [LegacyFormBinding; 1] = [LegacyFormBinding {
+        machine_selector: Some(1),
+        form_id: 256,
+        kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
+        semantic_version: 1,
+        abi_version: 1,
+        mode: MODE_OPTIMISTIC_V1,
+        input_span_count: 1,
+        spans: &BYTE_SUM_FORM_256_SPANS,
+    }];
+    #[cfg(feature = "sbf-real-lifecycle-test")]
+    pub static BYTE_SUM_REAL_LIFECYCLE_FORMS: [LegacyFormBinding; 2] = [
+        BYTE_SUM_LEGACY_FORMS[0],
+        BYTE_SUM_FORM_256_BINDING[0],
+    ];
     pub static MANIFEST_APP: ApplicationManifest = ApplicationManifest {
         application_id: b"dcg-test-app/1",
         version: 1,
         kernels: &KERNELS,
         optimistic_replays: &REPLAY_BINDINGS,
+        #[cfg(feature = "sbf-real-lifecycle-test")]
+        legacy_forms: &BYTE_SUM_REAL_LIFECYCLE_FORMS,
+        #[cfg(not(feature = "sbf-real-lifecycle-test"))]
         legacy_forms: &BYTE_SUM_LEGACY_FORMS,
         require_legacy_form_binding: true,
     };
@@ -898,6 +945,9 @@ mod tests {
         assert!(!m.supports_mode(BYTE_SUM.manifest().id, 1, 2, MODE_CONSENSUS_V1));
         assert!(m.resolve(BYTE_SUM.manifest().id, 2, 1).is_none());
         assert!(m.resolve(BYTE_SUM.manifest().id, 1, 2).is_none());
+        assert!(m
+            .resolve(KernelId(*b"dcg-missing-v1\0\0"), 1, 1)
+            .is_none());
         assert_eq!(
             m.execute(
                 BYTE_SUM.manifest().id,
@@ -963,6 +1013,39 @@ mod tests {
             Err(ManifestRunError::KernelUnavailable)
         );
         assert!(m.resolve_legacy_form(2, 22).is_none());
+
+        #[cfg(feature = "sbf-real-lifecycle-test")]
+        {
+            let replay = m.resolve_legacy_form(1, 256).unwrap();
+            assert_eq!(replay.kernel_id, BYTE_SUM.manifest().id);
+            assert_eq!((replay.semantic_version, replay.abi_version), (1, 1));
+            assert!(m.resolve_legacy_form(2, 256).is_none());
+            assert_eq!(m.validate(), Ok(()));
+        }
+    }
+
+    #[cfg(all(test, feature = "sbf-real-lifecycle-test"))]
+    #[test]
+    fn form_256_test_app_binding_uses_the_declared_zero_spans() {
+        let binding = test_kernel::MANIFEST_APP.resolve_legacy_form(1, 256).unwrap();
+        assert_eq!(binding.input_span_count, 1);
+        assert_eq!(binding.spans.len(), 2);
+        assert_eq!(
+            (
+                binding.spans[0].account_index,
+                binding.spans[0].offset,
+                binding.spans[0].length,
+            ),
+            (0, 184, 3)
+        );
+        assert_eq!(
+            (
+                binding.spans[1].account_index,
+                binding.spans[1].offset,
+                binding.spans[1].length,
+            ),
+            (2, 9, 8)
+        );
     }
 
     #[test]

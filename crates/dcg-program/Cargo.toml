@@ -23,6 +23,7 @@ legacy-hclosure-handlers = []
 pt2p-seal-profile = []
 test-kernel = []
 sbf-lifecycle-test = ["test-kernel"]
+sbf-real-lifecycle-test = ["test-kernel"]
 
 [lib]
 name = "dcg_program"
