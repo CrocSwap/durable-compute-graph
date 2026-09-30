@@ -54,10 +54,11 @@ data begins after the same header; `AccountSpan.data.as_ptr()` is its
 read-only context address. Application code must rebind and clear any engine
 context around each engine call, including render calls.
 
-The processor helper `process_with_kernel_or_else` routes only tags 230–239 to
-the selected static kernel and invokes the app's existing handler for other
-tags. It defines no Solana entrypoint. An application can therefore keep one
-entrypoint and compose DCG handling with its existing dispatch.
+The processor helper `process_with_kernel_or_else` routes tags 230–239 to the
+selected v1/v2 static kernel and routes tag 240 by wire version to v3's
+resource-copy handler. Other tags go to the app's existing handler. It defines
+no Solana entrypoint. An application can therefore keep one entrypoint and
+compose DCG handling with its existing dispatch.
 
 ## Resumable view publication
 

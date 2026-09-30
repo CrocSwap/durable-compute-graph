@@ -5,6 +5,12 @@ application-built transaction messages through an injected signer and RPC
 adapter. It does not construct DCG instructions, decide fees or rent, choose
 retry safety, interpret program errors, or define application state.
 
+The stateful application layer is [`dcg.session`](python-session.md). It uses
+this sequencer while owning stateful PDA derivation, instruction encoding,
+typed state reads, known stateful refusal messages and a local account
+inventory for cleanup. These responsibilities stay outside the generic
+sequencer core.
+
 The package includes a production HTTP JSON-RPC endpoint and a keypair-file
 signer, alongside the injectable `RpcEndpoint` and `Signer` protocols. Offline
 tests use an in-memory fake or an HTTPX mock transport and make no network

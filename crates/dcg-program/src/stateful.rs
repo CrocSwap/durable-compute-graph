@@ -354,7 +354,9 @@ fn checked_session(
     check_program_owned(account, program, writable)?;
     let raw = account.try_borrow_data()?;
     let session = decode_session(&raw)?;
-    if account.key != &session.self_key
+    let (derived_session_key, _) = session_pda(program, &session.authority, session.id);
+    if account.key != &derived_session_key
+        || account.key != &session.self_key
         || session.kernel_id != kernel.manifest().id
         || session.semantic_version != kernel.manifest().semantic_version
         || session.abi_version != kernel.manifest().abi_version
@@ -1647,6 +1649,12 @@ fn process_v1_with_kernel(
 #[path = "stateful_v2.rs"]
 pub mod v2;
 
+/// Explicit stateful wire v3. It keeps v2 records available while adding
+/// primary headerless state, committed-prefix halt, resource-backed views, and
+/// resumable initialization.
+#[path = "stateful_v3.rs"]
+pub mod v3;
+
 /// Invoke the version named in the instruction's wire-version byte.
 pub fn process_with_kernel(
     program: &Pubkey,
@@ -1656,6 +1664,7 @@ pub fn process_with_kernel(
 ) -> ProgramResult {
     match data.get(1).copied() {
         Some(2) => v2::process_with_kernel(program, accounts, data, kernel),
+        Some(3) => v3::process_with_kernel(program, accounts, data, kernel),
         Some(WIRE_VERSION) => process_v1_with_kernel(program, accounts, data, kernel),
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -1675,10 +1684,9 @@ pub fn process_with_kernel_or_else<F>(
 where
     F: FnOnce(&Pubkey, &[AccountInfo], &[u8]) -> ProgramResult,
 {
-    if data
-        .first()
-        .is_some_and(|tag| (TAG_OPEN_SESSION..=TAG_ANCHOR).contains(tag))
-    {
+    if data.first().is_some_and(|tag| {
+        (TAG_OPEN_SESSION..=TAG_ANCHOR).contains(tag) || *tag == v3::RESOURCE_CHUNK_TAG
+    }) {
         process_with_kernel(program, accounts, data, kernel)
     } else {
         existing_handlers(program, accounts, data)

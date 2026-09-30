@@ -69,7 +69,7 @@ pub fn process_instruction_with_manifest(
         return test_lifecycle::process(program_id, accounts, data);
     }
     #[cfg(feature = "sbf-real-lifecycle-test")]
-    if (230..=239).contains(&tag) {
+    if (230..=239).contains(&tag) || tag == stateful::v3::RESOURCE_CHUNK_TAG {
         return stateful_test::process(program_id, accounts, data);
     }
     match tag {

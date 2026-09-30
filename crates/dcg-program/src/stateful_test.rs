@@ -5,8 +5,10 @@
 
 use crate::{
     kernel::{
-        AccountSpan, Kernel, KernelError, KernelId, KernelManifest, PortLayout, ResourceLimits,
-        StateSchema, StateSpanMut, StatefulKernel, VersionedId, ViewAbi,
+        AccountSpan, InitializationPhase, Kernel, KernelError, KernelId, KernelManifest,
+        PortLayout, ResourceLimits, StateSchema, StateSpanMut, StatefulKernel,
+        TransitionDisposition, TransitionOutcome, VersionedId, ViewAbi, ViewPhase,
+        MAX_DECLARED_KERNEL_COMPUTE_UNITS,
     },
     stateful,
     stateful::v2 as stateful_v2,
@@ -170,6 +172,82 @@ impl StatefulKernel for CounterKernel {
 }
 
 pub static COUNTER: CounterKernel = CounterKernel;
+
+static V3_COUNTER_MODES: [VersionedId; 1] = [crate::stateful::v3::MODE_CONSENSUS_V3];
+static V3_COUNTER_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-counter-v1\0\0"),
+    semantic_version: 1,
+    abi_version: 1,
+    input: PortLayout {
+        id: INPUT_LAYOUT,
+        max_bytes: 8,
+        alignment: 1,
+    },
+    output: PortLayout {
+        id: OUTPUT_LAYOUT,
+        max_bytes: 16,
+        alignment: 1,
+    },
+    state: Some(StateSchema {
+        id: COUNTER_SCHEMA,
+        max_bytes: 16,
+    }),
+    resources: ResourceLimits {
+        max_input_bytes: 8,
+        max_output_bytes: 16,
+        max_state_bytes: 16,
+        max_operations: 8,
+        max_compute_units: 80_000,
+    },
+    modes: &V3_COUNTER_MODES,
+};
+
+pub struct V3CounterKernel;
+
+impl Kernel for V3CounterKernel {
+    fn manifest(&self) -> &'static KernelManifest {
+        &V3_COUNTER_MANIFEST
+    }
+
+    fn execute(&self, input: &[u8], output: &mut [u8]) -> Result<usize, KernelError> {
+        COUNTER.execute(input, output)
+    }
+}
+
+impl StatefulKernel for V3CounterKernel {
+    fn initial_state(&self, output: &mut [u8]) -> Result<usize, KernelError> {
+        COUNTER.initial_state(output)
+    }
+
+    fn transition(
+        &self,
+        input: &[u8],
+        prior_state: &[u8],
+        output: &mut [u8],
+        next_state: &mut [u8],
+    ) -> Result<(usize, usize), KernelError> {
+        COUNTER.transition(input, prior_state, output, next_state)
+    }
+
+    fn initial_state_spans(&self, spans: &mut [StateSpanMut<'_>]) -> Result<usize, KernelError> {
+        COUNTER.initial_state_spans(spans)
+    }
+
+    fn transition_spans(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        COUNTER.transition_spans(input, state, output)
+    }
+
+    fn view_abis(&self) -> &'static [ViewAbi] {
+        COUNTER.view_abis()
+    }
+}
+
+pub static V3_COUNTER: V3CounterKernel = V3CounterKernel;
 
 pub const WORKLOAD_RESOURCE_KEY: [u8; 32] = [0xC1; 32];
 pub const WORKLOAD_RESOURCE_SCHEMA: VersionedId = VersionedId {
@@ -410,8 +488,365 @@ impl StatefulKernel for ScaledWorkloadKernel {
 
 pub const SCALED_WORKLOAD: ScaledWorkloadKernel = ScaledWorkloadKernel::new();
 
+pub const V3_FIXED_STATE_LEN: u32 = 10_000_000;
+pub const V3_RESOURCE_KEY: [u8; 32] = [0xE7; 32];
+pub const V3_RESOURCE_OWNER: [u8; 32] = [0xD9; 32];
+pub const V3_RESOURCE_SCHEMA: VersionedId = VersionedId {
+    id: 0x5741_4431,
+    version: 1,
+};
+pub const V3_STATE_SCHEMA: VersionedId = VersionedId {
+    id: 0x444f_4f4d,
+    version: 1,
+};
+pub const V3_VIEW_ABI: [u8; 32] = [0xB3; 32];
+pub const V3_HALT_REASON: u32 = 0xD00D;
+pub const V3_FIXED_STATE_ADDRESS: usize = 0x4000_00060;
+pub const V3_INIT_PHASE_BYTES: u32 = 65_536;
+pub const V3_INIT_COMPUTE_UNITS: u32 = (MAX_DECLARED_KERNEL_COMPUTE_UNITS * 9 / 10) as u32;
+pub const V3_HALT_AFTER_REASON: u32 = 0xD00E;
+pub const V3_VIEW_WORKSPACE_BYTES: u32 = 64;
+const V3_VIEW_ROLE: u8 = 0;
+
+static V3_MODES: [VersionedId; 1] = [crate::stateful::v3::MODE_CONSENSUS_V3];
+static V3_VIEWS: [ViewAbi; 1] = [ViewAbi {
+    role: V3_VIEW_ROLE,
+    id: V3_VIEW_ABI,
+    max_bytes: 32,
+}];
+static V3_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-fixed-v3\0\0\0\0"),
+    semantic_version: 1,
+    abi_version: 1,
+    input: PortLayout {
+        id: VersionedId {
+            id: 0x494e_5054,
+            version: 3,
+        },
+        max_bytes: 1,
+        alignment: 1,
+    },
+    output: PortLayout {
+        id: VersionedId {
+            id: 0x4f55_5450,
+            version: 3,
+        },
+        max_bytes: 8,
+        alignment: 1,
+    },
+    state: Some(StateSchema {
+        id: V3_STATE_SCHEMA,
+        max_bytes: V3_FIXED_STATE_LEN,
+    }),
+    resources: ResourceLimits {
+        max_input_bytes: 1,
+        max_output_bytes: 8,
+        max_state_bytes: V3_FIXED_STATE_LEN,
+        max_operations: 8,
+        max_compute_units: 100_000,
+    },
+    modes: &V3_MODES,
+};
+
+/// Small Rust engine used by the SBF test. It rejects any state pointer except
+/// the legacy account-0 data address and exposes resource-backed rendering.
+pub struct V3FixedAddressKernel {
+    context: AtomicPtr<u8>,
+}
+
+impl V3FixedAddressKernel {
+    pub const fn new() -> Self {
+        Self {
+            context: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    fn check_fixed_address(&self, state: &mut [StateSpanMut<'_>]) -> Result<(), KernelError> {
+        let Some(primary) = state.first_mut() else {
+            return Err(KernelError::InvalidInput);
+        };
+        let full_state = primary.data.len() == V3_FIXED_STATE_LEN as usize
+            && primary.data_address() as usize == V3_FIXED_STATE_ADDRESS;
+        let small_test_state = primary.data.len() == 1_280
+            || primary.data.len() == crate::stateful::v3::HALT_BEFORE_RUNTIME_CHECK_BYTES;
+        if primary.offset != 0 || !(full_state || small_test_state) {
+            return Err(KernelError::Refused);
+        }
+        Ok(())
+    }
+
+    fn transition_one(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        if input.len() != 1 || output.len() < 8 {
+            return Err(KernelError::InvalidInput);
+        }
+        self.check_fixed_address(state)?;
+        if self.context.load(Ordering::Relaxed) != state[0].data.as_mut_ptr() {
+            return Err(KernelError::Refused);
+        }
+        if input[0] == 0xEE {
+            return Err(KernelError::Refused);
+        }
+        let at = state[0].data.len() - 8;
+        let value = u64::from_le_bytes(state[0].data[at..at + 8].try_into().unwrap());
+        let next = value
+            .checked_add(input[0] as u64)
+            .ok_or(KernelError::Refused)?;
+        state[0].data[at..at + 8].copy_from_slice(&next.to_le_bytes());
+        output[..8].copy_from_slice(&next.to_le_bytes());
+        Ok(8)
+    }
+}
+
+impl Kernel for V3FixedAddressKernel {
+    fn manifest(&self) -> &'static KernelManifest {
+        &V3_MANIFEST
+    }
+
+    fn execute(&self, _input: &[u8], _output: &mut [u8]) -> Result<usize, KernelError> {
+        Err(KernelError::Refused)
+    }
+}
+
+impl StatefulKernel for V3FixedAddressKernel {
+    fn initial_state(&self, _output: &mut [u8]) -> Result<usize, KernelError> {
+        Err(KernelError::Refused)
+    }
+
+    fn transition(
+        &self,
+        _input: &[u8],
+        _prior_state: &[u8],
+        _output: &mut [u8],
+        _next_state: &mut [u8],
+    ) -> Result<(usize, usize), KernelError> {
+        Err(KernelError::Refused)
+    }
+
+    fn initial_state_spans(&self, _spans: &mut [StateSpanMut<'_>]) -> Result<usize, KernelError> {
+        Err(KernelError::Refused)
+    }
+
+    fn transition_spans(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        self.transition_one(input, state, output)
+    }
+
+    fn transition_spans_with_outcome(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<TransitionOutcome, KernelError> {
+        self.check_fixed_address(state)?;
+        if self.context.load(Ordering::Relaxed) != state[0].data.as_mut_ptr() {
+            return Err(KernelError::Refused);
+        }
+        if input == [0xEE] {
+            return Ok(TransitionOutcome {
+                output_bytes: 0,
+                disposition: TransitionDisposition::HaltBefore {
+                    reason: V3_HALT_REASON,
+                },
+            });
+        }
+        if input == [0xED] {
+            state[0].data[0] ^= 1;
+            return Ok(TransitionOutcome {
+                output_bytes: 0,
+                disposition: TransitionDisposition::HaltBefore {
+                    reason: V3_HALT_REASON,
+                },
+            });
+        }
+        if input == [0xEF] {
+            let written = self.transition_one(input, state, output)?;
+            return Ok(TransitionOutcome {
+                output_bytes: written,
+                disposition: TransitionDisposition::HaltAfter {
+                    reason: V3_HALT_AFTER_REASON,
+                },
+            });
+        }
+        let written = self.transition_one(input, state, output)?;
+        Ok(TransitionOutcome {
+            output_bytes: written,
+            disposition: TransitionDisposition::Continue,
+        })
+    }
+
+    fn bind_invocation_state(&self, state: &mut [StateSpanMut<'_>]) -> Result<(), KernelError> {
+        self.check_fixed_address(state)?;
+        self.context
+            .store(state[0].data.as_mut_ptr(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn unbind_invocation_state(&self) {
+        self.context.store(core::ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    fn max_initialization_phase_bytes(&self) -> u32 {
+        V3_INIT_PHASE_BYTES
+    }
+
+    fn initialization_phase_compute_units(&self) -> u32 {
+        V3_INIT_COMPUTE_UNITS
+    }
+
+    fn initialize_state_phase(
+        &self,
+        phase: InitializationPhase,
+        resources: &[AccountSpan<'_>],
+        _commitment: &[u8; 32],
+        state: &mut [StateSpanMut<'_>],
+    ) -> Result<usize, KernelError> {
+        let [resource] = resources else {
+            return Err(KernelError::Refused);
+        };
+        let session_shape_fixture = state.len() == 1
+            && state[0].data.len() == 1_280
+            && resource.data.len() == 1_280
+            && resource.data.starts_with(b"DSS3");
+        if !session_shape_fixture {
+            self.check_fixed_address(state)?;
+        }
+        if resource.schema != V3_RESOURCE_SCHEMA
+            || resource.owner != V3_RESOURCE_OWNER
+            || resource.is_writable
+        {
+            return Err(KernelError::Refused);
+        }
+        if resource.data.first() == Some(&0xEE) {
+            return Err(KernelError::Refused);
+        }
+        let end = phase
+            .cursor
+            .checked_add(self.max_initialization_phase_bytes())
+            .unwrap_or(phase.total_bytes)
+            .min(phase.total_bytes);
+        if phase.cursor >= phase.total_bytes || end <= phase.cursor {
+            return Err(KernelError::InvalidInput);
+        }
+        let mut written = 0usize;
+        for span in state.iter_mut() {
+            let span_end = span
+                .offset
+                .checked_add(span.data.len() as u32)
+                .ok_or(KernelError::InvalidInput)?;
+            let from = phase.cursor.max(span.offset);
+            let to = end.min(span_end);
+            if from >= to {
+                continue;
+            }
+            let destination = (from - span.offset) as usize;
+            let len = (to - from) as usize;
+            let resource_end = to.min(resource.data.len() as u32);
+            span.data[destination..destination + len].fill(0);
+            if from < resource_end {
+                let source_len = (resource_end - from) as usize;
+                span.data[destination..destination + source_len]
+                    .copy_from_slice(&resource.data[from as usize..from as usize + source_len]);
+            }
+            written += len;
+        }
+        if session_shape_fixture && phase.cursor == 0 {
+            state[0].data[228..260].copy_from_slice(&state[0].key);
+        }
+        Ok(written)
+    }
+
+    fn max_view_phase_bytes(&self) -> u32 {
+        32
+    }
+
+    fn view_phase_compute_units(&self) -> u32 {
+        500_000
+    }
+
+    fn max_view_workspace_bytes(&self) -> u32 {
+        V3_VIEW_WORKSPACE_BYTES
+    }
+
+    fn view_abis(&self) -> &'static [ViewAbi] {
+        &V3_VIEWS
+    }
+
+    fn render_view_phase_with_resources(
+        &self,
+        phase: ViewPhase,
+        state: &[AccountSpan<'_>],
+        resources: &[AccountSpan<'_>],
+        _commitment: &[u8; 32],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        let [primary] = state else {
+            return Err(KernelError::Refused);
+        };
+        let [resource] = resources else {
+            return Err(KernelError::Refused);
+        };
+        if primary.offset != 0
+            || primary.data.len() != V3_FIXED_STATE_LEN as usize
+            || primary.data.as_ptr() as usize != V3_FIXED_STATE_ADDRESS
+            || resource.schema != V3_RESOURCE_SCHEMA
+            || resource.owner != V3_RESOURCE_OWNER
+            || resource.is_writable
+            || workspace.len() != V3_VIEW_WORKSPACE_BYTES as usize
+            || phase.role != V3_VIEW_ROLE
+            || phase.output_offset != 0
+            || output.len() != 32
+            || resource.data.len() < output.len()
+        {
+            return Err(KernelError::Refused);
+        }
+        workspace[0] = workspace[0].wrapping_add(1);
+        workspace[1..5].copy_from_slice(&phase.state_cursor.to_le_bytes());
+        output.copy_from_slice(&resource.data[..32]);
+        Ok(output.len())
+    }
+}
+
+pub const V3_FIXED_ENGINE: V3FixedAddressKernel = V3FixedAddressKernel::new();
+
+fn test_session_kernel_id(accounts: &[AccountInfo]) -> Option<KernelId> {
+    for account in accounts {
+        let raw = account.try_borrow_data().ok()?;
+        if raw.len() != 1_280 || &raw[..4] != b"DSS3" {
+            continue;
+        }
+        // This feature-only dispatcher deliberately routes a session-shaped
+        // primary image to its declared test kernel. The v3 processor must
+        // authenticate the account address itself before it trusts that image.
+        return Some(KernelId(raw[86..102].try_into().ok()?));
+    }
+    None
+}
+
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    if data.get(1) == Some(&stateful_v2::WIRE_VERSION) {
+    if data.get(1) == Some(&crate::stateful::v3::WIRE_VERSION) {
+        let kernel_id = if data.first() == Some(&stateful::TAG_OPEN_SESSION) {
+            data.get(17..33)
+                .and_then(|raw| raw.try_into().ok())
+                .map(KernelId)
+        } else {
+            test_session_kernel_id(accounts)
+        };
+        if kernel_id == Some(V3_FIXED_ENGINE.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_FIXED_ENGINE)
+        } else {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_COUNTER)
+        }
+    } else if data.get(1) == Some(&stateful_v2::WIRE_VERSION) {
         let kernel = ScaledWorkloadKernel::new();
         stateful::process_with_kernel_or_else(program, accounts, data, &kernel, |_, _, _| {
             Err(solana_program::program_error::ProgramError::InvalidInstructionData)
