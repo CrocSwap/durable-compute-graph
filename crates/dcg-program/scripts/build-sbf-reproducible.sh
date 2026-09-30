@@ -54,6 +54,35 @@ staging_created=1
 cp -R "$REPO_DIR"/. "$STAGING_DIR"/
 cd "$STAGING_DIR/crates/dcg-program"
 
+FEATURES=
+feature_value=0
+for argument do
+    if [ "$feature_value" -eq 1 ]; then
+        if [ -n "$FEATURES" ]; then
+            FEATURES="$FEATURES,$argument"
+        else
+            FEATURES=$argument
+        fi
+        feature_value=0
+        continue
+    fi
+    case "$argument" in
+        --features) feature_value=1 ;;
+        --features=*)
+            feature=${argument#--features=}
+            if [ -n "$FEATURES" ]; then
+                FEATURES="$FEATURES,$feature"
+            else
+                FEATURES=$feature
+            fi
+            ;;
+    esac
+done
+if [ "$feature_value" -eq 1 ]; then
+    echo "--features needs a value" >&2
+    exit 2
+fi
+
 EXPECT_SHA256=
 SBF_OUT_DIR=
 remaining=$#
@@ -90,6 +119,17 @@ esac
 if [ -n "$EXPECT_SHA256" ] && [ "${#EXPECT_SHA256}" -ne 64 ]; then
     echo "--expect-sha256 must contain 64 hex characters" >&2
     exit 2
+fi
+
+# The manifest is part of the linked app image. Run its required validator
+# with this build's feature set before producing SBF, including EMPTY_APPLICATION.
+if [ -n "$FEATURES" ]; then
+    cargo test --locked --offline --profile fasttest -p dcg-program \
+        --features "$FEATURES" --lib \
+        application_manifest_tests::compiled_application_manifest_is_valid -- --exact
+else
+    cargo test --locked --offline --profile fasttest -p dcg-program --lib \
+        application_manifest_tests::compiled_application_manifest_is_valid -- --exact
 fi
 
 {

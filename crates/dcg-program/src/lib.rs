@@ -108,7 +108,7 @@ pub fn process_instruction_with_manifest(
             data,
             manifest.decision_routes,
         ),
-        131 | 132 | 156..=169 | 172..=178 | 185..=187 | 197 => {
+        131 | 132 | 156..=169 | 172..=178 | 182..=187 | 197 => {
             unified::process_with_manifest(program_id, accounts, data, manifest)
                 .unwrap_or(Err(ProgramError::InvalidInstructionData))
         }
@@ -137,6 +137,14 @@ fn application_manifest() -> &'static kernel::ApplicationManifest {
         decision_routes: &compatibility::REVISION8_COMPATIBILITY,
     };
     &EMPTY_APPLICATION
+}
+
+#[cfg(test)]
+mod application_manifest_tests {
+    #[test]
+    fn compiled_application_manifest_is_valid() {
+        assert_eq!(super::application_manifest().validate(), Ok(()));
+    }
 }
 
 #[cfg(not(feature = "no-entrypoint"))]

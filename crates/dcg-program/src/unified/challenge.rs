@@ -34,8 +34,8 @@ use super::terms::{
 };
 use super::{
     address, d32, no, plan, u16_at, u32_at, u64_at, CL_AUTHORITY, CL_COORDINATE, CL_OVERFLOW,
-    CL_PATH, DCR1_AUTH, DCR1_BAD, DCR1_DEADLINE, DCR1_PHASE, DCR1_PROOF, PLAN_BINDING,
-    REGISTRY_ROOT, REVEAL_MISMATCH, REVEAL_ORDER, SETTLEMENT_PROGRAM,
+    CL_PATH, DCR1_AUTH, DCR1_BAD, DCR1_DEADLINE, DCR1_INCOMPLETE, DCR1_PHASE, DCR1_PROOF,
+    PLAN_BINDING, REGISTRY_ROOT, REVEAL_MISMATCH, REVEAL_ORDER, SETTLEMENT_PROGRAM,
 };
 use crate::closure_v2::{self as h, Node};
 use crate::hash;
@@ -65,10 +65,20 @@ pub const PATH_START: usize = SIZE - 32 * 32;
 pub const PATH_LEN_AT: usize = PATH_START - 1;
 pub const DEV2_AT: usize = 7_040;
 /// DCR1 v6 identity fills the space after DEV2 through `PATH_START`, including
-/// the old path-length byte. V6 is written only at a terminal fix-point, after
-/// the Merkle path is no longer needed.
+/// the old path-length byte. App-bound records switch to v6 when their
+/// fix-point enters RESPOND, so the executor response is pinned to the same
+/// manifest identity as the challenge.
 pub const APP_IDENTITY_AT: usize = DEV2_AT + 64;
 pub const APP_IDENTITY_BYTES: usize = 64;
+/// Chunked executor opening for the optional app-kernel replay response.
+/// These bytes occupy the unused middle of DCR1 only after a fix-point has
+/// cleared its descent path. Tag 184 consumes the staged preimage.
+/// Version-6 app records use the former t/form words for bounded staging
+/// counters while in RESPOND. DEV2 retains the t/form report.
+pub const APP_WITNESS_LEN_AT: usize = 170;
+pub const APP_WITNESS_AT: usize = PATH_START;
+pub const APP_WITNESS_CAP: usize = 900;
+pub const APP_SEGMENT_ROOT_AT: usize = APP_WITNESS_AT + APP_WITNESS_CAP;
 pub const REVEAL_STAGED_AT: usize = 176;
 pub const REVEAL_COUNT_AT: usize = 178;
 pub const REVEAL_VERIFIED_AT: usize = 180;
@@ -447,6 +457,204 @@ pub fn encode_dev2(
     out
 }
 
+/// Verify one app-declared read against the committed output of its same-
+/// position producer. This is the bounded route-witness case used by the
+/// revision-8 replay adapter; unsupported provenance refuses to replay.
+fn verify_app_route_opening(
+    program: &Pubkey,
+    doc: &AccountInfo,
+    plan_accounts: &[AccountInfo],
+    raw: &[u8],
+    application: &crate::kernel::ApplicationManifest,
+    binding: &crate::kernel::LegacyFormBinding,
+    witness: &crate::kernel::CommittedReplayWitness<'_>,
+    saved_segment_root: Option<&[u8; 32]>,
+) -> ProgramResult {
+    if binding.input_routes.is_empty() {
+        return if witness.extension.is_empty() {
+            Ok(())
+        } else {
+            Err(no(DCR1_PROOF))
+        };
+    }
+    if binding.input_routes.len() != 1 || witness.inputs.len() != 1 {
+        return Err(no(DCR1_PROOF));
+    }
+    let [pt2s, routes, geometry, drp2, pt1s] = plan_accounts else {
+        return Err(no(DCR1_BAD));
+    };
+    let route_binding = binding.input_routes[0];
+    let extension = witness.extension;
+    if extension.len() < 14 || extension[..4] != *b"RWP1" || extension[11] != 0 {
+        return Err(no(DCR1_PROOF));
+    }
+    let proof_route = u16_at(extension, 4, DCR1_PROOF)?;
+    let producer_local = u32_at(extension, 6, DCR1_PROOF)?;
+    let proof_height = extension[10] as usize;
+    let producer_len = u16_at(extension, 12, DCR1_PROOF)? as usize;
+    let producer_end = 14usize.checked_add(producer_len).ok_or(no(DCR1_PROOF))?;
+    let proof_end = producer_end
+        .checked_add(32usize.checked_mul(proof_height).ok_or(no(DCR1_PROOF))?)
+        .ok_or(no(DCR1_PROOF))?;
+    if proof_route != route_binding.ordinal || proof_end != extension.len() {
+        return Err(no(DCR1_PROOF));
+    }
+    let producer_witness =
+        crate::kernel::CommittedReplayWitness::decode(&extension[14..producer_end])
+            .map_err(|_| no(DCR1_PROOF))?;
+    if !producer_witness.extension.is_empty() {
+        return Err(no(DCR1_PROOF));
+    }
+    let descriptor = d32(raw, 72, DCR1_BAD)?;
+    let position = u32_at(raw, 156, DCR1_BAD)?;
+    let segment = u16_at(raw, 160, DCR1_BAD)?;
+    let local = u32_at(raw, 136, DCR1_BAD)?;
+    let d = doc.try_borrow_data()?;
+    bind_plan(program, &d, pt2s, routes, geometry, Some(drp2))?;
+    let s = pt2s.try_borrow_data()?;
+    let index_at = plan::bind_pt1s(program, pt2s, pt1s)?;
+    let pt1 = pt1s.try_borrow_data()?;
+    let (rb, gb) = (routes.try_borrow_data()?, geometry.try_borrow_data()?);
+    let x = plan::view(&s, &rb, &gb, &[], Some(&pt1[index_at..]))?;
+    let target_index = x
+        .entry_index(position, segment, local)
+        .map_err(|_| no(CL_COORDINATE))?;
+    let target = x
+        .entry(position, target_index)
+        .map_err(|_| no(CL_COORDINATE))?;
+    if route_binding.ordinal >= target.read_count {
+        return Err(no(DCR1_PROOF));
+    }
+    let route = x
+        .route(&target, route_binding.ordinal)
+        .map_err(|_| no(DCR1_PROOF))?;
+    let input = &witness.inputs[0];
+    let input_end = route_binding
+        .offset
+        .checked_add(route_binding.length)
+        .ok_or(no(DCR1_PROOF))?;
+    if route.direction != 0
+        || route.binding_kind != 1
+        || route.producer_position != position
+        || route.byte_length < input_end
+    {
+        return Err(no(DCR1_PROOF));
+    }
+    let producer = x
+        .entry(position, route.producer_entry)
+        .map_err(|_| no(DCR1_PROOF))?;
+    let producer_coordinate = x
+        .coordinate(position, route.producer_entry)
+        .map_err(|_| no(DCR1_PROOF))?;
+    if producer_coordinate.segment != segment
+        || producer_coordinate.local != producer_local
+        || producer_local >= local
+    {
+        return Err(no(DCR1_PROOF));
+    }
+    let producer_binding = application
+        .resolve_legacy_form(raw[MACHINE_AT], producer.kernel_index)
+        .ok_or(no(DCR1_PROOF))?;
+    let producer_output_route = x
+        .route(
+            &producer,
+            producer
+                .read_count
+                .checked_add(route.producer_write_ordinal as u16)
+                .ok_or(no(DCR1_PROOF))?,
+        )
+        .map_err(|_| no(DCR1_PROOF))?;
+    if producer_output_route.direction != 1
+        || producer_output_route.region_id != route.region_id
+        || producer_output_route.effective_offset != route.effective_offset
+        || producer_output_route.byte_length != route.byte_length
+        || producer_witness.claimed_output.len() != route.byte_length as usize
+    {
+        return Err(no(DCR1_PROOF));
+    }
+    let output_slice = producer_witness
+        .claimed_output
+        .get(route_binding.offset as usize..input_end as usize)
+        .ok_or(no(DCR1_PROOF))?;
+    let producer_digest = application.replay_leaf_digest(
+        producer_binding,
+        &descriptor,
+        position,
+        segment,
+        producer_local,
+        producer_witness.raw,
+    );
+    let (_, entries) = segment_ordinal(&x, position, segment)?;
+    if proof_height != r::path_height(entries)? as usize {
+        return Err(no(DCR1_PROOF));
+    }
+    let path: Vec<[u8; 32]> = extension[producer_end..]
+        .chunks_exact(32)
+        .map(|chunk| chunk.try_into().unwrap())
+        .collect();
+    let producer_tree = dl_fold(
+        &descriptor,
+        1,
+        position,
+        entries,
+        producer_local,
+        &producer_digest,
+        &path,
+    )
+    .ok_or(no(DCR1_PROOF))?;
+    let wrap_segment = |tree: &[u8; 32]| {
+        h::hash(
+            b"segment-root/2",
+            &[
+                &descriptor,
+                &position.to_le_bytes(),
+                &segment.to_le_bytes(),
+                &entries.to_le_bytes(),
+                tree,
+                &[1],
+            ],
+        )
+    };
+    let expected_root = if let Some(root) = saved_segment_root {
+        *root
+    } else {
+        let path_len = raw[PATH_LEN_AT] as usize;
+        let path_end = PATH_START
+            .checked_add(32usize.checked_mul(path_len).ok_or(no(DCR1_PROOF))?)
+            .ok_or(no(DCR1_PROOF))?;
+        let current_path: Vec<[u8; 32]> = raw
+            .get(PATH_START..path_end)
+            .ok_or(no(DCR1_PROOF))?
+            .chunks_exact(32)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect();
+        let current_leaf = d32(raw, 104, DCR1_BAD)?;
+        let current_tree = dl_fold(
+            &descriptor,
+            1,
+            position,
+            entries,
+            local,
+            &current_leaf,
+            &current_path,
+        )
+        .ok_or(no(DCR1_PROOF))?;
+        wrap_segment(&current_tree)
+    };
+    if wrap_segment(&producer_tree) != expected_root {
+        return Err(no(DCR1_PROOF));
+    }
+    if input.data.len() != route_binding.length as usize
+        || input.schema != binding.input_spans[0].schema
+        || output_slice != input.data
+    {
+        // The producer path is valid and proves different bytes from those
+        // the executor committed as a consumer input.
+        return Err(no(super::APP_KERNEL_UNAVAILABLE));
+    }
+    Ok(())
+}
+
 /// The per-instance check at a fix-point `(p, segment, local)`. Accounts
 /// `plan_accounts` = [PT2S, base routes, base geometry, DRP2, PT1S] as DCM2
 /// names them. A coordinate that names no committed entry refuses (581);
@@ -467,9 +675,9 @@ fn fix_point(
     witness_bytes: Option<&[u8]>,
 ) -> Result<bool, ProgramError> {
     let [pt2s, routes, geometry, drp2, pt1s] = plan_accounts else {
-        return Err(no(DCR1_BAD));
+        return Err(no(DCR1_INCOMPLETE));
     };
-    let (t, form, mut code, row, root) = {
+    let (t, form, mut code, row, root, segment_root) = {
         let d = doc.try_borrow_data()?;
         bind_plan(program, &d, pt2s, routes, geometry, Some(drp2))?;
         let s = pt2s.try_borrow_data()?;
@@ -525,12 +733,58 @@ fn fix_point(
                 }
             }
         }
-        (t, e.kernel_index, code, row, d32(&d, 392, DCR1_BAD)?)
+        let (_, entries) = segment_ordinal(&x, p, segment)?;
+        let path_len = raw[PATH_LEN_AT] as usize;
+        if path_len != r::path_height(entries)? as usize {
+            return Err(no(CL_PATH));
+        }
+        let current_path: Vec<[u8; 32]> = raw[PATH_START..PATH_START + 32 * path_len]
+            .chunks_exact(32)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect();
+        let current_leaf = d32(raw, 104, DCR1_BAD)?;
+        let current_tree = dl_fold(
+            &d32(raw, 72, DCR1_BAD)?,
+            1,
+            p,
+            entries,
+            local,
+            &current_leaf,
+            &current_path,
+        )
+        .ok_or(no(CL_PATH))?;
+        let segment_root = h::hash(
+            b"segment-root/2",
+            &[
+                &d32(raw, 72, DCR1_BAD)?,
+                &p.to_le_bytes(),
+                &segment.to_le_bytes(),
+                &entries.to_le_bytes(),
+                &current_tree,
+                &[1],
+            ],
+        );
+        (
+            t,
+            e.kernel_index,
+            code,
+            row,
+            d32(&d, 392, DCR1_BAD)?,
+            segment_root,
+        )
     };
     let mut winner = (code != 0).then_some(2);
     let mut cause = events::CAUSE_CONVICT;
     let mut app_identity = None;
-    if application.is_none() && witness_bytes.is_some() {
+    let mut app_binding_selected = false;
+    if witness_bytes
+        .is_some_and(|bytes| bytes.len() > crate::kernel::CommittedReplayWitness::MAX_WITNESS_BYTES)
+    {
+        return Err(no(DCR1_BAD));
+    }
+    if witness_bytes.is_some()
+        && application.is_none_or(|app| app.resolve_legacy_form(raw[MACHINE_AT], form).is_none())
+    {
         return Err(no(DCR1_BAD));
     }
     if code == 0 {
@@ -538,12 +792,13 @@ fn fix_point(
             let machine_selector = raw[MACHINE_AT];
             let binding = application.resolve_legacy_form(machine_selector, form);
             if let Some(binding) = binding {
-                use crate::kernel::{CommittedReplayWitness, ManifestRunError};
+                app_binding_selected = true;
                 app_identity = Some(application.ruling_identity(binding));
-                cause = events::CAUSE_APP_REPLAY;
-                if let Some(witness) =
-                    witness_bytes.and_then(|bytes| CommittedReplayWitness::decode(bytes).ok())
-                {
+                if let Some(bytes) = witness_bytes {
+                    use crate::kernel::{CommittedReplayWitness, ManifestRunError};
+                    if bytes.len() > CommittedReplayWitness::MAX_WITNESS_BYTES {
+                        return Err(no(DCR1_BAD));
+                    }
                     let descriptor = d32(raw, 72, DCR1_BAD)?;
                     let digest = application.replay_leaf_digest(
                         binding,
@@ -551,71 +806,52 @@ fn fix_point(
                         p,
                         segment,
                         local,
-                        witness.raw,
+                        bytes,
                     );
-                    if digest != d32(raw, 104, DCR1_BAD)? {
-                        // A leaf path proves a digest, but a challenger still
-                        // has to show its canonical preimage. A mismatch loses
-                        // for the challenger without changing the committed tree.
-                        winner = Some(1);
-                        code = DCR1_PROOF;
-                    } else {
-                        match application.replay_legacy_form(
-                            binding,
-                            &witness.inputs,
-                            witness.claimed_output,
-                        ) {
-                            Ok(true) => {
-                                winner = Some(1);
-                                code = 0;
+                    if digest == d32(raw, 104, DCR1_BAD)? {
+                        match CommittedReplayWitness::decode(bytes) {
+                            Ok(witness)
+                                if verify_app_route_opening(
+                                    program,
+                                    doc,
+                                    plan_accounts,
+                                    raw,
+                                    application,
+                                    binding,
+                                    &witness,
+                                    None,
+                                )
+                                .is_ok() =>
+                            {
+                                match application.replay_legacy_form(
+                                    binding,
+                                    &witness.inputs,
+                                    witness.claimed_output,
+                                ) {
+                                    // Only a matching, successfully decoded
+                                    // witness that demonstrates a bad committed
+                                    // output can end the challenge in the fast
+                                    // path. Every other case proceeds to RESPOND,
+                                    // where the executor must open the leaf.
+                                    Ok(false) => {
+                                        cause = events::CAUSE_APP_REPLAY;
+                                        winner = Some(2);
+                                        code = super::APP_KERNEL_MISMATCH;
+                                    }
+                                    Ok(true) | Err(ManifestRunError::ClaimedOutputLength) => {}
+                                    Err(_) => {}
+                                }
                             }
-                            Ok(false) | Err(ManifestRunError::ClaimedOutputLength) => {
-                                winner = Some(2);
-                                code = super::APP_KERNEL_MISMATCH;
-                            }
-                            Err(
-                                ManifestRunError::KernelUnavailable
-                                | ManifestRunError::ModeUnsupported
-                                | ManifestRunError::InputLimit
-                                | ManifestRunError::InputAlignment
-                                | ManifestRunError::OutputBufferTooSmall
-                                | ManifestRunError::InvalidOutputLength
-                                | ManifestRunError::Kernel(_)
-                                | ManifestRunError::InvalidSpanCount
-                                | ManifestRunError::SpanSchema
-                                | ManifestRunError::InvalidCommittedInput,
-                            ) => {
-                                // The executor committed these bytes under this
-                                // coordinate. If the selected kernel cannot accept
-                                // them, the executor loses deterministically.
-                                winner = Some(2);
-                                code = super::APP_KERNEL_UNAVAILABLE;
-                            }
+                            Ok(_) => {}
+                            Err(_) => {}
                         }
                     }
-                } else {
-                    // A malformed or absent challenger-supplied preimage does
-                    // not prove the committed digest, so the challenger loses.
-                    winner = Some(1);
-                    code = DCR1_PROOF;
                 }
             } else if application.require_legacy_form_binding {
-                // Admission rejects this case. Keep old already-committed
-                // documents deterministic if they reach a new image.
-                app_identity = Some(application.ruling_identity(
-                    &crate::kernel::LegacyFormBinding {
-                        machine_selector: Some(machine_selector),
-                        form_id: form,
-                        kernel_id: crate::kernel::KernelId([0; 16]),
-                        semantic_version: 0,
-                        abi_version: 0,
-                        mode: crate::kernel::ModeId { id: 0, version: 0 },
-                        input_spans: &[],
-                        claimed_output_bytes: 0,
-                    },
-                ));
-                winner = Some(2);
-                code = super::APP_KERNEL_UNAVAILABLE;
+                // Application binding may have changed after admission. That
+                // is a neutral refusal: this image cannot convict an executor
+                // for a binding it did not use at admission.
+                return Err(no(DCR1_BAD));
             }
         }
     }
@@ -631,6 +867,14 @@ fn fix_point(
     raw[174..176].copy_from_slice(&form.to_le_bytes());
     raw[DEV2_AT..DEV2_AT + 64].copy_from_slice(&encode_dev2(code, row.as_ref(), t, form, &root));
     if winner.is_none() {
+        // The challenge remains open in RESPOND until the executor opens the
+        // committed preimage. A challenger fast path that fails to open the
+        // leaf is only an unsuccessful optimization, never a ruling.
+        if app_binding_selected {
+            raw[APP_WITNESS_LEN_AT..APP_WITNESS_LEN_AT + 4].fill(0);
+            raw[APP_WITNESS_AT..APP_WITNESS_AT + APP_WITNESS_CAP].fill(0);
+            raw[APP_SEGMENT_ROOT_AT..APP_SEGMENT_ROOT_AT + 32].copy_from_slice(&segment_root);
+        }
         return Ok(true);
     }
     if winner == Some(2) {
@@ -1461,6 +1705,46 @@ pub fn reveal_with_manifest(
     {
         return Err(no(DCR1_BAD));
     }
+    if fix && data.len() > witness_at {
+        // App replay tails were never part of the empty compatibility image's
+        // tag-168 wire shape. Refuse them before proof processing when this
+        // coordinate has no statically selected app binding.
+        let Some(application) = application else {
+            return Err(no(DCR1_BAD));
+        };
+        let position = u32_at(&raw, 156, DCR1_BAD)?;
+        let segment = u16_at(&raw, 160, DCR1_BAD)?;
+        let local = u32_at(&raw, 136, DCR1_BAD)?;
+        bind_plan(
+            program,
+            &accounts[2].try_borrow_data()?,
+            &accounts[3],
+            &accounts[4],
+            &accounts[5],
+            Some(&accounts[6]),
+        )?;
+        let s = accounts[3].try_borrow_data()?;
+        let index_at = plan::bind_pt1s(program, &accounts[3], &accounts[7])?;
+        let pt1 = accounts[7].try_borrow_data()?;
+        let (rb, gb) = (
+            accounts[4].try_borrow_data()?,
+            accounts[5].try_borrow_data()?,
+        );
+        let x = plan::view(&s, &rb, &gb, &[], Some(&pt1[index_at..]))?;
+        let t = x
+            .entry_index(position, segment, local)
+            .map_err(|_| no(CL_COORDINATE))?;
+        let form = x
+            .entry(position, t)
+            .map_err(|_| no(CL_COORDINATE))?
+            .kernel_index;
+        if application
+            .resolve_legacy_form(raw[MACHINE_AT], form)
+            .is_none()
+        {
+            return Err(no(DCR1_BAD));
+        }
+    }
     let current: [u8; 32] = if opening {
         let tree = d32(data, 2, DCR1_BAD)?;
         let wrapped = h::hash(
@@ -1658,6 +1942,231 @@ pub fn descend_with_manifest(
 }
 
 // ------------------------------------------------------------------ family-table reveal
+
+/// tag 183: `total:u16 | offset:u16 | bytes`. The executor uploads an ARW1
+/// preimage in ordered chunks after an app-bound fix-point entered RESPOND.
+/// Uploading bytes never changes the ruling state; tag 184 authenticates and
+/// replays the complete opening.
+#[cfg(feature = "revision-8")]
+pub fn stage_app_witness(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if accounts.len() != 2 || data.len() <= 5 || !accounts[1].is_signer {
+        return Err(no(DCR1_BAD));
+    }
+    record(program, &accounts[0], Some(PHASE_RESPOND))?;
+    let total = u16_at(data, 1, DCR1_BAD)? as usize;
+    let offset = u16_at(data, 3, DCR1_BAD)? as usize;
+    let chunk = &data[5..];
+    let end = offset.checked_add(chunk.len()).ok_or(no(DCR1_BAD))?;
+    if total == 0 || total > crate::kernel::CommittedReplayWitness::MAX_WITNESS_BYTES || end > total
+    {
+        return Err(no(DCR1_BAD));
+    }
+    let mut raw = accounts[0].try_borrow_mut_data()?;
+    if raw[40..72] != accounts[1].key.to_bytes() {
+        return Err(no(DCR1_AUTH));
+    }
+    if now()? > u64_at(&raw, 148, DCR1_BAD)? {
+        return Err(no(DCR1_DEADLINE));
+    }
+    if d32(&raw, APP_SEGMENT_ROOT_AT, DCR1_BAD)? == [0; 32] {
+        return Err(no(DCR1_BAD));
+    }
+    let (declared, staged) = (
+        u16_at(&raw, APP_WITNESS_LEN_AT, DCR1_BAD)? as usize,
+        u16_at(&raw, APP_WITNESS_LEN_AT + 2, DCR1_BAD)? as usize,
+    );
+    if offset == 0 {
+        raw[APP_WITNESS_AT..APP_WITNESS_AT + APP_WITNESS_CAP].fill(0);
+        raw[APP_WITNESS_LEN_AT..APP_WITNESS_LEN_AT + 2]
+            .copy_from_slice(&(total as u16).to_le_bytes());
+        raw[APP_WITNESS_LEN_AT + 2..APP_WITNESS_LEN_AT + 4].fill(0);
+    } else if declared != total || staged != offset {
+        return Err(no(super::APPEND_ORDER));
+    }
+    raw[APP_WITNESS_AT + offset..APP_WITNESS_AT + end].copy_from_slice(chunk);
+    raw[APP_WITNESS_LEN_AT + 2..APP_WITNESS_LEN_AT + 4]
+        .copy_from_slice(&(end as u16).to_le_bytes());
+    respond_event(
+        &accounts[0].key,
+        &raw,
+        super::TAG_STAGE_APP_WITNESS,
+        1,
+        PHASE_RESPOND,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "revision-7")]
+pub fn stage_app_witness(
+    _program: &Pubkey,
+    _accounts: &[AccountInfo],
+    _data: &[u8],
+) -> ProgramResult {
+    Err(no(DCR1_BAD))
+}
+
+/// tag 184 opens and replays the executor's staged ARW1 preimage. A bad or
+/// partial opening is a refusal that leaves RESPOND open until timeout. Once
+/// the preimage matches the challenged digest, decode/kernel failures convict
+/// the executor (799), an incorrect output convicts it (800), and a successful
+/// replay rules for the challenger.
+#[cfg(feature = "revision-8")]
+pub fn respond_app_witness(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
+    if accounts.len() != 8 || data.len() != 1 || !accounts[1].is_signer {
+        return Err(no(DCR1_BAD));
+    }
+    record(program, &accounts[0], Some(PHASE_RESPOND))?;
+    let Some(application) = application else {
+        return Err(no(DCR1_BAD));
+    };
+    let (descriptor, position, segment, local, form, machine, witness) = {
+        let raw = accounts[0].try_borrow_data()?;
+        if raw[40..72] != accounts[1].key.to_bytes() {
+            return Err(no(DCR1_AUTH));
+        }
+        if now()? > u64_at(&raw, 148, DCR1_BAD)? {
+            return Err(no(DCR1_DEADLINE));
+        }
+        let total = u16_at(&raw, APP_WITNESS_LEN_AT, DCR1_BAD)? as usize;
+        let staged = u16_at(&raw, APP_WITNESS_LEN_AT + 2, DCR1_BAD)? as usize;
+        if total == 0 || total != staged || total > APP_WITNESS_CAP {
+            return Err(no(DCR1_INCOMPLETE));
+        }
+        if d32(&raw, APP_SEGMENT_ROOT_AT, DCR1_BAD)? == [0; 32] {
+            return Err(no(DCR1_BAD));
+        }
+        record_document(program, &raw, &accounts[2], true)?;
+        bind_plan(
+            program,
+            &accounts[2].try_borrow_data()?,
+            &accounts[3],
+            &accounts[4],
+            &accounts[5],
+            Some(&accounts[6]),
+        )?;
+        let s = accounts[3].try_borrow_data()?;
+        let index_at = plan::bind_pt1s(program, &accounts[3], &accounts[7])?;
+        let pt1 = accounts[7].try_borrow_data()?;
+        let (rb, gb) = (
+            accounts[4].try_borrow_data()?,
+            accounts[5].try_borrow_data()?,
+        );
+        let x = plan::view(&s, &rb, &gb, &[], Some(&pt1[index_at..]))?;
+        let (position, segment, local) = (
+            u32_at(&raw, 156, DCR1_BAD)?,
+            u16_at(&raw, 160, DCR1_BAD)?,
+            u32_at(&raw, 136, DCR1_BAD)?,
+        );
+        let t = x
+            .entry_index(position, segment, local)
+            .map_err(|_| no(CL_COORDINATE))?;
+        let entry = x.entry(position, t).map_err(|_| no(CL_COORDINATE))?;
+        (
+            d32(&raw, 72, DCR1_BAD)?,
+            position,
+            segment,
+            local,
+            entry.kernel_index,
+            raw[MACHINE_AT],
+            raw[APP_WITNESS_AT..APP_WITNESS_AT + total].to_vec(),
+        )
+    };
+    let binding = application
+        .resolve_legacy_form(machine, form)
+        .ok_or(no(DCR1_BAD))?;
+    if accounts[0].try_borrow_data()?[APP_IDENTITY_AT..APP_IDENTITY_AT + APP_IDENTITY_BYTES]
+        != application.ruling_identity(binding)
+    {
+        // The image changed after this challenge opened. Its response must
+        // not convict under a different app or kernel identity.
+        return Err(no(DCR1_BAD));
+    }
+    let digest =
+        application.replay_leaf_digest(binding, &descriptor, position, segment, local, &witness);
+    if digest != accounts[0].try_borrow_data()?[104..136] {
+        return Err(no(DCR1_BAD));
+    }
+    let decoded = crate::kernel::CommittedReplayWitness::decode(&witness);
+    let saved_segment_root = d32(
+        &accounts[0].try_borrow_data()?,
+        APP_SEGMENT_ROOT_AT,
+        DCR1_BAD,
+    )?;
+    let (winner, code) = match decoded {
+        Err(_) => (2, super::APP_KERNEL_UNAVAILABLE),
+        Ok(opened) => {
+            let route_check = {
+                let raw = accounts[0].try_borrow_data()?;
+                verify_app_route_opening(
+                    program,
+                    &accounts[2],
+                    &accounts[3..8],
+                    &raw,
+                    application,
+                    binding,
+                    &opened,
+                    Some(&saved_segment_root),
+                )
+            };
+            match route_check {
+                Err(ProgramError::Custom(code)) if code == super::APP_KERNEL_UNAVAILABLE => {
+                    (2, super::APP_KERNEL_UNAVAILABLE)
+                }
+                Err(_) => return Err(no(DCR1_BAD)),
+                Ok(()) => match application.replay_legacy_form(
+                    binding,
+                    &opened.inputs,
+                    opened.claimed_output,
+                ) {
+                    Ok(true) => (1, 0),
+                    Ok(false) => (2, super::APP_KERNEL_MISMATCH),
+                    Err(_) => (2, super::APP_KERNEL_UNAVAILABLE),
+                },
+            }
+        }
+    };
+    let mut raw = accounts[0].try_borrow_mut_data()?;
+    raw[APP_WITNESS_LEN_AT..APP_WITNESS_LEN_AT + 4].fill(0);
+    raw[APP_WITNESS_AT..APP_WITNESS_AT + APP_WITNESS_CAP].fill(0);
+    raw[APP_SEGMENT_ROOT_AT..APP_SEGMENT_ROOT_AT + 32].fill(0);
+    let t = u32_at(&raw, DEV2_AT + 20, DCR1_BAD)?;
+    let form = u16_at(&raw, DEV2_AT + 24, DCR1_BAD)?;
+    raw[170..174].copy_from_slice(&t.to_le_bytes());
+    raw[174..176].copy_from_slice(&form.to_le_bytes());
+    raw[DEV2_AT + 4] = if code == 0 {
+        OUTCOME_ADMITTED
+    } else {
+        OUTCOME_CONVICTED
+    };
+    raw[DEV2_AT + 8..DEV2_AT + 12].copy_from_slice(&code.to_le_bytes());
+    raw[6..8].copy_from_slice(&APP_REPLAY_VERSION.to_le_bytes());
+    raw[APP_IDENTITY_AT..APP_IDENTITY_AT + APP_IDENTITY_BYTES]
+        .copy_from_slice(&application.ruling_identity(binding));
+    rule_for_document(
+        program,
+        accounts[0].key,
+        &mut raw,
+        &accounts[2],
+        winner,
+        events::CAUSE_APP_REPLAY,
+        code,
+    )
+}
+
+#[cfg(feature = "revision-7")]
+pub fn respond_app_witness(
+    _program: &Pubkey,
+    _accounts: &[AccountInfo],
+    _data: &[u8],
+    _application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
+    Err(no(DCR1_BAD))
+}
 
 /// tag 173 RevealFamilyTableV5 (any signer): `first:u8 | count:u8 |
 /// root[count][32]`. Accounts: DCR1(w), signer(s), DCM2. Phase 1, FTR not
