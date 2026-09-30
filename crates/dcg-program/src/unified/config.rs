@@ -205,12 +205,39 @@ pub fn set_authority(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
 
 #[cfg(feature = "revision-7")]
 pub fn template_seal(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    template_seal_v7(program, accounts, data)
+    template_seal_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
 }
 
 #[cfg(feature = "revision-8")]
 pub fn template_seal(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    template_seal_v8_single(program, accounts, data)
+    template_seal_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn template_seal_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
+    #[cfg(feature = "revision-7")]
+    {
+        let _ = hooks;
+        template_seal_v7(program, accounts, data)
+    }
+    #[cfg(feature = "revision-8")]
+    {
+        template_seal_v8_single(program, accounts, data, hooks)
+    }
 }
 
 /// Revision-8 single-base TemplateSeal. One PT1X is bound to one PT2S at tag
@@ -222,6 +249,7 @@ fn template_seal_v8_single(
     program: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
 ) -> ProgramResult {
     let action = *data.get(1).ok_or(no(TEMPLATE_SEAL))?;
     match action {
@@ -424,7 +452,7 @@ fn template_seal_v8_single(
         }
     }
     let now = Clock::get()?.slot;
-    limits.check(now).map_err(no)?;
+    limits.check_with(now, hooks).map_err(no)?;
     if new_template {
         registry::create_pda(
             program,

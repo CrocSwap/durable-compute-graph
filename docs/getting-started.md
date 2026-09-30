@@ -56,28 +56,29 @@ static APPLICATION: ApplicationManifest = ApplicationManifest {
     optimistic_replays: &REPLAY_BINDINGS,
     legacy_forms: &MY_LEGACY_FORM_BINDINGS,
     require_legacy_form_binding: true,
+    hooks: &MY_APPLICATION_HOOKS,
+    decision_routes: &MY_DECISION_ROUTES,
 };
 ```
 
 Call `ApplicationManifest::validate` during app setup. Link the selected
 manifest into the image and call `process_instruction_with_manifest` from the
-app entrypoint. The default standalone image has an empty app manifest and no
-test kernel.
+app entrypoint. `ApplicationHooks` supplies revision-8 policy and `DecisionRouteSelector`
+supplies the typed-decision producer used by tags 146, 199, and 200. The default
+standalone image has an empty app manifest and no test kernel.
 
-## 3. Declare authenticated account regions
+## 3. Commit coordinate-specific replay inputs
 
-Each `AccountSpanBinding` names an account index, owner rule, signer/writable
-role, versioned schema, and checked offset and length. The SVM adapter verifies
-all descriptors and bounds before borrowing any account data. It rejects
-overlapping regions and any duplicate account key when either span is
-writable. Disjoint read-only regions of one account are allowed. The view
-passed to a kernel carries the account key, owner, roles, schema, offset, and
-bounded bytes.
-
-The revision-8 challenge handler first authenticates the plan accounts and
-fix-point coordinate. An application binding can then route that point through
-its exact manifest kernel. `ByteSum` demonstrates this as a pure byte kernel;
-the SVM adapter keeps `AccountInfo` out of its computation contract.
+Each application binding names the versioned input schema, input byte limit,
+kernel semantic version, ABI version, and replay mode. A canonical `ARW1`
+witness carries the disputed coordinate's input slices and claimed output. Its
+`app-replay-leaf/1` digest is committed into the existing ROOT_ONLY segment and
+position trees. At the revision-8 fix-point, DCG checks the witness against the
+proved leaf and invokes only the statically linked app kernel. A malformed
+challenger preimage loses as an unproved challenge; invalid committed input or
+a wrong output rules against the executor immediately. `AccountSpanBinding`
+remains available for separately authenticated account views, but it is not
+the source of a replay input in this app path.
 
 ## 4. Run the extracted handler tests
 
@@ -161,9 +162,9 @@ Round 5 used a 751,280-byte image with SHA-256
 expanded feature image now also links the test-only stateful counter app; its
 measured size and digest are in
 [`stateful-sbf-workload-2026-09-30.md`](experiments/stateful-sbf-workload-2026-09-30.md).
-The feature binds retained machine selector 1 / Form 256 to ByteSum with exact
-semantic version 1, ABI version 1, optimistic mode 1, and two authenticated
-read-only spans. These bindings and the extra form are absent from the default
+The feature binds retained machine selector 1 / Forms 22 and 256 to ByteSum
+with semantic version 1, ABI version 1, optimistic mode 1, and a versioned
+input schema. Those bindings and the extra form are absent from the default
 image.
 
 The real SBF transaction driver is retained in this repository as
@@ -180,8 +181,10 @@ BASANOS_DCG_V8_SBF=1 BPF_OUT_DIR=/private/tmp/dcg-sbf-real \
     rev8_position_challenge_rounds_reach_an_admitted_fixpoint -- --nocapture
 ```
 
-This case reaches tag 169's ByteSum fix-point replay and then tags 132, 131,
-and 172 for timeout, settlement, and close. The round-5 K=10,240 admission and
+The honest-input test reaches tag 169 and rules immediately for the challenger
+because replay matches. The wrong-output test reaches tag 169, rules against
+the executor with code 800, then runs tags 131 and 172 for settlement and
+close. The round-5 K=10,240 admission and
 resolve/close cases use the same target with the K=10,240 compiler-v1 bundle
 selected through `BASANOS_PT2P_ROOT`. Run the permanent K=10,240 registry and
 admission test:
@@ -208,11 +211,29 @@ BASANOS_DCG_V8_SBF=1 BPF_OUT_DIR=/private/tmp/dcg-sbf-real \
     rev8_pt1x_real_admission_to_resolve_sbf -- --nocapture
 ```
 
-The K=80 ByteSum timeout, standard settlement, and close case is
-`rev8_bytesum_fixpoint_silence_settles_and_closes_sbf`. See
-[`bytesum-sbf-lifecycle-2026-09-30.md`](experiments/bytesum-sbf-lifecycle-2026-09-30.md)
-for the exercised tags, CU values, retained image identity, and artifact
-provenance. No Basanos source is required or changed.
+To test that missing app bindings fail during admission, build the test-only
+sentinel manifest. It binds only Form 65,535, so a real form refuses on tag 160
+before a document can rely on it:
+
+```sh
+crates/dcg-program/scripts/build-sbf-reproducible.sh --features sbf-unbound-form-test --sbf-out-dir /private/tmp/dcg-sbf-unbound
+
+BASANOS_DCG_V8_SBF=1 BPF_OUT_DIR=/private/tmp/dcg-sbf-unbound \
+  BASANOS_PT2P_ROOT="$PT2P_ROOT_K80" \
+  CARGO_TARGET_DIR=/private/tmp/dcg-target \
+  cargo test --locked --offline --profile fasttest -p dcg-program \
+    --features sbf-unbound-form-test --test unified_v8_document \
+    rev8_unbound_form_refuses_admission_on_sbf -- --nocapture
+```
+
+The K=80 ByteSum wrong-output, standard settlement, and close case is
+`rev8_bytesum_wrong_output_rules_and_settles_sbf`. The companion
+`rev8_bytesum_malicious_challenger_loses_app_replay_sbf` and
+`rev8_bytesum_malformed_committed_input_rules_executor_sbf` cover the honest
+executor and malformed committed-input rules. See
+[`dcg-seam-fix-2026-09-30.md`](experiments/dcg-seam-fix-2026-09-30.md) for
+measured CU values, SBF image identities, and artifact provenance. No Basanos
+source is required or changed.
 
 ## 7. Stateful workload on the SBF image
 

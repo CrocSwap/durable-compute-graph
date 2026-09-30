@@ -36,7 +36,7 @@ pub trait DecisionRouteSelector: Sync {
 /// Revision-8 record and admission policy hooks. The records own parsing and
 /// byte encoding; an application supplies checks for terms, template limits,
 /// and admitted registry classes.
-pub trait ApplicationHooks: DecisionRouteSelector {
+pub trait ApplicationHooks: Sync {
     fn check_terms_v1(&self, terms: &Terms, round_floor_slots: u64) -> Result<(), u32>;
     fn check_terms_v2(&self, terms: &Terms2, round_floor_slots: u64) -> Result<(), u32>;
     fn check_terms2_template(&self, terms: &Terms2, limits: &TemplateLimits) -> Result<(), u32>;
@@ -538,10 +538,9 @@ pub mod profile_v1 {
                 | 29
                 | 30
                 | 47
-                | 48
                 | 256
                 | 40..=46
-        )
+        ) || (form == 48 && !cfg!(feature = "revision-8"))
     }
 
     pub fn witness_kind(form: u16) -> u8 {

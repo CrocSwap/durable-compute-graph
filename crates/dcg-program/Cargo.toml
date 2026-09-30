@@ -24,6 +24,7 @@ pt2p-seal-profile = []
 test-kernel = []
 sbf-lifecycle-test = ["test-kernel"]
 sbf-real-lifecycle-test = ["test-kernel"]
+sbf-unbound-form-test = ["sbf-real-lifecycle-test"]
 
 [lib]
 name = "dcg_program"

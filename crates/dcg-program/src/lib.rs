@@ -88,11 +88,26 @@ pub fn process_instruction_with_manifest(
         143 => pt2p_onchain::init(program_id, accounts, data),
         144 => pt2p_onchain::hash(program_id, accounts, data),
         145 => pt2p_onchain::seal(program_id, accounts, data),
-        146 => pt2p_onchain::instantiate(program_id, accounts, data),
+        146 => pt2p_onchain::instantiate_with_selector(
+            program_id,
+            accounts,
+            data,
+            manifest.decision_routes,
+        ),
         193 => pt2p_onchain::seal_pxr_chunk(program_id, accounts, data),
         198 => pt1_onchain::close_pt1x_output(program_id, accounts, data),
-        199 => pt2p_onchain::reserve_pt1o(program_id, accounts, data),
-        200 => pt2p_onchain::close_pt1o_reservation(program_id, accounts, data),
+        199 => pt2p_onchain::reserve_pt1o_with_selector(
+            program_id,
+            accounts,
+            data,
+            manifest.decision_routes,
+        ),
+        200 => pt2p_onchain::close_pt1o_reservation_with_selector(
+            program_id,
+            accounts,
+            data,
+            manifest.decision_routes,
+        ),
         131 | 132 | 156..=169 | 172..=178 | 185..=187 | 197 => {
             unified::process_with_manifest(program_id, accounts, data, manifest)
                 .unwrap_or(Err(ProgramError::InvalidInstructionData))
@@ -118,6 +133,8 @@ fn application_manifest() -> &'static kernel::ApplicationManifest {
         optimistic_replays: &EMPTY_REPLAYS,
         legacy_forms: &EMPTY_FORMS,
         require_legacy_form_binding: false,
+        hooks: &compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &compatibility::REVISION8_COMPATIBILITY,
     };
     &EMPTY_APPLICATION
 }

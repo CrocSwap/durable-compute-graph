@@ -11090,17 +11090,54 @@ fn challenge_tree(
     segment: u16,
     entries: u32,
 ) -> Vec<Vec<ChallengeNode>> {
+    challenge_tree_with_replay_leaf(descriptor, position, segment, entries, None)
+}
+
+fn challenge_tree_with_replay_leaf(
+    descriptor: &[u8; 32],
+    position: u32,
+    segment: u16,
+    entries: u32,
+    witness: Option<&[u8]>,
+) -> Vec<Vec<ChallengeNode>> {
+    let app_leaf = witness.map(|witness| {
+        #[cfg(feature = "sbf-real-lifecycle-test")]
+        {
+            let app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
+            let binding = app.resolve_legacy_form(1, 256).unwrap();
+            app.replay_leaf_digest(binding, descriptor, position, segment, entries - 1, witness)
+        }
+        #[cfg(not(feature = "sbf-real-lifecycle-test"))]
+        {
+            let _ = witness;
+            panic!("application replay fixtures require sbf-real-lifecycle-test")
+        }
+    });
     let mut level: Vec<ChallengeNode> = (0..entries)
         .map(|local| ChallengeNode {
-            digest: h::hash(
-                b"c5-challenge-leaf",
-                &[
-                    descriptor,
-                    &position.to_le_bytes(),
-                    &segment.to_le_bytes(),
-                    &local.to_le_bytes(),
-                ],
-            ),
+            digest: if local == entries - 1 {
+                app_leaf.unwrap_or_else(|| {
+                    h::hash(
+                        b"c5-challenge-leaf",
+                        &[
+                            descriptor,
+                            &position.to_le_bytes(),
+                            &segment.to_le_bytes(),
+                            &local.to_le_bytes(),
+                        ],
+                    )
+                })
+            } else {
+                h::hash(
+                    b"c5-challenge-leaf",
+                    &[
+                        descriptor,
+                        &position.to_le_bytes(),
+                        &segment.to_le_bytes(),
+                        &local.to_le_bytes(),
+                    ],
+                )
+            },
             first: local,
             end: local + 1,
         })
@@ -11153,6 +11190,23 @@ async fn commit_challenge_tree(
     u32,
     Vec<Vec<ChallengeNode>>,
 ) {
+    commit_challenge_tree_with_witness(f, binding, p, ordinal, None).await
+}
+
+async fn commit_challenge_tree_with_witness(
+    f: &mut Fix,
+    binding: &Binding2,
+    p: u32,
+    ordinal: usize,
+    witness: Option<&[u8]>,
+) -> (
+    [u8; 32],
+    [Pubkey; 4],
+    Vec<[u8; 32]>,
+    u16,
+    u32,
+    Vec<Vec<ChallengeNode>>,
+) {
     let descriptor = f.descriptor(binding, &f.terms_raw, 16);
     let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
     let x = Pt2p::new(
@@ -11164,7 +11218,7 @@ async fn commit_challenge_tree(
     )
     .unwrap();
     let (segment, entries) = x.segment_row(p, ordinal).unwrap();
-    let levels = challenge_tree(&descriptor, p, segment, entries);
+    let levels = challenge_tree_with_replay_leaf(&descriptor, p, segment, entries, witness);
     let tree = levels.last().unwrap()[0].digest;
     let segment_root = h::hash(
         b"segment-root/2",
@@ -11234,6 +11288,37 @@ async fn descend_position_challenge(
     levels: &[Vec<ChallengeNode>],
     nonce: u32,
     stop_before_fixpoint: bool,
+) -> Pubkey {
+    descend_position_challenge_with_witness(
+        f,
+        c,
+        descriptor,
+        roots,
+        p,
+        ordinal,
+        segment,
+        target_local,
+        levels,
+        nonce,
+        stop_before_fixpoint,
+        None,
+    )
+    .await
+}
+
+async fn descend_position_challenge_with_witness(
+    f: &mut Fix,
+    c: [Pubkey; 4],
+    descriptor: &[u8; 32],
+    roots: &[[u8; 32]],
+    p: u32,
+    ordinal: u16,
+    segment: u16,
+    target_local: u32,
+    levels: &[Vec<ChallengeNode>],
+    nonce: u32,
+    stop_before_fixpoint: bool,
+    witness: Option<&[u8]>,
 ) -> Pubkey {
     let record = address::challenge(&f.program, descriptor, &f.signer.pubkey(), nonce).0;
     let open_metas = challenge_position_metas(f, c, record);
@@ -11332,6 +11417,11 @@ async fn descend_position_challenge(
         let choice = (target_local - first) / span;
         let fix = child_height == 0;
         let mut descend = vec![TAG_DESCEND, choice as u8];
+        if fix {
+            if let Some(witness) = witness {
+                descend.extend_from_slice(witness);
+            }
+        }
         let mut metas = vec![
             AccountMeta::new(record, false),
             AccountMeta::new(f.signer.pubkey(), true),
@@ -11385,6 +11475,22 @@ fn final_position_choice(levels: &[Vec<ChallengeNode>], target: u32) -> u8 {
         first += choice * span;
         height = child_height;
     }
+}
+
+fn app_replay_witness(schema_id: u32, input: &[u8], claimed_output: u64) -> Vec<u8> {
+    let mut witness = Vec::with_capacity(12 + 8 + input.len() + 8);
+    witness.extend_from_slice(b"ARW1");
+    witness.extend_from_slice(&1u16.to_le_bytes());
+    witness.push(1);
+    witness.push(0);
+    witness.extend_from_slice(&8u16.to_le_bytes());
+    witness.extend_from_slice(&[0; 2]);
+    witness.extend_from_slice(&schema_id.to_le_bytes());
+    witness.extend_from_slice(&1u16.to_le_bytes());
+    witness.extend_from_slice(&(input.len() as u16).to_le_bytes());
+    witness.extend_from_slice(input);
+    witness.extend_from_slice(&claimed_output.to_le_bytes());
+    witness
 }
 
 fn challenge_leaf_packet(f: &Fix, descriptor: &[u8; 32], proof: &Rekeyed, nonce: u32) -> Vec<u8> {
@@ -12068,10 +12174,12 @@ async fn rev8_position_challenge_rounds_convict_executor_and_burn_uncreditable_b
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_position_challenge_rounds_reach_an_admitted_fixpoint() {
     let Some(mut f) = build().await else { return };
-    let binding = f.binding(29, 50);
+    let mut binding = f.binding(29, 50);
+    binding.request_id[0] = 4;
+    let witness = app_replay_witness(1, &[1, 2, 3], 6);
     let (descriptor, created, roots, segment, target, levels) =
-        commit_challenge_tree(&mut f, &binding, 79, 0).await;
-    let record = descend_position_challenge(
+        commit_challenge_tree_with_witness(&mut f, &binding, 79, 0, Some(&witness)).await;
+    let record = descend_position_challenge_with_witness(
         &mut f,
         created,
         &descriptor,
@@ -12083,25 +12191,42 @@ async fn rev8_position_challenge_rounds_reach_an_admitted_fixpoint() {
         &levels,
         20,
         false,
+        Some(&witness),
     )
     .await;
     let dcr1 = f.account(record).await;
-    assert_eq!(dcr1[4], challenge::PHASE_RESPOND);
-    assert_eq!(dcr1[5], 0, "an admitted fix-point does not select a winner");
-    assert_eq!(
-        u32_at(&dcr1, challenge::DEV2_AT + 8),
-        0,
-        "the frozen class admits the instance"
-    );
-    assert_eq!(u32_at(&f.account(created[0]).await, 128), 1);
+    #[cfg(feature = "test-kernel")]
+    {
+        assert_eq!(u16_at(&dcr1, 6), challenge::APP_REPLAY_VERSION);
+        assert_eq!(dcr1[4], challenge::PHASE_RULED);
+        assert_eq!(dcr1[5], 1, "an honest replay defeats the challenger");
+        assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
+        assert_eq!(u32_at(&dcr1, challenge::DEV2_AT + 8), 0);
+        assert_eq!(
+            u32_at(&f.account(created[0]).await, 128),
+            1,
+            "the ruled challenge remains open until tag 131 settles it"
+        );
+    }
+    #[cfg(not(feature = "test-kernel"))]
+    {
+        assert_eq!(dcr1[4], challenge::PHASE_RESPOND);
+        assert_eq!(dcr1[5], 0, "an admitted fix-point does not select a winner");
+        assert_eq!(
+            u32_at(&dcr1, challenge::DEV2_AT + 8),
+            0,
+            "the frozen class admits the instance"
+        );
+        assert_eq!(u32_at(&f.account(created[0]).await, 128), 1);
+    }
 }
 
 /// The extracted SBF app replays the terminal Form-256 fix-point through its
-/// static ByteSum manifest. The executor then cheats by going silent; tag 132
-/// rules against it, tag 131 settles the STANDARD bond, and tag 172 refunds
-/// the document rent to the original payer.
+/// static ByteSum manifest. The committed output is wrong, so tag 169 records
+/// an immediate app-replay ruling (800); tag 131 settles the STANDARD bond,
+/// and tag 172 refunds the document rent to the original payer.
 #[tokio::test(flavor = "multi_thread")]
-async fn rev8_bytesum_fixpoint_silence_settles_and_closes_sbf() {
+async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
     };
@@ -12113,11 +12238,13 @@ async fn rev8_bytesum_fixpoint_silence_settles_and_closes_sbf() {
     terms.custom_settle_window_slots = 0;
     f.terms_raw = terms.encode().to_vec();
 
-    let binding = f.binding(29, 50);
+    let mut binding = f.binding(29, 50);
+    binding.request_id[0] = 1;
+    let witness = app_replay_witness(1, &[1, 2, 3], 7);
     let (descriptor, created, roots, segment, target, levels) =
-        commit_challenge_tree(&mut f, &binding, 79, 0).await;
+        commit_challenge_tree_with_witness(&mut f, &binding, 79, 0, Some(&witness)).await;
     let nonce = 90;
-    let record = descend_position_challenge(
+    let record = descend_position_challenge_with_witness(
         &mut f,
         created,
         &descriptor,
@@ -12129,66 +12256,45 @@ async fn rev8_bytesum_fixpoint_silence_settles_and_closes_sbf() {
         &levels,
         nonce,
         true,
+        Some(&witness),
     )
     .await;
     let choice = final_position_choice(&levels, target);
-    let descend_data = vec![TAG_DESCEND, choice];
-    let mut wrong_role = vec![
-        AccountMeta::new(record, false),
-        AccountMeta::new(f.signer.pubkey(), true),
-        AccountMeta::new(created[0], false),
-        AccountMeta::new_readonly(f.pt2s, false),
-        AccountMeta::new_readonly(f.routes, false),
-        AccountMeta::new(f.geometry, false),
-        AccountMeta::new_readonly(f.drp2, false),
-        AccountMeta::new_readonly(f.pt1s_index, false),
-    ];
-    label("challenge-fixpoint-wrong-writable-geometry");
-    assert_eq!(
-        custom(
-            send_fresh(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                descend_data.clone(),
-                wrong_role.clone()
-            )
-            .await
-        ),
-        DCR1_AUTH_REFUSAL,
-        "tag 169 rejects a writable account where the manifest requires read-only"
-    );
-    wrong_role[5] = AccountMeta::new_readonly(f.geometry, false);
-    label("challenge-round-descend-rule-169");
-    send(&mut f.ctx, &f.signer, f.program, descend_data, wrong_role)
-        .await
-        .expect("the exact read-only spans reach ByteSum replay");
-    let dcr1 = f.account(record).await;
-    assert_eq!(dcr1[4], challenge::PHASE_RESPOND);
-    assert_eq!(dcr1[5], 0);
-    assert_eq!(
-        u32_at(&dcr1, challenge::DEV2_AT + 8),
-        0,
-        "manifest ByteSum replay admitted the step"
-    );
-
-    let response_deadline = u64_at(&dcr1, 148);
-    clock_to(&mut f, response_deadline + 1).await;
-    label("challenge-timeout-executor-132");
+    let mut descend_data = vec![TAG_DESCEND, choice];
+    descend_data.extend_from_slice(&witness);
+    label("challenge-round-descend-app-replay-rule-169");
     send(
         &mut f.ctx,
         &f.signer,
         f.program,
-        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        descend_data,
         vec![
             AccountMeta::new(record, false),
+            AccountMeta::new(f.signer.pubkey(), true),
             AccountMeta::new(created[0], false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+            AccountMeta::new_readonly(f.drp2, false),
+            AccountMeta::new_readonly(f.pt1s_index, false),
         ],
     )
     .await
-    .expect("tag 132 rules for the silent executor");
-    assert_eq!(f.account(record).await[4], challenge::PHASE_RULED);
-    assert_eq!(f.account(record).await[5], 2);
+    .expect("tag 169 replays the committed input and rules immediately");
+    let dcr1 = f.account(record).await;
+    assert_eq!(u16_at(&dcr1, 6), challenge::APP_REPLAY_VERSION);
+    assert_eq!(
+        dcr1[challenge::APP_IDENTITY_AT..challenge::APP_IDENTITY_AT + 4],
+        *b"ARI1"
+    );
+    assert_eq!(dcr1[4], challenge::PHASE_RULED);
+    assert_eq!(dcr1[5], 2, "the executor loses a committed bad output");
+    assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
+    assert_eq!(
+        u32_at(&dcr1, challenge::DEV2_AT + 8),
+        800,
+        "the incorrect ByteSum output is ruled against the executor"
+    );
     assert_eq!(
         u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
         FLAG_REFUTED
@@ -12274,6 +12380,142 @@ async fn rev8_bytesum_fixpoint_silence_settles_and_closes_sbf() {
     );
     assert_eq!(f.lamports(created[0]).await, 0);
     assert_eq!(f.account(created[3]).await[6], result::STATUS_REFUTED);
+}
+
+/// A challenger who supplies a preimage that does not open the committed
+/// app-replay leaf loses the fix-point immediately, even though the executor's
+/// committed output is honest.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_bytesum_malicious_challenger_loses_app_replay_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let mut binding = f.binding(29, 50);
+    binding.request_id[0] = 2;
+    let committed = app_replay_witness(1, &[1, 2, 3], 6);
+    let forged = app_replay_witness(1, &[1, 2, 3], 8);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_challenge_tree_with_witness(&mut f, &binding, 79, 0, Some(&committed)).await;
+    let record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        0,
+        segment,
+        target,
+        &levels,
+        91,
+        false,
+        Some(&forged),
+    )
+    .await;
+    let dcr1 = f.account(record).await;
+    assert_eq!(u16_at(&dcr1, 6), challenge::APP_REPLAY_VERSION);
+    assert_eq!(dcr1[4], challenge::PHASE_RULED);
+    assert_eq!(dcr1[5], 1, "the malicious challenger loses");
+    assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
+    assert_eq!(
+        u32_at(&dcr1, challenge::DEV2_AT + 8),
+        dcg_program::unified::DCR1_PROOF
+    );
+    assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
+}
+
+/// A schema-invalid input can be committed under a valid ROOT_ONLY proof, but
+/// the selected app kernel cannot replay it. The executor is ruled out with
+/// code 799 at the fix-point.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_bytesum_malformed_committed_input_rules_executor_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let mut binding = f.binding(29, 50);
+    binding.request_id[0] = 3;
+    let malformed = app_replay_witness(2, &[1, 2, 3], 6);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_challenge_tree_with_witness(&mut f, &binding, 79, 0, Some(&malformed)).await;
+    let record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        0,
+        segment,
+        target,
+        &levels,
+        92,
+        false,
+        Some(&malformed),
+    )
+    .await;
+    let dcr1 = f.account(record).await;
+    assert_eq!(u16_at(&dcr1, 6), challenge::APP_REPLAY_VERSION);
+    assert_eq!(dcr1[4], challenge::PHASE_RULED);
+    assert_eq!(dcr1[5], 2, "unreplayable committed input convicts executor");
+    assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
+    assert_eq!(u32_at(&dcr1, challenge::DEV2_AT + 8), 799);
+    assert_eq!(
+        u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
+        FLAG_REFUTED
+    );
+}
+
+/// The dedicated unbound-form SBF image maps only a test sentinel form. A real
+/// registry class therefore refuses at admission tag 160 with 799, before a
+/// document can depend on a replay kernel the app did not bind.
+#[cfg(feature = "sbf-unbound-form-test")]
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_unbound_form_refuses_admission_on_sbf() {
+    assert!(std::env::var_os("BASANOS_DCG_V8_SBF").is_some());
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let mut admission_state = f.account(f.dea2).await;
+    let total = u32_at(&admission_state, 140) + u32_at(&admission_state, 144);
+    assert!(total > 0);
+    admission_state[6..8].fill(0);
+    admission_state[148..152].fill(0);
+    admission_state[admission::HEADER..].fill(0);
+    f.ctx
+        .set_account(&f.dea2, &shared(owned(&f.program, admission_state)));
+
+    let mut first = 0;
+    while first < total {
+        let count = (total - first).min(admission::MAX_STEP as u32) as u16;
+        let mut data = vec![160];
+        data.extend_from_slice(&first.to_le_bytes());
+        data.extend_from_slice(&count.to_le_bytes());
+        let result = send(
+            &mut f.ctx,
+            &f.executor,
+            f.program,
+            data,
+            vec![
+                AccountMeta::new(f.dea2, false),
+                AccountMeta::new_readonly(f.drp2, false),
+                AccountMeta::new_readonly(f.pt2s, false),
+                AccountMeta::new_readonly(f.pt1s_index, false),
+                AccountMeta::new_readonly(f.routes, false),
+                AccountMeta::new_readonly(f.geometry, false),
+            ],
+        )
+        .await;
+        match result {
+            Err(error) => {
+                assert_eq!(
+                    custom(Err(error)),
+                    dcg_program::unified::APP_KERNEL_UNAVAILABLE
+                );
+                assert_eq!(u32_at(&f.account(f.dea2).await, 148), first);
+                return;
+            }
+            Ok(()) => first += count as u32,
+        }
+    }
+    panic!("expected an unbound form to refuse before admission completed");
 }
 
 /// Build only the real K=10,240 PT1X/PT2S registry and admission path. This

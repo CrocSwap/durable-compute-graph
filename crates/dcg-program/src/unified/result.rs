@@ -221,7 +221,28 @@ pub fn view_v8_status(
     writable: bool,
     max_status: u8,
 ) -> Result<View, ProgramError> {
-    view_v8_status_inner(program, account, descriptor, writable, max_status, None)
+    view_v8_status_inner(
+        program,
+        account,
+        descriptor,
+        writable,
+        max_status,
+        None,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn view_v8_status_with_hooks(
+    program: &Pubkey,
+    account: &AccountInfo,
+    descriptor: &[u8; 32],
+    writable: bool,
+    max_status: u8,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> Result<View, ProgramError> {
+    view_v8_status_inner(
+        program, account, descriptor, writable, max_status, None, hooks,
+    )
 }
 
 /// The close's bounded CU path checks the DCR2 PDA using the bump stored at
@@ -241,6 +262,27 @@ pub fn view_v8_status_with_bump(
         writable,
         max_status,
         Some(bump),
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn view_v8_status_with_bump_and_hooks(
+    program: &Pubkey,
+    account: &AccountInfo,
+    descriptor: &[u8; 32],
+    writable: bool,
+    max_status: u8,
+    bump: u8,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> Result<View, ProgramError> {
+    view_v8_status_inner(
+        program,
+        account,
+        descriptor,
+        writable,
+        max_status,
+        Some(bump),
+        hooks,
     )
 }
 
@@ -251,6 +293,7 @@ fn view_v8_status_inner(
     writable: bool,
     max_status: u8,
     bump: Option<u8>,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
 ) -> Result<View, ProgramError> {
     let raw = account.try_borrow_data()?;
     let expected = if let Some(bump) = bump {
@@ -279,8 +322,11 @@ fn view_v8_status_inner(
     if raw.len() > full || !(1..=MAX_WIDTH).contains(&width) {
         return Err(no(CL_MALFORMED));
     }
-    let terms = Terms2::decode(&raw[RESULT_TERMS_AT_V6..RESULT_TERMS_AT_V6 + TERMS_BYTES_V2])
-        .map_err(no)?;
+    let terms = Terms2::decode_with(
+        &raw[RESULT_TERMS_AT_V6..RESULT_TERMS_AT_V6 + TERMS_BYTES_V2],
+        hooks,
+    )
+    .map_err(no)?;
     let retention = u64_at(&raw, RETENTION_SLOTS_AT_V6, CL_MALFORMED)?;
     let start = u64_at(&raw, RETENTION_START_AT_V6, CL_MALFORMED)?;
     let deadline = u64_at(&raw, RETENTION_DEADLINE_AT_V6, CL_MALFORMED)?;
@@ -356,6 +402,28 @@ pub fn create_v8<'a>(
     terms: &[u8],
     binding: &Binding2,
 ) -> ProgramResult {
+    create_v8_with_hooks(
+        program,
+        executor,
+        dcr2,
+        system,
+        descriptor,
+        terms,
+        binding,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn create_v8_with_hooks<'a>(
+    program: &Pubkey,
+    executor: &AccountInfo<'a>,
+    dcr2: &AccountInfo<'a>,
+    system: &AccountInfo<'a>,
+    descriptor: &[u8; 32],
+    terms: &[u8],
+    binding: &Binding2,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     let full =
         bytes_v8(binding.output_count, binding.output_width).ok_or(no(super::RUN_BINDING))?;
     let (key, bump) = address::result(program, descriptor);
@@ -384,7 +452,7 @@ pub fn create_v8<'a>(
     raw[200..204].copy_from_slice(&binding.output_first_position.to_le_bytes());
     raw[208] = binding.output_width;
     raw[RESULT_TERMS_AT_V6..RESULT_TERMS_AT_V6 + TERMS_BYTES_V2].copy_from_slice(terms);
-    let decoded = Terms2::decode(terms).map_err(no)?;
+    let decoded = Terms2::decode_with(terms, hooks).map_err(no)?;
     raw[RETENTION_SLOTS_AT_V6..RETENTION_SLOTS_AT_V6 + 8]
         .copy_from_slice(&decoded.result_retention_slots.to_le_bytes());
     raw[RESULT_PDA_BUMP_AT_V6] = bump;
@@ -432,7 +500,25 @@ pub fn check_for_finalize_v8(
     descriptor: &[u8; 32],
     b: &Binding2,
 ) -> ProgramResult {
-    let v = view_v8(program, dcr2, descriptor, true)?;
+    check_for_finalize_v8_with_hooks(
+        program,
+        dcr2,
+        doc,
+        descriptor,
+        b,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn check_for_finalize_v8_with_hooks(
+    program: &Pubkey,
+    dcr2: &AccountInfo,
+    doc: &[u8],
+    descriptor: &[u8; 32],
+    b: &Binding2,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
+    let v = view_v8_status_with_hooks(program, dcr2, descriptor, true, STATUS_SETTLED, hooks)?;
     let raw = dcr2.try_borrow_data()?;
     if v.status != STATUS_PENDING
         || v.closed
@@ -469,6 +555,23 @@ pub fn attest(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
     #[cfg(feature = "revision-8")]
     {
         attest_v8(program, accounts, data)
+    }
+}
+
+pub fn attest_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
+    #[cfg(feature = "revision-7")]
+    {
+        let _ = hooks;
+        attest_v7(program, accounts, data)
+    }
+    #[cfg(feature = "revision-8")]
+    {
+        attest_v8_with_hooks(program, accounts, data, hooks)
     }
 }
 
@@ -678,6 +781,21 @@ pub fn attest_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
 /// 4. the value's byte range and the DCR2 output region are the v6 ones.
 #[cfg(feature = "revision-8")]
 pub fn attest_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    attest_v8_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+#[cfg(feature = "revision-8")]
+pub fn attest_v8_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     let [signer, dcm2, dpr2, dcr2, pt2s, routes, geometry] = accounts else {
         return Err(no(CL_MALFORMED));
     };
@@ -691,7 +809,7 @@ pub fn attest_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     if u16_at(&dcm2.try_borrow_data()?, 6, CL_MALFORMED)? & document::FLAG_FINAL == 0 {
         return Err(no(CL_MISSING));
     }
-    let v = view_v8(program, dcr2, &descriptor, true)?;
+    let v = view_v8_status_with_hooks(program, dcr2, &descriptor, true, STATUS_SETTLED, hooks)?;
     // 1. Exact parse at the document's width.
     let w = v.width as usize;
     let value = data.get(37..37 + w).ok_or(no(CL_MALFORMED))?;
@@ -899,6 +1017,23 @@ pub fn resolve(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     #[cfg(feature = "revision-8")]
     {
         resolve_v8(program, accounts, data)
+    }
+}
+
+pub fn resolve_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
+    #[cfg(feature = "revision-7")]
+    {
+        let _ = hooks;
+        resolve_v7(program, accounts, data)
+    }
+    #[cfg(feature = "revision-8")]
+    {
+        resolve_v8_with_hooks(program, accounts, data, hooks)
     }
 }
 
@@ -1127,6 +1262,21 @@ pub fn resolve_check(
 /// names DCM2 as writable means it.
 #[cfg(feature = "revision-8")]
 pub fn resolve_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    resolve_v8_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+#[cfg(feature = "revision-8")]
+pub fn resolve_v8_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     let [dcm2, dcr2] = accounts else {
         return Err(no(CL_MALFORMED));
     };
@@ -1135,7 +1285,7 @@ pub fn resolve_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     }
     let descriptor = d32(data, 1, CL_MALFORMED)?;
     document::document_v8(program, dcm2, Some(&descriptor), false, CL_MALFORMED)?;
-    let v = view_v8(program, dcr2, &descriptor, true)?;
+    let v = view_v8_status_with_hooks(program, dcr2, &descriptor, true, STATUS_SETTLED, hooks)?;
     if v.status != STATUS_PENDING || v.closed || dcr2.data_len() != v.full {
         return Err(no(RESULT_STATE));
     }
@@ -1254,6 +1404,23 @@ pub fn close<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8]) ->
     #[cfg(feature = "revision-8")]
     {
         close_v8(program, accounts, data)
+    }
+}
+
+pub fn close_with_hooks<'a>(
+    program: &Pubkey,
+    accounts: &[AccountInfo<'a>],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
+    #[cfg(feature = "revision-7")]
+    {
+        let _ = hooks;
+        close_v7(program, accounts, data)
+    }
+    #[cfg(feature = "revision-8")]
+    {
+        close_v8_with_hooks(program, accounts, data, hooks)
     }
 }
 
@@ -1398,6 +1565,21 @@ pub fn close_v7<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8])
 ///   lamports plus one byte; there is no callee, no deadline and no fallback.
 #[cfg(feature = "revision-8")]
 pub fn close_v8<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8]) -> ProgramResult {
+    close_v8_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+#[cfg(feature = "revision-8")]
+pub fn close_v8_with_hooks<'a>(
+    program: &Pubkey,
+    accounts: &[AccountInfo<'a>],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     let [signer, dcm2, dpr2, dfs2, dcr2, payer, use_record, aux, tail, burn] = accounts else {
         return Err(no(CL_MALFORMED));
     };
@@ -1412,13 +1594,14 @@ pub fn close_v8<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8])
         .get(RESULT_PDA_BUMP_AT_V6)
         .copied()
         .ok_or(no(CL_MALFORMED))?;
-    let v = view_v8_status_with_bump(
+    let v = view_v8_status_with_bump_and_hooks(
         program,
         dcr2,
         &descriptor,
         true,
         STATUS_WITHHELD,
         result_bump,
+        hooks,
     )?;
     if v.closed {
         return Err(no(CL_CLOSE));
@@ -1455,7 +1638,8 @@ pub fn close_v8<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8])
             u32_at(&doc, 132, CL_MALFORMED)?,
             u32_at(&doc, 84, CL_MALFORMED)?,
             d32(&doc, document::WINNER_AT_V8, CL_MALFORMED)?,
-            Terms2::decode(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2]).map_err(no)?,
+            Terms2::decode_with(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2], hooks)
+                .map_err(no)?,
             // The DRB1 v2 block init wrote once. A decode failure here is 794 on a
             // record that init already decoded. No revision-8 document exists on
             // any cluster: revision 8 has not been deployed (stream G is the
@@ -1952,6 +2136,21 @@ pub fn close_result<'a>(
     accounts: &[AccountInfo<'a>],
     data: &[u8],
 ) -> ProgramResult {
+    close_result_v8_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+#[cfg(feature = "revision-8")]
+pub fn close_result_v8_with_hooks<'a>(
+    program: &Pubkey,
+    accounts: &[AccountInfo<'a>],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     let [signer, record, executor] = accounts else {
         return Err(no(CL_MALFORMED));
     };
@@ -1968,14 +2167,18 @@ pub fn close_result<'a>(
     if record.try_borrow_data()?.starts_with(b"DCRZ") {
         return Err(no(CL_CLOSE));
     }
-    let view = view_v8_status(program, record, &descriptor, true, STATUS_WITHHELD)?;
+    let view =
+        view_v8_status_with_hooks(program, record, &descriptor, true, STATUS_WITHHELD, hooks)?;
     if !view.closed {
         return Err(no(CL_CLOSE));
     }
     let (record_executor, start, deadline, status, bond_state, cause, winner, terms) = {
         let raw = record.try_borrow_data()?;
-        let terms = Terms2::decode(&raw[RESULT_TERMS_AT_V6..RESULT_TERMS_AT_V6 + TERMS_BYTES_V2])
-            .map_err(no)?;
+        let terms = Terms2::decode_with(
+            &raw[RESULT_TERMS_AT_V6..RESULT_TERMS_AT_V6 + TERMS_BYTES_V2],
+            hooks,
+        )
+        .map_err(no)?;
         (
             d32(&raw, 136, CL_MALFORMED)?,
             u64_at(&raw, RETENTION_START_AT_V6, CL_MALFORMED)?,
@@ -2057,4 +2260,21 @@ pub fn close_result<'a>(
             .pad(4),
     );
     Ok(())
+}
+
+pub fn close_result_with_hooks<'a>(
+    program: &Pubkey,
+    accounts: &[AccountInfo<'a>],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
+    #[cfg(feature = "revision-7")]
+    {
+        let _ = hooks;
+        close_result(program, accounts, data)
+    }
+    #[cfg(feature = "revision-8")]
+    {
+        close_result_v8_with_hooks(program, accounts, data, hooks)
+    }
 }

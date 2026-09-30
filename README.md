@@ -44,8 +44,8 @@ returns `None` because no typed-decision producer is linked. The default test
 image therefore refuses tags 120–124 and 126–129 and is not a replacement for
 Basanos's revision-8 image.
 
-For a first-hour path through the kernel contract, app manifest, authenticated
-account spans, and the extracted revision-8 handler tests, see
+For a first-hour path through the kernel contract, app manifest, replay witness,
+and the extracted revision-8 handler tests, see
 [`docs/getting-started.md`](docs/getting-started.md). The separate
 `bytesum_sbf_lifecycle` target is an isolated canary, not the revision-8
 lifecycle.
@@ -62,24 +62,41 @@ implement `Kernel`. A kernel manifest declares:
 `Kernel::execute` accepts authenticated canonical bytes and writes canonical
 output bytes. Stateful kernels may additionally implement `StatefulKernel`;
 optimistically replayable kernels may implement `OptimisticReplay`. An
-application can bind an old revision-8 form row to an exact kernel semantic
-version, ABI version, and mode in its static manifest. At the challenge
-fix-point, the SVM adapter checks account identity, owner, signer/writable
-roles, schema, region bounds, and aliases before it forms the kernel's span
-view. A byte-only kernel such as `ByteSum` continues to use its single-slice
-method. No revision-8 instruction or document bytes change.
+application binds an old revision-8 form row to an exact kernel semantic
+version, ABI version, and mode in its static manifest. Required form bindings
+are checked during class admission; a missing mapping refuses with code 799.
+The app supplies `ApplicationHooks` and a `DecisionRouteSelector` through
+separate manifest fields; revision-8 policy uses the hooks, and tags 146, 199,
+and 200 use the app's selector.
+
+For a bound form, the committed ROOT_ONLY leaf is an `app-replay-leaf/1`
+digest over the descriptor, exact `(position, segment, local)` coordinate,
+app/kernel/mode identity, and canonical `ARW1` witness. The witness contains
+the coordinate's versioned input slices and claimed output. Tags 166, 168, and
+169 carry it to the fix-point; the program checks the opened leaf digest and
+replays the selected kernel before the challenge can advance. A mismatched
+claimed output rules against the executor with code 800. Committed inputs the
+selected kernel cannot replay rule against the executor with code 799. A
+challenger who does not open the committed leaf loses with the existing proof
+refusal code. This app path uses DCR1 version 6 with an `ARI1` identity block;
+the version-5 compatibility record remains unchanged when no app binding is
+selected.
 
 The application separately supplies a `ResolutionBackend` that owns
 admission, challenge transitions, and resolution status. Commitment-scheme
 versions are independent of kernel, ABI, and mode versions. The core has no
 dynamic loading path; `AccountInfo` is confined to the SVM adapter.
 
-The included `ByteSum` test kernel exercises the compiled manifest and
-authenticated-span replay in focused tests. The optional
+The included `ByteSum` test kernel exercises manifest validation, bounded
+`ARW1` parsing, and committed-input replay in focused tests. The optional
 `sbf-real-lifecycle-test` feature adds a test-only Form-256 binding and a
 small stateful counter app. Its ProgramTest targets run against the feature
 SBF image; they are mechanics tests, not model-capability demonstrations. The
 feature must not be used for a production image.
+
+The separate `sbf-unbound-form-test` image contains one sentinel mapping and
+uses the same revision-8 driver to verify that an unbound registry form refuses
+at admission tag 160 with code 799.
 
 ## Stateful workloads
 

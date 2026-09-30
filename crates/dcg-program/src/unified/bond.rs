@@ -314,6 +314,18 @@ pub struct Settlement {
 /// The codes are §1.4's; the order is the program's, and it is the only order
 /// that can check anything.
 pub fn read_settlement(program: &Pubkey, record: &AccountInfo) -> Result<Settlement, ProgramError> {
+    read_settlement_with_hooks(
+        program,
+        record,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn read_settlement_with_hooks(
+    program: &Pubkey,
+    record: &AccountInfo,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> Result<Settlement, ProgramError> {
     if record.owner != program || !record.is_writable {
         return Err(no(CL_MALFORMED));
     }
@@ -380,13 +392,23 @@ pub fn read_settlement(program: &Pubkey, record: &AccountInfo) -> Result<Settlem
         let raw = record.try_borrow_data()?;
         d32(&raw, 8, CL_MALFORMED)?
     };
-    let v = result::view_v8_status(program, record, &descriptor, true, STATUS_WITHHELD)?;
+    let v = result::view_v8_status_with_hooks(
+        program,
+        record,
+        &descriptor,
+        true,
+        STATUS_WITHHELD,
+        hooks,
+    )?;
     let raw = record.try_borrow_data()?;
     if !v.closed || raw[BOND_STATE_AT_V6] != BOND_ESCROWED {
         return Err(no(CL_CLOSE));
     }
-    let terms = Terms2::decode(&raw[RESULT_TERMS_AT_V6..RESULT_TERMS_AT_V6 + TERMS_BYTES_V2])
-        .map_err(no)?;
+    let terms = Terms2::decode_with(
+        &raw[RESULT_TERMS_AT_V6..RESULT_TERMS_AT_V6 + TERMS_BYTES_V2],
+        hooks,
+    )
+    .map_err(no)?;
     if terms.settlement_program == [0; 32] {
         return Err(no(CL_CLOSE));
     }
@@ -477,6 +499,20 @@ pub fn encode_cause4(
 /// **violates a post-check**, the transaction aborts 798 -- a *misbehaving*
 /// program, and the only case the escrow does not survive.
 pub fn retry(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    retry_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn retry_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     let [signer, settlement_program, escrow, winner, remainder, executor, record_acc, system] =
         accounts
     else {
@@ -486,7 +522,7 @@ pub fn retry(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
         return Err(no(CL_MALFORMED));
     }
     // 0. The record, which names the descriptor everything else needs.
-    let s = read_settlement(program, record_acc)?;
+    let s = read_settlement_with_hooks(program, record_acc, hooks)?;
     // 1. The escrow: this document's, a writable system-owned 0-byte account,
     //    and holding lamports. **599** if it holds none -- already settled, or
     //    never escrowed -- because "nothing to do" is a refusal and not a no-op
