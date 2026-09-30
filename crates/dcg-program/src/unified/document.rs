@@ -1067,12 +1067,39 @@ pub fn mmr_root(descriptor: &[u8; 32], count: u32, peaks: &[Peak]) -> Result<[u8
 /// binding.
 #[cfg(feature = "revision-7")]
 pub fn init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    init_v7(program, accounts, data)
+    init_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
 }
 
 #[cfg(feature = "revision-8")]
 pub fn init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    init_v8(program, accounts, data)
+    init_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn init_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
+    #[cfg(feature = "revision-7")]
+    {
+        let _ = hooks;
+        init_v7(program, accounts, data)
+    }
+    #[cfg(feature = "revision-8")]
+    {
+        init_v8_with_hooks(program, accounts, data, hooks)
+    }
 }
 
 /// tag 161 UnifiedInit (revision 7). Data: `terms[96] | binding[160] |
@@ -1341,6 +1368,21 @@ pub fn init_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
 /// (§1.7), whose one `documents + 1` is the last write of the instruction.
 #[cfg(feature = "revision-8")]
 pub fn init_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    init_v8_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+#[cfg(feature = "revision-8")]
+pub fn init_v8_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     const FIXED: usize = 1 + TERMS_BYTES_V2 + BINDING_BYTES_V8 + 96 + 2;
     if accounts.len() != 14 || data.len() < FIXED {
         return Err(no(CL_MALFORMED));
@@ -1374,7 +1416,7 @@ pub fn init_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     );
     let family_count = u16_at(data, at + 96, CL_MALFORMED)?;
     // 2. The DDT2 v2 block and the anchors.
-    let terms = Terms2::decode(terms_raw).map_err(no)?;
+    let terms = Terms2::decode_with(terms_raw, hooks).map_err(no)?;
     if [model, table, prompt].iter().any(|a| **a == [0; 32]) {
         return Err(no(CL_MALFORMED));
     }
@@ -1499,7 +1541,7 @@ pub fn init_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         let row = find_row(&rows_raw[DRP2_HEADER..], registry::FORM_RS1_SUMMARY).map_err(no)?;
         for (_, _, slots) in &fams {
             let shape = summary_shape(&x, slots).map_err(|_| no(PLAN_BINDING))?;
-            let code = registry::check(row.as_ref(), &shape);
+            let code = registry::check_with(row.as_ref(), &shape, hooks);
             if code != 0 {
                 return Err(no(code));
             }
@@ -1628,7 +1670,7 @@ pub fn init_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         )?;
     }
     // 9. The PENDING DCR2 v6 result record.
-    super::result::create_v8(
+    super::result::create_v8_with_hooks(
         program,
         executor,
         dcr2,
@@ -1636,6 +1678,7 @@ pub fn init_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         &descriptor,
         terms_raw,
         &binding,
+        hooks,
     )?;
     // 9a. DTU1's one increment (spec §1.7). It is the **last** write, after
     // every account this instruction creates exists, so a document can never
@@ -1678,6 +1721,20 @@ pub fn land_position_roots(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
+    land_position_roots_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn land_position_roots_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     #[cfg(feature = "revision-7")]
     {
         if accounts.len() != 3 {
@@ -1690,7 +1747,7 @@ pub fn land_position_roots(
         if accounts.len() != 4 {
             return Err(no(CL_MALFORMED));
         }
-        land_position_roots_v8(program, accounts, data)
+        land_position_roots_v8_with_hooks(program, accounts, data, hooks)
     }
 }
 
@@ -1827,6 +1884,21 @@ pub fn land_position_roots_v8(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
+    land_position_roots_v8_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+#[cfg(feature = "revision-8")]
+pub fn land_position_roots_v8_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     // 1. count >= 1 and the exact length.
     if accounts.len() != 4
         || data.len() < 38
@@ -1898,7 +1970,8 @@ pub fn land_position_roots_v8(
     }
     let abandon_deadline = {
         let doc = accounts[1].try_borrow_data()?;
-        let terms = Terms2::decode(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2]).map_err(no)?;
+        let terms = Terms2::decode_with(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2], hooks)
+            .map_err(no)?;
         // The clamp of §1.3 (ii)(c), and `init_slot` derived as §1.3's
         // invariant paragraph states: `dispute_deadline − challenge_window`,
         // read from the record **before** this write. A landing is refused 592
@@ -1954,6 +2027,20 @@ pub fn land_position_roots_v8(
 /// 8's data gains the document length `n` (spec §1.6):
 /// `descriptor[32] | n:u32 | F:u16 | root_f[F][32]`, `39 + 32F` bytes.
 pub fn finalize(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    finalize_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn finalize_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     #[cfg(feature = "revision-7")]
     {
         if accounts.len() != 3 {
@@ -1966,7 +2053,7 @@ pub fn finalize(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
         if accounts.len() != 4 {
             return Err(no(CL_MALFORMED));
         }
-        finalize_v8(program, accounts, data)
+        finalize_v8_with_hooks(program, accounts, data, hooks)
     }
 }
 
@@ -2063,6 +2150,21 @@ pub fn finalize_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
 /// names.
 #[cfg(feature = "revision-8")]
 pub fn finalize_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    finalize_v8_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+#[cfg(feature = "revision-8")]
+pub fn finalize_v8_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     if accounts.len() != 4 || data.len() < 39 {
         return Err(no(CL_MALFORMED));
     }
@@ -2088,7 +2190,8 @@ pub fn finalize_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     }
     // The two deadline rules, both 736, both read before the write.
     let (now, new_abandon) = {
-        let terms = Terms2::decode(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2]).map_err(no)?;
+        let terms = Terms2::decode_with(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2], hooks)
+            .map_err(no)?;
         let window = u64_at(&doc, 184, CL_MALFORMED)?;
         let init_slot =
             Terms2::init_slot(u64_at(&doc, 144, CL_MALFORMED)?, window).ok_or(no(CL_MALFORMED))?;
@@ -2143,7 +2246,14 @@ pub fn finalize_v8(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     if roots.chunks_exact(32).any(|r| r == [0; 32]) {
         return Err(no(CL_ROOT));
     }
-    super::result::check_for_finalize_v8(program, &accounts[2], &doc, &descriptor, &binding)?;
+    super::result::check_for_finalize_v8_with_hooks(
+        program,
+        &accounts[2],
+        &doc,
+        &descriptor,
+        &binding,
+        hooks,
+    )?;
     let window = u64_at(&doc, 184, CL_MALFORMED)?;
     let deadline = now.checked_add(window).ok_or(no(CL_OVERFLOW))?;
     let prefix = d32(&doc, 152, CL_MALFORMED)?;

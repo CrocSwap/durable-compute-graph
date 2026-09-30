@@ -20,7 +20,7 @@ fn refusal(code: u32) -> ProgramError {
 /// Borrow a statically described set of account regions for the duration of
 /// `f`. All account identities, roles, bounds, and pairwise alias rules are
 /// checked before the first data borrow is taken.
-pub fn with_account_spans<R>(
+pub(crate) fn with_account_spans<R>(
     program: &Pubkey,
     accounts: &[AccountInfo<'_>],
     bindings: &[AccountSpanBinding],

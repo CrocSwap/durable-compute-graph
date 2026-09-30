@@ -20,6 +20,18 @@ use solana_program::{
     pubkey::Pubkey,
 };
 
+fn check_app_binding(
+    manifest: &crate::kernel::ApplicationManifest,
+    machine_selector: Option<u8>,
+    form_id: u16,
+) -> ProgramResult {
+    if manifest.admits_legacy_form(machine_selector, form_id) {
+        Ok(())
+    } else {
+        Err(no(super::APP_KERNEL_UNAVAILABLE))
+    }
+}
+
 pub const HEADER: usize = 192;
 #[cfg(feature = "revision-7")]
 pub const VERSION: u16 = 2;
@@ -194,6 +206,15 @@ pub fn begin(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
 /// omits it (reported). Classes run in index order; an empty class sets its
 /// bit; the first refusal returns its §3.2 code and changes nothing.
 pub fn step(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    step_with_manifest(program, accounts, data, None)
+}
+
+pub fn step_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
     if accounts.len() != 6 || data.len() != 7 || !accounts[0].is_writable {
         return Err(no(ADMISSION_STATE));
     }
@@ -233,6 +254,7 @@ pub fn step(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         }
         let rows_raw = accounts[1].try_borrow_data()?;
         let rows = &rows_raw[DRP2_HEADER..];
+        let machine_selector = registry::machine_selector(&rows_raw[56..120]);
         let bitmap = accounts[0].try_borrow_data()?;
         for i in first..end {
             if bitmap[HEADER + i as usize / 8] >> (i % 8) & 1 == 1 {
@@ -240,8 +262,14 @@ pub fn step(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
             }
             let key = classes::key_of(&x, i).map_err(|_| no(PLAN_BINDING))?;
             if let Some(shape) = classes::class_shape(&x, key).map_err(|_| no(PLAN_BINDING))? {
+                if let Some(manifest) = manifest {
+                    check_app_binding(manifest, machine_selector, shape.form)?;
+                }
                 let row = find_row(rows, shape.form).map_err(no)?;
-                let code = registry::check(row.as_ref(), &shape);
+                let hooks: &dyn crate::compatibility::ApplicationHooks = manifest
+                    .map(|app| app.hooks)
+                    .unwrap_or(&crate::compatibility::REVISION8_COMPATIBILITY);
+                let code = registry::check_with(row.as_ref(), &shape, hooks);
                 if code != 0 {
                     return Err(no(code));
                 }
@@ -260,4 +288,23 @@ pub fn step(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         raw[6..8].copy_from_slice(&1u16.to_le_bytes());
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "test-kernel"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_app_binding_is_an_admission_refusal() {
+        let manifest = &crate::kernel::test_kernel::MANIFEST_APP;
+        assert_eq!(check_app_binding(manifest, Some(1), 256), Ok(()));
+        assert_eq!(
+            check_app_binding(manifest, Some(1), 257),
+            Err(no(super::super::APP_KERNEL_UNAVAILABLE))
+        );
+        assert_eq!(
+            check_app_binding(manifest, None, 256),
+            Err(no(super::super::APP_KERNEL_UNAVAILABLE))
+        );
+    }
 }

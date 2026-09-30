@@ -56,11 +56,19 @@ use solana_program::{
 };
 
 pub const VERSION: u16 = 5;
+/// New DCR1 identity for app-kernel replay rulings. Revision-8's original
+/// DCR1 v5 remains the compatibility record and keeps its bytes unchanged.
+pub const APP_REPLAY_VERSION: u16 = 6;
 pub const SIZE: usize = 8_192;
 pub const HEADER: usize = 176;
 pub const PATH_START: usize = SIZE - 32 * 32;
 pub const PATH_LEN_AT: usize = PATH_START - 1;
 pub const DEV2_AT: usize = 7_040;
+/// DCR1 v6 identity fills the space after DEV2 through `PATH_START`, including
+/// the old path-length byte. V6 is written only at a terminal fix-point, after
+/// the Merkle path is no longer needed.
+pub const APP_IDENTITY_AT: usize = DEV2_AT + 64;
+pub const APP_IDENTITY_BYTES: usize = 64;
 pub const REVEAL_STAGED_AT: usize = 176;
 pub const REVEAL_COUNT_AT: usize = 178;
 pub const REVEAL_VERIFIED_AT: usize = 180;
@@ -82,6 +90,11 @@ pub const PHASE_SELECT: u8 = 8;
 pub const OUTCOME_ADMITTED: u8 = 1;
 pub const OUTCOME_CONVICTED: u8 = 2;
 
+fn is_challenge_version(raw: &[u8]) -> bool {
+    raw.get(6..8)
+        .is_some_and(|v| v == VERSION.to_le_bytes() || v == APP_REPLAY_VERSION.to_le_bytes())
+}
+
 fn now() -> Result<u64, ProgramError> {
     Ok(Clock::get()?.slot)
 }
@@ -98,27 +111,27 @@ pub fn is_v5_record(accounts: &[AccountInfo]) -> bool {
 }
 
 /// Revision 8 does not link the revision-7 settle or timeout handlers. It only
-/// recognizes their DCR1 v5 account here so tags 131/132 can be refused before
-/// the same numeric tags fall through to the distinct legacy root-only module.
+/// recognizes revision-8 challenge DCR1 v5/v6 accounts here so tags 131/132 can
+/// be refused before the same numeric tags fall through to the legacy module.
 #[cfg(feature = "revision-8")]
 pub fn is_revision7_record(accounts: &[AccountInfo]) -> bool {
-    is_revision5_record(accounts) && !has_revision8_document(accounts)
+    is_v8_challenge_record(accounts) && !has_revision8_document(accounts)
 }
 
 /// Whether tags 131/132 carry a v8 DCR1 with its required DCM2 v7 account.
 #[cfg(feature = "revision-8")]
 pub fn is_revision8_record(accounts: &[AccountInfo]) -> bool {
-    is_revision5_record(accounts) && has_revision8_document(accounts)
+    is_v8_challenge_record(accounts) && has_revision8_document(accounts)
 }
 
+/// Recognize v5 compatibility and v6 app-replay records in the revision-8
+/// challenge dispatcher.
 #[cfg(feature = "revision-8")]
-fn is_revision5_record(accounts: &[AccountInfo]) -> bool {
+fn is_v8_challenge_record(accounts: &[AccountInfo]) -> bool {
     accounts
         .first()
         .and_then(|a| a.try_borrow_data().ok())
-        .is_some_and(|raw| {
-            raw.len() == SIZE && raw[..4] == *b"DCR1" && raw[6..8] == 5u16.to_le_bytes()
-        })
+        .is_some_and(|raw| raw.len() == SIZE && raw[..4] == *b"DCR1" && is_challenge_version(&raw))
 }
 
 #[cfg(feature = "revision-8")]
@@ -154,8 +167,6 @@ fn record(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> Program
 /// Revision-8 DCR1 stores its open nonce at 140..144 so readers can rederive
 /// the challenge PDA. Revision 7 continues to use record() unchanged.
 fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> ProgramResult {
-    #[cfg(feature = "revision-7")]
-    record(program, account, phase)?;
     #[cfg(feature = "revision-8")]
     {
         if account.owner != program || !account.is_writable || account.data_len() != SIZE {
@@ -163,9 +174,11 @@ fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> Prog
         }
         let raw = account.try_borrow_data()?;
         if raw[..4] != *b"DCR1"
-            || raw[6..8] != VERSION.to_le_bytes()
+            || !is_challenge_version(&raw)
             || phase.is_some_and(|p| raw[4] != p)
             || (phase.is_some_and(|p| p != PHASE_RULED) && raw[PT2P_MODE_AT] != 1)
+            || (raw[6..8] == APP_REPLAY_VERSION.to_le_bytes()
+                && raw[APP_IDENTITY_AT..APP_IDENTITY_AT + 4] != *b"ARI1")
         {
             return Err(no(DCR1_PHASE));
         }
@@ -219,7 +232,12 @@ fn record_document(
 }
 
 #[cfg(feature = "revision-7")]
-fn response_deadline(doc: &AccountInfo) -> Result<u64, ProgramError> {
+fn response_deadline(
+    doc: &AccountInfo,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> Result<u64, ProgramError> {
+    #[cfg(feature = "revision-7")]
+    let _ = hooks;
     let window = u64_at(&doc.try_borrow_data()?, RESPONSE_WINDOW_AT, DCR1_BAD)?;
     now()?.checked_add(window).ok_or(no(DCR1_DEADLINE))
 }
@@ -227,9 +245,13 @@ fn response_deadline(doc: &AccountInfo) -> Result<u64, ProgramError> {
 /// The DDT2 v2 block moved with DCM2 v7. Every revision-8 round uses this
 /// offset, including the rounds shared with the revision-7 challenge machine.
 #[cfg(feature = "revision-8")]
-fn response_deadline(doc: &AccountInfo) -> Result<u64, ProgramError> {
+fn response_deadline(
+    doc: &AccountInfo,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> Result<u64, ProgramError> {
     let data = doc.try_borrow_data()?;
-    let terms = Terms2::decode(&data[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2]).map_err(no)?;
+    let terms =
+        Terms2::decode_with(&data[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2], hooks).map_err(no)?;
     now()?
         .checked_add(terms.response_window_slots)
         .ok_or(no(DCR1_DEADLINE))
@@ -442,6 +464,7 @@ fn fix_point(
     segment: u16,
     local: u32,
     application: Option<&'static crate::kernel::ApplicationManifest>,
+    witness_bytes: Option<&[u8]>,
 ) -> Result<bool, ProgramError> {
     let [pt2s, routes, geometry, drp2, pt1s] = plan_accounts else {
         return Err(no(DCR1_BAD));
@@ -504,49 +527,116 @@ fn fix_point(
         }
         (t, e.kernel_index, code, row, d32(&d, 392, DCR1_BAD)?)
     };
+    let mut winner = (code != 0).then_some(2);
+    let mut cause = events::CAUSE_CONVICT;
+    let mut app_identity = None;
+    if application.is_none() && witness_bytes.is_some() {
+        return Err(no(DCR1_BAD));
+    }
     if code == 0 {
         if let Some(application) = application {
             let machine_selector = raw[MACHINE_AT];
             let binding = application.resolve_legacy_form(machine_selector, form);
             if let Some(binding) = binding {
-                let replay_matches = crate::kernel_svm::with_account_spans(
-                    program,
-                    plan_accounts,
-                    binding.spans,
-                    |spans| {
-                        application
-                            .replay_legacy_form(binding, spans)
-                            .map_err(|error| {
-                                use crate::kernel::ManifestRunError;
-                                let code = match error {
-                                    ManifestRunError::KernelUnavailable
-                                    | ManifestRunError::ModeUnsupported => {
-                                        super::APP_KERNEL_UNAVAILABLE
-                                    }
-                                    _ => DCR1_BAD,
-                                };
-                                no(code)
-                            })
-                    },
-                )?;
-                if !replay_matches {
-                    code = super::APP_KERNEL_MISMATCH;
+                use crate::kernel::{CommittedReplayWitness, ManifestRunError};
+                app_identity = Some(application.ruling_identity(binding));
+                cause = events::CAUSE_APP_REPLAY;
+                if let Some(witness) =
+                    witness_bytes.and_then(|bytes| CommittedReplayWitness::decode(bytes).ok())
+                {
+                    let descriptor = d32(raw, 72, DCR1_BAD)?;
+                    let digest = application.replay_leaf_digest(
+                        binding,
+                        &descriptor,
+                        p,
+                        segment,
+                        local,
+                        witness.raw,
+                    );
+                    if digest != d32(raw, 104, DCR1_BAD)? {
+                        // A leaf path proves a digest, but a challenger still
+                        // has to show its canonical preimage. A mismatch loses
+                        // for the challenger without changing the committed tree.
+                        winner = Some(1);
+                        code = DCR1_PROOF;
+                    } else {
+                        match application.replay_legacy_form(
+                            binding,
+                            &witness.inputs,
+                            witness.claimed_output,
+                        ) {
+                            Ok(true) => {
+                                winner = Some(1);
+                                code = 0;
+                            }
+                            Ok(false) | Err(ManifestRunError::ClaimedOutputLength) => {
+                                winner = Some(2);
+                                code = super::APP_KERNEL_MISMATCH;
+                            }
+                            Err(
+                                ManifestRunError::KernelUnavailable
+                                | ManifestRunError::ModeUnsupported
+                                | ManifestRunError::InputLimit
+                                | ManifestRunError::InputAlignment
+                                | ManifestRunError::OutputBufferTooSmall
+                                | ManifestRunError::InvalidOutputLength
+                                | ManifestRunError::Kernel(_)
+                                | ManifestRunError::InvalidSpanCount
+                                | ManifestRunError::SpanSchema
+                                | ManifestRunError::InvalidCommittedInput,
+                            ) => {
+                                // The executor committed these bytes under this
+                                // coordinate. If the selected kernel cannot accept
+                                // them, the executor loses deterministically.
+                                winner = Some(2);
+                                code = super::APP_KERNEL_UNAVAILABLE;
+                            }
+                        }
+                    }
+                } else {
+                    // A malformed or absent challenger-supplied preimage does
+                    // not prove the committed digest, so the challenger loses.
+                    winner = Some(1);
+                    code = DCR1_PROOF;
                 }
             } else if application.require_legacy_form_binding {
-                return Err(no(super::APP_KERNEL_UNAVAILABLE));
+                // Admission rejects this case. Keep old already-committed
+                // documents deterministic if they reach a new image.
+                app_identity = Some(application.ruling_identity(
+                    &crate::kernel::LegacyFormBinding {
+                        machine_selector: Some(machine_selector),
+                        form_id: form,
+                        kernel_id: crate::kernel::KernelId([0; 16]),
+                        semantic_version: 0,
+                        abi_version: 0,
+                        mode: crate::kernel::ModeId { id: 0, version: 0 },
+                        input_spans: &[],
+                        claimed_output_bytes: 0,
+                    },
+                ));
+                winner = Some(2);
+                code = super::APP_KERNEL_UNAVAILABLE;
             }
         }
     }
     // Review R3: DEV2 lies inside the descent area; clear first, then write.
     raw[HEADER..PATH_LEN_AT].fill(0);
+    if let Some(identity) = app_identity {
+        // V6 is terminal here, so its identity can reuse the old path-length
+        // byte without affecting any later challenge proof.
+        raw[6..8].copy_from_slice(&APP_REPLAY_VERSION.to_le_bytes());
+        raw[APP_IDENTITY_AT..APP_IDENTITY_AT + APP_IDENTITY_BYTES].copy_from_slice(&identity);
+    }
     raw[170..174].copy_from_slice(&t.to_le_bytes());
     raw[174..176].copy_from_slice(&form.to_le_bytes());
     raw[DEV2_AT..DEV2_AT + 64].copy_from_slice(&encode_dev2(code, row.as_ref(), t, form, &root));
-    if code == 0 {
+    if winner.is_none() {
         return Ok(true);
     }
-    debug_assert!(super::CONVICT_CODES.contains(&code));
-    rule_for_document(program, challenge, raw, doc, 2, events::CAUSE_CONVICT, code)?;
+    if winner == Some(2) {
+        debug_assert!(super::CONVICT_CODES.contains(&code));
+    }
+    rule_for_document(program, challenge, raw, doc, winner.unwrap(), cause, code)?;
     Ok(false)
 }
 
@@ -740,6 +830,7 @@ fn open_checks(
     descriptor: &[u8; 32],
     position: u32,
     nonce: u32,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
 ) -> Result<([u8; 32], u64, u64, u8), ProgramError> {
     let [record_acc, challenger, dcm2, dpr2, system, pt2s, routes, geometry, drp2, ..] = accounts
     else {
@@ -777,7 +868,7 @@ fn open_checks(
     if position >= p_count {
         return Err(no(CL_COORDINATE));
     }
-    let terms = Terms::decode(&d[TERMS_AT..TERMS_AT + TERMS_BYTES]).map_err(no)?;
+    let terms = Terms::decode_with(&d[TERMS_AT..TERMS_AT + TERMS_BYTES], hooks).map_err(no)?;
     let deadline = now
         .checked_add(terms.response_window_slots)
         .ok_or(no(DCR1_DEADLINE))?;
@@ -798,6 +889,7 @@ fn open_checks(
     descriptor: &[u8; 32],
     position: u32,
     nonce: u32,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
 ) -> Result<([u8; 32], u64, u64, u8), ProgramError> {
     let [record_acc, challenger, dcm2, dpr2, system, pt2s, routes, geometry, drp2, ..] = accounts
     else {
@@ -837,7 +929,8 @@ fn open_checks(
     if position >= positions_complete {
         return Err(no(CL_COORDINATE));
     }
-    let terms = Terms2::decode(&d[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2]).map_err(no)?;
+    let terms =
+        Terms2::decode_with(&d[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2], hooks).map_err(no)?;
     let deadline = now
         .checked_add(terms.response_window_slots)
         .ok_or(no(DCR1_DEADLINE))?;
@@ -956,14 +1049,24 @@ pub fn challenge_position(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
+    challenge_position_with_manifest(program, accounts, data, None)
+}
+
+pub fn challenge_position_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
     if accounts.len() != 9 || data.len() != 41 {
         return Err(no(DCR1_BAD));
     }
     let descriptor = d32(data, 1, DCR1_BAD)?;
     let position = u32_at(data, 33, DCR1_BAD)?;
     let nonce = u32_at(data, 37, DCR1_BAD)?;
+    let hooks = super::application_hooks(application);
     let (executor, bond, deadline, bump) =
-        open_checks(program, accounts, &descriptor, position, nonce)?;
+        open_checks(program, accounts, &descriptor, position, nonce, hooks)?;
     let segments = u16_at(&accounts[2].try_borrow_data()?, 76, DCR1_BAD)?;
     open_record(
         program,
@@ -1014,18 +1117,20 @@ pub fn challenge_leaf_with_manifest(
     if data.len() < spp1_at + 4 {
         return Err(no(DCR1_BAD));
     }
-    let (ordinal, proof_table, spp1_path, used) =
-        decode_spp1(&data[spp1_at..data.len() - 4]).map_err(no)?;
-    if data.len() != spp1_at + used + 4 {
+    let (ordinal, proof_table, spp1_path, used) = decode_spp1(&data[spp1_at..]).map_err(no)?;
+    let nonce_at = spp1_at.checked_add(used).ok_or(no(DCR1_BAD))?;
+    if data.len() < nonce_at + 4 {
         return Err(no(DCR1_BAD));
     }
-    let nonce = u32_at(data, data.len() - 4, DCR1_BAD)?;
+    let nonce = u32_at(data, nonce_at, DCR1_BAD)?;
+    let hooks = super::application_hooks(application);
+    let witness_bytes = data.get(nonce_at + 4..).filter(|bytes| !bytes.is_empty());
     let path: Vec<[u8; 32]> = data[76..spp1_at]
         .chunks_exact(32)
         .map(|c| c.try_into().unwrap())
         .collect();
     let (executor, bond, deadline, bump) =
-        open_checks(program, accounts, &descriptor, position, nonce)?;
+        open_checks(program, accounts, &descriptor, position, nonce, hooks)?;
     // The leaf proof: segment root from the leaf path, position root from SPP1.
     {
         let d = accounts[2].try_borrow_data()?;
@@ -1123,6 +1228,7 @@ pub fn challenge_leaf_with_manifest(
             segment,
             local,
             application,
+            witness_bytes,
         )?
     };
     if admitted {
@@ -1138,6 +1244,16 @@ pub fn challenge_leaf_with_manifest(
 /// geometry. The completing chunk must reproduce the landed DPR2 root with
 /// the on-chain `segment_table_root(p)` (789); a refusal changes nothing.
 pub fn reveal_position(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    reveal_position_with_manifest(program, accounts, data, None)
+}
+
+pub fn reveal_position_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
+    let hooks = super::application_hooks(application);
     if accounts.len() != 7
         || data.len() < 4
         || data[3] == 0
@@ -1207,7 +1323,7 @@ pub fn reveal_position(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         if root != document::landed_root(&accounts[3], position, REVEAL_MISMATCH)? {
             return Err(no(REVEAL_MISMATCH));
         }
-        Some(response_deadline(&accounts[2])?)
+        Some(response_deadline(&accounts[2], hooks)?)
     } else {
         None
     };
@@ -1233,6 +1349,16 @@ pub fn reveal_position(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
 /// DCM2, PT2S, base routes, base geometry. Enters the v4 segment descent at
 /// the revealed root of `ordinal` (phase 5, executor opens).
 pub fn select_segment(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    select_segment_with_manifest(program, accounts, data, None)
+}
+
+pub fn select_segment_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
+    let hooks = super::application_hooks(application);
     if accounts.len() != 6 || data.len() != 3 {
         return Err(no(DCR1_BAD));
     }
@@ -1268,7 +1394,7 @@ pub fn select_segment(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         x.segment_row(position, ordinal as usize)
             .map_err(|_| no(PLAN_BINDING))?
     };
-    let deadline = response_deadline(&accounts[2])?;
+    let deadline = response_deadline(&accounts[2], hooks)?;
     let mut raw = accounts[0].try_borrow_mut_data()?;
     raw[HEADER..PATH_LEN_AT].fill(0);
     raw[160..162].copy_from_slice(&segment_id.to_le_bytes());
@@ -1304,6 +1430,7 @@ pub fn reveal_with_manifest(
     data: &[u8],
     application: Option<&'static crate::kernel::ApplicationManifest>,
 ) -> ProgramResult {
+    let hooks = super::application_hooks(application);
     if !matches!(accounts.len(), 3 | 8) || data.len() < 2 || data[1] > 16 || !accounts[1].is_signer
     {
         return Err(no(DCR1_BAD));
@@ -1326,7 +1453,9 @@ pub fn reveal_with_manifest(
     let k = data[1] as usize;
     let digests_at = if opening { 34 } else { 2 };
     let fix = k == 0;
-    if data.len() != digests_at + 32 * k
+    let witness_at = digests_at + 32 * k;
+    if (fix && data.len() < witness_at)
+        || (!fix && data.len() != witness_at)
         || (fix && !(opening && height == 0))
         || accounts.len() != if fix { 8 } else { 3 }
     {
@@ -1353,7 +1482,7 @@ pub fn reveal_with_manifest(
         d32(&raw, HEADER, DCR1_BAD)?
     };
     record_document(program, &raw, &accounts[2], fix)?;
-    let deadline = response_deadline(&accounts[2])?;
+    let deadline = response_deadline(&accounts[2], hooks)?;
     if fix {
         drop(raw);
         let mut raw = accounts[0].try_borrow_mut_data()?;
@@ -1372,6 +1501,7 @@ pub fn reveal_with_manifest(
             segment,
             0,
             application,
+            data.get(witness_at..).filter(|bytes| !bytes.is_empty()),
         )? {
             respond_event(accounts[0].key, &raw, super::TAG_REVEAL, 1, PHASE_REVEAL);
         }
@@ -1419,7 +1549,12 @@ pub fn descend_with_manifest(
     data: &[u8],
     application: Option<&'static crate::kernel::ApplicationManifest>,
 ) -> ProgramResult {
-    if !matches!(accounts.len(), 3 | 8) || data.len() != 2 || !accounts[1].is_signer {
+    let hooks = super::application_hooks(application);
+    if !matches!(accounts.len(), 3 | 8)
+        || data.len() < 2
+        || data.len() > 2 + crate::kernel::CommittedReplayWitness::MAX_WITNESS_BYTES
+        || !accounts[1].is_signer
+    {
         return Err(no(DCR1_BAD));
     }
     record(program, &accounts[0], Some(PHASE_DESCEND))?;
@@ -1437,6 +1572,9 @@ pub fn descend_with_manifest(
     }
     let child_height = raw[HEADER + 41];
     let fix = child_height == 0;
+    if (!fix && data.len() != 2) || (fix && accounts.len() != 8) {
+        return Err(no(DCR1_BAD));
+    }
     if accounts.len() != if fix { 8 } else { 3 } {
         return Err(no(DCR1_BAD));
     }
@@ -1479,7 +1617,7 @@ pub fn descend_with_manifest(
     }
     let old_path = raw[PATH_START..PATH_START + 32 * old_len].to_vec();
     record_document(program, &raw, &accounts[2], fix)?;
-    let deadline = response_deadline(&accounts[2])?;
+    let deadline = response_deadline(&accounts[2], hooks)?;
     drop(raw);
     let mut raw = accounts[0].try_borrow_mut_data()?;
     for (i, sibling) in chunk.iter().enumerate() {
@@ -1502,6 +1640,7 @@ pub fn descend_with_manifest(
             segment,
             first,
             application,
+            data.get(2..).filter(|bytes| !bytes.is_empty()),
         )? {
             respond_event(accounts[0].key, &raw, super::TAG_DESCEND, 2, PHASE_DESCEND);
         }
@@ -1660,6 +1799,16 @@ pub fn timeout(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         events::CAUSE_TIMEOUT,
         0,
     )
+}
+
+pub fn timeout_with_hooks(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
+    let _ = hooks;
+    timeout(program, accounts, data)
 }
 
 #[cfg(feature = "revision-7")]
@@ -1854,21 +2003,36 @@ fn custom_settlement<'a>(
 /// moves. **Nine** is a length revision 7 never accepted: it refused it with 730
 /// at the length test, and it still does, because a nine-account call on a
 /// revision-7 record takes `settle_v7` and hits the same test.
-#[cfg(feature = "revision-7")]
 pub fn settle<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8]) -> ProgramResult {
-    if accounts.len() == 9 {
-        if let Some(dcm2) = accounts.get(4) {
-            if document::revision(program, dcm2, DCR1_BAD)? == 7 {
-                return settle_v8(program, accounts, data);
-            }
-        }
-    }
-    settle_v7(program, accounts, data)
+    settle_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
 }
 
-#[cfg(feature = "revision-8")]
-pub fn settle<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8]) -> ProgramResult {
-    settle_v8(program, accounts, data)
+pub fn settle_with_hooks<'a>(
+    program: &Pubkey,
+    accounts: &[AccountInfo<'a>],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
+    #[cfg(feature = "revision-7")]
+    {
+        if accounts.len() == 9 {
+            if let Some(dcm2) = accounts.get(4) {
+                if document::revision(program, dcm2, DCR1_BAD)? == 7 {
+                    return settle_v8_with_hooks(program, accounts, data, hooks);
+                }
+            }
+        }
+        settle_v7(program, accounts, data)
+    }
+    #[cfg(feature = "revision-8")]
+    {
+        settle_v8_with_hooks(program, accounts, data, hooks)
+    }
 }
 
 /// tag 131 ChallengeSettleV5 (revision 7), unchanged byte for byte: the
@@ -2093,6 +2257,20 @@ fn ruling_winner_of(dcm2: &AccountInfo) -> Result<[u8; 32], ProgramError> {
 /// amount goes to the incinerator. That keeps the later close from paying any bond
 /// residual to the convict (spec §1.4's "where a skipped share goes").
 pub fn settle_v8<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8]) -> ProgramResult {
+    settle_v8_with_hooks(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn settle_v8_with_hooks<'a>(
+    program: &Pubkey,
+    accounts: &[AccountInfo<'a>],
+    data: &[u8],
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> ProgramResult {
     if data.len() != 1 || accounts.len() != 9 {
         return Err(no(DCR1_BAD));
     }
@@ -2131,13 +2309,14 @@ pub fn settle_v8<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8]
         if winner.key.as_ref() != who
             || challenger.key.as_ref() != &raw[8..40]
             || executor.key.as_ref() != &raw[40..72]
-            || !matches!(raw[178], 1..=3)
+            || !matches!(raw[178], 1..=events::CAUSE_APP_REPLAY)
         {
             return Err(no(DCR1_AUTH));
         }
         record_document_v8(program, &raw, dcm2, true)?;
         let doc = dcm2.try_borrow_data()?;
-        let terms = Terms2::decode(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2]).map_err(no)?;
+        let terms = Terms2::decode_with(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2], hooks)
+            .map_err(no)?;
         (
             u64_at(&raw, 162, DCR1_BAD)?,
             raw[5] == 2,

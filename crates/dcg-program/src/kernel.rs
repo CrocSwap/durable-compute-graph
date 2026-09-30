@@ -84,6 +84,22 @@ pub struct AccountSpan<'a> {
     pub data: &'a [u8],
 }
 
+/// One input slice opened from a challenged ROOT_ONLY leaf preimage. The leaf
+/// digest and its position proof authenticate these bytes before replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayInputSpan<'a> {
+    pub schema: VersionedId,
+    pub data: &'a [u8],
+}
+
+/// App-declared input slice ABI for one replay witness. Its bytes come from
+/// the disputed leaf preimage, not fixed template offsets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayInputLayout {
+    pub schema: VersionedId,
+    pub max_bytes: u32,
+}
+
 /// A mutable, invocation-local state region authenticated by the stateful SVM
 /// adapter. `data` borrows account bytes for this call; the borrow is never
 /// serialized into an engine-state account.
@@ -152,9 +168,82 @@ pub struct LegacyFormBinding {
     pub semantic_version: u16,
     pub abi_version: u16,
     pub mode: ModeId,
-    /// Input spans come first; the final span contains the claimed output.
-    pub input_span_count: u8,
-    pub spans: &'static [AccountSpanBinding],
+    /// Coordinate-specific inputs opened from the challenged leaf preimage.
+    pub input_spans: &'static [ReplayInputLayout],
+    /// Exact output width required by this form/kernel ABI.
+    pub claimed_output_bytes: u16,
+}
+
+/// App-owned preimage carried alongside a challenged ROOT_ONLY leaf digest.
+/// Wire: `ARW1 | version:u16=1 | span_count:u8 | 0 | output_len:u16 | 0:u16`,
+/// then `schema_id:u32 | schema_version:u16 | length:u16 | bytes` per span,
+/// then exactly `output_len` claimed-output bytes.
+pub struct CommittedReplayWitness<'a> {
+    pub raw: &'a [u8],
+    pub inputs: Vec<ReplayInputSpan<'a>>,
+    pub claimed_output: &'a [u8],
+}
+
+impl<'a> CommittedReplayWitness<'a> {
+    pub const HEADER_BYTES: usize = 12;
+    pub const SPAN_HEADER_BYTES: usize = 8;
+    pub const MAX_SPANS: usize = 16;
+    pub const MAX_WITNESS_BYTES: usize = 900;
+
+    pub fn decode(raw: &'a [u8]) -> Result<Self, ManifestRunError> {
+        if raw.len() < Self::HEADER_BYTES
+            || raw.len() > Self::MAX_WITNESS_BYTES
+            || raw[..4] != *b"ARW1"
+            || u16::from_le_bytes([raw[4], raw[5]]) != 1
+            || raw[7] != 0
+            || raw[10..12] != [0; 2]
+        {
+            return Err(ManifestRunError::InvalidSpanCount);
+        }
+        let count = raw[6] as usize;
+        if count == 0 || count > Self::MAX_SPANS {
+            return Err(ManifestRunError::InvalidSpanCount);
+        }
+        let output_len = u16::from_le_bytes([raw[8], raw[9]]) as usize;
+        let mut at = Self::HEADER_BYTES;
+        let mut inputs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let end = at
+                .checked_add(Self::SPAN_HEADER_BYTES)
+                .ok_or(ManifestRunError::InvalidSpanCount)?;
+            let header = raw.get(at..end).ok_or(ManifestRunError::InvalidSpanCount)?;
+            let schema = VersionedId {
+                id: u32::from_le_bytes(header[0..4].try_into().unwrap()),
+                version: u16::from_le_bytes(header[4..6].try_into().unwrap()),
+            };
+            let len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
+            if len == 0 {
+                return Err(ManifestRunError::SpanSchema);
+            }
+            let end = end
+                .checked_add(len)
+                .ok_or(ManifestRunError::InvalidSpanCount)?;
+            let bytes = raw
+                .get(at + Self::SPAN_HEADER_BYTES..end)
+                .ok_or(ManifestRunError::InvalidSpanCount)?;
+            inputs.push(ReplayInputSpan {
+                schema,
+                data: bytes,
+            });
+            at = end;
+        }
+        let end = at
+            .checked_add(output_len)
+            .ok_or(ManifestRunError::InvalidSpanCount)?;
+        if output_len == 0 || end != raw.len() {
+            return Err(ManifestRunError::InvalidSpanCount);
+        }
+        Ok(Self {
+            raw,
+            inputs,
+            claimed_output: &raw[at..end],
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,6 +352,22 @@ pub trait OptimisticReplay: Kernel {
         }
         self.replay(input.data, &[], claimed_output, claimed_state)
     }
+
+    /// Replay coordinate-specific inputs opened from a challenged ROOT_ONLY
+    /// leaf preimage. Multi-span applications may override this method.
+    fn replay_input_spans(
+        &self,
+        inputs: &[ReplayInputSpan<'_>],
+        claimed_output: &[u8],
+    ) -> Result<bool, KernelError> {
+        let [input] = inputs else {
+            return Err(KernelError::InvalidInput);
+        };
+        if input.schema != self.replay_manifest().input.id {
+            return Err(KernelError::InvalidInput);
+        }
+        self.replay(input.data, &[], claimed_output, &[])
+    }
 }
 
 /// A statically linked replay implementation bound to one advertised mode.
@@ -283,8 +388,14 @@ pub struct ApplicationManifest {
     /// An empty list leaves the historical adapter's behavior unchanged.
     pub legacy_forms: &'static [LegacyFormBinding],
     /// When true, a form without an explicit app mapping is refused rather
-    /// than handled by the historical profile adapter.
+    /// than handled by the historical profile adapter. Admission checks this
+    /// before a document can rely on the mapping.
     pub require_legacy_form_binding: bool,
+    /// App-selected revision-8 policy hooks.
+    pub hooks: &'static dyn crate::compatibility::ApplicationHooks,
+    /// App-selected typed-decision route producer. Kept as a separate trait
+    /// object so the pinned SBF Rust toolchain does not need trait upcasting.
+    pub decision_routes: &'static dyn crate::compatibility::DecisionRouteSelector,
 }
 
 impl ApplicationManifest {
@@ -371,17 +482,25 @@ impl ApplicationManifest {
             })
     }
 
+    /// Whether admission may rely on the app binding for this machine/form
+    /// pair. Required mappings fail closed when the registry has no machine
+    /// selector or the app did not bind the selected form.
+    pub fn admits_legacy_form(&self, machine_selector: Option<u8>, form_id: u16) -> bool {
+        !self.require_legacy_form_binding
+            || machine_selector
+                .is_some_and(|machine| self.resolve_legacy_form(machine, form_id).is_some())
+    }
+
     /// Re-execute a historical form only through the exact identity and mode
-    /// selected by this app's static manifest. `spans` has already been
-    /// formed by the SVM adapter after account checks and alias validation.
+    /// selected by this app's static manifest. Inputs and output are opened
+    /// from the coordinate-specific ROOT_ONLY leaf preimage.
     pub fn replay_legacy_form(
         &self,
         binding: &LegacyFormBinding,
-        spans: &[AccountSpan<'_>],
+        inputs: &[ReplayInputSpan<'_>],
+        claimed_output: &[u8],
     ) -> Result<bool, ManifestRunError> {
-        let expected_spans = binding.spans.len();
-        let input_count = binding.input_span_count as usize;
-        if input_count == 0 || expected_spans != input_count + 1 || spans.len() != expected_spans {
+        if binding.input_spans.is_empty() || inputs.len() != binding.input_spans.len() {
             return Err(ManifestRunError::InvalidSpanCount);
         }
         let replay = self
@@ -410,38 +529,90 @@ impl ApplicationManifest {
         if !manifest.modes.contains(&binding.mode) {
             return Err(ManifestRunError::ModeUnsupported);
         }
-        if manifest.input.alignment == 0 {
+        if manifest.input.alignment == 0 || manifest.output.alignment == 0 {
             return Err(ManifestRunError::InputAlignment);
         }
         let input_limit =
             (manifest.input.max_bytes as usize).min(manifest.resources.max_input_bytes as usize);
         let mut total_input = 0usize;
-        for span in &spans[..input_count] {
-            if span.schema != manifest.input.id {
-                return Err(ManifestRunError::SpanSchema);
+        for (layout, span) in binding.input_spans.iter().zip(inputs) {
+            if span.schema != layout.schema
+                || span.schema != manifest.input.id
+                || span.data.is_empty()
+                || span.data.len() > layout.max_bytes as usize
+            {
+                return Err(ManifestRunError::InvalidCommittedInput);
             }
-            if span.is_empty() || span.len() % manifest.input.alignment as usize != 0 {
-                return Err(ManifestRunError::InputAlignment);
+            if span.data.len() % manifest.input.alignment as usize != 0 {
+                return Err(ManifestRunError::InvalidCommittedInput);
             }
             total_input = total_input
-                .checked_add(span.len())
+                .checked_add(span.data.len())
                 .ok_or(ManifestRunError::InputLimit)?;
         }
         if total_input > input_limit {
-            return Err(ManifestRunError::InputLimit);
+            return Err(ManifestRunError::InvalidCommittedInput);
         }
-        let claimed = spans.last().ok_or(ManifestRunError::InvalidSpanCount)?;
-        if claimed.schema != manifest.output.id
-            || claimed.len()
-                > (manifest.output.max_bytes as usize)
-                    .min(manifest.resources.max_output_bytes as usize)
+        let output_limit =
+            (manifest.output.max_bytes as usize).min(manifest.resources.max_output_bytes as usize);
+        if claimed_output.len() != binding.claimed_output_bytes as usize
+            || claimed_output.len() > output_limit
         {
-            return Err(ManifestRunError::SpanSchema);
+            return Err(ManifestRunError::ClaimedOutputLength);
         }
         replay
             .replay
-            .replay_spans(&spans[..input_count], claimed.data, &[])
+            .replay_input_spans(inputs, claimed_output)
             .map_err(ManifestRunError::Kernel)
+    }
+
+    /// Stable app-image identity used by app-specific replay leaves and the
+    /// versioned ruling record.
+    pub fn identity_digest(&self) -> [u8; 32] {
+        hash::sha256(&[
+            b"dcg/application-manifest/1",
+            self.application_id,
+            &self.version.to_le_bytes(),
+        ])
+    }
+
+    /// 64-byte ARI1 identity written only to the new app-replay DCR1 record
+    /// version. Revision-8 DCR1 v5 bytes remain untouched on the compatibility
+    /// path.
+    pub fn ruling_identity(&self, binding: &LegacyFormBinding) -> [u8; 64] {
+        let mut out = [0; 64];
+        out[..4].copy_from_slice(b"ARI1");
+        out[4..36].copy_from_slice(&self.identity_digest());
+        out[36..52].copy_from_slice(&binding.kernel_id.0);
+        out[52..54].copy_from_slice(&binding.semantic_version.to_le_bytes());
+        out[54..56].copy_from_slice(&binding.abi_version.to_le_bytes());
+        out[56..60].copy_from_slice(&binding.mode.id.to_le_bytes());
+        out[60..62].copy_from_slice(&binding.mode.version.to_le_bytes());
+        out[62..64].copy_from_slice(&binding.form_id.to_le_bytes());
+        out
+    }
+
+    /// App-specific leaf commitment for the exact coordinate and canonical
+    /// witness. The enclosing revision-8 ROOT_ONLY segment/position proofs
+    /// commit this digest into the document's landed position root.
+    pub fn replay_leaf_digest(
+        &self,
+        binding: &LegacyFormBinding,
+        descriptor: &[u8; 32],
+        position: u32,
+        segment: u16,
+        local: u32,
+        witness: &[u8],
+    ) -> [u8; 32] {
+        let mut coordinate = [0; 10];
+        coordinate[..4].copy_from_slice(&position.to_le_bytes());
+        coordinate[4..6].copy_from_slice(&segment.to_le_bytes());
+        coordinate[6..].copy_from_slice(&local.to_le_bytes());
+        let identity = self.ruling_identity(binding);
+        crate::closure_v2::hash(
+            b"app-replay-leaf/1",
+            &[descriptor, &coordinate, &identity[4..], witness],
+        )
     }
 
     /// Run one already-authenticated byte transition through a kernel that
@@ -491,10 +662,7 @@ impl ApplicationManifest {
             let a = left.manifest();
             for right in self.kernels.iter().skip(i + 1) {
                 let b = right.manifest();
-                if a.id == b.id
-                    && a.semantic_version == b.semantic_version
-                    && a.abi_version == b.abi_version
-                {
+                if a.id == b.id {
                     return Err(ManifestError::DuplicateKernel(a.id));
                 }
             }
@@ -564,10 +732,15 @@ impl ApplicationManifest {
                 ));
             }
         }
+        if self.application_id.is_empty()
+            || (self.require_legacy_form_binding && self.legacy_forms.is_empty())
+        {
+            return Err(ManifestError::MissingRequiredFormBindings);
+        }
         for (i, binding) in self.legacy_forms.iter().enumerate() {
             if binding.form_id == 0
-                || binding.input_span_count == 0
-                || binding.spans.len() != binding.input_span_count as usize + 1
+                || binding.input_spans.is_empty()
+                || binding.claimed_output_bytes == 0
             {
                 return Err(ManifestError::InvalidLegacyForm(binding.form_id));
             }
@@ -597,26 +770,18 @@ impl ApplicationManifest {
             {
                 return Err(ManifestError::LegacyModeUnsupported(binding.form_id));
             }
-            for (index, span) in binding.spans.iter().enumerate() {
-                let expected_schema = if index < binding.input_span_count as usize {
-                    kernel_manifest.input.id
-                } else {
-                    kernel_manifest.output.id
-                };
-                let max_bytes = if index < binding.input_span_count as usize {
-                    (kernel_manifest.input.max_bytes as usize)
-                        .min(kernel_manifest.resources.max_input_bytes as usize)
-                } else {
-                    (kernel_manifest.output.max_bytes as usize)
-                        .min(kernel_manifest.resources.max_output_bytes as usize)
-                };
-                if span.schema != expected_schema
-                    || span.length == 0
-                    || span.length as usize > max_bytes
-                    || span.offset.checked_add(span.length).is_none()
-                {
-                    return Err(ManifestError::InvalidLegacyForm(binding.form_id));
-                }
+            let input_limit = (kernel_manifest.input.max_bytes as usize)
+                .min(kernel_manifest.resources.max_input_bytes as usize);
+            let output_limit = (kernel_manifest.output.max_bytes as usize)
+                .min(kernel_manifest.resources.max_output_bytes as usize);
+            if binding.claimed_output_bytes as usize > output_limit
+                || binding.input_spans.iter().any(|span| {
+                    span.schema != kernel_manifest.input.id
+                        || span.max_bytes == 0
+                        || span.max_bytes as usize > input_limit
+                })
+            {
+                return Err(ManifestError::InvalidLegacyForm(binding.form_id));
             }
         }
         Ok(())
@@ -638,6 +803,7 @@ pub enum ManifestError {
     DuplicateLegacyForm(u16),
     LegacyKernelUnavailable(u16),
     LegacyModeUnsupported(u16),
+    MissingRequiredFormBindings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -651,6 +817,8 @@ pub enum ManifestRunError {
     Kernel(KernelError),
     InvalidSpanCount,
     SpanSchema,
+    InvalidCommittedInput,
+    ClaimedOutputLength,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -875,28 +1043,10 @@ pub mod test_kernel {
         mode: MODE_OPTIMISTIC_V1,
         replay: &BYTE_SUM,
     }];
-    pub static BYTE_SUM_SPANS: [AccountSpanBinding; 2] = [
-        AccountSpanBinding {
-            account_index: 4,
-            key: None,
-            owner: SpanOwner::Program,
-            is_signer: false,
-            is_writable: false,
-            schema: VersionedId { id: 1, version: 1 },
-            offset: 0,
-            length: 3,
-        },
-        AccountSpanBinding {
-            account_index: 4,
-            key: None,
-            owner: SpanOwner::Program,
-            is_signer: false,
-            is_writable: false,
-            schema: VersionedId { id: 2, version: 1 },
-            offset: 3,
-            length: 8,
-        },
-    ];
+    pub static BYTE_SUM_INPUTS: [ReplayInputLayout; 1] = [ReplayInputLayout {
+        schema: VersionedId { id: 1, version: 1 },
+        max_bytes: 64,
+    }];
     pub static BYTE_SUM_LEGACY_FORMS: [LegacyFormBinding; 1] = [LegacyFormBinding {
         machine_selector: Some(1),
         form_id: 22,
@@ -904,37 +1054,9 @@ pub mod test_kernel {
         semantic_version: 1,
         abi_version: 1,
         mode: MODE_OPTIMISTIC_V1,
-        input_span_count: 1,
-        spans: &BYTE_SUM_SPANS,
+        input_spans: &BYTE_SUM_INPUTS,
+        claimed_output_bytes: 8,
     }];
-    // The extracted real-handler SBF fixture descends into the retained
-    // compiler-v1 Form-256 row. Its three-byte PT2S cursor and eight-byte
-    // geometry reserved field are both zero, so the same ByteSum replay has
-    // a byte-exact honest answer without changing the retained plan artifact.
-    // This second binding exists only in the dedicated SBF lifecycle image.
-    #[cfg(feature = "sbf-real-lifecycle-test")]
-    pub static BYTE_SUM_FORM_256_SPANS: [AccountSpanBinding; 2] = [
-        AccountSpanBinding {
-            account_index: 0,
-            key: None,
-            owner: SpanOwner::Program,
-            is_signer: false,
-            is_writable: false,
-            schema: VersionedId { id: 1, version: 1 },
-            offset: 184,
-            length: 3,
-        },
-        AccountSpanBinding {
-            account_index: 2,
-            key: None,
-            owner: SpanOwner::Program,
-            is_signer: false,
-            is_writable: false,
-            schema: VersionedId { id: 2, version: 1 },
-            offset: 9,
-            length: 8,
-        },
-    ];
     #[cfg(feature = "sbf-real-lifecycle-test")]
     pub static BYTE_SUM_FORM_256_BINDING: [LegacyFormBinding; 1] = [LegacyFormBinding {
         machine_selector: Some(1),
@@ -943,22 +1065,43 @@ pub mod test_kernel {
         semantic_version: 1,
         abi_version: 1,
         mode: MODE_OPTIMISTIC_V1,
-        input_span_count: 1,
-        spans: &BYTE_SUM_FORM_256_SPANS,
+        input_spans: &BYTE_SUM_INPUTS,
+        claimed_output_bytes: 8,
     }];
     #[cfg(feature = "sbf-real-lifecycle-test")]
     pub static BYTE_SUM_REAL_LIFECYCLE_FORMS: [LegacyFormBinding; 2] =
         [BYTE_SUM_LEGACY_FORMS[0], BYTE_SUM_FORM_256_BINDING[0]];
+    #[cfg(feature = "sbf-unbound-form-test")]
+    pub static BYTE_SUM_UNBOUND_FORM_TEST: [LegacyFormBinding; 1] = [LegacyFormBinding {
+        machine_selector: Some(1),
+        form_id: u16::MAX,
+        kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
+        semantic_version: 1,
+        abi_version: 1,
+        mode: MODE_OPTIMISTIC_V1,
+        input_spans: &BYTE_SUM_INPUTS,
+        claimed_output_bytes: 8,
+    }];
     pub static MANIFEST_APP: ApplicationManifest = ApplicationManifest {
         application_id: b"dcg-test-app/1",
         version: 1,
         kernels: &KERNELS,
         optimistic_replays: &REPLAY_BINDINGS,
-        #[cfg(feature = "sbf-real-lifecycle-test")]
+        #[cfg(feature = "sbf-unbound-form-test")]
+        legacy_forms: &BYTE_SUM_UNBOUND_FORM_TEST,
+        #[cfg(all(
+            feature = "sbf-real-lifecycle-test",
+            not(feature = "sbf-unbound-form-test")
+        ))]
         legacy_forms: &BYTE_SUM_REAL_LIFECYCLE_FORMS,
-        #[cfg(not(feature = "sbf-real-lifecycle-test"))]
+        #[cfg(all(
+            not(feature = "sbf-real-lifecycle-test"),
+            not(feature = "sbf-unbound-form-test")
+        ))]
         legacy_forms: &BYTE_SUM_LEGACY_FORMS,
         require_legacy_form_binding: true,
+        hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
 }
 
@@ -1010,6 +1153,8 @@ mod tests {
         optimistic_replays: &[],
         legacy_forms: &[],
         require_legacy_form_binding: false,
+        hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
 
     #[test]
@@ -1022,10 +1167,45 @@ mod tests {
 
     #[cfg(feature = "test-kernel")]
     #[test]
+    fn manifest_rejects_duplicate_kernel_ids() {
+        static DUPLICATE_KERNELS: [&'static dyn Kernel; 2] =
+            [&test_kernel::BYTE_SUM, &test_kernel::BYTE_SUM];
+        static DUPLICATE_APP: ApplicationManifest = ApplicationManifest {
+            application_id: b"dcg-duplicate-kernel-test/1",
+            version: 1,
+            kernels: &DUPLICATE_KERNELS,
+            optimistic_replays: &[],
+            legacy_forms: &[],
+            require_legacy_form_binding: false,
+            hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+            decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
+        };
+        assert_eq!(
+            DUPLICATE_APP.validate(),
+            Err(ManifestError::DuplicateKernel(
+                test_kernel::BYTE_SUM.manifest().id
+            ))
+        );
+    }
+
+    #[cfg(feature = "test-kernel")]
+    #[test]
     fn static_application_manifest_resolves_exact_semantic_and_abi_versions() {
         use test_kernel::{BYTE_SUM, MODE_CONSENSUS_V1, MODE_OPTIMISTIC_V1};
         let m = &test_kernel::MANIFEST_APP;
         assert_eq!(m.validate(), Ok(()));
+        #[cfg(not(feature = "sbf-unbound-form-test"))]
+        assert!(m.admits_legacy_form(Some(1), 256));
+        #[cfg(not(feature = "sbf-unbound-form-test"))]
+        assert!(!m.admits_legacy_form(Some(1), 257));
+        #[cfg(not(feature = "sbf-unbound-form-test"))]
+        assert!(!m.admits_legacy_form(None, 256));
+        #[cfg(feature = "sbf-unbound-form-test")]
+        {
+            assert!(!m.admits_legacy_form(Some(1), 22));
+            assert!(!m.admits_legacy_form(Some(1), 256));
+            assert!(m.admits_legacy_form(Some(1), u16::MAX));
+        }
         let kernel = m.resolve(KernelId(*b"dcg-test-sum-v1\0"), 1, 1).unwrap();
         assert_eq!(kernel.manifest().id, BYTE_SUM.manifest().id);
         let mut output = [0u8; 8];
@@ -1086,50 +1266,41 @@ mod tests {
             Err(ManifestRunError::InputLimit)
         );
 
+        #[cfg(not(feature = "sbf-unbound-form-test"))]
         let binding = m.resolve_legacy_form(1, 22).unwrap();
+        #[cfg(feature = "sbf-unbound-form-test")]
+        let binding = &test_kernel::BYTE_SUM_LEGACY_FORMS[0];
         let input = [1u8, 2, 3];
         let claimed = 6u64.to_le_bytes();
-        let spans = [
-            AccountSpan {
-                key: [4; 32],
-                owner: [5; 32],
-                is_signer: false,
-                is_writable: false,
-                schema: VersionedId { id: 1, version: 1 },
-                offset: 0,
-                data: &input,
-            },
-            AccountSpan {
-                key: [4; 32],
-                owner: [5; 32],
-                is_signer: false,
-                is_writable: false,
-                schema: VersionedId { id: 2, version: 1 },
-                offset: 3,
-                data: &claimed,
-            },
-        ];
-        assert_eq!(m.replay_legacy_form(binding, &spans), Ok(true));
+        let inputs = [ReplayInputSpan {
+            schema: VersionedId { id: 1, version: 1 },
+            data: &input,
+        }];
+        assert_eq!(m.replay_legacy_form(binding, &inputs, &claimed), Ok(true));
         let bad_claim = 7u64.to_le_bytes();
-        let mut bad_spans = spans;
-        bad_spans[1].data = &bad_claim;
-        assert_eq!(m.replay_legacy_form(binding, &bad_spans), Ok(false));
+        assert_eq!(
+            m.replay_legacy_form(binding, &inputs, &bad_claim),
+            Ok(false)
+        );
 
         let mut wrong_abi = *binding;
         wrong_abi.abi_version = 2;
         assert_eq!(
-            m.replay_legacy_form(&wrong_abi, &spans),
+            m.replay_legacy_form(&wrong_abi, &inputs, &claimed),
             Err(ManifestRunError::KernelUnavailable)
         );
         let mut unknown_id = *binding;
         unknown_id.kernel_id = KernelId([0xFF; 16]);
         assert_eq!(
-            m.replay_legacy_form(&unknown_id, &spans),
+            m.replay_legacy_form(&unknown_id, &inputs, &claimed),
             Err(ManifestRunError::KernelUnavailable)
         );
         assert!(m.resolve_legacy_form(2, 22).is_none());
 
-        #[cfg(feature = "sbf-real-lifecycle-test")]
+        #[cfg(all(
+            feature = "sbf-real-lifecycle-test",
+            not(feature = "sbf-unbound-form-test")
+        ))]
         {
             let replay = m.resolve_legacy_form(1, 256).unwrap();
             assert_eq!(replay.kernel_id, BYTE_SUM.manifest().id);
@@ -1139,30 +1310,23 @@ mod tests {
         }
     }
 
-    #[cfg(all(test, feature = "sbf-real-lifecycle-test"))]
+    #[cfg(all(
+        test,
+        feature = "sbf-real-lifecycle-test",
+        not(feature = "sbf-unbound-form-test")
+    ))]
     #[test]
-    fn form_256_test_app_binding_uses_the_declared_zero_spans() {
+    fn form_256_test_app_binding_uses_coordinate_leaf_inputs() {
         let binding = test_kernel::MANIFEST_APP
             .resolve_legacy_form(1, 256)
             .unwrap();
-        assert_eq!(binding.input_span_count, 1);
-        assert_eq!(binding.spans.len(), 2);
+        assert_eq!(binding.input_spans.len(), 1);
         assert_eq!(
-            (
-                binding.spans[0].account_index,
-                binding.spans[0].offset,
-                binding.spans[0].length,
-            ),
-            (0, 184, 3)
+            binding.input_spans[0].schema,
+            VersionedId { id: 1, version: 1 }
         );
-        assert_eq!(
-            (
-                binding.spans[1].account_index,
-                binding.spans[1].offset,
-                binding.spans[1].length,
-            ),
-            (2, 9, 8)
-        );
+        assert_eq!(binding.input_spans[0].max_bytes, 64);
+        assert_eq!(binding.claimed_output_bytes, 8);
     }
 
     #[test]

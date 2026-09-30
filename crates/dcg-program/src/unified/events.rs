@@ -57,6 +57,8 @@ pub const OUTCOME_SETTLED: u8 = 1;
 pub const CAUSE_VERDICT: u8 = 1;
 pub const CAUSE_CONVICT: u8 = 2;
 pub const CAUSE_TIMEOUT: u8 = 3;
+/// The revision-9 DCR1 v6 app-kernel replay result selected the winner.
+pub const CAUSE_APP_REPLAY: u8 = 4;
 
 /// A fixed-length body under construction.
 pub struct Body {

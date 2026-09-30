@@ -114,7 +114,7 @@ pub const APP_KERNEL_UNAVAILABLE: u32 = 799;
 pub const APP_KERNEL_MISMATCH: u32 = 800;
 
 /// Codes that, returned by the per-instance check at a fix-point, convict.
-pub const CONVICT_CODES: [u32; 9] = [
+pub const CONVICT_CODES: [u32; 10] = [
     FORM_ABSENT,
     WITHDRAW_ONLY,
     OVER_CU,
@@ -123,11 +123,20 @@ pub const CONVICT_CODES: [u32; 9] = [
     WITNESS_DOMAIN,
     RANGE_BOUND,
     crate::kernels::decision::ERR_OPTION_RANGE,
+    APP_KERNEL_UNAVAILABLE,
     APP_KERNEL_MISMATCH,
 ];
 
 pub(crate) fn no(code: u32) -> ProgramError {
     ProgramError::Custom(code)
+}
+
+fn application_hooks(
+    manifest: Option<&'static crate::kernel::ApplicationManifest>,
+) -> &'static dyn crate::compatibility::ApplicationHooks {
+    manifest
+        .map(|app| app.hooks)
+        .unwrap_or(&crate::compatibility::REVISION8_COMPATIBILITY)
 }
 
 pub(crate) fn u16_at(b: &[u8], at: usize, code: u32) -> Result<u16, ProgramError> {
@@ -192,34 +201,61 @@ fn process_inner(
         TAG_REGISTRY_WRITE => registry::write(program, accounts, data),
         TAG_REGISTRY_FREEZE => registry::freeze(program, accounts, data),
         TAG_ADMISSION_BEGIN => admission::begin(program, accounts, data),
-        TAG_ADMISSION_STEP => admission::step(program, accounts, data),
-        TAG_UNIFIED_INIT => document::init(program, accounts, data),
-        TAG_LAND_POSITION_ROOTS => document::land_position_roots(program, accounts, data),
-        TAG_FINALIZE_DOCUMENT => document::finalize(program, accounts, data),
-        TAG_REVEAL_POSITION => challenge::reveal_position(program, accounts, data),
-        TAG_SELECT_SEGMENT => challenge::select_segment(program, accounts, data),
+        TAG_ADMISSION_STEP => admission::step_with_manifest(program, accounts, data, manifest),
+        TAG_UNIFIED_INIT => {
+            document::init_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_LAND_POSITION_ROOTS => document::land_position_roots_with_hooks(
+            program,
+            accounts,
+            data,
+            application_hooks(manifest),
+        ),
+        TAG_FINALIZE_DOCUMENT => {
+            document::finalize_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_REVEAL_POSITION => {
+            challenge::reveal_position_with_manifest(program, accounts, data, manifest)
+        }
+        TAG_SELECT_SEGMENT => {
+            challenge::select_segment_with_manifest(program, accounts, data, manifest)
+        }
         TAG_CHALLENGE_LEAF => {
             challenge::challenge_leaf_with_manifest(program, accounts, data, manifest)
         }
-        TAG_CHALLENGE_POSITION => challenge::challenge_position(program, accounts, data),
+        TAG_CHALLENGE_POSITION => {
+            challenge::challenge_position_with_manifest(program, accounts, data, manifest)
+        }
         TAG_REVEAL => challenge::reveal_with_manifest(program, accounts, data, manifest),
         TAG_DESCEND => challenge::descend_with_manifest(program, accounts, data, manifest),
         TAG_REVEAL_FAMILY_TABLE => challenge::reveal_family_table(program, accounts, data),
         TAG_CLOSE_RESPONSE => challenge::close_response(program, accounts, data),
-        TAG_CLOSE_RESULT => result::close_result(program, accounts, data),
-        TAG_RETRY_BOND_SETTLEMENT => bond::retry(program, accounts, data),
+        TAG_CLOSE_RESULT => {
+            result::close_result_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_RETRY_BOND_SETTLEMENT => {
+            bond::retry_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
         crate::root_only_challenge::TAG_SETTLE if challenge::is_v5_record(accounts) => {
-            challenge::settle(program, accounts, data)
+            challenge::settle_with_hooks(program, accounts, data, application_hooks(manifest))
         }
         crate::root_only_challenge::TAG_TIMEOUT if challenge::is_v5_record(accounts) => {
-            challenge::timeout(program, accounts, data)
+            challenge::timeout_with_hooks(program, accounts, data, application_hooks(manifest))
         }
-        TAG_CLOSE_DOCUMENT => result::close(program, accounts, data),
+        TAG_CLOSE_DOCUMENT => {
+            result::close_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
         TAG_CONFIG_INIT => config::init(program, accounts, data),
         TAG_CONFIG_SET => config::set_authority(program, accounts, data),
-        TAG_TEMPLATE_SEAL => config::template_seal(program, accounts, data),
-        TAG_ATTEST_OUTPUT => result::attest(program, accounts, data),
-        TAG_RESOLVE_RESULT => result::resolve(program, accounts, data),
+        TAG_TEMPLATE_SEAL => {
+            config::template_seal_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_ATTEST_OUTPUT => {
+            result::attest_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_RESOLVE_RESULT => {
+            result::resolve_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
         _ => return None,
     })
 }
@@ -249,9 +285,9 @@ fn process_inner(
         }
         if challenge::is_revision8_record(accounts) {
             return Some(if tag == crate::root_only_challenge::TAG_SETTLE {
-                challenge::settle(program, accounts, data)
+                challenge::settle_with_hooks(program, accounts, data, application_hooks(manifest))
             } else {
-                challenge::timeout(program, accounts, data)
+                challenge::timeout_with_hooks(program, accounts, data, application_hooks(manifest))
             });
         }
     }
@@ -260,16 +296,31 @@ fn process_inner(
         TAG_REGISTRY_WRITE => registry::write(program, accounts, data),
         TAG_REGISTRY_FREEZE => registry::freeze(program, accounts, data),
         TAG_ADMISSION_BEGIN => admission::begin(program, accounts, data),
-        TAG_ADMISSION_STEP => admission::step(program, accounts, data),
-        TAG_UNIFIED_INIT => document::init(program, accounts, data),
-        TAG_LAND_POSITION_ROOTS => document::land_position_roots(program, accounts, data),
-        TAG_FINALIZE_DOCUMENT => document::finalize(program, accounts, data),
-        TAG_REVEAL_POSITION => challenge::reveal_position(program, accounts, data),
-        TAG_SELECT_SEGMENT => challenge::select_segment(program, accounts, data),
+        TAG_ADMISSION_STEP => admission::step_with_manifest(program, accounts, data, manifest),
+        TAG_UNIFIED_INIT => {
+            document::init_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_LAND_POSITION_ROOTS => document::land_position_roots_with_hooks(
+            program,
+            accounts,
+            data,
+            application_hooks(manifest),
+        ),
+        TAG_FINALIZE_DOCUMENT => {
+            document::finalize_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_REVEAL_POSITION => {
+            challenge::reveal_position_with_manifest(program, accounts, data, manifest)
+        }
+        TAG_SELECT_SEGMENT => {
+            challenge::select_segment_with_manifest(program, accounts, data, manifest)
+        }
         TAG_CHALLENGE_LEAF => {
             challenge::challenge_leaf_with_manifest(program, accounts, data, manifest)
         }
-        TAG_CHALLENGE_POSITION => challenge::challenge_position(program, accounts, data),
+        TAG_CHALLENGE_POSITION => {
+            challenge::challenge_position_with_manifest(program, accounts, data, manifest)
+        }
         TAG_REVEAL => challenge::reveal_with_manifest(program, accounts, data, manifest),
         TAG_DESCEND => challenge::descend_with_manifest(program, accounts, data, manifest),
         TAG_REVEAL_FAMILY_TABLE => challenge::reveal_family_table(program, accounts, data),
@@ -277,18 +328,30 @@ fn process_inner(
         // fall through to the legacy root-only dispatcher, but do not link the
         // revision-7 reader into the revision-8 image.
         TAG_CLOSE_RESPONSE => Err(no(DCR1_BAD)),
-        TAG_CLOSE_RESULT => result::close_result(program, accounts, data),
-        TAG_RETRY_BOND_SETTLEMENT => bond::retry(program, accounts, data),
-        TAG_CLOSE_DOCUMENT => result::close(program, accounts, data),
+        TAG_CLOSE_RESULT => {
+            result::close_result_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_RETRY_BOND_SETTLEMENT => {
+            bond::retry_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_CLOSE_DOCUMENT => {
+            result::close_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
         TAG_CLOSE_TEMPLATE => config::close_template(program, accounts, data),
         TAG_CLOSE_UNPUBLISHED_TEMPLATE => {
             config::close_unpublished_template(program, accounts, data)
         }
         TAG_CONFIG_INIT => config::init(program, accounts, data),
         TAG_CONFIG_SET => config::set_authority(program, accounts, data),
-        TAG_TEMPLATE_SEAL => config::template_seal(program, accounts, data),
-        TAG_ATTEST_OUTPUT => result::attest(program, accounts, data),
-        TAG_RESOLVE_RESULT => result::resolve(program, accounts, data),
+        TAG_TEMPLATE_SEAL => {
+            config::template_seal_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_ATTEST_OUTPUT => {
+            result::attest_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
+        TAG_RESOLVE_RESULT => {
+            result::resolve_with_hooks(program, accounts, data, application_hooks(manifest))
+        }
         _ => return None,
     })
 }

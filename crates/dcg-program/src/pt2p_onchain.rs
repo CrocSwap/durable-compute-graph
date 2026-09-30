@@ -1062,16 +1062,24 @@ pub fn instantiate_with_selector(
 /// the same account list and request tuple, computes the exact serialized
 /// output size, and performs one bounded growth step without writing output.
 pub fn reserve_pt1o(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    if !cfg!(feature = "revision-8") {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    instantiate_with_mode(
+    reserve_pt1o_with_selector(
         program,
         accounts,
         data,
-        InstantiateMode::Reserve,
         &crate::compatibility::REVISION8_COMPATIBILITY,
     )
+}
+
+pub fn reserve_pt1o_with_selector(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    selector: &dyn crate::compatibility::DecisionRouteSelector,
+) -> ProgramResult {
+    if !cfg!(feature = "revision-8") {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    instantiate_with_mode(program, accounts, data, InstantiateMode::Reserve, selector)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1398,6 +1406,20 @@ pub fn close_pt1o_reservation(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
+    close_pt1o_reservation_with_selector(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+pub fn close_pt1o_reservation_with_selector(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    selector: &dyn crate::compatibility::DecisionRouteSelector,
+) -> ProgramResult {
     if !cfg!(feature = "revision-8") {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -1406,7 +1428,7 @@ pub fn close_pt1o_reservation(
         accounts,
         data,
         InstantiateMode::CloseReservation,
-        &crate::compatibility::REVISION8_COMPATIBILITY,
+        selector,
     )
 }
 
