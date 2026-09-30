@@ -1319,8 +1319,23 @@ pub mod test_kernel {
         claimed_output_bytes: 256,
     }];
     #[cfg(feature = "sbf-real-lifecycle-test")]
-    pub static BYTE_SUM_REAL_LIFECYCLE_FORMS: [LegacyFormBinding; 2] =
-        [BYTE_SUM_LEGACY_FORMS[0], BYTE_SUM_PRODUCER_FORM_BINDING[0]];
+    pub static BYTE_SUM_ROUTE_FREE_FORM_BINDING: [LegacyFormBinding; 1] = [LegacyFormBinding {
+        machine_selector: Some(1),
+        form_id: 256,
+        kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
+        semantic_version: 1,
+        abi_version: 1,
+        mode: MODE_OPTIMISTIC_V1,
+        input_spans: &[],
+        input_routes: &[],
+        claimed_output_bytes: 256,
+    }];
+    #[cfg(feature = "sbf-real-lifecycle-test")]
+    pub static BYTE_SUM_REAL_LIFECYCLE_FORMS: [LegacyFormBinding; 3] = [
+        BYTE_SUM_LEGACY_FORMS[0],
+        BYTE_SUM_PRODUCER_FORM_BINDING[0],
+        BYTE_SUM_ROUTE_FREE_FORM_BINDING[0],
+    ];
     #[cfg(feature = "sbf-unbound-form-test")]
     pub static BYTE_SUM_UNBOUND_FORM_TEST: [LegacyFormBinding; 1] = [LegacyFormBinding {
         machine_selector: Some(1),
@@ -1551,7 +1566,10 @@ mod tests {
         {
             assert!(m.resolve_legacy_form(1, 22).is_some());
             assert!(m.resolve_legacy_form(1, 30).is_some());
-            assert!(m.resolve_legacy_form(1, 256).is_none());
+            let route_free = m.resolve_legacy_form(1, 256).unwrap();
+            assert!(route_free.input_spans.is_empty());
+            assert!(route_free.input_routes.is_empty());
+            assert_eq!(route_free.claimed_output_bytes, 256);
         }
         #[cfg(feature = "sbf-unbound-form-test")]
         {
@@ -1578,7 +1596,7 @@ mod tests {
             m.resolve_optimistic_replay(BYTE_SUM.manifest().id, 1, 1, MODE_OPTIMISTIC_V1)
                 .unwrap()
                 .replay
-                .replay(&[1, 2, 3, 250], &[], &output, &[]),
+                .replay(&[1, 2, 3, 250], &[], &output[..8], &[]),
             Ok(true)
         );
         assert_eq!(

@@ -2425,6 +2425,11 @@ pub fn timeout_with_manifest(
         false
     };
     if admission_identity_changed || ruling_identity_changed {
+        if raw[6..8] == APP_REPLAY_VERSION.to_le_bytes() {
+            raw[DEV2_AT + 4] = OUTCOME_IDENTITY_CHANGED;
+            raw[DEV2_AT + 8..DEV2_AT + 12]
+                .copy_from_slice(&(OUTCOME_IDENTITY_CHANGED as u32).to_le_bytes());
+        }
         return rule_for_document(
             program,
             accounts[0].key,

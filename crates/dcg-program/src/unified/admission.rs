@@ -34,6 +34,76 @@ fn check_app_binding(
     }
 }
 
+/// The plan and manifest facts needed to decide whether one routed app
+/// opening can be admitted by the revision-8 adapter. Keeping the final
+/// decision in one pure function makes each unsupported provenance refusal
+/// independently testable without duplicating the adapter's checks.
+#[derive(Clone, Copy)]
+struct AppRouteFacts {
+    route_count: usize,
+    input_span_count: usize,
+    read_count: u16,
+    route_ordinal: u16,
+    route_direction: u8,
+    binding_kind: u8,
+    consumer_position: u32,
+    producer_position: u32,
+    consumer_segment: u16,
+    producer_segment: u16,
+    consumer_local: u32,
+    producer_local: u32,
+    input_end: u32,
+    read_route_bytes: u32,
+    producer_has_binding: bool,
+    producer_write_direction: u8,
+    read_region: u16,
+    write_region: u16,
+    read_offset: u64,
+    write_offset: u64,
+    read_bytes: u32,
+    write_bytes: u32,
+    producer_output_bytes: u32,
+    consumer_arw1_bytes: usize,
+    producer_arw1_bytes: usize,
+    segment_entries: u32,
+}
+
+fn app_route_opening_bound(facts: AppRouteFacts) -> Result<usize, u32> {
+    let fail = || super::APP_KERNEL_UNAVAILABLE;
+    if facts.route_count != 1
+        || facts.input_span_count != 1
+        || facts.read_count as usize != facts.route_count
+        || facts.route_ordinal >= facts.read_count
+        || facts.route_direction != 0
+        || facts.binding_kind != 1
+        || facts.producer_position != facts.consumer_position
+        || facts.read_route_bytes < facts.input_end
+        || facts.producer_segment != facts.consumer_segment
+        || facts.producer_local >= facts.consumer_local
+        || !facts.producer_has_binding
+        || facts.producer_write_direction != 1
+        || facts.read_region != facts.write_region
+        || facts.read_offset != facts.write_offset
+        || facts.read_bytes != facts.write_bytes
+        || facts.producer_output_bytes != facts.read_bytes
+    {
+        return Err(fail());
+    }
+
+    let path_height = if facts.segment_entries <= 1 {
+        0usize
+    } else {
+        (32 - (facts.segment_entries - 1).leading_zeros()) as usize
+    };
+    facts
+        .consumer_arw1_bytes
+        .checked_add(14)
+        .and_then(|n| n.checked_add(facts.producer_arw1_bytes))
+        .and_then(|n| n.checked_add(32usize.checked_mul(path_height)?))
+        .filter(|&n| n <= crate::kernel::CommittedReplayWitness::MAX_WITNESS_BYTES)
+        .ok_or_else(fail)
+}
+
 /// Bound the largest opening the fixed revision-8 adapter can accept at this
 /// exact plan coordinate. This is shared by tag 160 and the fix-point backstop.
 pub(crate) fn app_opening_bound(
@@ -78,30 +148,15 @@ pub(crate) fn app_opening_bound(
         return Err(fail());
     }
     let target = entry;
-    if route_binding.ordinal >= target.read_count {
-        return Err(fail());
-    }
     let route = x
         .route(&target, route_binding.ordinal)
         .map_err(|_| fail())?;
-    if route.direction != 0
-        || route.binding_kind != 1
-        || route.producer_position != position
-        || route.byte_length < input_end
-    {
-        return Err(fail());
-    }
     let producer = x
         .entry(position, route.producer_entry)
         .map_err(|_| fail())?;
     let producer_coordinate = x
         .coordinate(position, route.producer_entry)
         .map_err(|_| fail())?;
-    if producer_coordinate.segment != coordinate.segment
-        || producer_coordinate.local >= coordinate.local
-    {
-        return Err(fail());
-    }
     let producer_binding = manifest
         .resolve_legacy_form(machine, producer.kernel_index)
         .ok_or_else(fail)?;
@@ -112,14 +167,6 @@ pub(crate) fn app_opening_bound(
     let producer_route = x
         .route(&producer, producer_route_ordinal)
         .map_err(|_| fail())?;
-    if producer_route.direction != 1
-        || producer_route.region_id != route.region_id
-        || producer_route.effective_offset != route.effective_offset
-        || producer_route.byte_length != route.byte_length
-        || producer_binding.claimed_output_bytes as u32 != route.byte_length
-    {
-        return Err(fail());
-    }
 
     let segment_index = (0..x.segment_count)
         .find(|&i| {
@@ -131,21 +178,35 @@ pub(crate) fn app_opening_bound(
         .segment_row(position, segment_index as usize)
         .map_err(|_| fail())?
         .1;
-    let height = if entries <= 1 {
-        0usize
-    } else {
-        (32 - (entries - 1).leading_zeros()) as usize
-    };
     let producer_bytes = ApplicationManifest::max_arw1_bytes(producer_binding).ok_or_else(fail)?;
-    let complete = consumer_bytes
-        .checked_add(14)
-        .and_then(|n| n.checked_add(producer_bytes))
-        .and_then(|n| n.checked_add(32usize.checked_mul(height)?))
-        .ok_or_else(fail)?;
-    if complete > CommittedReplayWitness::MAX_WITNESS_BYTES {
-        return Err(fail());
-    }
-    Ok(complete)
+    app_route_opening_bound(AppRouteFacts {
+        route_count: binding.input_routes.len(),
+        input_span_count: binding.input_spans.len(),
+        read_count: target.read_count,
+        route_ordinal: route_binding.ordinal,
+        route_direction: route.direction,
+        binding_kind: route.binding_kind,
+        consumer_position: position,
+        producer_position: route.producer_position,
+        consumer_segment: coordinate.segment,
+        producer_segment: producer_coordinate.segment,
+        consumer_local: coordinate.local,
+        producer_local: producer_coordinate.local,
+        input_end,
+        read_route_bytes: route.byte_length,
+        producer_has_binding: true,
+        producer_write_direction: producer_route.direction,
+        read_region: route.region_id,
+        write_region: producer_route.region_id,
+        read_offset: route.effective_offset,
+        write_offset: producer_route.effective_offset,
+        read_bytes: route.byte_length,
+        write_bytes: producer_route.byte_length,
+        producer_output_bytes: producer_binding.claimed_output_bytes as u32,
+        consumer_arw1_bytes: consumer_bytes,
+        producer_arw1_bytes: producer_bytes,
+        segment_entries: entries,
+    })
 }
 
 fn validate_app_bound_class(
@@ -507,5 +568,108 @@ mod tests {
                 Err(no(super::super::APP_KERNEL_UNAVAILABLE))
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod app_route_admission_tests {
+    use super::*;
+
+    fn valid_route() -> AppRouteFacts {
+        AppRouteFacts {
+            route_count: 1,
+            input_span_count: 1,
+            read_count: 1,
+            route_ordinal: 0,
+            route_direction: 0,
+            binding_kind: 1,
+            consumer_position: 5,
+            producer_position: 5,
+            consumer_segment: 2,
+            producer_segment: 2,
+            consumer_local: 9,
+            producer_local: 8,
+            input_end: 3,
+            read_route_bytes: 8,
+            producer_has_binding: true,
+            producer_write_direction: 1,
+            read_region: 4,
+            write_region: 4,
+            read_offset: 24,
+            write_offset: 24,
+            read_bytes: 8,
+            write_bytes: 8,
+            producer_output_bytes: 8,
+            consumer_arw1_bytes: 44,
+            producer_arw1_bytes: 268,
+            segment_entries: 8,
+        }
+    }
+
+    #[test]
+    fn app_admission_accepts_a_bounded_same_segment_route() {
+        assert_eq!(app_route_opening_bound(valid_route()), Ok(422));
+    }
+
+    #[test]
+    fn app_admission_refuses_cross_segment_routes() {
+        let mut facts = valid_route();
+        facts.producer_segment = facts.consumer_segment + 1;
+        assert_eq!(
+            app_route_opening_bound(facts),
+            Err(super::super::APP_KERNEL_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn app_admission_refuses_cross_position_routes() {
+        let mut facts = valid_route();
+        facts.producer_position -= 1;
+        assert_eq!(
+            app_route_opening_bound(facts),
+            Err(super::super::APP_KERNEL_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn app_admission_refuses_document_inputs() {
+        let mut facts = valid_route();
+        facts.binding_kind = 2;
+        assert_eq!(
+            app_route_opening_bound(facts),
+            Err(super::super::APP_KERNEL_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn app_admission_refuses_multi_route_forms() {
+        let mut facts = valid_route();
+        facts.route_count = 2;
+        facts.input_span_count = 2;
+        facts.read_count = 2;
+        assert_eq!(
+            app_route_opening_bound(facts),
+            Err(super::super::APP_KERNEL_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn app_admission_refuses_unbound_producers() {
+        let mut facts = valid_route();
+        facts.producer_has_binding = false;
+        assert_eq!(
+            app_route_opening_bound(facts),
+            Err(super::super::APP_KERNEL_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn app_admission_refuses_route_paths_over_the_witness_cap() {
+        let mut facts = valid_route();
+        facts.segment_entries = 1 << 20;
+        assert_eq!(
+            app_route_opening_bound(facts),
+            Err(super::super::APP_KERNEL_UNAVAILABLE)
+        );
     }
 }

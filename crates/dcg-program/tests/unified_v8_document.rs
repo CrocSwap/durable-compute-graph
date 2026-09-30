@@ -1537,7 +1537,7 @@ async fn build_f47() -> Option<Fix> {
     build_with_pre_fix_seal_processor(false, false, false, true).await
 }
 async fn build_honest_pt1x() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, true, false, false).await
+    build_with_pre_fix_seal_processor(false, true, false, true).await
 }
 
 async fn build_with_swapped_roles() -> Option<Fix> {
@@ -11100,23 +11100,36 @@ fn challenge_tree_with_replay_leaf(
     entries: u32,
     witness: Option<&[u8]>,
 ) -> Vec<Vec<ChallengeNode>> {
-    let app_leaf = witness.map(|witness| {
-        #[cfg(feature = "sbf-real-lifecycle-test")]
-        {
-            let app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
-            let binding = app.resolve_legacy_form(1, 22).unwrap();
-            app.replay_leaf_digest(binding, descriptor, position, segment, entries - 1, witness)
-        }
-        #[cfg(not(feature = "sbf-real-lifecycle-test"))]
-        {
-            let _ = witness;
-            panic!("application replay fixtures require sbf-real-lifecycle-test")
-        }
-    });
+    let app_leaves = witness
+        .map(|witness| vec![(entries - 1, 22, witness)])
+        .unwrap_or_default();
+    challenge_tree_with_app_leaves(descriptor, position, segment, entries, &app_leaves)
+}
+
+fn challenge_tree_with_app_leaves(
+    descriptor: &[u8; 32],
+    position: u32,
+    segment: u16,
+    entries: u32,
+    app_leaves: &[(u32, u16, &[u8])],
+) -> Vec<Vec<ChallengeNode>> {
+    let app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
+    let digests = app_leaves
+        .iter()
+        .map(|(local, form, witness)| {
+            let binding = app.resolve_legacy_form(1, *form).unwrap();
+            (
+                *local,
+                app.replay_leaf_digest(binding, descriptor, position, segment, *local, witness),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut level: Vec<ChallengeNode> = (0..entries)
         .map(|local| ChallengeNode {
-            digest: if local == entries - 1 {
-                app_leaf.unwrap_or_else(|| {
+            digest: digests
+                .iter()
+                .find_map(|(at, digest)| (*at == local).then_some(*digest))
+                .unwrap_or_else(|| {
                     h::hash(
                         b"c5-challenge-leaf",
                         &[
@@ -11126,18 +11139,7 @@ fn challenge_tree_with_replay_leaf(
                             &local.to_le_bytes(),
                         ],
                     )
-                })
-            } else {
-                h::hash(
-                    b"c5-challenge-leaf",
-                    &[
-                        descriptor,
-                        &position.to_le_bytes(),
-                        &segment.to_le_bytes(),
-                        &local.to_le_bytes(),
-                    ],
-                )
-            },
+                }),
             first: local,
             end: local + 1,
         })
@@ -11350,6 +11352,100 @@ async fn commit_challenge_tree_with_witness(
     assert_eq!(actual_descriptor, descriptor);
     f.finalize(&descriptor, created, f.k).await;
     (descriptor, created, roots, segment, entries - 1, levels)
+}
+
+/// A real app-bound challenge fixture for Form 256, the retained plan's
+/// zero-route entry mapped to ByteSum in the focused SBF image. The tree
+/// commits this exact coordinate-specific ARW1 leaf and UnifiedInit freezes
+/// the app identity.
+async fn commit_route_free_app_tree(
+    f: &mut Fix,
+    binding: &Binding2,
+    p: u32,
+    ordinal: usize,
+    target_form: u16,
+    witness: &[u8],
+) -> (
+    [u8; 32],
+    [Pubkey; 4],
+    Vec<[u8; 32]>,
+    u16,
+    u32,
+    Vec<Vec<ChallengeNode>>,
+) {
+    let app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
+    let mut adm = f.account(f.dea2).await;
+    let flags = u16_at(&adm, 6) | 2;
+    adm[6..8].copy_from_slice(&flags.to_le_bytes());
+    f.ctx.set_account(&f.dea2, &shared(owned(&f.program, adm)));
+
+    let descriptor = f.descriptor(binding, &f.terms_raw, 16);
+    let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
+    let x = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        None,
+        pt2p::Program::decode(&pwr1).unwrap(),
+    )
+    .unwrap();
+    let (segment, entries) = x.segment_row(p, ordinal).unwrap();
+    let target_local = (0..entries)
+        .find(|&local| {
+            let Ok(index) = x.entry_index(p, segment, local) else {
+                return false;
+            };
+            x.entry(p, index)
+                .is_ok_and(|entry| entry.kernel_index == target_form)
+        })
+        .expect("the selected segment contains the requested app form");
+    let t = x.entry_index(p, segment, target_local).unwrap();
+    assert_eq!(x.entry(p, t).unwrap().kernel_index, target_form);
+    let levels = challenge_tree_with_app_leaves(
+        &descriptor,
+        p,
+        segment,
+        entries,
+        &[(target_local, target_form, witness)],
+    );
+    let tree = levels.last().unwrap()[0].digest;
+    let segment_root = h::hash(
+        b"segment-root/2",
+        &[
+            &descriptor,
+            &p.to_le_bytes(),
+            &segment.to_le_bytes(),
+            &entries.to_le_bytes(),
+            &tree,
+            &[1],
+        ],
+    );
+    let table = x.segment_table_root(p).unwrap();
+    let mut roots = (0..f.segments)
+        .map(|i| {
+            h::hash(
+                b"c5-unselected-segment",
+                &[&descriptor, &p.to_le_bytes(), &i.to_le_bytes()],
+            )
+        })
+        .collect::<Vec<_>>();
+    roots[ordinal] = segment_root;
+    let position_root = h::position_root(&descriptor, p, &table, &roots).unwrap();
+    let mut positions = f.position_roots[..f.k as usize].to_vec();
+    positions[p as usize] = position_root;
+    let (actual_descriptor, created) = f.run_document_with_roots(binding, &positions).await;
+    assert_eq!(actual_descriptor, descriptor);
+    f.finalize(&descriptor, created, f.k).await;
+    let document = f.account(created[0]).await;
+    let identity = document::application_identity_v8(&document)
+        .unwrap()
+        .expect("app-bound fixture stores an ARI1 identity");
+    assert_eq!(
+        &identity[4..36],
+        &app.admission_identity_digest()[..],
+        "the document freezes this SBF image's admission identity"
+    );
+    (descriptor, created, roots, segment, target_local, levels)
 }
 
 async fn commit_challenge_tree_with_route_witness(
@@ -11936,6 +12032,8 @@ async fn settle_and_close_neutral_app_challenge(
     let document_lamports =
         f.lamports(created[0]).await + f.lamports(created[1]).await + f.lamports(created[2]).await;
     let executor_before_close = f.lamports(f.executor.pubkey()).await;
+    let remainder_before_close = f.lamports(remainder).await;
+    let incinerator_before_close = f.lamports(incinerator::ID).await;
     let document = f.account(created[0]).await;
     let close_deadline =
         u64_at(&document, 144).max(u64_at(&document, document::ABANDON_DEADLINE_AT)) + 1;
@@ -11955,10 +12053,13 @@ async fn settle_and_close_neutral_app_challenge(
     )
     .await
     .expect("tag 172 closes after neutral settlement");
+    let remainder_paid = f.lamports(remainder).await - remainder_before_close;
+    let burned = f.lamports(incinerator::ID).await - incinerator_before_close;
     assert_eq!(
         f.lamports(f.executor.pubkey()).await,
-        executor_before_close + document_lamports
+        executor_before_close + document_lamports - remainder_paid - burned
     );
+    assert_eq!(remainder_paid + burned, terms.executor_bond_lamports);
     for key in created[..3].iter().copied() {
         assert_eq!(f.lamports(key).await, 0);
     }
@@ -12647,13 +12748,9 @@ async fn rev8_position_challenge_rounds_reach_an_admitted_fixpoint() {
     let Some(mut f) = build().await else { return };
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 4;
-    let witness = app_replay_witness(1, &[1, 2, 3], 6);
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, witness) =
-        commit_challenge_tree_with_route_witness(
-            &mut f, &binding, 79, 1, 235, 207, &witness, &producer,
-        )
-        .await;
+    let witness = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &witness).await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -12698,9 +12795,8 @@ async fn rev8_position_challenge_rounds_reach_an_admitted_fixpoint() {
     }
 }
 
-/// A wrong output with an invalid challenger-supplied RWP1 cannot use the fast
-/// path to rule. The executor opens the committed route witness in RESPOND,
-/// after which tag 131 settles the STANDARD bond and tag 172 closes the doc.
+/// A valid but incorrect route-free output is convicted by the app replay
+/// fast path. Tag 131 settles the STANDARD bond and tag 172 closes the doc.
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
     let Some(mut f) = build().await else {
@@ -12714,18 +12810,10 @@ async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
     terms.custom_settle_window_slots = 0;
     f.terms_raw = terms.encode().to_vec();
 
-    let mut binding = f.binding(29, 50);
-    binding.request_id[0] = 1;
-    let witness = app_replay_witness(1, &[1, 2, 3], 7);
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, witness) =
-        commit_challenge_tree_with_route_witness(
-            &mut f, &binding, 79, 1, 235, 207, &witness, &producer,
-        )
-        .await;
-    let nonce = 90;
-    let mut invalid_fastpath = witness.clone();
-    *invalid_fastpath.last_mut().unwrap() ^= 1;
+    let binding = f.binding(29, 50);
+    let witness = app_route_producer_witness_with(&[4, 5, 6]);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &witness).await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -12736,35 +12824,11 @@ async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
         segment,
         target,
         &levels,
-        nonce,
-        true,
-        Some(&invalid_fastpath),
+        90,
+        false,
+        Some(&witness),
     )
     .await;
-    assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
-    executor_opens_app_witness(&mut f, record, created[0], &witness).await;
-    let choice = final_position_choice(&levels, target);
-    let mut descend_data = vec![TAG_DESCEND, choice];
-    descend_data.extend_from_slice(&witness);
-    label("challenge-round-descend-app-replay-rule-169");
-    send(
-        &mut f.ctx,
-        &f.signer,
-        f.program,
-        descend_data,
-        vec![
-            AccountMeta::new(record, false),
-            AccountMeta::new(f.signer.pubkey(), true),
-            AccountMeta::new(created[0], false),
-            AccountMeta::new_readonly(f.pt2s, false),
-            AccountMeta::new_readonly(f.routes, false),
-            AccountMeta::new_readonly(f.geometry, false),
-            AccountMeta::new_readonly(f.drp2, false),
-            AccountMeta::new_readonly(f.pt1s_index, false),
-        ],
-    )
-    .await
-    .expect("tag 169 replays the committed input and rules immediately");
     let dcr1 = f.account(record).await;
     assert_eq!(u16_at(&dcr1, 6), challenge::APP_REPLAY_VERSION);
     assert_eq!(
@@ -12866,9 +12930,9 @@ async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
     assert_eq!(f.account(created[3]).await[6], result::STATUS_REFUTED);
 }
 
-/// A matching challenger fast-path witness with a correct output must not
-/// convict. The fix-point stays in RESPOND, and the executor opens the same
-/// witness to defeat the challenge.
+/// A matching challenger fast-path witness with a correct route-free output
+/// must not convict. The executor opens the same witness to defeat the
+/// challenge.
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_bytesum_matching_honest_fastpath_enters_respond_sbf() {
     let Some(mut f) = build().await else {
@@ -12883,20 +12947,9 @@ async fn rev8_bytesum_matching_honest_fastpath_enters_respond_sbf() {
     f.terms_raw = terms.encode().to_vec();
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 4;
-    let witness_base = app_replay_witness(1, &[1, 2, 3], 6);
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, committed) =
-        commit_challenge_tree_with_route_witness(
-            &mut f,
-            &binding,
-            79,
-            1,
-            235,
-            207,
-            &witness_base,
-            &producer,
-        )
-        .await;
+    let committed = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &committed).await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -12955,8 +13008,8 @@ async fn rev8_bytesum_matching_honest_fastpath_enters_respond_sbf() {
 }
 
 /// A challenger who supplies a preimage that does not open the committed
-/// app-replay leaf has not proved anything. The executor opens the committed
-/// preimage in RESPOND and defeats the challenge.
+/// route-free app leaf has not proved anything. The executor opens the
+/// committed preimage in RESPOND and defeats the challenge.
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_bytesum_malicious_challenger_loses_app_replay_sbf() {
     let Some(mut f) = build().await else {
@@ -12964,23 +13017,10 @@ async fn rev8_bytesum_malicious_challenger_loses_app_replay_sbf() {
     };
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 2;
-    let committed_base = app_replay_witness(1, &[1, 2, 3], 6);
-    let forged_base = app_replay_witness(1, &[1, 2, 3], 8);
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, committed) =
-        commit_challenge_tree_with_route_witness(
-            &mut f,
-            &binding,
-            79,
-            1,
-            235,
-            207,
-            &committed_base,
-            &producer,
-        )
-        .await;
-    let mut forged = forged_base;
-    forged.extend_from_slice(&committed[committed_base.len()..]);
+    let committed = app_route_producer_witness();
+    let forged = app_route_producer_witness_with(&[4, 5, 6]);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &committed).await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -13006,9 +13046,8 @@ async fn rev8_bytesum_malicious_challenger_loses_app_replay_sbf() {
     assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
 }
 
-/// A schema-invalid input can be committed under a valid ROOT_ONLY proof, but
-/// the selected app kernel cannot replay it. The executor is ruled out with
-/// code 799 at the fix-point.
+/// A malformed committed ARW1 leaf is admitted as a Merkle commitment, then
+/// the executor is ruled out with code 799 when tag 184 cannot decode it.
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_bytesum_malformed_committed_input_rules_executor_sbf() {
     let Some(mut f) = build().await else {
@@ -13017,19 +13056,16 @@ async fn rev8_bytesum_malformed_committed_input_rules_executor_sbf() {
     let mut terms = Terms2::decode(&f.terms_raw).unwrap();
     terms.executor_bond_lamports = 500_000;
     terms.bond_policy_kind = BOND_POLICY_STANDARD;
-    terms.bond_slasher_bps = 0;
+    terms.bond_slasher_bps = 10_000;
     terms.settlement_program = [0; 32];
     terms.custom_settle_window_slots = 0;
     f.terms_raw = terms.encode().to_vec();
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 3;
-    let malformed = app_replay_witness(2, &[1, 2, 3], 6);
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, malformed) =
-        commit_challenge_tree_with_route_witness(
-            &mut f, &binding, 79, 1, 235, 207, &malformed, &producer,
-        )
-        .await;
+    let mut malformed = app_route_producer_witness();
+    malformed[10] = 1; // ARW1 reserved bytes must be zero.
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &malformed).await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -13060,23 +13096,17 @@ async fn rev8_bytesum_malformed_committed_input_rules_executor_sbf() {
         .await;
 }
 
-/// The input schema and ByteSum result are valid, but the committed input
-/// differs from the exact bytes proved by its producer route. The executor
-/// therefore loses even though it committed the matching sum for its fake
-/// input.
+/// A committed incorrect route-free output still convicts the executor when
+/// it opens the committed leaf in RESPOND.
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_bytesum_fake_input_against_predecessor_loses_sbf() {
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
     };
     let binding = f.binding(29, 50);
-    let fake = app_replay_witness(1, &[4, 5, 6], 15);
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, fake) =
-        commit_challenge_tree_with_route_witness(
-            &mut f, &binding, 79, 1, 235, 207, &fake, &producer,
-        )
-        .await;
+    let fake = app_route_producer_witness_with(&[4, 5, 6]);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &fake).await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -13098,18 +13128,18 @@ async fn rev8_bytesum_fake_input_against_predecessor_loses_sbf() {
     assert_eq!(dcr1[4], challenge::PHASE_RULED);
     assert_eq!(dcr1[5], 2, "the executor loses for fake predecessor bytes");
     assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
-    assert_eq!(u32_at(&dcr1, challenge::DEV2_AT + 8), 799);
+    assert_eq!(u32_at(&dcr1, challenge::DEV2_AT + 8), 800);
     assert_eq!(
         u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
         FLAG_REFUTED
     );
 }
 
-/// The dispute descends to the first divergent leaf. A consumer that correctly
-/// sums a fabricated predecessor output is honest relative to that input; the
-/// producer leaf is where the fake output is disproved.
+/// Form 22 has multiple graph reads in the retained K80 plan, beyond the
+/// single route supported by the revision-8 adapter. An app-bound document
+/// with that unsupported provenance therefore rules neutrally.
 #[tokio::test(flavor = "multi_thread")]
-async fn rev8_bytesum_first_divergent_leaf_protects_honest_consumer_sbf() {
+async fn rev8_unsupported_multi_read_form_is_neutral_at_fixpoint_sbf() {
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
     };
@@ -13123,7 +13153,7 @@ async fn rev8_bytesum_first_divergent_leaf_protects_honest_consumer_sbf() {
         )
         .await;
 
-    let consumer_record = descend_position_challenge_with_witness(
+    let record = descend_position_challenge_with_witness(
         &mut f,
         created,
         &descriptor,
@@ -13138,41 +13168,14 @@ async fn rev8_bytesum_first_divergent_leaf_protects_honest_consumer_sbf() {
         Some(&committed),
     )
     .await;
+    let ruling = f.account(record).await;
+    assert_eq!(ruling[4], challenge::PHASE_RULED);
+    assert_eq!(ruling[5], 0, "unsupported app provenance is neutral");
+    assert_eq!(ruling[178], events::CAUSE_APP_IDENTITY_CHANGED);
     assert_eq!(
-        f.account(consumer_record).await[4],
-        challenge::PHASE_RESPOND
+        u32_at(&ruling, challenge::DEV2_AT + 8),
+        challenge::OUTCOME_IDENTITY_CHANGED as u32
     );
-    executor_opens_app_witness(&mut f, consumer_record, created[0], &committed).await;
-    let consumer_ruling = f.account(consumer_record).await;
-    assert_eq!(consumer_ruling[4], challenge::PHASE_RULED);
-    assert_eq!(
-        consumer_ruling[5], 1,
-        "the correctly computed consumer wins"
-    );
-    assert_eq!(u32_at(&consumer_ruling, challenge::DEV2_AT + 8), 0);
-
-    let producer_record = descend_position_challenge_with_witness(
-        &mut f,
-        created,
-        &descriptor,
-        &roots,
-        79,
-        1,
-        segment,
-        207,
-        &levels,
-        115,
-        false,
-        Some(&producer),
-    )
-    .await;
-    let producer_ruling = f.account(producer_record).await;
-    assert_eq!(producer_ruling[4], challenge::PHASE_RULED);
-    assert_eq!(
-        producer_ruling[5], 2,
-        "the fabricated producer output loses"
-    );
-    assert_eq!(u32_at(&producer_ruling, challenge::DEV2_AT + 8), 800);
 }
 
 /// Distinct challenger PDAs may contest the same committed app leaf. Each
@@ -13183,13 +13186,9 @@ async fn rev8_two_challengers_can_contest_the_same_app_leaf_sbf() {
         panic!("retained artifacts absent")
     };
     let binding = f.binding(29, 50);
-    let witness = app_replay_witness(1, &[1, 2, 3], 6);
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, committed) =
-        commit_challenge_tree_with_route_witness(
-            &mut f, &binding, 79, 1, 235, 207, &witness, &producer,
-        )
-        .await;
+    let committed = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &committed).await;
 
     let first_record = descend_position_challenge_with_witness(
         &mut f,
@@ -13249,25 +13248,14 @@ async fn rev8_app_respond_rejects_bad_openings_and_timeout_favors_challenger_sbf
     let mut terms = Terms2::decode(&f.terms_raw).unwrap();
     terms.executor_bond_lamports = 500_000;
     terms.bond_policy_kind = BOND_POLICY_STANDARD;
-    terms.bond_slasher_bps = 0;
+    terms.bond_slasher_bps = 10_000;
     terms.settlement_program = [0; 32];
     terms.custom_settle_window_slots = 0;
     f.terms_raw = terms.encode().to_vec();
     let binding = f.binding(29, 50);
-    let witness_base = app_replay_witness(1, &[1, 2, 3], 6);
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, committed) =
-        commit_challenge_tree_with_route_witness(
-            &mut f,
-            &binding,
-            79,
-            1,
-            235,
-            207,
-            &witness_base,
-            &producer,
-        )
-        .await;
+    let committed = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &committed).await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -13389,10 +13377,9 @@ async fn rev8_app_respond_rejects_bad_openings_and_timeout_favors_challenger_sbf
         ))
     ));
 
-    let mut other_coordinate = committed.clone();
-    other_coordinate[witness_base.len() + 6..witness_base.len() + 10]
-        .copy_from_slice(&206u32.to_le_bytes());
-    for bad_opening in [b"random-not-arw1".as_slice(), other_coordinate.as_slice()] {
+    let mut wrong_output = committed.clone();
+    *wrong_output.last_mut().unwrap() ^= 1;
+    for bad_opening in [b"random-not-arw1".as_slice(), wrong_output.as_slice()] {
         let mut stage = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
         stage.extend_from_slice(&(bad_opening.len() as u16).to_le_bytes());
         stage.extend_from_slice(&0u16.to_le_bytes());
@@ -13559,13 +13546,9 @@ async fn rev8_app_identity_change_during_respond_is_neutral_sbf() {
     f.terms_raw = terms.encode().to_vec();
 
     let binding = f.binding(29, 50);
-    let witness = app_replay_witness(1, &[1, 2, 3], 6);
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, _) =
-        commit_challenge_tree_with_route_witness(
-            &mut f, &binding, 79, 1, 235, 207, &witness, &producer,
-        )
-        .await;
+    let witness = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &witness).await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -13582,15 +13565,23 @@ async fn rev8_app_identity_change_during_respond_is_neutral_sbf() {
     )
     .await;
     assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
-
     // Simulate a new image identity while the turn is pending. The bytes are
     // otherwise a well-formed DCR1 v6 app record, so tag 132 exercises the
     // same identity comparison as an upgraded static manifest.
     let mut changed = f.account(record).await;
     assert_eq!(u16_at(&changed, 6), challenge::APP_REPLAY_VERSION);
     changed[challenge::APP_IDENTITY_AT + 4] ^= 1;
-    f.ctx
-        .set_account(&record, &shared(owned(&f.program, changed)));
+    let record_lamports = f.lamports(record).await;
+    f.ctx.set_account(
+        &record,
+        &shared(Account {
+            lamports: record_lamports,
+            data: changed,
+            owner: f.program,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
     let deadline = u64_at(&f.account(record).await, 148) + 1;
     clock_to(&mut f, deadline).await;
     send_fresh_with(
@@ -13629,19 +13620,8 @@ async fn rev8_non_arw1_committed_leaf_executor_timeout_favors_challenger_sbf() {
     };
     let binding = f.binding(29, 50);
     let invalid_preimage = b"committed-random-leaf";
-    let producer = app_route_producer_witness();
-    let (descriptor, created, roots, segment, target, levels, _unused_opening) =
-        commit_challenge_tree_with_route_witness(
-            &mut f,
-            &binding,
-            79,
-            1,
-            235,
-            207,
-            invalid_preimage,
-            &producer,
-        )
-        .await;
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, invalid_preimage).await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -14021,6 +14001,28 @@ async fn rev8_late_unbound_manifest_refuses_fixpoint_neutrally_on_sbf() {
     let binding = f.binding(29, 50);
     let (descriptor, created, roots, segment, target, levels) =
         commit_challenge_tree(&mut f, &binding, 79, 1).await;
+    // Represent a document admitted under a prior image whose static form
+    // table still included this route. A later image that no longer binds the
+    // form must settle neutrally at the fix-point.
+    let mut older_document = f.account(created[0]).await;
+    let option_count = older_document[document::BINDING_AT_V8 + 151] as usize;
+    let identity_at = document::OPTION_REGION_AT + 4 * option_count;
+    assert_eq!(older_document.len(), identity_at);
+    let mut previous_identity = [0; document::APP_IDENTITY_BYTES];
+    previous_identity[..4].copy_from_slice(b"ARI1");
+    previous_identity[4..36].fill(0x5a);
+    older_document.extend_from_slice(&previous_identity);
+    let document_lamports = f.lamports(created[0]).await;
+    f.ctx.set_account(
+        &created[0],
+        &shared(Account {
+            lamports: document_lamports,
+            data: older_document,
+            owner: f.program,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
     let record = descend_position_challenge(
         &mut f,
         created,
@@ -14041,7 +14043,7 @@ async fn rev8_late_unbound_manifest_refuses_fixpoint_neutrally_on_sbf() {
     assert_eq!(before[5], 0);
     let choice = final_position_choice(&levels, target);
     label("late-binding-neutral-fixpoint-169");
-    let result = send_fresh_with(
+    send_fresh_with(
         &mut f.ctx,
         &f.signer,
         f.program,
@@ -14057,16 +14059,17 @@ async fn rev8_late_unbound_manifest_refuses_fixpoint_neutrally_on_sbf() {
             AccountMeta::new_readonly(f.pt1s_index, false),
         ],
     )
-    .await;
-    assert!(matches!(
-        result,
-        Err(TransactionError::InstructionError(
-            _,
-            InstructionError::Custom(730)
-        ))
-    ));
+    .await
+    .expect("the stale admission identity rules neutrally at tag 169");
     let after = f.account(record).await;
-    assert_eq!(after, before, "the late-binding refusal is neutral");
+    assert_eq!(after[4], challenge::PHASE_RULED);
+    assert_eq!(after[5], 0);
+    assert_eq!(after[178], events::CAUSE_APP_IDENTITY_CHANGED);
+    assert_eq!(
+        u32_at(&after, challenge::DEV2_AT + 8),
+        challenge::OUTCOME_IDENTITY_CHANGED as u32
+    );
+    assert_ne!(after, before, "the neutral ruling is recorded");
     assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
 }
 
@@ -14082,6 +14085,70 @@ async fn rev8_pt1x_registry_and_admission_sbf() {
     let admission = f.account(f.dea2).await;
     assert_eq!(&admission[..4], b"DEA2");
     assert_eq!(u32_at(&admission, 136), f.k);
+}
+
+/// The manifest-aware tag-160 walk must refuse a Form-22 class whose retained
+/// plan entry contains multiple graph reads, before recording any admission.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_multi_read_form_refuses_tag160_admission_sbf() {
+    assert!(std::env::var_os("BASANOS_DCG_V8_SBF").is_some());
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
+    let payload_index = retained_payload_index(&payloads);
+    let x = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        Some(&payload_index),
+        pt2p::Program::decode(&pwr1).unwrap(),
+    )
+    .unwrap();
+    let form22_index = (0..class_count(&x).unwrap())
+        .find(|&index| {
+            let key = dcg_program::unified::classes::key_of(&x, index).unwrap();
+            dcg_program::unified::classes::class_shape(&x, key)
+                .unwrap()
+                .is_some_and(|shape| shape.form == 22)
+        })
+        .expect("the retained plan has a Form-22 class");
+
+    let mut state = f.account(f.dea2).await;
+    state[6..8].fill(0);
+    state[148..152].fill(0);
+    state[admission::HEADER..].fill(0);
+    f.ctx
+        .set_account(&f.dea2, &shared(owned(&f.program, state)));
+
+    let mut data = vec![dcg_program::unified::TAG_ADMISSION_STEP];
+    data.extend_from_slice(&form22_index.to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes());
+    let result = send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        data,
+        vec![
+            AccountMeta::new(f.dea2, false),
+            AccountMeta::new_readonly(f.drp2, false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.pt1s_index, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(code)
+        )) if code == dcg_program::unified::APP_KERNEL_UNAVAILABLE
+    ));
+    let after = f.account(f.dea2).await;
+    assert_eq!(u32_at(&after, 148), 0, "refusal admits no class");
+    assert!(after[admission::HEADER..].iter().all(|byte| *byte == 0));
 }
 
 /// Full real admission to final result on the extracted SBF image: actual
