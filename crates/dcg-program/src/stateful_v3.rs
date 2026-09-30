@@ -109,7 +109,7 @@ const RESOURCE_MAGIC: &[u8; 4] = b"DRS3";
 const ANCHOR_MAGIC: &[u8; 4] = b"DAN3";
 const RESOURCE_BITMAP_AT: usize = 88;
 const RESOURCE_ALLOCATED_AT: usize = 112;
-const HALT_BEFORE_RUNTIME_CHECK_BYTES: usize = 65_536;
+pub(crate) const HALT_BEFORE_RUNTIME_CHECK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug)]
 struct Session {
@@ -341,7 +341,6 @@ fn checked_resource(
         || raw[7] != 0
         || raw[8..40] != session_account.key.to_bytes()
         || raw[40..72] != session.resource_commitment
-        || raw[88..RESOURCE_BITMAP_AT].iter().any(|byte| *byte != 0)
     {
         return Err(refusal(REFUSAL_RESOURCE));
     }
@@ -1626,7 +1625,7 @@ fn begin_initialization(
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
     exact_data(data, 11)?;
-    let [authority, session_account] = accounts else {
+    let [authority, session_account, remainder @ ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     check_unique(accounts)?;
@@ -1635,6 +1634,16 @@ fn begin_initialization(
     }
     let mut session =
         checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    if session.resource_key == Pubkey::default() {
+        if !remainder.is_empty() {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+    } else {
+        let [resource] = remainder else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+        checked_resource(program, resource, session_account, &session, true, false)?;
+    }
     let declared = u32_at(data, 7);
     initialization_declaration(kernel, declared)?;
     if session.status != STATUS_ACTIVE
@@ -2548,20 +2557,23 @@ fn advance(
         .iter()
         .try_fold(0usize, |total, span| total.checked_add(span.data.len()))
         .ok_or_else(|| refusal(REFUSAL_STATE))?;
+    // SBF's default heap is 32 KiB and its allocator does not reclaim Vec
+    // allocations during an instruction. Reuse one bounded snapshot buffer;
+    // above the cap, HaltBefore immutability is a kernel obligation.
+    let mut before_halt_guard =
+        (state_bytes <= HALT_BEFORE_RUNTIME_CHECK_BYTES).then(|| vec![0u8; state_bytes]);
     let transition_result = if bind.is_ok() {
         (|| {
             let mut output = vec![0u8; output_len];
             for command in &commands {
-                // For bounded spans the adapter enforces the HaltBefore
-                // obligation. Larger spans rely on the kernel contract so
-                // this guard never copies an unbounded state value.
-                let before_halt_guard =
-                    (state_bytes <= HALT_BEFORE_RUNTIME_CHECK_BYTES).then(|| {
-                        spans
-                            .iter()
-                            .map(|span| span.data.to_vec())
-                            .collect::<Vec<_>>()
-                    });
+                if let Some(snapshot) = before_halt_guard.as_mut() {
+                    let mut offset = 0;
+                    for span in &spans {
+                        let end = offset + span.data.len();
+                        snapshot[offset..end].copy_from_slice(span.data);
+                        offset = end;
+                    }
+                }
                 output.fill(0);
                 let outcome = kernel
                     .transition_spans_with_outcome(command, &mut spans, &mut output)
@@ -2575,11 +2587,14 @@ fn advance(
                         if reason == 0 {
                             return Err(refusal(REFUSAL_KERNEL));
                         }
+                        let mut offset = 0;
                         if before_halt_guard.as_ref().is_some_and(|before| {
-                            before
-                                .iter()
-                                .zip(spans.iter())
-                                .any(|(old, span)| old.as_slice() != span.data)
+                            spans.iter().any(|span| {
+                                let end = offset + span.data.len();
+                                let changed = before[offset..end] != span.data[..];
+                                offset = end;
+                                changed
+                            })
                         }) {
                             return Err(refusal(REFUSAL_KERNEL));
                         }
@@ -3346,6 +3361,11 @@ fn close_child(
     {
         return Err(refusal(REFUSAL_SESSION));
     }
+    if kind == KIND_STATE
+        && (session.state_span_count == 0 || state_index + 1 != session.state_span_count as usize)
+    {
+        return Err(refusal(REFUSAL_STATE));
+    }
     drop(raw);
     if kind == KIND_ANCHOR {
         checked_anchor(program, target, session_account, true)?;
@@ -3353,6 +3373,11 @@ fn close_child(
     match kind {
         KIND_STREAM => session.stream_key = Pubkey::default(),
         KIND_STATE => {
+            let span_len = session.state_lengths[state_index];
+            session.state_bytes = session
+                .state_bytes
+                .checked_sub(span_len)
+                .ok_or_else(|| refusal(REFUSAL_STATE))?;
             session.state_keys[state_index] = Pubkey::default();
             session.state_lengths[state_index] = 0;
             session.state_span_count = session
@@ -3745,7 +3770,7 @@ fn finish_anchor(
     let schema_id = schema.id.id.to_le_bytes();
     let schema_version = schema.id.version.to_le_bytes();
     session.state_anchor = crate::hash::sha256(&[
-        b"dcg/state-anchor/3",
+        b"dcg/state-anchor-chunked/3",
         &anchor.accumulator,
         &anchor.input_root,
         &session.kernel_id.0,
@@ -3812,28 +3837,39 @@ fn anchor_one_shot(
     data: &[u8],
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
-    if accounts.len() < 3 {
+    if accounts.len() < 4 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     check_unique(accounts)?;
-    let session_zero = checked_session(program, &accounts[0], false, kernel).ok();
-    let session_one = checked_session(program, &accounts[1], false, kernel).ok();
-    let (session_account, stream, state_accounts) = if session_zero.is_some() {
-        (&accounts[0], &accounts[1], accounts[2..].to_vec())
-    } else if session_one.is_some() {
+    let primary_layout = !accounts[0].is_signer;
+    let (authority, session_account, stream, state_accounts) = if primary_layout {
         (
             &accounts[1],
             &accounts[2],
+            &accounts[3],
             core::iter::once(accounts[0].clone())
-                .chain(accounts[3..].iter().cloned())
+                .chain(accounts[4..].iter().cloned())
                 .collect::<Vec<_>>(),
         )
     } else {
-        return Err(refusal(REFUSAL_SESSION));
+        (
+            &accounts[0],
+            &accounts[1],
+            &accounts[2],
+            accounts[3..].to_vec(),
+        )
     };
-    let mut session = checked_session(program, session_account, true, kernel)?;
-    if session.phase != PHASE_NONE || !session.state_initialized {
+    if !authority.is_signer {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let mut session =
+        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    if session.status != STATUS_ACTIVE || session.phase != PHASE_NONE || !session.state_initialized
+    {
         return Err(refusal(REFUSAL_LIVE));
+    }
+    if primary_layout != session.primary_state {
+        return Err(refusal(REFUSAL_STATE));
     }
     let cursor = u32_at(data, 2);
     if cursor != session.cursor
@@ -3862,7 +3898,7 @@ fn anchor_one_shot(
     let schema_version = schema.id.version.to_le_bytes();
     let cursor_bytes = cursor.to_le_bytes();
     parts
-        .push(b"dcg/state-anchor/3")
+        .push(b"dcg/state-anchor-one-shot/3")
         .push(&session.kernel_id.0)
         .push(&schema_id)
         .push(&schema_version)

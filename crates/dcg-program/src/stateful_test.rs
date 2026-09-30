@@ -567,7 +567,8 @@ impl V3FixedAddressKernel {
         };
         let full_state = primary.data.len() == V3_FIXED_STATE_LEN as usize
             && primary.data_address() as usize == V3_FIXED_STATE_ADDRESS;
-        let small_test_state = primary.data.len() == 1_280;
+        let small_test_state = primary.data.len() == 1_280
+            || primary.data.len() == crate::stateful::v3::HALT_BEFORE_RUNTIME_CHECK_BYTES;
         if primary.offset != 0 || !(full_state || small_test_state) {
             return Err(KernelError::Refused);
         }

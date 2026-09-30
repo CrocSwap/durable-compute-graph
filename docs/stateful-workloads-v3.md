@@ -16,6 +16,13 @@ PDA seeds. The stateful processor routes these instructions to a selected
 static kernel; the application composes the helper with its existing
 instruction handler.
 
+**Composition constraint:** do not compose the headerless primary layout
+(selector `1`) into an image that also dispatches revision 8 or stateful v1/v2
+handlers. A headerless primary can be sized to resemble a legacy session
+record. V1 and v2 now re-derive their session addresses; revision-8 handlers
+still authenticate some records by owner and contents alone. Keep this layout
+in a v3-only dispatch image or enforce an equivalent routing boundary.
+
 ## V3 additions
 
 | Tag | Operation | V3 contract |
@@ -29,7 +36,7 @@ instruction handler.
 | 236 | `BEGIN_PHASE`, `RUN_PHASE`, `COMMIT_PHASE`, `ABORT_PHASE` | The renderer receives the authenticated resource read-only, the state at the bound state version, and the writable renderer workspace. Output staging remains separately committed atomically. |
 | 237 | `HALT_SESSION` | Retains explicit session halt. |
 | 238 | `CLOSE_ACCOUNT` | Retains child/session account closure and refund behavior. |
-| 239 | `ANCHOR` | Supports one-shot anchors up to 65,536 bytes and phase-locked chunked anchors for larger state under `dcg/state-anchor/3`. |
+| 239 | `ANCHOR` | Supports one-shot anchors up to 65,536 bytes under `dcg/state-anchor-one-shot/3` and phase-locked chunked anchors for larger state under `dcg/state-anchor-chunked/3`. |
 | 240 | `RESOURCE_COPY` | `RESOURCE_GROW` increases the program-owned copy by at most 8,192 bytes. `RESOURCE_CHUNK` verifies one Merkle proof and copies one source chunk; the copy is sealed once every chunk is present. |
 
 Stateful tag payloads begin with the v3 version byte. V3 preserves v2's
@@ -67,7 +74,10 @@ the authority seed; instructions without one derive from the session's stored
 authority. State,
 stream, resource, view, workspace, scratch, and anchor readers also check the
 PDA derived from the session account key. The headerless primary must be the
-derived state PDA at index zero in both state access and close.
+derived state PDA at index zero in both state access and close. The v1 and v2
+session checks also re-derive their PDA from the stored authority and id without
+changing either wire format. This does not relax the composition constraint
+above for revision-8 handlers.
 
 ### Prefix halt semantics
 
@@ -78,16 +88,18 @@ unconsumed; `HaltAfter` consumes and commits that command. In either case, the
 session enters the halted state and records the reason and resulting cursor.
 Thus the stream cursor agrees with the committed prefix. Ordinary refusal
 paths continue to use transaction rollback, so state, stream, and session
-remain unchanged on refusal. For aggregate state at or below 65,536 bytes the
-adapter snapshots state and refuses a `HaltBefore` callback that changed it.
-For larger state, leaving state unchanged on `HaltBefore` remains a kernel
-obligation.
+remain unchanged on refusal. For aggregate state at or below 8,192 bytes the
+adapter uses one reusable snapshot buffer and refuses a `HaltBefore` callback
+that changed state. Above that cap, leaving state unchanged on `HaltBefore`
+remains a kernel obligation.
 
 ### Phased initialization and rendering
 
 `BEGIN_INITIALIZE` binds an initialization declaration to the current session,
 state layout, exact aggregate state size, kernel-declared maximum phase bytes,
-and compute units. Each `RUN_INITIALIZE` supplies the exact next byte cursor.
+and compute units. If the session names a resource, `BEGIN_INITIALIZE` also
+requires its program-owned copy to be sealed, with every committed chunk
+present. Each `RUN_INITIALIZE` supplies the exact next byte cursor.
 The callback receives the committed resource identity/schema/digest and the
 phase range and writes only the declared state range. The phase cursor moves
 forward until every declared byte has been initialized. Transition and render
@@ -120,10 +132,16 @@ through the stateful API after it is sealed.
 
 `BEGIN_PHASE` zeros the workspace payload before each publication. `ANCHOR`
 creates a session-bound `DAN3` account and processes 65,536-byte state slices
-under the phase lock. The accumulator uses `dcg/state-anchor/3`; `ADVANCE`
-refuses while the anchor phase is open. A small state can still use the
-one-shot v3 anchor path. After the session halts, a finished or abandoned
-anchor can be closed as a child account to recover its rent.
+under the phase lock. Chunked anchors use the
+`dcg/state-anchor-chunked/3` domain; the one-shot path uses the distinct
+`dcg/state-anchor-one-shot/3` domain and requires the active session authority
+to sign. `ADVANCE` refuses while the anchor phase is open. A small state can
+still use the one-shot v3 anchor path. After the session halts, a finished or
+abandoned anchor can be closed as a child account to recover its rent.
+
+State spans are closed from the highest index down. Each close subtracts that
+span's declared length and then reduces the live span count, keeping the
+remaining session record decodable until the final span and session are closed.
 
 ## Scaled SBF mechanics demonstration
 

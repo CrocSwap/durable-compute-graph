@@ -208,3 +208,70 @@ status.
 The feature SBF image, default revision-8 images, clean base archive, target,
 and ProgramTest logs were moved under `/private/tmp/trash-dcg-stateful-3-fix`
 after verification. No validator or deployed chain was used.
+
+## Follow-up fixes and measurements (2026-09-30, dispatch dcg-stateful-3-fix2)
+
+**Measured mechanics demonstration.** The full focused v3 SBF workload passed
+12 tests, 0 failed, in 154.58 seconds. The feature image was built with the
+pinned `cargo-build-sbf` and platform-tools v1.51 setup below. Its size was
+1,184,136 bytes and its SHA-256 was
+`e7f94cec2baf9cb351cddf5d6fa5dfa118cf127bb30f1fc64b97c7c9be321184`. The
+Rust target directory was 1.5 GiB after the runs, below the 4 GiB limit.
+
+The follow-up tests close both spans of a primary-plus-headered session and of
+the default two-span layout, then close the session and verify that all rent
+returns. They also exercise `HaltBefore` at the 8,192-byte snapshot cap with
+eight-step `ADVANCE`, reject initialization before the named resource copy is
+sealed, and verify the one-shot anchor authority, status, and distinct domain
+checks. The implementation closes state spans highest-index first and
+subtracts each closed span's length; it reuses one capped snapshot buffer. For
+state above 8,192 bytes, `HaltBefore` immutability remains the kernel's
+obligation.
+
+The v1 and v2 compatibility SBF workloads also passed, one test each. They
+exercise the unchanged wire formats with session address re-derivation added
+to the v1 and v2 session checks.
+
+### Follow-up focused test names
+
+- `stateful_v3_closes_two_spans_in_order_and_recovers_all_rent`
+- `stateful_v3_halt_before_at_snapshot_cap_with_eight_step_advance`
+- `stateful_v3_begin_initialization_requires_sealed_resource`
+- `stateful_v3_one_shot_anchor_requires_authority_and_active_session`
+- `stateful_v3_sbf_workload::stateful_consensus_stream_views_close_and_refusal_atomicity` (v1)
+- `stateful_v2_sbf_workload::stateful_v2_windows_resources_phased_views_and_lifecycle` (v2)
+
+The complete v3 workload also reran the eight tests listed above under
+“Focused test names.” These results are SBF ProgramTest mechanics evidence;
+they do not establish validator or deployed-chain behavior.
+
+### Follow-up commands
+
+```sh
+DCG_CARGO_BUILD_SBF=/Users/colkitt/.local/share/solana/install/active_release/bin/cargo-build-sbf \
+DCG_SBF_SDK=/private/tmp/basanos-sbf-sdk-v151-20260920 \
+DCG_SBF_TOOLS_VERSION=v1.51 \
+DCG_SBF_STAGING_NAME=dcg-stateful-3-fix2-staging \
+CARGO_TARGET_DIR=/private/tmp/basanos-dcg-stateful-3-fix2-target \
+  crates/dcg-program/scripts/build-sbf-reproducible.sh \
+  --features sbf-real-lifecycle-test \
+  --sbf-out-dir /private/tmp/dcg-stateful-3-fix2-sbf
+
+RUST_LOG=error BPF_OUT_DIR=/private/tmp/dcg-stateful-3-fix2-sbf \
+SBF_OUT_DIR=/private/tmp/dcg-stateful-3-fix2-sbf \
+CARGO_TARGET_DIR=/private/tmp/basanos-dcg-stateful-3-fix2-target \
+  cargo test --locked --offline --profile fasttest -p dcg-program \
+  --features sbf-real-lifecycle-test --test stateful_v3_sbf_workload \
+  -- --nocapture --test-threads=1
+
+RUST_LOG=error BPF_OUT_DIR=/private/tmp/dcg-stateful-3-fix2-sbf \
+SBF_OUT_DIR=/private/tmp/dcg-stateful-3-fix2-sbf \
+CARGO_TARGET_DIR=/private/tmp/basanos-dcg-stateful-3-fix2-target \
+  cargo test --locked --offline --profile fasttest -p dcg-program \
+  --features sbf-real-lifecycle-test --test stateful_sbf_workload \
+  --test stateful_v2_sbf_workload -- --nocapture --test-threads=1
+```
+
+The target and SBF output directories were moved to
+`/private/tmp/trash-dcg-stateful-3-fix2` after verification. No validator,
+deployed chain, network, or remote was used.

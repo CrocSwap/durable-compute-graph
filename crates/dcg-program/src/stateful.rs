@@ -354,7 +354,9 @@ fn checked_session(
     check_program_owned(account, program, writable)?;
     let raw = account.try_borrow_data()?;
     let session = decode_session(&raw)?;
-    if account.key != &session.self_key
+    let (derived_session_key, _) = session_pda(program, &session.authority, session.id);
+    if account.key != &derived_session_key
+        || account.key != &session.self_key
         || session.kernel_id != kernel.manifest().id
         || session.semantic_version != kernel.manifest().semantic_version
         || session.abi_version != kernel.manifest().abi_version

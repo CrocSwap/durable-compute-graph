@@ -270,8 +270,35 @@ fn begin_initialization_len(authority: Pubkey, session: Pubkey, len: u32) -> Ins
         vec![
             AccountMeta::new_readonly(authority, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(resource_pda(&session), false),
         ],
     )
+}
+
+fn one_shot_anchor(
+    authority: Pubkey,
+    session: Pubkey,
+    primary_layout: bool,
+    authority_signer: bool,
+) -> Instruction {
+    let mut payload = vec![v3::WIRE_VERSION];
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    let accounts = if primary_layout {
+        vec![
+            AccountMeta::new_readonly(state_pda(&session, 0), false),
+            AccountMeta::new_readonly(authority, authority_signer),
+            AccountMeta::new(session, false),
+            AccountMeta::new_readonly(stream_pda(&session), false),
+        ]
+    } else {
+        vec![
+            AccountMeta::new_readonly(authority, authority_signer),
+            AccountMeta::new(session, false),
+            AccountMeta::new_readonly(stream_pda(&session), false),
+            AccountMeta::new_readonly(state_pda(&session, 0), false),
+        ]
+    };
+    instruction(sw::TAG_ANCHOR, payload, accounts)
 }
 
 fn run_initialization(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction {
@@ -1548,6 +1575,418 @@ async fn stateful_v3_primary_and_headered_spans_advance_twice() {
         ),
         4
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stateful_v3_closes_two_spans_in_order_and_recovers_all_rent() {
+    let (mut context, _) = start_sbf().await;
+    let payer = context.payer.pubkey();
+
+    for (id, primary_layout) in [(15, true), (16, false)] {
+        let authority = keypair(id as u8);
+        let session = session_pda(&authority.pubkey(), id);
+        let stream = stream_pda(&session);
+        let states = [state_pda(&session, 0), state_pda(&session, 1)];
+        let open = if primary_layout {
+            open_counter_primary(payer, authority.pubkey(), id)
+        } else {
+            open_default(payer, authority.pubkey(), id)
+        };
+        send(
+            &mut context,
+            open,
+            &[&authority],
+            &format!("OPEN_SESSION-v3-close-two-spans-{id}"),
+            Ok(()),
+            false,
+        )
+        .await;
+        send(
+            &mut context,
+            create_stream(payer, session),
+            &[],
+            &format!("CREATE_STREAM-v3-close-two-spans-{id}"),
+            Ok(()),
+            false,
+        )
+        .await;
+
+        let mut create_state_data = vec![v3::WIRE_VERSION, 2];
+        create_state_data.extend_from_slice(&8u32.to_le_bytes());
+        create_state_data.extend_from_slice(&8u32.to_le_bytes());
+        send(
+            &mut context,
+            instruction(
+                sw::TAG_CREATE_STATE,
+                create_state_data,
+                vec![
+                    AccountMeta::new(payer, true),
+                    AccountMeta::new(session, false),
+                    AccountMeta::new(states[0], false),
+                    AccountMeta::new(states[1], false),
+                    AccountMeta::new_readonly(SYSTEM, false),
+                ],
+            ),
+            &[],
+            &format!("CREATE_STATE-v3-close-two-spans-{id}"),
+            Ok(()),
+            false,
+        )
+        .await;
+        let accounts = [session, stream, states[0], states[1]];
+        let mut rent_before_close = 0u64;
+        for key in accounts {
+            rent_before_close += account(&mut context, key).await.lamports;
+        }
+        let authority_balance_before = context
+            .banks_client
+            .get_balance(authority.pubkey())
+            .await
+            .unwrap_or(0);
+
+        send(
+            &mut context,
+            halt_session(authority.pubkey(), session, 0),
+            &[&authority],
+            &format!("HALT_SESSION-v3-close-two-spans-{id}"),
+            Ok(()),
+            false,
+        )
+        .await;
+        for index in (0..states.len()).rev() {
+            send(
+                &mut context,
+                close_child(session, states[index], authority.pubkey(), v3::KIND_STATE),
+                &[],
+                &format!("CLOSE_STATE-v3-span-{index}-session-{id}"),
+                Ok(()),
+                false,
+            )
+            .await;
+        }
+        send(
+            &mut context,
+            close_child(session, stream, authority.pubkey(), v3::KIND_STREAM),
+            &[],
+            &format!("CLOSE_STREAM-v3-close-two-spans-{id}"),
+            Ok(()),
+            false,
+        )
+        .await;
+        send(
+            &mut context,
+            close_session(session, authority.pubkey()),
+            &[],
+            &format!("CLOSE_SESSION-v3-close-two-spans-{id}"),
+            Ok(()),
+            false,
+        )
+        .await;
+
+        let authority_balance_after = context
+            .banks_client
+            .get_balance(authority.pubkey())
+            .await
+            .unwrap_or(0);
+        assert_eq!(
+            authority_balance_after - authority_balance_before,
+            rent_before_close,
+            "all session, stream, and state rent is refunded for layout {primary_layout}"
+        );
+        for key in accounts {
+            assert!(context
+                .banks_client
+                .get_account(key)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stateful_v3_halt_before_at_snapshot_cap_with_eight_step_advance() {
+    const SNAPSHOT_CAP_BYTES: u32 = 8 * 1024;
+    let resource = vec![0x5A; RESOURCE_LEN];
+    let (mut context, _) = start_sbf_with_resource(resource.clone()).await;
+    let payer = context.payer.pubkey();
+    let authority = keypair(77);
+    let id = 17;
+    let session = session_pda(&authority.pubkey(), id);
+    let state = state_pda(&session, 0);
+
+    send(
+        &mut context,
+        open_primary(payer, authority.pubkey(), id, resource_root(&resource)),
+        &[&authority],
+        "OPEN_SESSION-v3-halt-before-snapshot-cap",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        upload_resource_chunk(
+            authority.pubkey(),
+            session,
+            RESOURCE,
+            0,
+            &resource_proof(&resource, 0),
+        ),
+        &[&authority],
+        "RESOURCE_CHUNK-v3-halt-before-snapshot-cap",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        create_stream(payer, session),
+        &[],
+        "CREATE_STREAM-v3-halt-before-snapshot-cap",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        create_primary_state_len(payer, session, SNAPSHOT_CAP_BYTES),
+        &[],
+        "CREATE_STATE-v3-halt-before-snapshot-cap",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        begin_initialization_len(authority.pubkey(), session, SNAPSHOT_CAP_BYTES),
+        &[&authority],
+        "BEGIN_INITIALIZATION-v3-halt-before-snapshot-cap",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        run_initialization(authority.pubkey(), session, 0),
+        &[&authority],
+        "RUN_INITIALIZATION-v3-halt-before-snapshot-cap",
+        Ok(()),
+        false,
+    )
+    .await;
+    assert_eq!(
+        account(&mut context, state).await.data.len(),
+        SNAPSHOT_CAP_BYTES as usize
+    );
+
+    for sequence in 0..8 {
+        let command = if sequence == 7 { 0xEE } else { 1 };
+        send(
+            &mut context,
+            write_input(authority.pubkey(), session, sequence, command),
+            &[&authority],
+            &format!("WRITE_INPUT-v3-halt-before-cap-{sequence}"),
+            Ok(()),
+            false,
+        )
+        .await;
+    }
+    send(
+        &mut context,
+        advance(authority.pubkey(), session, 0, 8),
+        &[&authority],
+        "ADVANCE-v3-halt-before-cap-eight-steps",
+        Ok(()),
+        true,
+    )
+    .await;
+    let session_after = account(&mut context, session).await.data;
+    assert_eq!(session_after[6], 2);
+    assert_eq!(
+        u32::from_le_bytes(session_after[112..116].try_into().unwrap()),
+        7
+    );
+    assert_eq!(
+        u32::from_le_bytes(session_after[1254..1258].try_into().unwrap()),
+        app::V3_HALT_REASON
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            account(&mut context, state).await.data[SNAPSHOT_CAP_BYTES as usize - 8..]
+                .try_into()
+                .unwrap()
+        ),
+        7
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stateful_v3_begin_initialization_requires_sealed_resource() {
+    let resource = vec![0x5A; RESOURCE_LEN];
+    let (mut context, _) = start_sbf_with_resource(resource.clone()).await;
+    let payer = context.payer.pubkey();
+    let authority = keypair(78);
+    let id = 18;
+    let session = session_pda(&authority.pubkey(), id);
+
+    send(
+        &mut context,
+        open_primary(payer, authority.pubkey(), id, resource_root(&resource)),
+        &[&authority],
+        "OPEN_SESSION-v3-unsealed-init",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        create_stream(payer, session),
+        &[],
+        "CREATE_STREAM-v3-unsealed-init",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        create_primary_state_len(payer, session, 1_280),
+        &[],
+        "CREATE_STATE-v3-unsealed-init",
+        Ok(()),
+        false,
+    )
+    .await;
+    let session_before = account(&mut context, session).await;
+    send(
+        &mut context,
+        begin_initialization_len(authority.pubkey(), session, 1_280),
+        &[&authority],
+        "BEGIN_INITIALIZATION-v3-unsealed-resource-refused",
+        Err(v3::REFUSAL_RESOURCE),
+        true,
+    )
+    .await;
+    assert_eq!(account(&mut context, session).await, session_before);
+
+    send(
+        &mut context,
+        upload_resource_chunk(
+            authority.pubkey(),
+            session,
+            RESOURCE,
+            0,
+            &resource_proof(&resource, 0),
+        ),
+        &[&authority],
+        "RESOURCE_CHUNK-v3-seal-before-init",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        begin_initialization_len(authority.pubkey(), session, 1_280),
+        &[&authority],
+        "BEGIN_INITIALIZATION-v3-sealed-resource",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        run_initialization(authority.pubkey(), session, 0),
+        &[&authority],
+        "RUN_INITIALIZATION-v3-sealed-resource",
+        Ok(()),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stateful_v3_one_shot_anchor_requires_authority_and_active_session() {
+    let resource = vec![0x5A; RESOURCE_LEN];
+    let (mut context, _) = start_sbf_with_resource(resource.clone()).await;
+    let authority = keypair(79);
+    let (session, _, _) = open_fixed_small(&mut context, &authority, 19, &resource).await;
+
+    let session_before_unsigned_anchor = account(&mut context, session).await;
+    send(
+        &mut context,
+        one_shot_anchor(authority.pubkey(), session, true, false),
+        &[],
+        "ANCHOR-v3-one-shot-nonsigner-refused",
+        Err(v3::REFUSAL_AUTHORITY),
+        true,
+    )
+    .await;
+    assert_eq!(
+        account(&mut context, session).await,
+        session_before_unsigned_anchor
+    );
+
+    send(
+        &mut context,
+        one_shot_anchor(authority.pubkey(), session, true, true),
+        &[&authority],
+        "ANCHOR-v3-one-shot-valid-authority",
+        Ok(()),
+        true,
+    )
+    .await;
+    let session_after_anchor = account(&mut context, session).await;
+    assert_ne!(&session_after_anchor.data[192..224], &[0; 32]);
+    let state = account(&mut context, state_pda(&session, 0)).await;
+    let schema_id = app::V3_STATE_SCHEMA.id.to_le_bytes();
+    let schema_version = app::V3_STATE_SCHEMA.version.to_le_bytes();
+    let cursor = 0u32.to_le_bytes();
+    let mut expected_anchor = dcg_program::hash::Parts::new();
+    expected_anchor
+        .push(b"dcg/state-anchor-one-shot/3")
+        .push(&session_after_anchor.data[86..102])
+        .push(&schema_id)
+        .push(&schema_version)
+        .push(&cursor)
+        .push(&session_after_anchor.data[156..188])
+        .push(&state.data);
+    assert_eq!(
+        &session_after_anchor.data[192..224],
+        &expected_anchor.finish()
+    );
+
+    let wrong_authority = keypair(80);
+    send(
+        &mut context,
+        one_shot_anchor(wrong_authority.pubkey(), session, true, true),
+        &[&wrong_authority],
+        "ANCHOR-v3-one-shot-wrong-authority-refused",
+        Err(v3::REFUSAL_AUTHORITY),
+        true,
+    )
+    .await;
+    assert_eq!(account(&mut context, session).await, session_after_anchor);
+
+    send(
+        &mut context,
+        halt_session(authority.pubkey(), session, 0),
+        &[&authority],
+        "HALT_SESSION-v3-one-shot-anchor",
+        Ok(()),
+        false,
+    )
+    .await;
+    let halted_session = account(&mut context, session).await;
+    send(
+        &mut context,
+        one_shot_anchor(authority.pubkey(), session, true, true),
+        &[&authority],
+        "ANCHOR-v3-one-shot-halted-refused",
+        Err(v3::REFUSAL_LIVE),
+        true,
+    )
+    .await;
+    assert_eq!(account(&mut context, session).await, halted_session);
 }
 
 fn forged_session_resource(authority: Pubkey, id: u64) -> Vec<u8> {
