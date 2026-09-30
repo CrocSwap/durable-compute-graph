@@ -1,0 +1,17 @@
+[project]
+name = "dcg-sequencer"
+version = "0.1.0"
+description = "Pure-Python durable transaction sequencer for DCG clients"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dcg"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
