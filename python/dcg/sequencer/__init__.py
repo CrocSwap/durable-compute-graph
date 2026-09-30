@@ -2,8 +2,11 @@
 
 from .core import RunResult, Sequencer, StepOutcome
 from .journal import JournalEvent, JournalStore, SCHEMA_VERSION
+from .rpc import RpcConfig, SolanaRpcEndpoint
+from .signer import KeypairFileSigner
 from .types import (
     AmbiguousFate,
+    AccountInfo,
     Backoff,
     BlockhashExpired,
     BlockhashLease,
@@ -16,6 +19,7 @@ from .types import (
     PostconditionResult,
     ProgramRefused,
     RateLimited,
+    RpcConfigurationError,
     RecoveryEvidence,
     RetryPolicy,
     RpcEndpoint,
@@ -24,6 +28,7 @@ from .types import (
     SendReceipt,
     SignatureObservation,
     SignedTransaction,
+    SimulationResult,
     Signer,
     StepTimeCapExceeded,
     TransactionPlan,
@@ -32,6 +37,7 @@ from .types import (
 
 __all__ = [
     "AmbiguousFate",
+    "AccountInfo",
     "Backoff",
     "BlockhashExpired",
     "BlockhashLease",
@@ -45,7 +51,9 @@ __all__ = [
     "PlanError",
     "PostconditionResult",
     "ProgramRefused",
+    "RpcConfig",
     "RateLimited",
+    "RpcConfigurationError",
     "RecoveryEvidence",
     "RetryPolicy",
     "RpcEndpoint",
@@ -55,11 +63,14 @@ __all__ = [
     "Sequencer",
     "SequencerConfig",
     "SendReceipt",
+    "SolanaRpcEndpoint",
     "SignatureObservation",
     "SignedTransaction",
+    "SimulationResult",
     "Signer",
     "StepOutcome",
     "StepTimeCapExceeded",
+    "KeypairFileSigner",
     "TransactionPlan",
     "TransactionStep",
 ]
