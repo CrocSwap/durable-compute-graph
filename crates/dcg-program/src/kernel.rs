@@ -113,6 +113,27 @@ pub struct StateSpanMut<'a> {
     pub data: &'a mut [u8],
 }
 
+impl StateSpanMut<'_> {
+    /// Address of the first engine byte in this span. The adapter constructs
+    /// `data` after removing its account header, so this is the actual
+    /// invocation-local span address. Kernels may bind it for the duration of
+    /// a callback, but must never serialize or retain it after that callback.
+    pub fn data_address(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
+    }
+}
+
+/// A bounded publication phase over one declared output view. `source_offset`
+/// is in the canonical state byte string; `output_offset` is in this view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewPhase {
+    pub state_cursor: u32,
+    pub role: u8,
+    pub source_offset: u32,
+    pub output_offset: u32,
+    pub compute_units: u32,
+}
+
 /// A statically bound, versioned output ABI that a stateful application may
 /// expose as a view. `role` is application data, while the view's wire role
 /// and lifetime are enforced by the DCG adapter.
@@ -299,6 +320,86 @@ pub trait StatefulKernel: Kernel {
         let _ = spans;
         Err(KernelError::Refused)
     }
+
+    /// Initialise state from the resource accounts committed by the session
+    /// authority. The adapter authenticates the account keys and passes the
+    /// committed schema and digest. The application kernel must validate the
+    /// resource bytes against `commitment` (or validate its own bounded
+    /// inclusion proof) before using them. The default accepts only sessions
+    /// with no external resource.
+    fn initial_state_spans_with_resources(
+        &self,
+        resources: &[AccountSpan<'_>],
+        commitment: &[u8; 32],
+        spans: &mut [StateSpanMut<'_>],
+    ) -> Result<usize, KernelError> {
+        if !resources.is_empty() || *commitment != [0; 32] {
+            return Err(KernelError::Refused);
+        }
+        self.initial_state_spans(spans)
+    }
+
+    /// Maximum bytes staged by one deterministic view-publication phase.
+    /// Returning zero disables phased publication for this kernel.
+    fn max_view_phase_bytes(&self) -> u32 {
+        0
+    }
+
+    /// Static compute declaration required on every phase instruction. It is
+    /// checked against the SVM transaction ceiling; it is not a CU estimate.
+    fn view_phase_compute_units(&self) -> u32 {
+        0
+    }
+
+    /// Render one bounded part of a view into invocation-local output bytes.
+    /// The adapter supplies authenticated state slices and the view ABI/range.
+    /// The default implementation copies that range from canonical state.
+    fn render_view_phase(
+        &self,
+        phase: ViewPhase,
+        state: &[AccountSpan<'_>],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        let start = phase
+            .source_offset
+            .checked_add(phase.output_offset)
+            .ok_or(KernelError::InvalidInput)?;
+        let end = start
+            .checked_add(output.len() as u32)
+            .ok_or(KernelError::InvalidInput)?;
+        let mut copied = 0usize;
+        for span in state {
+            let span_end = span
+                .offset
+                .checked_add(span.data.len() as u32)
+                .ok_or(KernelError::InvalidInput)?;
+            let from = start.max(span.offset);
+            let to = end.min(span_end);
+            if from >= to {
+                continue;
+            }
+            let source = (from - span.offset) as usize;
+            let target = (from - start) as usize;
+            let len = (to - from) as usize;
+            output[target..target + len].copy_from_slice(&span.data[source..source + len]);
+            copied += len;
+        }
+        if copied != output.len() {
+            return Err(KernelError::InvalidInput);
+        }
+        Ok(copied)
+    }
+
+    /// Bind invocation-local engine state immediately before state callbacks.
+    /// A C adapter can use `StateSpanMut::data_address()` here to rebind its
+    /// context pointer; the address excludes the DCG account header.
+    fn bind_invocation_state(&self, _spans: &mut [StateSpanMut<'_>]) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    /// Clear any pointer installed by `bind_invocation_state` after the
+    /// callback. No pointer may be stored in a committed account.
+    fn unbind_invocation_state(&self) {}
 
     /// Apply one deterministic transition to a versioned, split state. A
     /// caller may invoke this at most `manifest().resources.max_operations`

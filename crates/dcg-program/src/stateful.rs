@@ -1617,7 +1617,7 @@ fn anchor(
 /// Invoke the protocol-v1 stateful account adapter with a statically linked
 /// application kernel. The surrounding application chooses the kernel and
 /// instruction tags; there is no dynamic loading or CPI to an engine.
-pub fn process_with_kernel(
+fn process_v1_with_kernel(
     program: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
@@ -1638,5 +1638,49 @@ pub fn process_with_kernel(
         TAG_CLOSE_ACCOUNT => close_account(program, accounts, data, kernel),
         TAG_ANCHOR => anchor(program, accounts, data, kernel),
         _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+/// Explicit version-2 stateful adapter. The v1 handler remains available for
+/// reproducing its original wire bytes; the dispatcher below selects the
+/// version from the instruction data.
+#[path = "stateful_v2.rs"]
+pub mod v2;
+
+/// Invoke the version named in the instruction's wire-version byte.
+pub fn process_with_kernel(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    kernel: &dyn StatefulKernel,
+) -> ProgramResult {
+    match data.get(1).copied() {
+        Some(2) => v2::process_with_kernel(program, accounts, data, kernel),
+        Some(WIRE_VERSION) => process_v1_with_kernel(program, accounts, data, kernel),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+/// Composition seam for application entrypoints that already dispatch other
+/// handlers. Stateful tags are handled by the supplied static kernel; every
+/// other instruction is passed to `existing_handlers`. This is a processor
+/// helper and intentionally defines no second Solana entrypoint.
+pub fn process_with_kernel_or_else<F>(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    kernel: &dyn StatefulKernel,
+    existing_handlers: F,
+) -> ProgramResult
+where
+    F: FnOnce(&Pubkey, &[AccountInfo], &[u8]) -> ProgramResult,
+{
+    if data
+        .first()
+        .is_some_and(|tag| (TAG_OPEN_SESSION..=TAG_ANCHOR).contains(tag))
+    {
+        process_with_kernel(program, accounts, data, kernel)
+    } else {
+        existing_handlers(program, accounts, data)
     }
 }
