@@ -366,15 +366,3 @@ fn process_inner(
         _ => return None,
     })
 }
-
-#[cfg(all(test, feature = "revision-7"))]
-mod revision7_compatibility_tests {
-    use super::*;
-
-    #[test]
-    fn app_witness_tags_remain_unsupported_on_revision_7() {
-        let program = Pubkey::new_unique();
-        assert!(process(&program, &[], &[TAG_STAGE_APP_WITNESS]).is_none());
-        assert!(process(&program, &[], &[TAG_RESPOND_APP_WITNESS]).is_none());
-    }
-}

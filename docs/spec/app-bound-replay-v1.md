@@ -10,13 +10,21 @@ identity must be versioned as specified below.
 An application manifest used for admission MUST pass `ApplicationManifest::validate`.
 Until a later app-bound replay version defines multi-input routes, each legacy
 form binding MUST declare at most one input route. That declaration selects
-the plan read ordinal that becomes the application's input span; other reads
-in the plan instance are outside this app replay contract and remain subject
-to their own first-divergent-leaf challenges. The selected ordinal MUST exist
-at every admitted instance of the bound form. A zero-span binding is accepted
-only when its replay opts into empty input spans and implements
-`replay_input_spans` for that case. Every route length MUST be a multiple of
-the bound kernel's input alignment. Every class whose form is
+the plan read ordinal that becomes the application's input span; the selected
+ordinal MUST exist at every admitted instance of the bound form. Other reads
+are outside this kernel's replay input binding. Their producer leaves can be
+challenged separately, but that does not check how this consumer used those
+reads. Applications must not treat those producer challenges as verification
+of the consumer's complete input use; a future multi-input version must bind
+every read on which replay depends.
+
+A binding with no input spans at an instance that has plan reads is refused
+unless its replay explicitly opts in with `accepts_empty_input_spans()`. That
+opt-in means replay accepts no opened plan input at that coordinate; the
+application is responsible for ensuring its result does not depend on those
+unbound reads. The default `replay_input_spans` adapter calls `replay(&[], …)`
+when the opt-in is present. Every route length MUST be a multiple of the bound
+kernel's input alignment. Every class whose form is
 bound by the manifest MUST be checked against the sealed plan at tag 160.
 Admission rejects with code 799 if any instance cannot be opened by the tag-184
 adapter, including when:
@@ -72,22 +80,24 @@ the application version or the kernel semantic version. A program upgrade
 that changes replay behavior without changing those versions is outside this
 identity guarantee and is invalid application versioning.
 
-At a fix-point, identity neutrality applies only when the registry shape is
-valid and the challenged coordinate selects an app binding. Non-app
-coordinates and registry-code convictions keep their ordinary rulings even in
-an app-bound document. A missing, newly bound, or changed identity on a
-selected app coordinate cannot be used to convict either role: the challenge
-is ruled with winner byte 0 and cause 5 (`APP_IDENTITY_CHANGED`), without
-setting DCM2's refuted flag or counter. Tag 131 refunds the challenger's
-challenge bond and changes only the open-challenge count.
+At a fix-point with registry code 0, a saved ARI1 identity whose manifest
+digest differs from the current manifest is ruled with winner byte 0 and cause
+5 (`APP_IDENTITY_CHANGED`), even when the current image no longer binds the
+challenged form. A saved identity with no current manifest is also ruled
+neutrally. When DCM2 has no saved identity, neutrality applies only if the
+current manifest binds the challenged coordinate. Registry-code convictions
+keep their ordinary rulings. Neutral identity rulings do not set DCM2's
+refuted flag or counter. Tag 131 refunds the challenger's challenge bond and
+changes only the open-challenge count.
 
 At timeout, identity neutrality applies only to a live DCR1 v6 app RESPOND
 record, after the handler verifies that the record is in a timeout-eligible
-phase. A phase-3 ruling cannot be changed by tag 132 after an app upgrade. The
-challenger receives no conviction or protocol bond pot, and the executor
-receives no challenge-bond transfer when a live app RESPOND record is ruled
-neutral. This rule records no computational finding under a replay identity
-different from the one admitted.
+phase, and follows the same saved-identity rules as a fix-point. A phase-3
+ruling cannot be changed by tag 132 after an app upgrade. The challenger
+receives no conviction or protocol bond pot, and the executor receives no
+challenge-bond transfer when a live app RESPOND record is ruled neutral. This
+rule records no computational finding under a replay identity different from
+the one admitted.
 
 The DCM2 ARI1 admission digest commits the whole static form table. A table
 change can therefore still neutralize a dispute at a selected app coordinate

@@ -96,9 +96,12 @@ that replays successfully wins; authenticated malformed input or a wrong
 output convicts the executor; a withheld opening loses at timeout. Tags 183
 and 184 accept the exact deadline slot, and tag 132 refuses at that slot and
 times out only after it in the implementation; the exact-slot source cases
-were not part of this SBF run. A changed app identity ends neutrally. Admission
-checks that every bound coordinate has a route the adapter can open and a
-complete witness no larger than the staging cap. The focused SBF suite covers
+were not part of this SBF run. Identity neutrality follows the saved admission
+identity: a changed saved digest or a saved identity with no current manifest
+ends neutrally even if that image no longer binds the form; without a saved
+identity, neutrality requires a current binding. Admission checks that every
+bound coordinate has a route the adapter can open and a complete witness no
+larger than the staging cap. The focused SBF suite covers
 both recorded ruling winners, post-ruling identity mutation refusal at tag 132,
 settlement to the recorded winner, malformed input, and a malicious challenger.
 The separate K=10,240 test reaches tag 184 with a 900-byte routed witness.

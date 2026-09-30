@@ -111,6 +111,62 @@ fn now() -> Result<u64, ProgramError> {
     Ok(Clock::get()?.slot)
 }
 
+/// Whether the admitted app replay identity is unavailable for this ruling.
+/// A saved identity with a different manifest digest, or with no manifest,
+/// always ends neutrally. Without a saved identity, neutrality is safe only
+/// when the current manifest still identifies this coordinate as app-bound.
+fn app_admission_identity_changed(
+    saved_identity: Option<[u8; APP_IDENTITY_BYTES]>,
+    current_digest: Option<[u8; 32]>,
+    app_binding_selected: bool,
+) -> bool {
+    match (saved_identity, current_digest) {
+        (Some(saved), Some(current)) => saved[4..36] != current,
+        (Some(_), None) => true,
+        (None, _) => app_binding_selected,
+    }
+}
+
+#[cfg(all(test, feature = "revision-8"))]
+mod app_identity_tests {
+    use super::app_admission_identity_changed;
+
+    #[test]
+    fn changed_saved_digest_is_neutral_even_after_binding_removal() {
+        let mut saved = [0; 64];
+        saved[4..36].fill(1);
+        assert!(app_admission_identity_changed(
+            Some(saved),
+            Some([2; 32]),
+            false
+        ));
+    }
+
+    #[test]
+    fn saved_identity_with_missing_manifest_is_neutral() {
+        let saved = [0; 64];
+        assert!(app_admission_identity_changed(Some(saved), None, false));
+    }
+
+    #[test]
+    fn missing_saved_identity_is_neutral_only_for_a_current_binding() {
+        assert!(app_admission_identity_changed(None, Some([1; 32]), true));
+        assert!(!app_admission_identity_changed(None, Some([1; 32]), false));
+        assert!(!app_admission_identity_changed(None, None, false));
+    }
+
+    #[test]
+    fn matching_saved_digest_does_not_neutralize_an_unbound_coordinate() {
+        let mut saved = [0; 64];
+        saved[4..36].fill(1);
+        assert!(!app_admission_identity_changed(
+            Some(saved),
+            Some([1; 32]),
+            false
+        ));
+    }
+}
+
 /// True when account 0 is a DCR1 v5 record (tag 131/132 dispatch).
 #[cfg(feature = "revision-7")]
 pub fn is_v5_record(accounts: &[AccountInfo]) -> bool {
@@ -758,12 +814,11 @@ fn fix_point(
         let saved_identity = None;
         #[cfg(feature = "revision-8")]
         let identity_changed = code == 0
-            && app_binding.is_some()
-            && match (saved_identity, application) {
-                (Some(saved), Some(app)) => saved[4..36] != app.admission_identity_digest(),
-                (Some(_), None) => true,
-                (None, _) => true,
-            };
+            && app_admission_identity_changed(
+                saved_identity,
+                application.map(|app| app.admission_identity_digest()),
+                app_binding.is_some(),
+            );
         #[cfg(not(feature = "revision-8"))]
         let identity_changed = false;
         let app_opening_supported = if let (Some(app), Some(_)) = (application, app_binding) {
@@ -2405,26 +2460,27 @@ pub fn timeout_with_manifest(
             return Err(no(DCR1_DEADLINE));
         }
     }
-    document::revision(program, &accounts[1], DCR1_AUTH)?;
     let mut raw = accounts[0].try_borrow_mut_data()?;
     record_document_v8(program, &raw, &accounts[1], true)?;
     let identity_changed = if raw[4] == PHASE_RESPOND
         && raw[6..8] == APP_REPLAY_VERSION.to_le_bytes()
     {
         let document_identity = document::application_identity_v8(&accounts[1].try_borrow_data()?)?;
-        let admission_identity_changed = match (document_identity, application) {
-            (Some(saved), Some(app)) => saved[4..36] != app.admission_identity_digest(),
-            (Some(_), None) | (None, Some(_)) => true,
-            (None, None) => false,
-        };
         let form = u16_at(&raw, DEV2_AT + 24, DCR1_BAD)?;
-        let current = application.and_then(|app| {
-            app.resolve_legacy_form(raw[MACHINE_AT], form)
-                .map(|binding| app.ruling_identity(binding))
-        });
-        let ruling_identity_changed = current.is_none_or(|identity| {
-            identity != raw[APP_IDENTITY_AT..APP_IDENTITY_AT + APP_IDENTITY_BYTES]
-        });
+        let current_binding =
+            application.and_then(|app| app.resolve_legacy_form(raw[MACHINE_AT], form));
+        let admission_identity_changed = app_admission_identity_changed(
+            document_identity,
+            application.map(|app| app.admission_identity_digest()),
+            current_binding.is_some(),
+        );
+        let ruling_identity_changed =
+            application
+                .zip(current_binding)
+                .is_some_and(|(app, binding)| {
+                    app.ruling_identity(binding)
+                        != raw[APP_IDENTITY_AT..APP_IDENTITY_AT + APP_IDENTITY_BYTES]
+                });
         admission_identity_changed || ruling_identity_changed
     } else {
         false

@@ -571,6 +571,9 @@ pub trait OptimisticReplay: Kernel {
         inputs: &[ReplayInputSpan<'_>],
         claimed_output: &[u8],
     ) -> Result<bool, KernelError> {
+        if inputs.is_empty() && self.accepts_empty_input_spans() {
+            return self.replay(&[], &[], claimed_output, &[]);
+        }
         let [input] = inputs else {
             return Err(KernelError::InvalidInput);
         };
@@ -1513,7 +1516,9 @@ mod tests {
         modes: &[ALIGNMENT_PROBE_MODE],
     };
     #[cfg(feature = "test-kernel")]
-    struct AlignmentProbe;
+    struct AlignmentProbe {
+        accepts_empty: bool,
+    }
     #[cfg(feature = "test-kernel")]
     impl Kernel for AlignmentProbe {
         fn manifest(&self) -> &'static KernelManifest {
@@ -1532,16 +1537,26 @@ mod tests {
 
         fn replay(
             &self,
-            _input: &[u8],
-            _prior_state: &[u8],
+            input: &[u8],
+            prior_state: &[u8],
             _claimed_output: &[u8],
-            _claimed_state: &[u8],
+            claimed_state: &[u8],
         ) -> Result<bool, KernelError> {
-            Ok(true)
+            Ok(input.is_empty() && prior_state.is_empty() && claimed_state.is_empty())
+        }
+
+        fn accepts_empty_input_spans(&self) -> bool {
+            self.accepts_empty
         }
     }
     #[cfg(feature = "test-kernel")]
-    static ALIGNMENT_PROBE: AlignmentProbe = AlignmentProbe;
+    static ALIGNMENT_PROBE: AlignmentProbe = AlignmentProbe {
+        accepts_empty: false,
+    };
+    #[cfg(feature = "test-kernel")]
+    static EMPTY_INPUT_PROBE: AlignmentProbe = AlignmentProbe {
+        accepts_empty: true,
+    };
     #[cfg(feature = "test-kernel")]
     static ALIGNMENT_PROBE_KERNELS: [&'static dyn Kernel; 1] = [&ALIGNMENT_PROBE];
     #[cfg(feature = "test-kernel")]
@@ -1673,6 +1688,19 @@ mod tests {
             Err(ManifestError::InvalidLegacyForm(701))
         );
         assert_eq!(test_kernel::MANIFEST_APP.validate(), Ok(()));
+    }
+
+    #[cfg(feature = "test-kernel")]
+    #[test]
+    fn default_empty_input_replay_calls_kernel_with_empty_bytes() {
+        assert!(EMPTY_INPUT_PROBE
+            .replay_input_spans(&[], &[])
+            .expect("the opt-in default adapter replays empty bytes"));
+        assert_eq!(
+            ALIGNMENT_PROBE.replay_input_spans(&[], &[]),
+            Err(KernelError::InvalidInput),
+            "an empty-input kernel without the opt-in still refuses"
+        );
     }
 
     #[cfg(feature = "test-kernel")]

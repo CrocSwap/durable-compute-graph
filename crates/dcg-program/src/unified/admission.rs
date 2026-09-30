@@ -34,6 +34,14 @@ fn check_app_binding(
     }
 }
 
+fn zero_span_with_reads_allowed(
+    read_count: u16,
+    input_span_count: usize,
+    accepts_empty_input_spans: bool,
+) -> bool {
+    input_span_count != 0 || read_count == 0 || accepts_empty_input_spans
+}
+
 /// The plan and manifest facts needed to decide whether one routed app
 /// opening can be admitted by the revision-8 adapter. Keeping the final
 /// decision in one pure function makes each unsupported provenance refusal
@@ -117,9 +125,24 @@ pub(crate) fn app_opening_bound(
     let binding = manifest
         .resolve_legacy_form(machine, entry.kernel_index)
         .ok_or_else(fail)?;
+    let accepts_empty_input_spans = manifest
+        .resolve_optimistic_replay(
+            binding.kernel_id,
+            binding.semantic_version,
+            binding.abi_version,
+            binding.mode,
+        )
+        .is_some_and(|replay| replay.replay.accepts_empty_input_spans());
+    if !zero_span_with_reads_allowed(
+        entry.read_count,
+        binding.input_spans.len(),
+        accepts_empty_input_spans,
+    ) {
+        return Err(fail());
+    }
     // Manifest routes select the plan reads that become application inputs;
-    // other plan reads remain outside the app replay contract. Every selected
-    // ordinal must exist at this particular plan coordinate.
+    // other plan reads are not authenticated as consumer inputs. Every
+    // selected ordinal must exist at this particular plan coordinate.
     if binding
         .input_routes
         .iter()
@@ -612,6 +635,14 @@ mod app_route_admission_tests {
     #[test]
     fn app_admission_accepts_a_bounded_same_segment_route() {
         assert_eq!(app_route_opening_bound(valid_route()), Ok(422));
+    }
+
+    #[test]
+    fn zero_span_bindings_with_plan_reads_require_explicit_replay_opt_in() {
+        assert!(!zero_span_with_reads_allowed(2, 0, false));
+        assert!(zero_span_with_reads_allowed(2, 0, true));
+        assert!(zero_span_with_reads_allowed(0, 0, false));
+        assert!(zero_span_with_reads_allowed(2, 1, false));
     }
 
     #[test]

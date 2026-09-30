@@ -115,6 +115,19 @@ use dcg_program::unified::result;
 use dcg_program::unified::terms::{
     Terms2, BOND_POLICY_CUSTOM, BOND_POLICY_STANDARD, TERMS_BYTES_V2,
 };
+
+#[cfg(feature = "sbf-unbound-form-test")]
+static PREVIOUS_APP_MANIFEST: dcg_program::kernel::ApplicationManifest =
+    dcg_program::kernel::ApplicationManifest {
+        application_id: b"dcg-test-app/1",
+        version: 1,
+        kernels: &dcg_program::kernel::test_kernel::KERNELS,
+        optimistic_replays: &dcg_program::kernel::test_kernel::REPLAY_BINDINGS,
+        legacy_forms: &dcg_program::kernel::test_kernel::BYTE_SUM_REAL_LIFECYCLE_FORMS,
+        require_legacy_form_binding: true,
+        hooks: &dcg_program::compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &dcg_program::compatibility::REVISION8_COMPATIBILITY,
+    };
 use dcg_program::unified::{
     SETTLEMENT_PROGRAM, TAG_ATTEST_OUTPUT, TAG_CHALLENGE_LEAF, TAG_CHALLENGE_POSITION,
     TAG_CLOSE_DOCUMENT, TAG_CLOSE_TEMPLATE, TAG_DESCEND, TAG_FINALIZE_DOCUMENT,
@@ -11130,7 +11143,24 @@ fn challenge_tree_with_app_leaves(
     entries: u32,
     app_leaves: &[(u32, u16, &[u8])],
 ) -> Vec<Vec<ChallengeNode>> {
-    let app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
+    challenge_tree_with_app_leaves_for(
+        &dcg_program::kernel::test_kernel::MANIFEST_APP,
+        descriptor,
+        position,
+        segment,
+        entries,
+        app_leaves,
+    )
+}
+
+fn challenge_tree_with_app_leaves_for(
+    app: &dcg_program::kernel::ApplicationManifest,
+    descriptor: &[u8; 32],
+    position: u32,
+    segment: u16,
+    entries: u32,
+    app_leaves: &[(u32, u16, &[u8])],
+) -> Vec<Vec<ChallengeNode>> {
     let digests = app_leaves
         .iter()
         .map(|(local, form, witness)| {
@@ -11390,7 +11420,36 @@ async fn commit_route_free_app_tree(
     u32,
     Vec<Vec<ChallengeNode>>,
 ) {
-    let app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
+    commit_route_free_app_tree_with_manifest(
+        f,
+        binding,
+        p,
+        ordinal,
+        target_form,
+        witness,
+        &dcg_program::kernel::test_kernel::MANIFEST_APP,
+        None,
+    )
+    .await
+}
+
+async fn commit_route_free_app_tree_with_manifest(
+    f: &mut Fix,
+    binding: &Binding2,
+    p: u32,
+    ordinal: usize,
+    target_form: u16,
+    witness: &[u8],
+    app: &'static dcg_program::kernel::ApplicationManifest,
+    saved_admission_digest: Option<[u8; 32]>,
+) -> (
+    [u8; 32],
+    [Pubkey; 4],
+    Vec<[u8; 32]>,
+    u16,
+    u32,
+    Vec<Vec<ChallengeNode>>,
+) {
     let mut adm = f.account(f.dea2).await;
     let flags = u16_at(&adm, 6) | 2;
     adm[6..8].copy_from_slice(&flags.to_le_bytes());
@@ -11418,7 +11477,8 @@ async fn commit_route_free_app_tree(
         .expect("the selected segment contains the requested app form");
     let t = x.entry_index(p, segment, target_local).unwrap();
     assert_eq!(x.entry(p, t).unwrap().kernel_index, target_form);
-    let levels = challenge_tree_with_app_leaves(
+    let levels = challenge_tree_with_app_leaves_for(
+        app,
         &descriptor,
         p,
         segment,
@@ -11453,6 +11513,26 @@ async fn commit_route_free_app_tree(
     let (actual_descriptor, created) = f.run_document_with_roots(binding, &positions).await;
     assert_eq!(actual_descriptor, descriptor);
     f.finalize(&descriptor, created, f.k).await;
+    if let Some(identity_digest) = saved_admission_digest {
+        let mut document = f.account(created[0]).await;
+        let option_count = document[BINDING_AT_V8 + 151] as usize;
+        let identity_at = OPTION_REGION_AT + 4 * option_count;
+        assert_eq!(document.len(), identity_at + document::APP_IDENTITY_BYTES);
+        document[identity_at..identity_at + 4].copy_from_slice(b"ARI1");
+        document[identity_at + 4..identity_at + 36].copy_from_slice(&identity_digest);
+        document[identity_at + 36..identity_at + 64].fill(0);
+        let lamports = f.lamports(created[0]).await;
+        f.ctx.set_account(
+            &created[0],
+            &shared(Account {
+                lamports,
+                data: document,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
     let document = f.account(created[0]).await;
     let identity = document::application_identity_v8(&document)
         .unwrap()
@@ -14306,12 +14386,11 @@ async fn rev8_unbound_form_refuses_admission_on_sbf() {
     panic!("expected an unbound form to refuse before admission completed");
 }
 
-/// A document may carry a stale app-wide digest while this selected form is
-/// not bound by the current image. Its non-app DCR1 stays v5 and follows the
-/// ordinary RESPOND timeout rule instead of ending neutrally.
+/// A saved app identity that differs from the current image ends neutrally at
+/// a fix-point, even when the current image no longer binds that coordinate.
 #[cfg(feature = "sbf-unbound-form-test")]
 #[tokio::test(flavor = "multi_thread")]
-async fn rev8_stale_manifest_does_not_neutralize_non_app_fixpoint_on_sbf() {
+async fn rev8_stale_manifest_neutralizes_non_app_fixpoint_on_sbf() {
     assert!(std::env::var_os("BASANOS_DCG_V8_SBF").is_some());
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
@@ -14377,35 +14456,91 @@ async fn rev8_stale_manifest_does_not_neutralize_non_app_fixpoint_on_sbf() {
         ],
     )
     .await
-    .expect("the non-app coordinate follows its ordinary fix-point path");
+    .expect("a stale saved app identity ends neutrally at the fix-point");
     let after = f.account(record).await;
-    assert_eq!(after[4], challenge::PHASE_RESPOND);
-    assert_eq!(after[5], 0);
-    assert_eq!(u16_at(&after, 6), 5, "the non-app DCR1 remains v5");
-    assert_ne!(after, before, "tag 169 records the ordinary fix-point");
-    let deadline = u64_at(&after, 148) + 1;
-    clock_to(&mut f, deadline).await;
-    send_fresh_with(
-        &mut f.ctx,
-        &f.signer,
-        f.program,
-        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
-        vec![
-            AccountMeta::new(record, false),
-            AccountMeta::new(created[0], false),
-        ],
-    )
-    .await
-    .expect("the ordinary non-app timeout path remains available");
-    let timed_out = f.account(record).await;
-    assert_eq!(timed_out[4], challenge::PHASE_RULED);
-    assert_eq!(timed_out[5], 2);
-    assert_eq!(timed_out[178], events::CAUSE_TIMEOUT);
-    assert_ne!(
+    assert_eq!(after[4], challenge::PHASE_RULED);
+    assert_eq!(
+        after[5], 0,
+        "the stale app identity cannot convict either role"
+    );
+    assert_eq!(u16_at(&after, 6), challenge::APP_REPLAY_VERSION);
+    assert_eq!(after[178], events::CAUSE_APP_IDENTITY_CHANGED);
+    assert_ne!(after, before, "tag 169 records a neutral identity ruling");
+    assert_eq!(
+        u32_at(&after, challenge::DEV2_AT + 8),
+        challenge::OUTCOME_IDENTITY_CHANGED as u32
+    );
+    assert_eq!(
         u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
         0,
-        "the non-app record takes its ordinary timeout ruling"
+        "neutral identity handling leaves the honest executor unrefuted"
     );
+    assert_eq!(u32_at(&f.account(created[0]).await, 132), 0);
+}
+
+/// The earlier app image admitted Form 256. This image has removed that
+/// binding; its identity digest therefore changes, and a correct committed
+/// ByteSum leaf must not be turned into an honest executor loss.
+#[cfg(feature = "sbf-unbound-form-test")]
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_removed_app_binding_after_admission_is_neutral_on_sbf() {
+    assert!(std::env::var_os("BASANOS_DCG_V8_SBF").is_some());
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let prior_app = &PREVIOUS_APP_MANIFEST;
+    let current_app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
+    assert!(prior_app.resolve_legacy_form(1, 256).is_some());
+    assert!(current_app.resolve_legacy_form(1, 256).is_none());
+
+    let binding = f.binding(29, 50);
+    let witness = app_route_producer_witness();
+    let saved_identity = prior_app.admission_identity_digest();
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree_with_manifest(
+            &mut f,
+            &binding,
+            79,
+            1,
+            256,
+            &witness,
+            prior_app,
+            Some(saved_identity),
+        )
+        .await;
+    let stored_identity = document::application_identity_v8(&f.account(created[0]).await)
+        .unwrap()
+        .expect("the admitted app document retains its old ARI1 identity");
+    assert_eq!(&stored_identity[4..36], &saved_identity);
+
+    let record = descend_position_challenge(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        118,
+        false,
+    )
+    .await;
+    let ruled = f.account(record).await;
+    assert_eq!(ruled[4], challenge::PHASE_RULED);
+    assert_eq!(
+        ruled[5], 0,
+        "the removed binding does not convict the executor"
+    );
+    assert_eq!(ruled[178], events::CAUSE_APP_IDENTITY_CHANGED);
+    assert_eq!(
+        u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
+        0,
+        "a correct app-format leaf remains unrefuted after binding removal"
+    );
+    let terms = Terms2::decode(&f.terms_raw).unwrap();
+    settle_and_close_neutral_app_challenge(&mut f, record, created, descriptor, &terms).await;
 }
 
 /// Build only the real K=10,240 PT1X/PT2S registry and admission path. This

@@ -80,12 +80,18 @@ executor with code 800. Committed inputs the selected kernel cannot replay
 rule against the executor with code 799. A successful replay rules for the
 executor. For a routed input, descend to the first divergent leaf: if a
 consumer correctly used a fabricated producer output, the consumer wins and
-the producer is the challenge target. A route-free binding must have no plan
-read routes; a routed binding must account for the instance's only read route.
-Admission rejects unsupported producer provenance and any opening that cannot
-fit the bounded witness. App-bound documents record an `ARI1` manifest
-identity; a later identity mismatch ends
-the challenge neutrally and refunds the challenger bond. The app path uses
+the producer is the challenge target. A binding may select one plan read even
+when the instance has other reads. Those other reads are not authenticated as
+inputs to this kernel replay; challenging their producers does not verify how
+this consumer used them. A zero-span binding at an instance with plan reads
+must opt in through `accepts_empty_input_spans()`; the application then declares
+that replay accepts no opened plan input there. Admission rejects unsupported
+producer provenance and any opening that cannot fit the bounded witness.
+App-bound documents record an `ARI1` manifest identity; a changed saved
+identity, or a saved identity with no current manifest, ends the challenge
+neutrally even if the current image removed the form binding. Without a saved
+identity, neutrality applies only when the current image still binds the
+coordinate. The app path uses
 DCR1 version 6 while it is in RESPOND; the version-5 compatibility record
 remains unchanged when no app binding is selected.
 
