@@ -96,3 +96,53 @@ revision-8 paths need cross-implementation tests against the crate before
 switch-over. Graph and sweep wire formats remain unspecified. Historical
 Basanos HClosure fixtures are also absent here, so the optional
 `legacy-basanos-fixtures` suite was not run.
+
+## Round 4 extraction attempt (2026-09-30)
+
+**The real revision-8 SBF lifecycle remains open.** The round-4 app-dispatch
+and account-span code has native unit coverage, but this attempt did not
+produce the requested honest and cheating documents through the real
+revision-8 handlers. The existing real-handler `unified_v8_bond` ProgramTest
+uses five small native settlement programs under fixture-only names. A trial
+with `prefer_bpf(true)` loaded `dcg_program.so`, then stopped before test
+execution because ProgramTest looked for `settler_honest.so` and reported
+`Program file data not available for settler_honest`. No SBF lifecycle CU is
+claimed from that attempt.
+
+The separate `bytesum_sbf_lifecycle` canary remains behind the
+`sbf-lifecycle-test` feature and still passes on the round-4 SBF image. This is
+a repeat of the bespoke tags 240–250 mechanics demonstration, not evidence
+that the app manifest is reached by a real revision-8 challenge. Its measured
+SBF image SHA-256 was
+`af45c579cb18a763b5e33e3edc5c63bc104e3553647accbf4939601a04b48a6e`. The
+reproduction command is the one above with `dcg-extract-4` substituted for
+`dcg-extract-3` in the target, staging, and output paths.
+
+| Instruction | Round 3 CU | Round 4 canary CU | Change |
+| --- | ---: | ---: | ---: |
+| Malformed tag 240–250, each | 186–188 | 188–190 | +2 each |
+| Register template | 6,158 | 6,489 | +331 |
+| Admit template | 2,378 | 2,380 | +2 |
+| Initialize honest document | 16,038 | 16,040 | +2 |
+| Land honest roots | 8,788 | 8,790 | +2 |
+| Finalize honest document | 7,321 | 7,323 | +2 |
+| Honest resolve | 8,374 | 8,376 | +2 |
+| Honest close and refund | 11,586 | 11,588 | +2 |
+| Initialize cheating document | 14,538 | 14,540 | +2 |
+| Land cheating roots | 5,788 | 5,790 | +2 |
+| Finalize cheating document | 4,321 | 4,323 | +2 |
+| Challenge | 4,438 | 4,440 | +2 |
+| Bisect, round 0 | 2,726 | 2,728 | +2 |
+| Bisect, round 1 | 2,698 | 2,700 | +2 |
+| Replay disputed step | 5,052 | 5,054 | +2 |
+| Settle against cheater | 5,719 | 5,721 | +2 |
+| Cheating close | 10,088 | 10,090 | +2 |
+
+The 11 malformed CU values in order were 188, 189, 188, 189, 190, 188, 189,
+190, 188, 189, and 190. The round-4 canary retest passed 1/1. These are
+measured mechanics values from the canary image; they do not estimate the CU
+cost of the app-manifest replay path.
+
+The remaining stateful design includes the input stream, engine-state
+accounts, views, and session close. No wire format was introduced for these
+features.

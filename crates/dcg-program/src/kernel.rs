@@ -64,6 +64,71 @@ pub struct KernelManifest {
     pub modes: &'static [ModeId],
 }
 
+/// A region of account data selected by the application's compiled SVM
+/// adapter. The adapter authenticates the account and bounds before a kernel
+/// receives this view. `schema` identifies the region layout independently of
+/// the kernel's semantic and ABI versions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountSpan<'a> {
+    pub key: [u8; 32],
+    pub owner: [u8; 32],
+    pub is_signer: bool,
+    pub is_writable: bool,
+    pub schema: VersionedId,
+    pub offset: u32,
+    pub data: &'a [u8],
+}
+
+impl AccountSpan<'_> {
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+/// The owner rule for a statically declared account span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanOwner {
+    Program,
+    Exact([u8; 32]),
+}
+
+/// A static account/region selection belonging to a legacy form adapter.
+/// Account indices refer to the five PT2S/route/geometry/registry/PT1S
+/// accounts passed to the revision-8 fix-point adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountSpanBinding {
+    pub account_index: u8,
+    /// `None` uses the account key already authenticated by the lifecycle
+    /// handler. Applications may pin a more specific key when appropriate.
+    pub key: Option<[u8; 32]>,
+    pub owner: SpanOwner,
+    pub is_signer: bool,
+    pub is_writable: bool,
+    pub schema: VersionedId,
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// Application-selected bridge from one frozen revision-8 form row to an
+/// exact compiled kernel identity. This is app-image configuration; it adds
+/// no fields to a revision-8 document or instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyFormBinding {
+    pub machine_selector: Option<u8>,
+    pub form_id: u16,
+    pub kernel_id: KernelId,
+    pub semantic_version: u16,
+    pub abi_version: u16,
+    pub mode: ModeId,
+    /// Input spans come first; the final span contains the claimed output.
+    pub input_span_count: u8,
+    pub spans: &'static [AccountSpanBinding],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelError {
     InputTooLarge,
@@ -78,6 +143,22 @@ pub enum KernelError {
 pub trait Kernel: Sync {
     fn manifest(&self) -> &'static KernelManifest;
     fn execute(&self, input: &[u8], output: &mut [u8]) -> Result<usize, KernelError>;
+
+    /// Multi-account kernels may override this method. A pure byte kernel
+    /// keeps the convenient single-slice implementation by default.
+    fn execute_spans(
+        &self,
+        inputs: &[AccountSpan<'_>],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        let [input] = inputs else {
+            return Err(KernelError::InvalidInput);
+        };
+        if input.schema != self.manifest().input.id {
+            return Err(KernelError::InvalidInput);
+        }
+        self.execute(input.data, output)
+    }
 }
 
 /// Optional state-transition contract. Consensus-only kernels may implement
@@ -107,6 +188,23 @@ pub trait OptimisticReplay: Kernel {
         claimed_output: &[u8],
         claimed_state: &[u8],
     ) -> Result<bool, KernelError>;
+
+    /// Account-span convenience for adapters that authenticate account
+    /// identity, role, and schema before invoking the replay implementation.
+    fn replay_spans(
+        &self,
+        inputs: &[AccountSpan<'_>],
+        claimed_output: &[u8],
+        claimed_state: &[u8],
+    ) -> Result<bool, KernelError> {
+        let [input] = inputs else {
+            return Err(KernelError::InvalidInput);
+        };
+        if input.schema != self.replay_manifest().input.id {
+            return Err(KernelError::InvalidInput);
+        }
+        self.replay(input.data, &[], claimed_output, claimed_state)
+    }
 }
 
 /// A statically linked replay implementation bound to one advertised mode.
@@ -123,6 +221,12 @@ pub struct ApplicationManifest {
     pub version: u16,
     pub kernels: &'static [&'static dyn Kernel],
     pub optimistic_replays: &'static [OptimisticReplayBinding],
+    /// Optional app-selected mappings from revision-8 form rows to kernels.
+    /// An empty list leaves the historical adapter's behavior unchanged.
+    pub legacy_forms: &'static [LegacyFormBinding],
+    /// When true, a form without an explicit app mapping is refused rather
+    /// than handled by the historical profile adapter.
+    pub require_legacy_form_binding: bool,
 }
 
 impl ApplicationManifest {
@@ -187,6 +291,99 @@ impl ApplicationManifest {
             index += 1;
         }
         None
+    }
+
+    /// Resolve an app binding, preferring an exact machine selector over a
+    /// machine-neutral binding. Duplicate bindings are rejected by
+    /// `validate`, so this order is deterministic.
+    pub fn resolve_legacy_form(
+        &self,
+        machine_selector: u8,
+        form_id: u16,
+    ) -> Option<&'static LegacyFormBinding> {
+        self.legacy_forms
+            .iter()
+            .find(|binding| {
+                binding.machine_selector == Some(machine_selector) && binding.form_id == form_id
+            })
+            .or_else(|| {
+                self.legacy_forms.iter().find(|binding| {
+                    binding.machine_selector.is_none() && binding.form_id == form_id
+                })
+            })
+    }
+
+    /// Re-execute a historical form only through the exact identity and mode
+    /// selected by this app's static manifest. `spans` has already been
+    /// formed by the SVM adapter after account checks and alias validation.
+    pub fn replay_legacy_form(
+        &self,
+        binding: &LegacyFormBinding,
+        spans: &[AccountSpan<'_>],
+    ) -> Result<bool, ManifestRunError> {
+        let expected_spans = binding.spans.len();
+        let input_count = binding.input_span_count as usize;
+        if input_count == 0 || expected_spans != input_count + 1 || spans.len() != expected_spans {
+            return Err(ManifestRunError::InvalidSpanCount);
+        }
+        let replay = self
+            .resolve_optimistic_replay(
+                binding.kernel_id,
+                binding.semantic_version,
+                binding.abi_version,
+                binding.mode,
+            )
+            .ok_or(ManifestRunError::KernelUnavailable)?;
+        let kernel = self
+            .resolve(
+                binding.kernel_id,
+                binding.semantic_version,
+                binding.abi_version,
+            )
+            .ok_or(ManifestRunError::KernelUnavailable)?;
+        let manifest = kernel.manifest();
+        let replay_manifest = replay.replay.replay_manifest();
+        if replay_manifest.id != manifest.id
+            || replay_manifest.semantic_version != manifest.semantic_version
+            || replay_manifest.abi_version != manifest.abi_version
+        {
+            return Err(ManifestRunError::KernelUnavailable);
+        }
+        if !manifest.modes.contains(&binding.mode) {
+            return Err(ManifestRunError::ModeUnsupported);
+        }
+        if manifest.input.alignment == 0 {
+            return Err(ManifestRunError::InputAlignment);
+        }
+        let input_limit =
+            (manifest.input.max_bytes as usize).min(manifest.resources.max_input_bytes as usize);
+        let mut total_input = 0usize;
+        for span in &spans[..input_count] {
+            if span.schema != manifest.input.id {
+                return Err(ManifestRunError::SpanSchema);
+            }
+            if span.is_empty() || span.len() % manifest.input.alignment as usize != 0 {
+                return Err(ManifestRunError::InputAlignment);
+            }
+            total_input = total_input
+                .checked_add(span.len())
+                .ok_or(ManifestRunError::InputLimit)?;
+        }
+        if total_input > input_limit {
+            return Err(ManifestRunError::InputLimit);
+        }
+        let claimed = spans.last().ok_or(ManifestRunError::InvalidSpanCount)?;
+        if claimed.schema != manifest.output.id
+            || claimed.len()
+                > (manifest.output.max_bytes as usize)
+                    .min(manifest.resources.max_output_bytes as usize)
+        {
+            return Err(ManifestRunError::SpanSchema);
+        }
+        replay
+            .replay
+            .replay_spans(&spans[..input_count], claimed.data, &[])
+            .map_err(ManifestRunError::Kernel)
     }
 
     /// Run one already-authenticated byte transition through a kernel that
@@ -303,6 +500,61 @@ impl ApplicationManifest {
                 ));
             }
         }
+        for (i, binding) in self.legacy_forms.iter().enumerate() {
+            if binding.form_id == 0
+                || binding.input_span_count == 0
+                || binding.spans.len() != binding.input_span_count as usize + 1
+            {
+                return Err(ManifestError::InvalidLegacyForm(binding.form_id));
+            }
+            if self.legacy_forms.iter().skip(i + 1).any(|other| {
+                other.machine_selector == binding.machine_selector
+                    && other.form_id == binding.form_id
+            }) {
+                return Err(ManifestError::DuplicateLegacyForm(binding.form_id));
+            }
+            let Some(kernel) = self.resolve(
+                binding.kernel_id,
+                binding.semantic_version,
+                binding.abi_version,
+            ) else {
+                return Err(ManifestError::LegacyKernelUnavailable(binding.form_id));
+            };
+            let kernel_manifest = kernel.manifest();
+            if !kernel_manifest.modes.contains(&binding.mode)
+                || self
+                    .resolve_optimistic_replay(
+                        binding.kernel_id,
+                        binding.semantic_version,
+                        binding.abi_version,
+                        binding.mode,
+                    )
+                    .is_none()
+            {
+                return Err(ManifestError::LegacyModeUnsupported(binding.form_id));
+            }
+            for (index, span) in binding.spans.iter().enumerate() {
+                let expected_schema = if index < binding.input_span_count as usize {
+                    kernel_manifest.input.id
+                } else {
+                    kernel_manifest.output.id
+                };
+                let max_bytes = if index < binding.input_span_count as usize {
+                    (kernel_manifest.input.max_bytes as usize)
+                        .min(kernel_manifest.resources.max_input_bytes as usize)
+                } else {
+                    (kernel_manifest.output.max_bytes as usize)
+                        .min(kernel_manifest.resources.max_output_bytes as usize)
+                };
+                if span.schema != expected_schema
+                    || span.length == 0
+                    || span.length as usize > max_bytes
+                    || span.offset.checked_add(span.length).is_none()
+                {
+                    return Err(ManifestError::InvalidLegacyForm(binding.form_id));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -317,6 +569,10 @@ pub enum ManifestError {
     ReplayNotRegistered(KernelId),
     ReplayModeUnsupported(KernelId, ModeId),
     DuplicateReplay(KernelId, ModeId),
+    InvalidLegacyForm(u16),
+    DuplicateLegacyForm(u16),
+    LegacyKernelUnavailable(u16),
+    LegacyModeUnsupported(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,6 +584,8 @@ pub enum ManifestRunError {
     OutputBufferTooSmall,
     InvalidOutputLength,
     Kernel(KernelError),
+    InvalidSpanCount,
+    SpanSchema,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,11 +810,45 @@ pub mod test_kernel {
         mode: MODE_OPTIMISTIC_V1,
         replay: &BYTE_SUM,
     }];
+    pub static BYTE_SUM_SPANS: [AccountSpanBinding; 2] = [
+        AccountSpanBinding {
+            account_index: 4,
+            key: None,
+            owner: SpanOwner::Program,
+            is_signer: false,
+            is_writable: false,
+            schema: VersionedId { id: 1, version: 1 },
+            offset: 0,
+            length: 3,
+        },
+        AccountSpanBinding {
+            account_index: 4,
+            key: None,
+            owner: SpanOwner::Program,
+            is_signer: false,
+            is_writable: false,
+            schema: VersionedId { id: 2, version: 1 },
+            offset: 3,
+            length: 8,
+        },
+    ];
+    pub static BYTE_SUM_LEGACY_FORMS: [LegacyFormBinding; 1] = [LegacyFormBinding {
+        machine_selector: Some(1),
+        form_id: 22,
+        kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
+        semantic_version: 1,
+        abi_version: 1,
+        mode: MODE_OPTIMISTIC_V1,
+        input_span_count: 1,
+        spans: &BYTE_SUM_SPANS,
+    }];
     pub static MANIFEST_APP: ApplicationManifest = ApplicationManifest {
         application_id: b"dcg-test-app/1",
         version: 1,
         kernels: &KERNELS,
         optimistic_replays: &REPLAY_BINDINGS,
+        legacy_forms: &BYTE_SUM_LEGACY_FORMS,
+        require_legacy_form_binding: true,
     };
 }
 
@@ -628,6 +920,49 @@ mod tests {
             ),
             Err(ManifestRunError::InputLimit)
         );
+
+        let binding = m.resolve_legacy_form(1, 22).unwrap();
+        let input = [1u8, 2, 3];
+        let claimed = 6u64.to_le_bytes();
+        let spans = [
+            AccountSpan {
+                key: [4; 32],
+                owner: [5; 32],
+                is_signer: false,
+                is_writable: false,
+                schema: VersionedId { id: 1, version: 1 },
+                offset: 0,
+                data: &input,
+            },
+            AccountSpan {
+                key: [4; 32],
+                owner: [5; 32],
+                is_signer: false,
+                is_writable: false,
+                schema: VersionedId { id: 2, version: 1 },
+                offset: 3,
+                data: &claimed,
+            },
+        ];
+        assert_eq!(m.replay_legacy_form(binding, &spans), Ok(true));
+        let bad_claim = 7u64.to_le_bytes();
+        let mut bad_spans = spans;
+        bad_spans[1].data = &bad_claim;
+        assert_eq!(m.replay_legacy_form(binding, &bad_spans), Ok(false));
+
+        let mut wrong_abi = *binding;
+        wrong_abi.abi_version = 2;
+        assert_eq!(
+            m.replay_legacy_form(&wrong_abi, &spans),
+            Err(ManifestRunError::KernelUnavailable)
+        );
+        let mut unknown_id = *binding;
+        unknown_id.kernel_id = KernelId([0xFF; 16]);
+        assert_eq!(
+            m.replay_legacy_form(&unknown_id, &spans),
+            Err(ManifestRunError::KernelUnavailable)
+        );
+        assert!(m.resolve_legacy_form(2, 22).is_none());
     }
 
     #[test]

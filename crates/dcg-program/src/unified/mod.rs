@@ -108,9 +108,13 @@ pub const DCR1_PHASE: u32 = 733;
 pub const DCR1_PROOF: u32 = 734;
 pub const DCR1_DEADLINE: u32 = 736;
 pub const DCR1_INCOMPLETE: u32 = 741;
+/// Application-manifest lookup failed for a selected legacy form.
+pub const APP_KERNEL_UNAVAILABLE: u32 = 799;
+/// An app kernel replay rejected the committed output at a fix-point.
+pub const APP_KERNEL_MISMATCH: u32 = 800;
 
 /// Codes that, returned by the per-instance check at a fix-point, convict.
-pub const CONVICT_CODES: [u32; 8] = [
+pub const CONVICT_CODES: [u32; 9] = [
     FORM_ABSENT,
     WITHDRAW_ONLY,
     OVER_CU,
@@ -119,6 +123,7 @@ pub const CONVICT_CODES: [u32; 8] = [
     WITNESS_DOMAIN,
     RANGE_BOUND,
     crate::kernels::decision::ERR_OPTION_RANGE,
+    APP_KERNEL_MISMATCH,
 ];
 
 pub(crate) fn no(code: u32) -> ProgramError {
@@ -161,6 +166,27 @@ pub(crate) fn d32(b: &[u8], at: usize, code: u32) -> Result<[u8; 32], ProgramErr
 /// program. Tag 186 is the revision-8 template close.
 #[cfg(feature = "revision-7")]
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Option<ProgramResult> {
+    process_inner(program, accounts, data, None)
+}
+
+/// Revision-8 application-dispatch entry. The supplied manifest is compiled
+/// into the caller's image; only the tag-169 fix-point path consumes it.
+pub fn process_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &'static crate::kernel::ApplicationManifest,
+) -> Option<ProgramResult> {
+    process_inner(program, accounts, data, Some(manifest))
+}
+
+#[cfg(feature = "revision-7")]
+fn process_inner(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: Option<&'static crate::kernel::ApplicationManifest>,
+) -> Option<ProgramResult> {
     Some(match data.first().copied()? {
         TAG_REGISTRY_CREATE => registry::create(program, accounts, data),
         TAG_REGISTRY_WRITE => registry::write(program, accounts, data),
@@ -172,10 +198,12 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Optio
         TAG_FINALIZE_DOCUMENT => document::finalize(program, accounts, data),
         TAG_REVEAL_POSITION => challenge::reveal_position(program, accounts, data),
         TAG_SELECT_SEGMENT => challenge::select_segment(program, accounts, data),
-        TAG_CHALLENGE_LEAF => challenge::challenge_leaf(program, accounts, data),
+        TAG_CHALLENGE_LEAF => {
+            challenge::challenge_leaf_with_manifest(program, accounts, data, manifest)
+        }
         TAG_CHALLENGE_POSITION => challenge::challenge_position(program, accounts, data),
-        TAG_REVEAL => challenge::reveal(program, accounts, data),
-        TAG_DESCEND => challenge::descend(program, accounts, data),
+        TAG_REVEAL => challenge::reveal_with_manifest(program, accounts, data, manifest),
+        TAG_DESCEND => challenge::descend_with_manifest(program, accounts, data, manifest),
         TAG_REVEAL_FAMILY_TABLE => challenge::reveal_family_table(program, accounts, data),
         TAG_CLOSE_RESPONSE => challenge::close_response(program, accounts, data),
         TAG_CLOSE_RESULT => result::close_result(program, accounts, data),
@@ -201,6 +229,16 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Optio
 /// available to the distinct root-only challenge module for its own records.
 #[cfg(feature = "revision-8")]
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Option<ProgramResult> {
+    process_inner(program, accounts, data, None)
+}
+
+#[cfg(feature = "revision-8")]
+fn process_inner(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: Option<&'static crate::kernel::ApplicationManifest>,
+) -> Option<ProgramResult> {
     let tag = data.first().copied()?;
     if matches!(
         tag,
@@ -228,10 +266,12 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Optio
         TAG_FINALIZE_DOCUMENT => document::finalize(program, accounts, data),
         TAG_REVEAL_POSITION => challenge::reveal_position(program, accounts, data),
         TAG_SELECT_SEGMENT => challenge::select_segment(program, accounts, data),
-        TAG_CHALLENGE_LEAF => challenge::challenge_leaf(program, accounts, data),
+        TAG_CHALLENGE_LEAF => {
+            challenge::challenge_leaf_with_manifest(program, accounts, data, manifest)
+        }
         TAG_CHALLENGE_POSITION => challenge::challenge_position(program, accounts, data),
-        TAG_REVEAL => challenge::reveal(program, accounts, data),
-        TAG_DESCEND => challenge::descend(program, accounts, data),
+        TAG_REVEAL => challenge::reveal_with_manifest(program, accounts, data, manifest),
+        TAG_DESCEND => challenge::descend_with_manifest(program, accounts, data, manifest),
         TAG_REVEAL_FAMILY_TABLE => challenge::reveal_family_table(program, accounts, data),
         // CloseResponseV5 is a revision-7-only path. Claim its tag so it cannot
         // fall through to the legacy root-only dispatcher, but do not link the

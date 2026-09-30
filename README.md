@@ -44,8 +44,11 @@ returns `None` because no typed-decision producer is linked. The default test
 image therefore refuses tags 120–124 and 126–129 and is not a replacement for
 Basanos's revision-8 image.
 
-For a first-hour path through the kernel contract, manifest, SBF build, and
-lifecycle canary, see [`docs/getting-started.md`](docs/getting-started.md).
+For a first-hour path through the kernel contract, app manifest, authenticated
+account spans, and the extracted revision-8 handler tests, see
+[`docs/getting-started.md`](docs/getting-started.md). The separate
+`bytesum_sbf_lifecycle` target is an isolated canary, not the revision-8
+lifecycle.
 
 ## Kernel contract: what a developer implements
 
@@ -58,16 +61,22 @@ implement `Kernel`. A kernel manifest declares:
 
 `Kernel::execute` accepts authenticated canonical bytes and writes canonical
 output bytes. Stateful kernels may additionally implement `StatefulKernel`;
-optimistically replayable kernels may implement `OptimisticReplay`. The
-application separately supplies a `ResolutionBackend` that owns admission,
-challenge transitions, and resolution status. Commitment-scheme versions are
-independent of kernel, ABI, and mode versions. The core performs exact static
-registry lookup and has no dynamic loading path or `AccountInfo` in its byte
-contract.
+optimistically replayable kernels may implement `OptimisticReplay`. An
+application can bind an old revision-8 form row to an exact kernel semantic
+version, ABI version, and mode in its static manifest. At the challenge
+fix-point, the SVM adapter checks account identity, owner, signer/writable
+roles, schema, region bounds, and aliases before it forms the kernel's span
+view. A byte-only kernel such as `ByteSum` continues to use its single-slice
+method. No revision-8 instruction or document bytes change.
 
-The included `ByteSum` test kernel exercises the compiled manifest, byte
-execution, SHA-256 commitment, and an optimistic lifecycle backend in the
-lifecycle harness. It is a seam test, not a model-capability demonstration.
+The application separately supplies a `ResolutionBackend` that owns
+admission, challenge transitions, and resolution status. Commitment-scheme
+versions are independent of kernel, ABI, and mode versions. The core has no
+dynamic loading path; `AccountInfo` is confined to the SVM adapter.
+
+The included `ByteSum` test kernel exercises the compiled manifest and
+authenticated-span replay in focused tests. It is a mechanics test, not a
+model-capability demonstration.
 
 ## Checks and standalone SBF image
 
@@ -82,10 +91,15 @@ resolve-check, and bond tests. Tests gated by the optional
 `legacy-basanos-fixtures` feature require historical Basanos v7/rung-D fixtures
 that are not included here.
 
-Measured on 2026-09-30: 87 tests passed with the default command above. The
-SBF-only lifecycle canary is a separate ProgramTest invocation and passed one
-test; its measured CU by instruction and image identity are in
+Measured before the app-dispatch change on 2026-09-30: 87 tests passed with the
+default command above. The SBF-only lifecycle canary is a separate ProgramTest
+invocation and passed one test; its measured CU by instruction and image identity are in
 [`docs/experiments/bytesum-sbf-lifecycle-2026-09-30.md`](docs/experiments/bytesum-sbf-lifecycle-2026-09-30.md).
+
+The canary uses bespoke test-only tags 240–250 and its own compact account
+layout. It does not exercise registry/admission, document init/roots/finalize,
+attest/resolve, challenge descent, or the extracted close handlers. Full SBF
+execution of that real handler sequence remains open.
 
 Measured lifecycle test image built with `cargo-build-sbf 3.0.15` and
 platform-tools v1.51: 792,056 bytes, SHA-256

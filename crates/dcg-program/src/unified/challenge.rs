@@ -441,11 +441,12 @@ fn fix_point(
     p: u32,
     segment: u16,
     local: u32,
+    application: Option<&'static crate::kernel::ApplicationManifest>,
 ) -> Result<bool, ProgramError> {
     let [pt2s, routes, geometry, drp2, pt1s] = plan_accounts else {
         return Err(no(DCR1_BAD));
     };
-    let (t, form, code, row, root) = {
+    let (t, form, mut code, row, root) = {
         let d = doc.try_borrow_data()?;
         bind_plan(program, &d, pt2s, routes, geometry, Some(drp2))?;
         let s = pt2s.try_borrow_data()?;
@@ -503,6 +504,39 @@ fn fix_point(
         }
         (t, e.kernel_index, code, row, d32(&d, 392, DCR1_BAD)?)
     };
+    if code == 0 {
+        if let Some(application) = application {
+            let machine_selector = raw[MACHINE_AT];
+            let binding = application.resolve_legacy_form(machine_selector, form);
+            if let Some(binding) = binding {
+                let replay_matches = crate::kernel_svm::with_account_spans(
+                    program,
+                    plan_accounts,
+                    binding.spans,
+                    |spans| {
+                        application
+                            .replay_legacy_form(binding, spans)
+                            .map_err(|error| {
+                                use crate::kernel::ManifestRunError;
+                                let code = match error {
+                                    ManifestRunError::KernelUnavailable
+                                    | ManifestRunError::ModeUnsupported => {
+                                        super::APP_KERNEL_UNAVAILABLE
+                                    }
+                                    _ => DCR1_BAD,
+                                };
+                                no(code)
+                            })
+                    },
+                )?;
+                if !replay_matches {
+                    code = super::APP_KERNEL_MISMATCH;
+                }
+            } else if application.require_legacy_form_binding {
+                return Err(no(super::APP_KERNEL_UNAVAILABLE));
+            }
+        }
+    }
     // Review R3: DEV2 lies inside the descent area; clear first, then write.
     raw[HEADER..PATH_LEN_AT].fill(0);
     raw[170..174].copy_from_slice(&t.to_le_bytes());
@@ -958,6 +992,15 @@ pub fn challenge_position(
 /// root with the derived `segment_table_root(p)`; then the leaf is a
 /// fix-point, which admits (CHALLENGE_OPEN) or convicts (RULING only).
 pub fn challenge_leaf(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    challenge_leaf_with_manifest(program, accounts, data, None)
+}
+
+pub fn challenge_leaf_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
     if accounts.len() != 10 || data.len() < 84 {
         return Err(no(DCR1_BAD));
     }
@@ -1079,6 +1122,7 @@ pub fn challenge_leaf(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             position,
             segment,
             local,
+            application,
         )?
     };
     if admitted {
@@ -1251,6 +1295,15 @@ pub fn select_segment(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
 /// fix-point of a one-entry segment adds PT2S, base routes, base geometry,
 /// DRP2, PT1S, with DCM2 writable.
 pub fn reveal(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    reveal_with_manifest(program, accounts, data, None)
+}
+
+pub fn reveal_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
     if !matches!(accounts.len(), 3 | 8) || data.len() < 2 || data[1] > 16 || !accounts[1].is_signer
     {
         return Err(no(DCR1_BAD));
@@ -1318,6 +1371,7 @@ pub fn reveal(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
             position,
             segment,
             0,
+            application,
         )? {
             respond_event(accounts[0].key, &raw, super::TAG_REVEAL, 1, PHASE_REVEAL);
         }
@@ -1353,6 +1407,18 @@ pub fn reveal(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
 /// fix-point and adds PT2S, base routes, base geometry, DRP2, PT1S, with
 /// DCM2 writable.
 pub fn descend(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    descend_with_manifest(program, accounts, data, None)
+}
+
+/// The manifest-aware revision-8 descent adapter. Applications that bind a
+/// form route its final fix-point through their exact static kernel manifest;
+/// no instruction or account bytes change for legacy callers.
+pub fn descend_with_manifest(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    application: Option<&'static crate::kernel::ApplicationManifest>,
+) -> ProgramResult {
     if !matches!(accounts.len(), 3 | 8) || data.len() != 2 || !accounts[1].is_signer {
         return Err(no(DCR1_BAD));
     }
@@ -1435,6 +1501,7 @@ pub fn descend(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
             position,
             segment,
             first,
+            application,
         )? {
             respond_event(accounts[0].key, &raw, super::TAG_DESCEND, 2, PHASE_DESCEND);
         }

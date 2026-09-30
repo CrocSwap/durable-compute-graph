@@ -6,7 +6,7 @@ publish = false
 license = "GPL-3.0-only"
 
 [features]
-default = ["custom-heap", "revision-8", "test-kernel"]
+default = ["custom-heap", "revision-8"]
 revision-7 = []
 revision-8 = []
 test-rev8-before-payer-alias-fix = []

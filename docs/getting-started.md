@@ -1,16 +1,16 @@
 # Getting started with DCG
 
-This guide follows the `ByteSum` test kernel through the static kernel
-contract, application manifest, reproducible SBF build, and full optimistic
-lifecycle canary. The canary is a mechanics demonstration. It defines no
-production graph or sweep format and says nothing about model quality.
+This first-hour path follows the static kernel contract and app manifest, then
+runs tests against the extracted revision-8 handlers. It does not claim a full
+SBF document lifecycle: the only existing SBF lifecycle harness is the
+isolated, test-feature canary described at the end.
 
 ## 1. Define a kernel
 
-Implement `Kernel` over authenticated canonical byte inputs. Keep the
-computation deterministic, bound input and output lengths from the manifest,
-and write canonical output bytes. The test implementation in
-[`kernel.rs`](../crates/dcg-program/src/kernel.rs) is a complete small example.
+Implement `Kernel` over deterministic canonical bytes. Keep input and output
+lengths within the manifest limits. A byte-only kernel uses the convenient
+single-slice method; a kernel that reads several committed account regions can
+override `execute_spans` or `replay_spans`.
 
 ```rust
 impl Kernel for MyKernel {
@@ -19,25 +19,28 @@ impl Kernel for MyKernel {
     }
 
     fn execute(&self, input: &[u8], output: &mut [u8]) -> Result<usize, KernelError> {
-        // Validate the canonical input, perform bounded deterministic work,
-        // write the canonical output, and return the number of bytes written.
+        // Validate canonical input, perform bounded deterministic work,
+        // write canonical output, and return the number of bytes written.
         todo!()
     }
 }
 ```
 
-The manifest pins a kernel ID, semantic version, ABI version, input and output
+The manifest pins `KernelId`, semantic version, ABI version, input and output
 layouts, optional state schema, resource limits, and enabled versioned modes.
 Implement `StatefulKernel` only if the transition owns state. Implement
-`OptimisticReplay` only for modes where the application can re-execute a
-disputed step from authenticated inputs and compare the claimed output and
-state.
+`OptimisticReplay` only for modes where one disputed transition fits one SVM
+instruction.
 
-## 2. Register the kernel in an application manifest
+## 2. Bind the kernel in the application image
 
-Keep the kernel, manifest, and replay binding in static application data. A
-replay binding names both the exact kernel implementation and the versioned
-mode for which replay is allowed.
+Keep kernel implementations, replay bindings, and legacy-form selections in
+static application data. `LegacyFormBinding` maps a frozen revision-8
+`(machine selector, form id)` to an exact kernel semantic version, ABI version,
+and mode. It changes no revision-8 record or instruction bytes. When an app
+requires these bindings, an unbound form or unavailable kernel identity is
+refused. An app that supplies no bindings retains the revision-8 compatibility
+adapter.
 
 ```rust
 static KERNELS: [&'static dyn Kernel; 1] = [&MY_KERNEL];
@@ -51,20 +54,58 @@ static APPLICATION: ApplicationManifest = ApplicationManifest {
     version: 1,
     kernels: &KERNELS,
     optimistic_replays: &REPLAY_BINDINGS,
+    legacy_forms: &MY_LEGACY_FORM_BINDINGS,
+    require_legacy_form_binding: true,
 };
 ```
 
-Call `ApplicationManifest::validate` during application setup. Resolution
-backends implement `ResolutionBackend` separately; they own admission,
-challenge transitions, and status. The byte kernel contract does not include
-SVM account types or load code dynamically.
+Call `ApplicationManifest::validate` during app setup. Link the selected
+manifest into the image and call `process_instruction_with_manifest` from the
+app entrypoint. The default standalone image has an empty app manifest and no
+test kernel.
 
-## 3. Build the SBF lifecycle image
+## 3. Declare authenticated account regions
 
-Use the pinned platform-tools SDK root. It must contain
-`dependencies/platform-tools`; the tools-version flag alone is not a toolchain
-pin. The wrapper checks for SBF stack-frame warnings and cleans its staging
-copy on exit.
+Each `AccountSpanBinding` names an account index, owner rule, signer/writable
+role, versioned schema, and checked offset and length. The SVM adapter verifies
+all descriptors and bounds before borrowing any account data. It rejects
+overlapping regions and any duplicate account key when either span is
+writable. Disjoint read-only regions of one account are allowed. The view
+passed to a kernel carries the account key, owner, roles, schema, offset, and
+bounded bytes.
+
+The revision-8 challenge handler first authenticates the plan accounts and
+fix-point coordinate. An application binding can then route that point through
+its exact manifest kernel. `ByteSum` demonstrates this as a pure byte kernel;
+the SVM adapter keeps `AccountInfo` out of its computation contract.
+
+## 4. Run the extracted handler tests
+
+Use Python's caller-independent Rust profile and the locked offline dependency
+set:
+
+```sh
+CARGO_TARGET_DIR=/private/tmp/dcg-target \
+cargo test --locked --offline --profile fasttest -p dcg-program \
+  --features test-kernel --lib kernel
+
+CARGO_TARGET_DIR=/private/tmp/dcg-target \
+cargo test --locked --offline --profile fasttest -p dcg-program \
+  --test unified_v8_bond
+```
+
+The first command checks exact manifest lookup, ByteSum replay, schema and
+account-span bounds, role checks, and alias refusal. The second enters the real
+revision-8 program dispatcher and exercises tags 131 and 187 for settlement and
+retry. Its test records are deliberately crafted for those handler slices; it
+does not exercise registry/admission, document initialization, or a complete
+document lifecycle.
+
+## 5. Optional isolated SBF canary
+
+The canary is test-only behind `sbf-lifecycle-test`; it is not linked into the
+default image and does not exercise the extracted revision-8 handlers. Build
+with the pinned platform-tools SDK root:
 
 ```sh
 export CARGO_TARGET_DIR=/private/tmp/dcg-target
@@ -77,14 +118,7 @@ crates/dcg-program/scripts/build-sbf-reproducible.sh \
   --sbf-out-dir /private/tmp/dcg-sbf
 ```
 
-`cargo-build-sbf` must be installed, or set `DCG_CARGO_BUILD_SBF` to its
-executable path. The feature links `ByteSum` and the isolated lifecycle
-instructions into the test image. It does not enable those instructions in the
-default program image.
-
-## 4. Run the ProgramTest lifecycle
-
-Point ProgramTest at the image just built:
+Then run its separate ProgramTest target:
 
 ```sh
 SBF_OUT_DIR=/private/tmp/dcg-sbf \
@@ -94,17 +128,7 @@ cargo test --locked --profile fasttest -p dcg-program \
   --test bytesum_sbf_lifecycle -- --nocapture
 ```
 
-The test uses a local Solana ProgramTest runtime. It first sends one malformed
-input for each lifecycle stage, then runs:
-
-- an honest template registration, admission, document initialization, root
-  landing, finalization, resolution, and close with a rent refund;
-- a dishonest claimed output, challenge, two bisection rounds, on-chain
-  `OptimisticReplay`, settlement against the cheater, and close.
-
-Each measured transaction contains one lifecycle program instruction. The
-test prints `SBF_CU|stage|units` from ProgramTest transaction metadata. The
-four-entry trace and its instruction tags exist only for this test harness;
-they are not a DCG or Basanos wire format. See the
-[`measured lifecycle record`](experiments/bytesum-sbf-lifecycle-2026-09-30.md)
-for the current image digest, tool versions, and CU table.
+The canary uses private tags 240–250 and a bespoke template, document, bond,
+and Merkle layout. It demonstrates SBF mechanics only. It does not replace a
+ProgramTest run through the revision-8 registry/admission, document,
+challenge/response, settlement, resolution, and close handlers.
