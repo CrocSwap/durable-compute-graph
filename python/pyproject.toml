@@ -3,7 +3,10 @@ name = "dcg-sequencer"
 version = "0.1.0"
 description = "Pure-Python durable transaction sequencer for DCG clients"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "httpx==0.28.1",
+    "solders==0.29.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -5,22 +5,80 @@ application-built transaction messages through an injected signer and RPC
 adapter. It does not construct DCG instructions, decide fees or rent, choose
 retry safety, interpret program errors, or define application state.
 
-The package currently provides the sequencing and journal API only. A chain
-SDK or application supplies the `Signer` and `RpcEndpoint` implementations;
-the offline tests use an in-memory fake and make no network calls.
+The package includes a production HTTP JSON-RPC endpoint and a keypair-file
+signer, alongside the injectable `RpcEndpoint` and `Signer` protocols. Offline
+tests use an in-memory fake or an HTTPX mock transport and make no network
+calls.
+
+## Production adapters
+
+The runtime dependencies are pinned in `pyproject.toml` and `uv.lock`:
+
+- `httpx==0.28.1` provides async HTTP, connection reuse, and explicit request
+  timeouts for JSON-RPC.
+- `solders==0.29.0` parses Solana keypair bytes and signs canonical legacy and
+  v0 messages. This avoids implementing Ed25519 or transaction signature
+  framing in the client.
+
+`SolanaRpcEndpoint` implements `sendTransaction`, `getLatestBlockhash`,
+`getSignatureStatuses`, `getAccountInfo`, `getHealth`, and
+`simulateTransaction`. It checks `getGenesisHash` before issuing its first
+blockhash lease and rejects a mismatch with the plan. Account reads accept
+`confirmed` or `finalized`; simulations accept the requested commitment.
+Metadata not returned by `getSignatureStatuses` remains `None`.
+
+Concurrent single-signature polls are coalesced for a short configurable
+window and sent as `getSignatureStatuses([signatures])`, in groups capped at
+256 by default. One endpoint-wide limiter spaces all RPC calls and bounds
+in-flight requests. HTTP 429 and JSON-RPC rate-limit errors become
+`RateLimited` and honor `Retry-After`; timeouts, transport failures, and 5xx
+responses become `RpcUnavailable`; explicit blockhash errors become
+`BlockhashExpired`; and explicit instruction/program errors become
+`ProgramRefused`. Other HTTP 4xx responses become terminal
+`RpcConfigurationError`. Unknown JSON-RPC errors remain resumable so they do
+not authorize a fresh signature.
+
+`KeypairFileSigner.from_file(path)` reads a standard Solana 64-byte JSON
+keypair into memory and supports one required transaction signer. It validates
+that the message fee payer matches the keypair before signing. A regression
+test checks that private key bytes do not appear in captured output or the
+journal. Hardware or remote signers can implement the same `Signer` protocol,
+keeping signing custody outside the sequencer. This round does not provide a
+multisigner aggregator; callers that build transactions with additional
+required signers need to supply that adapter before submitting those messages.
+
+```python
+from dcg.sequencer import KeypairFileSigner, RpcConfig, SolanaRpcEndpoint
+
+signer = KeypairFileSigner.from_file("/secure/path/id.json")
+rpc = SolanaRpcEndpoint(
+    "fogo-rpc-a",
+    "https://rpc.example.invalid",
+    config=RpcConfig(timeout_seconds=8, requests_per_second=12, max_in_flight=6),
+)
+```
+
+Close the endpoint with `await rpc.aclose()` or an async context manager when
+the run ends.
 
 ## Offline tests
 
-From the repository root, run the standard-library test suite with Python 3.12:
+From the repository root, install the pinned dependencies once, then run the
+offline test suite with Python 3.12:
 
 ```sh
-PYTHONPATH=python UV_PROJECT_ENVIRONMENT=/private/tmp/dcg-sequencer-venv \
+UV_PROJECT_ENVIRONMENT=/private/tmp/dcg-sequencer-venv \
+UV_CACHE_DIR=/private/tmp/dcg-sequencer-uv-cache \
+uv sync --locked --project python --python 3.12
+
+UV_PROJECT_ENVIRONMENT=/private/tmp/dcg-sequencer-venv \
 UV_CACHE_DIR=/private/tmp/dcg-sequencer-uv-cache \
 uv run --locked --no-sync --project python --python 3.12 \
 python -m unittest discover -s python/tests -v
 ```
 
-There are no live-network tests in this round.
+The default suite is offline. The opt-in local-validator test is skipped unless
+`DCG_RUN_LOCAL_VALIDATOR=1` is set.
 
 ## First use
 
@@ -39,12 +97,16 @@ from dcg.sequencer import (
     PostconditionResult,
     Sequencer,
     SequencerConfig,
+    KeypairFileSigner,
+    SolanaRpcEndpoint,
     TransactionPlan,
     TransactionStep,
 )
 
-# rpc implements RpcEndpoint; signer implements Signer. Keep their secrets in
-# the signer implementation and choose the endpoint's genesis hash explicitly.
+# The endpoint checks its actual genesis hash against the plan before it gets
+# the first blockhash. Keep key material inside the signer.
+signer = KeypairFileSigner.from_file("/secure/path/id.json")
+rpc = SolanaRpcEndpoint("fogo-testnet-rpc-a", "https://rpc.example.invalid")
 step = TransactionStep(
     step_id="write-range-0",
     dependencies=(),
@@ -198,9 +260,52 @@ for resume. This bounds one step, not the overall plan.
   lifetime. Other networks should configure their own bound.
 - **Designed:** every step requires caller-provided compute class and CU limit;
   no generic CU values are asserted.
-- **Open:** production provider behavior, real signer implementations, live
-  network limits and power-loss behavior have not been exercised in this
-  package round.
+- **Open:** external-cluster behavior, multisigner transaction support, live
+  network limits and storage-device power-loss behavior have not been
+  exercised in this package round.
+
+## Run against a local validator
+
+Build the standalone DCG SBF image with the repository's pinned platform-tools
+v1.51 wrapper, then run the opt-in integration test:
+
+```sh
+export DCG_SBF_SDK=/private/tmp/basanos-sbf-sdk-v151-20260920
+export DCG_SBF_TOOLS_VERSION=v1.51
+export DCG_SBF_STAGING_NAME=dcg-sequencer-2-sbf-staging
+export CARGO_TARGET_DIR=/private/tmp/dcg-sequencer-2-target
+
+crates/dcg-program/scripts/build-sbf-reproducible.sh \
+  --features sbf-lifecycle-test \
+  --sbf-out-dir /private/tmp/dcg-sequencer-2-sbf
+
+DCG_RUN_LOCAL_VALIDATOR=1 \
+DCG_SBF_IMAGE=/private/tmp/dcg-sequencer-2-sbf/dcg_program.so \
+uv run --locked --no-sync --project python --python 3.12 \
+  python -m unittest discover -s python/tests -p 'test_local_validator.py' -v
+```
+
+`test_local_validator.py` starts `solana-test-validator` under `/private/tmp`,
+funds a temporary payer, then submits seven dependent transactions through the
+sequencer, JSON-RPC adapter, and keypair-file signer. It kills a child
+sequencer after the validator accepts the first packet but before its send
+acknowledgment is journaled, then resumes from that journal and verifies the
+final account state. It prints the transaction count, elapsed wall time,
+retries, and recovered ambiguous fates. The ledger and journal are moved into
+`/private/tmp/trash-dcg-sequencer-2` after the run; the temporary payer
+keypair file is deleted during teardown.
+
+Each local step uses `RetryPolicy.NEVER`. The kill exercise therefore measures
+status/account reconciliation after an ambiguous send, not same-byte
+rebroadcast frequency; same-byte retry behavior remains covered by the offline
+sequencer tests.
+
+The checked-in local fixture uses private test-only tags 240–250 for the
+crate's four-entry ByteSum honest lifecycle. It validates the local RPC,
+signer, journal-recovery, and SBF-loading path only. It does **not** run the
+round-5 revision-8 sequence, PT2P/PT2S setup, registry/admission, or a protocol
+lifecycle. Those Basanos-specific fixture builders are not part of this
+standalone package, so revision-8 local-validator coverage remains open.
 
 ## First Basanos migration
 
@@ -216,3 +321,13 @@ program/template identities into `TransactionPlan`, and leave cursor policy,
 template bytes, account allocation, rent, fees, and the decision to authorize a
 fresh signature in the Basanos adapter. This round does not migrate that
 sender.
+
+For `rev8_template.py`, the next adapter work is to map its existing
+instruction builders to stable step intents, carry its per-tag CU limits and
+write hazards into `TransactionStep`, and implement its account/cursor
+postconditions from the template's current on-chain bytes. It also needs a
+multisigner implementation for setup instructions that require the authority
+and newly allocated account keypairs in one transaction. Compare its old
+receipts against the sequencer journal on local-validator runs before replacing
+the sender; keep cursor, rent, funding, fee, and fresh-sign authorization
+decisions in the Basanos adapter.

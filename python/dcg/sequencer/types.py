@@ -31,6 +31,10 @@ class RpcError(SequencerError):
     failure_class = FailureClass.RESUMABLE
 
 
+class RpcConfigurationError(SequencerError):
+    """The endpoint rejected its credentials or the request configuration."""
+
+
 class RpcUnavailable(RpcError):
     """The endpoint is temporarily unavailable or timed out."""
 
@@ -103,6 +107,24 @@ class SignatureObservation:
     transaction_metadata_available: bool = False
     fee_lamports: int | None = None
     compute_units_consumed: int | None = None
+
+
+@dataclass(frozen=True)
+class AccountInfo:
+    owner: str
+    lamports: int
+    executable: bool
+    rent_epoch: int | None
+    data: bytes
+    context_slot: int | None = None
+
+
+@dataclass(frozen=True)
+class SimulationResult:
+    error: object | None
+    logs: tuple[str, ...]
+    units_consumed: int | None
+    return_data: object | None = None
 
 
 @dataclass(frozen=True)
