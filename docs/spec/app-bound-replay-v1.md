@@ -9,14 +9,20 @@ identity must be versioned as specified below.
 
 An application manifest used for admission MUST pass `ApplicationManifest::validate`.
 Until a later app-bound replay version defines multi-input routes, each legacy
-form binding MUST declare at most one input route. A route-free form MUST have
-zero plan read routes; a one-route form MUST account for the instance's only
-plan read route. Extra or unbound reads are refused. Every class whose form is
+form binding MUST declare at most one input route. That declaration selects
+the plan read ordinal that becomes the application's input span; other reads
+in the plan instance are outside this app replay contract and remain subject
+to their own first-divergent-leaf challenges. The selected ordinal MUST exist
+at every admitted instance of the bound form. A zero-span binding is accepted
+only when its replay opts into empty input spans and implements
+`replay_input_spans` for that case. Every route length MUST be a multiple of
+the bound kernel's input alignment. Every class whose form is
 bound by the manifest MUST be checked against the sealed plan at tag 160.
 Admission rejects with code 799 if any instance cannot be opened by the tag-184
 adapter, including when:
 
-- the consumer's route count is unsupported or its route is not a bound read;
+- the consumer's route count is unsupported or its selected ordinal is outside
+  the instance's plan reads;
 - the route is a document input, crosses a position or segment, or names a
   producer that is not earlier in the same segment;
 - no application binding exists for the producer;
@@ -41,11 +47,13 @@ spans; this is a valid zero-span ARW1, not an empty byte string. A producer
 preimage in RWP1 opens its committed output leaf and route bytes. The producer
 is separately challenged at its own coordinate to test its computation.
 
-Each kernel's declared compute units MUST be at most
-`1,400,000 - 85,433 - 25,000 = 1,289,567`. Here 85,433 CU is the measured
-worst tag-184 adapter cost in the retained SBF cases from the Round 2 receipt,
-and 25,000 CU is the declared safety margin. These numbers constrain the
-manifest; they do not prove every app kernel's actual worst-case runtime.
+Each kernel's declared compute units MUST be at most the transaction ceiling
+minus the measured worst-case tag-184 adapter cost and the declared safety
+margin. With the current measured cost of 45,573 CU, a 25,000-CU designed
+margin, and a 1,400,000-CU transaction ceiling, the cap is 1,329,427 CU. The
+fixture and image are recorded in `docs/experiments/dcg-seam-fix-2026-09-30.md`.
+These numbers constrain the manifest; they do not prove every app kernel's
+actual worst-case runtime.
 
 ## 2. App identity
 
@@ -64,18 +72,28 @@ the application version or the kernel semantic version. A program upgrade
 that changes replay behavior without changing those versions is outside this
 identity guarantee and is invalid application versioning.
 
-At every app-bound fix-point, the current admission identity is compared with
-the DCM2 identity. A missing, newly bound, or changed identity cannot be used
-to convict either role: the challenge is ruled with winner byte 0 and cause 5
-(`APP_IDENTITY_CHANGED`), without setting DCM2's refuted flag or counter. Tag
-131 refunds the challenger's challenge bond and changes only the open-challenge
-count. If the app identity changes while an app-bound challenge is waiting in
-RESPOND, tag 132 uses the same neutral rule instead of treating silence as an
-executor timeout loss. The challenger receives no conviction or protocol bond
-pot, and the executor receives no challenge-bond transfer. This rule is safe
-for both parties because it records no computational finding under a replay
-identity different from the one admitted; the challenge is not evidence for
-either side.
+At a fix-point, identity neutrality applies only when the registry shape is
+valid and the challenged coordinate selects an app binding. Non-app
+coordinates and registry-code convictions keep their ordinary rulings even in
+an app-bound document. A missing, newly bound, or changed identity on a
+selected app coordinate cannot be used to convict either role: the challenge
+is ruled with winner byte 0 and cause 5 (`APP_IDENTITY_CHANGED`), without
+setting DCM2's refuted flag or counter. Tag 131 refunds the challenger's
+challenge bond and changes only the open-challenge count.
+
+At timeout, identity neutrality applies only to a live DCR1 v6 app RESPOND
+record, after the handler verifies that the record is in a timeout-eligible
+phase. A phase-3 ruling cannot be changed by tag 132 after an app upgrade. The
+challenger receives no conviction or protocol bond pot, and the executor
+receives no challenge-bond transfer when a live app RESPOND record is ruled
+neutral. This rule records no computational finding under a replay identity
+different from the one admitted.
+
+The DCM2 ARI1 admission digest commits the whole static form table. A table
+change can therefore still neutralize a dispute at a selected app coordinate
+when the changed row is unrelated to that form. This version retains that
+manifest-wide commitment because DCM2 has one admission-identity field; a
+per-form commitment would require a separately versioned storage layout.
 
 ## 3. Leaf commitment and first divergence
 

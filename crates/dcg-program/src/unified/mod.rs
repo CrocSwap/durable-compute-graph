@@ -236,10 +236,6 @@ fn process_inner(
         TAG_REVEAL => challenge::reveal_with_manifest(program, accounts, data, manifest),
         TAG_DESCEND => challenge::descend_with_manifest(program, accounts, data, manifest),
         TAG_REVEAL_FAMILY_TABLE => challenge::reveal_family_table(program, accounts, data),
-        TAG_STAGE_APP_WITNESS => challenge::stage_app_witness(program, accounts, data),
-        TAG_RESPOND_APP_WITNESS => {
-            challenge::respond_app_witness(program, accounts, data, manifest)
-        }
         TAG_CLOSE_RESPONSE => challenge::close_response(program, accounts, data),
         TAG_CLOSE_RESULT => {
             result::close_result_with_hooks(program, accounts, data, application_hooks(manifest))
@@ -369,4 +365,16 @@ fn process_inner(
         }
         _ => return None,
     })
+}
+
+#[cfg(all(test, feature = "revision-7"))]
+mod revision7_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn app_witness_tags_remain_unsupported_on_revision_7() {
+        let program = Pubkey::new_unique();
+        assert!(process(&program, &[], &[TAG_STAGE_APP_WITNESS]).is_none());
+        assert!(process(&program, &[], &[TAG_RESPOND_APP_WITNESS]).is_none());
+    }
 }

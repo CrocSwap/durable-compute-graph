@@ -1,12 +1,13 @@
 # Referee laws
 
-Status: **designed contract**, assessed against the DCG revision-8 source at
-`4d1446f` plus the app-bound replay changes described in
+Status: **designed contract**, assessed against this revision-8 source and the
+app-bound replay changes described in
 [`app-bound-replay-v1.md`](app-bound-replay-v1.md). This page is not a machine
-spec. The baseline `dcg-repo/docs/spec/` directory contains only its license;
-the README and Rust comments refer to `docs/spec/dcg-unified-v1.md`, which is
-not present in this checkout. App-bound behavior is specified separately, and
-the current SBF image has not been rebuilt and verified against these changes.
+spec. The baseline `dcg-repo/docs/spec/` directory
+contains only its license; the README and Rust comments refer to
+`docs/spec/dcg-unified-v1.md`, which is not present in this checkout. Focused
+SBF scenarios are measured for the listed test fixtures; no universal proof of
+the laws is claimed.
 
 ## Model and notation
 
@@ -41,10 +42,10 @@ the revision-8 Rust source at the commit above, not to a deployed image.
 
 | Law | Current Rust | Bugs this law catches | Existing harness coverage |
 |---|---|---|---|
-| Honest party wins | **App path implemented; SBF unverified** | Executor wins without opening; unprovable leaf; malformed challenge that strands an honest party | Focused native app-replay and timeout cases; see §1 |
+| Honest party wins | **Targeted app scenarios measured on SBF; universal law unproven** | Executor wins without opening; unprovable leaf; malformed challenge that strands an honest party | Five focused ByteSum SBF tests; see §1 |
 | Conservation | **Unknown** | Unexplained bond, escrow, fee, or rent delta | Partial setup/close and malformed-refusal balance checks |
 | Authority | **Yes**, for the reviewed revision-8 paths | Tag 98/146 writable-account takeover | Malformed tag-146 attempts, wrong-authority close, and unsupported-tag refusal |
-| Binding | **App route path implemented; SBF unverified** | Missing predecessor binding; stale RUN_BINDING/package digest | Native producer-route and first-divergent-leaf cases; see §4 |
+| Binding | **Targeted app route case measured on SBF; general binding unproven** | Missing predecessor binding; stale RUN_BINDING/package digest | 900-byte K=10,240 producer-route case; see §4 |
 | Termination | **No for full account finality** | Unreachable leaf; unbounded bond retry | App RESPOND timeout is covered natively; custom settlement retry remains unbounded |
 | Determinism | **No** for document bond winner | Caller/order-dependent ruling or settlement | Does not permute competing valid challenges or submitter order |
 | Close safety | **Yes** on the reviewed revision-8 close paths | Closing a live dependency; rent paid to closer instead of named payer | PT1X rent refund, wrong-authority refusal, double-close, and reinitialization refusal |
@@ -89,28 +90,30 @@ executor (799). It catches the earlier case where malformed replay input
 refuses instead of deciding, leaving a timeout route that rewards the
 executor.
 
-**Current Rust: app-bound path implemented, SBF unverified.** An app-bound
-fix-point that has no ruling remains in RESPOND. A matching executor opening
+**Current Rust: targeted app-bound cases measured on SBF; the general law is
+unproven.** A matching executor opening
 that replays successfully wins; authenticated malformed input or a wrong
 output convicts the executor; a withheld opening loses at timeout. Tags 183
 and 184 accept the exact deadline slot, and tag 132 refuses at that slot and
-times out only after it. A changed app identity ends neutrally. Admission
+times out only after it in the implementation; the exact-slot source cases
+were not part of this SBF run. A changed app identity ends neutrally. Admission
 checks that every bound coordinate has a route the adapter can open and a
-complete witness no larger than the staging cap. These rules are designed to
-satisfy this law for admitted app-bound coordinates; one native processor
-attempt reached the app replay ruling and settlement path, but no rebuilt SBF
-image has verified these rules.
+complete witness no larger than the staging cap. The focused SBF suite covers
+both recorded ruling winners, post-ruling identity mutation refusal at tag 132,
+settlement to the recorded winner, malformed input, and a malicious challenger.
+The separate K=10,240 test reaches tag 184 with a 900-byte routed witness.
+These are bounded mechanics demonstrations; they do not establish the law for
+all kernels, forms, route topologies, or legal dispute paths.
 
-**Existing harness.** The source tests in `unified_v8_document.rs` cover an
-honest executor, a malicious challenger, malformed and withheld openings,
-identity change, and both replay outcomes. Only
-`rev8_bytesum_matching_honest_fastpath_enters_respond_sbf` was attempted with
-the native processor in this round; it reached the executor-win ruling and
-settlement handlers but failed its old final balance assertion. The corrected
-assertion and the other source tests remain unrun. The same focused cases have
-not been run against a freshly built SBF image. Cross-position, cross-segment,
-document-input, multi-route, and non-app-producer admission cases also remain
-without individual handler tests.
+**Existing harness.** `rev8_bytesum_` ran five tests against the reproducible
+`sbf-real-lifecycle-test` image: fake input against predecessor, malformed
+committed input, malicious challenger, honest matching fast path followed by
+identity mutation and timeout-tag refusal, and wrong output followed by
+identity mutation and challenger settlement. All five passed. The 900-byte
+route test and the real K=10,240 admission test ran separately. Cross-position,
+cross-segment, document-input, multi-route, and non-app-producer route cases
+remain without individual handler tests; the full lifecycle law and broader
+kernel correctness remain unverified.
 
 ## 2. Conservation
 
@@ -250,24 +253,27 @@ canonical encoding and domain named by the applicable machine spec.
 predecessor output, the `RUN_BINDING`/stale package digest failure, and reuse
 of a valid witness at another coordinate or document.
 
-**Current Rust: app route path implemented, SBF unverified.** The exact
+**Current Rust: targeted app route checks measured on SBF; general binding
+correctness remains unproven.** The exact
 coordinate leaf digest includes the descriptor, `(p,s,i)`, app/kernel/mode
 identity, and ARW1 bytes after stripping the RWP1 suffix. Admission refuses
-routes that are not a single supported bound read from an earlier same-segment
-producer with a matching write. Tag 184 proves the producer leaf into the
-saved segment root and compares the routed bytes to the consumer input. The
-producer's computation remains a separate challenge, so clients must challenge
-the first divergent leaf. `init_v8` also hashes the sealed PT2S and compares
-the digest-keyed DTA1/DTU1 records and PT2S base digests. The source and native
-handlers implement these checks; current SBF conformance remains unverified.
+routes that are not a single supported declared input read from an earlier
+same-segment producer with a matching write. Tag 184 proves the producer leaf
+into the saved segment root and compares the routed bytes to the consumer
+input. The producer's computation remains a separate challenge, so clients
+must challenge the first divergent leaf. `init_v8` also hashes the sealed PT2S and compares
+the digest-keyed DTA1/DTU1 records and PT2S base digests. One selected route
+and the 900-byte maximum opening were measured on SBF; broader route
+conformance remains unverified.
 
 **Existing harness.** `rev8_bytesum_fake_input_against_predecessor_loses_sbf`
 checks that a consumer's well-formed input differing from the proved producer
 bytes convicts the executor. `rev8_bytesum_first_divergent_leaf_protects_honest_consumer_sbf`
 shows that a consumer computed correctly from fabricated producer bytes wins
 and that challenging that producer exposes its wrong output. These ran under
-the native processor; no current SBF run or separate stale-package mutation
-test is claimed.
+the native processor. The 900-byte K=10,240 route test also ran against the
+current SBF image. A separate stale-package mutation test and the general
+route topologies listed above remain unverified.
 
 ## 5. Termination
 

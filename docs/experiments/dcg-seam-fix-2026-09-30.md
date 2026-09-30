@@ -240,3 +240,65 @@ Exact-deadline staging/response/timeout, staging order/restart/signer, duplicate
 response, post-timeout response, first-divergent-leaf guidance, identity
 change, and the existing winner paths have source-test coverage, but Round 3
 SBF execution has not verified them.
+
+## Round 4 SBF follow-up (2026-09-30)
+
+Round 4 corrects the selected-route rule: a manifest's one declared route
+selects one plan read ordinal that becomes the replay kernel's input span. A
+plan may contain additional reads; they are not inputs to this app replay
+contract and remain independently challengeable at their own coordinates.
+Admission and fix-point support both check that the selected ordinal exists at
+every instance of the bound form. This change is needed by the retained
+K=10,240 Form-22 route, whose selected ordinal is 7 in a multi-read form.
+
+The focused app-bound SBF image was rebuilt with
+`cargo-build-sbf 3.0.15` / platform-tools v1.51 and the pinned SDK:
+
+| Image | Features | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| App lifecycle v2 | `sbf-real-lifecycle-test` | 1,233,600 | `3d2839d2fa193a3a002f5c98152a07215a9fa6203fc9a14cbca6239c04a3c406` |
+| Empty application final | `revision-8` | 801,128 | `055565c48f27461a3ca5e84cb78b5165b5b2ba56f69b19068b5e0b1e2457a1af` |
+| Unbound form | `sbf-unbound-form-test` | 1,233,456 | `fe2838b6a41711b3f23aaf930d2acc547264a50f8b22344aeb01efcee9203552` |
+
+The focused SBF results are:
+
+| Scenario | Image / fixture | Result |
+| --- | --- | --- |
+| `rev8_bytesum_` lifecycle, mismatch, malformed input, malicious challenger, and timeout identity checks | App lifecycle v2; K=80 retained plan | 5 passed; both a challenger ruling and an executor ruling survive an identity mutation attempt at tag 132, with settlement paid to the recorded winner |
+| `rev8_app_respond_full_900_witness_k10240_sbf` | App lifecycle v2; K=10,240 PT2S and 900-byte routed ARW1/RWP1 witness | 1 passed; tag 184 measured 45,573 CU |
+| `rev8_pt1x_registry_and_admission_sbf` | Empty application image; retained K=10,240 fixture | 1 passed; real tag-159/160 admission completed, with the largest observed tag-160 chunk at 720,384 CU |
+| `rev8_multi_read_form_admits_selected_route_tag160_sbf` | App lifecycle v2; K=80 retained plan, Form 22 reads ordinal 7 | 1 passed; tag 160 admitted the class at 744,559 CU |
+| `rev8_stale_manifest_does_not_neutralize_non_app_fixpoint_on_sbf` | Unbound-form image; non-app DCR1 v5 | 1 passed; tag 169 stayed on the v5 RESPOND path and ordinary tag-132 timeout ruled the challenger (18,450 CU) |
+| `rev8_empty_application_refuses_witness_tails_for_166_168_169_sbf` | Empty application image | 1 passed; legacy trailing-data and phase-first refusal behavior remained intact |
+
+The tag-184 CU figure includes the test's Compute Budget instruction. The
+manifest cap is now `1,400,000 - 45,573 - 25,000 = 1,329,427` CU; the 25,000
+CU margin is designed. The K=10,240 adapter test uses the retained plan and
+its full 10,240-position geometry, while the committed completion lands the
+retained executor's 80 available position roots. The separate real admission
+test uses `EMPTY_APPLICATION`; full application-aware K=10,240 tag-160
+admission remains unverified because the first app-image attempt exhausted its
+transaction budget during tag 160 before reaching tag 184.
+
+The K=10,240 measurement uses a pre-admitted DEA2 fixture to isolate the
+tag-184 adapter cost from tag-160 admission. It measures routed replay and the
+single PT2S bind/view performed by the adapter, not general kernel runtime.
+It does not show that every application kernel fits its declared budget.
+
+Receipts are retained at
+`/Users/colkitt/sith/toys/crypto/basanos/out/runs/dcg-seam-fix-4-2026-09-30/`.
+That directory includes the successful logs and earlier failed measurement
+attempts (app-image admission reached the CU limit; pre-measurement harness
+iterations exposed and corrected witness sizing, plan-position, and selected
+route-bound checks). The revision-7 feature build still fails before tests
+because this source tree imports `crate::rs1_summary` without containing that
+module. The default offline `dcg-program` suite passed, including 48 library
+tests and the revision-8 portable golden check; `unified_v8_records` also
+passed all 11 tests. The stale-manifest test confirmed that a non-app v5
+record enters ordinary RESPOND and receives the ordinary challenger timeout
+ruling; an earlier assertion expecting DESCEND was corrected to match that
+observed transition. A K=10,240 app-image attempt at full application-aware
+tag-160 admission still hit the transaction CU ceiling before tag 184; the
+successful tag-160 run used the empty application image, and the 900-byte
+adapter test used a pre-admitted K=10,240 DEA2 fixture. Full app-aware
+K=10,240 admission is therefore **unverified**.

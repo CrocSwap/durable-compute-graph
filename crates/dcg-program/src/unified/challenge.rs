@@ -747,14 +747,25 @@ fn fix_point(
                 }
             }
         }
+        #[cfg(feature = "revision-8")]
         let app_binding =
             application.and_then(|app| app.resolve_legacy_form(raw[MACHINE_AT], e.kernel_index));
+        #[cfg(not(feature = "revision-8"))]
+        let app_binding = None;
+        #[cfg(feature = "revision-8")]
         let saved_identity = document::application_identity_v8(&d)?;
-        let identity_changed = match (saved_identity, application) {
-            (Some(saved), Some(app)) => saved[4..36] != app.admission_identity_digest(),
-            (Some(_), None) => true,
-            (None, _) => app_binding.is_some(),
-        };
+        #[cfg(not(feature = "revision-8"))]
+        let saved_identity = None;
+        #[cfg(feature = "revision-8")]
+        let identity_changed = code == 0
+            && app_binding.is_some()
+            && match (saved_identity, application) {
+                (Some(saved), Some(app)) => saved[4..36] != app.admission_identity_digest(),
+                (Some(_), None) => true,
+                (None, _) => true,
+            };
+        #[cfg(not(feature = "revision-8"))]
+        let identity_changed = false;
         let app_opening_supported = if let (Some(app), Some(_)) = (application, app_binding) {
             super::admission::app_opening_bound(&x, p, t, raw[MACHINE_AT], app).is_ok()
         } else {
@@ -804,7 +815,7 @@ fn fix_point(
             app_binding,
             saved_identity,
             identity_changed,
-            !app_opening_supported,
+            code == 0 && !app_opening_supported,
         )
     };
     let mut winner = (code != 0).then_some(2);
@@ -2098,37 +2109,17 @@ pub fn respond_app_witness(
             return Err(no(DCR1_BAD));
         }
         record_document(program, &raw, &accounts[2], true)?;
-        bind_plan(
-            program,
-            &accounts[2].try_borrow_data()?,
-            &accounts[3],
-            &accounts[4],
-            &accounts[5],
-            Some(&accounts[6]),
-        )?;
-        let s = accounts[3].try_borrow_data()?;
-        let index_at = plan::bind_pt1s(program, &accounts[3], &accounts[7])?;
-        let pt1 = accounts[7].try_borrow_data()?;
-        let (rb, gb) = (
-            accounts[4].try_borrow_data()?,
-            accounts[5].try_borrow_data()?,
-        );
-        let x = plan::view(&s, &rb, &gb, &[], Some(&pt1[index_at..]))?;
         let (position, segment, local) = (
             u32_at(&raw, 156, DCR1_BAD)?,
             u16_at(&raw, 160, DCR1_BAD)?,
             u32_at(&raw, 136, DCR1_BAD)?,
         );
-        let t = x
-            .entry_index(position, segment, local)
-            .map_err(|_| no(CL_COORDINATE))?;
-        let entry = x.entry(position, t).map_err(|_| no(CL_COORDINATE))?;
         (
             d32(&raw, 72, DCR1_BAD)?,
             position,
             segment,
             local,
-            entry.kernel_index,
+            u16_at(&raw, DEV2_AT + 24, DCR1_BAD)?,
             raw[MACHINE_AT],
             raw[APP_WITNESS_AT..APP_WITNESS_AT + total].to_vec(),
         )
@@ -2385,9 +2376,10 @@ pub fn timeout_with_hooks(
     timeout(program, accounts, data)
 }
 
-/// Manifest-aware revision-8 timeout. If an app-bound challenge outlives the
-/// app identity that admitted it, timeout is neutral: the challenger receives
-/// its bond back, and neither side is ruled to have won.
+/// Manifest-aware revision-8 timeout. Only an app-bound RESPOND record carries
+/// identity-neutral timeout semantics; earlier challenge phases retain their
+/// normal timeout winner even if the app identity changes.
+#[cfg(feature = "revision-8")]
 pub fn timeout_with_manifest(
     program: &Pubkey,
     accounts: &[AccountInfo],
@@ -2399,37 +2391,48 @@ pub fn timeout_with_manifest(
     }
     document::revision(program, &accounts[1], DCR1_AUTH)?;
     record_v8(program, &accounts[0], None)?;
-    let mut raw = accounts[0].try_borrow_mut_data()?;
-    if now()? <= u64_at(&raw, 148, DCR1_BAD)? {
-        return Err(no(DCR1_DEADLINE));
-    }
-    record_document_v8(program, &raw, &accounts[1], true)?;
-    let document_identity = document::application_identity_v8(&accounts[1].try_borrow_data()?)?;
-    let admission_identity_changed = match (document_identity, application) {
-        (Some(saved), Some(app)) => saved[4..36] != app.admission_identity_digest(),
-        (Some(_), None) => true,
-        // A DCM2 without ARI1 predates app-bound admission, or has no app
-        // binding. Keep its revision-8 v5 timeout semantics intact.
-        (None, _) => false,
+    let winner = {
+        let raw = accounts[0].try_borrow_data()?;
+        match (raw[PT2P_MODE_AT], raw[4]) {
+            (1, PHASE_RESPOND | PHASE_SEALED | PHASE_REVEAL | PHASE_POSITION_REVEAL) => 2,
+            (1, PHASE_DESCEND | PHASE_SELECT) => 1,
+            _ => return Err(no(DCR1_PHASE)),
+        }
     };
-    let ruling_identity_changed = if raw[6..8] == APP_REPLAY_VERSION.to_le_bytes() {
+    {
+        let raw = accounts[0].try_borrow_data()?;
+        if now()? <= u64_at(&raw, 148, DCR1_BAD)? {
+            return Err(no(DCR1_DEADLINE));
+        }
+    }
+    document::revision(program, &accounts[1], DCR1_AUTH)?;
+    let mut raw = accounts[0].try_borrow_mut_data()?;
+    record_document_v8(program, &raw, &accounts[1], true)?;
+    let identity_changed = if raw[4] == PHASE_RESPOND
+        && raw[6..8] == APP_REPLAY_VERSION.to_le_bytes()
+    {
+        let document_identity = document::application_identity_v8(&accounts[1].try_borrow_data()?)?;
+        let admission_identity_changed = match (document_identity, application) {
+            (Some(saved), Some(app)) => saved[4..36] != app.admission_identity_digest(),
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        };
         let form = u16_at(&raw, DEV2_AT + 24, DCR1_BAD)?;
         let current = application.and_then(|app| {
             app.resolve_legacy_form(raw[MACHINE_AT], form)
                 .map(|binding| app.ruling_identity(binding))
         });
-        current.is_none_or(|identity| {
+        let ruling_identity_changed = current.is_none_or(|identity| {
             identity != raw[APP_IDENTITY_AT..APP_IDENTITY_AT + APP_IDENTITY_BYTES]
-        })
+        });
+        admission_identity_changed || ruling_identity_changed
     } else {
         false
     };
-    if admission_identity_changed || ruling_identity_changed {
-        if raw[6..8] == APP_REPLAY_VERSION.to_le_bytes() {
-            raw[DEV2_AT + 4] = OUTCOME_IDENTITY_CHANGED;
-            raw[DEV2_AT + 8..DEV2_AT + 12]
-                .copy_from_slice(&(OUTCOME_IDENTITY_CHANGED as u32).to_le_bytes());
-        }
+    if identity_changed {
+        raw[DEV2_AT + 4] = OUTCOME_IDENTITY_CHANGED;
+        raw[DEV2_AT + 8..DEV2_AT + 12]
+            .copy_from_slice(&(OUTCOME_IDENTITY_CHANGED as u32).to_le_bytes());
         return rule_for_document(
             program,
             accounts[0].key,
@@ -2440,11 +2443,6 @@ pub fn timeout_with_manifest(
             OUTCOME_IDENTITY_CHANGED as u32,
         );
     }
-    let winner = match (raw[PT2P_MODE_AT], raw[4]) {
-        (1, PHASE_RESPOND | PHASE_SEALED | PHASE_REVEAL | PHASE_POSITION_REVEAL) => 2,
-        (1, PHASE_DESCEND | PHASE_SELECT) => 1,
-        _ => return Err(no(DCR1_PHASE)),
-    };
     rule_for_document(
         program,
         accounts[0].key,

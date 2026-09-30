@@ -5,7 +5,10 @@
 //! retained rung-D template** (the PWR1 and base triple under
 //! `BASANOS_PT2P_ROOT`). The suite's fixture configuration pairs that K=80
 //! completion fixture with the compiler-v1 PXR1 fixture under
-//! `BASANOS_PT2P_F47_ROOT` for the Form-47 and Form-48 cases. The dispute
+//! `BASANOS_PT2P_F47_ROOT` for the Form-47 and Form-48 cases. The real
+//! K=10,240 admission case uses the separate retained rung-D fixture selected
+//! by `BASANOS_PT2P_K10240_ROOT`; it does not use the 128-option F47 bundle.
+//! The dispute
 //! position defaults to the retained p=29 fixture and is selectable with
 //! `BASANOS_PT2P_F47_POSITION` for the K=10,240 p=10,239 measurement. Both are selected in the
 //! same test invocation so all completion and decision cases run together.
@@ -252,6 +255,17 @@ fn f47_artifacts() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
     let fixture = artifacts_at(root)?;
     pt::route_header_v4_shallow(&fixture.0).ok()?.2.as_ref()?;
     Some(fixture)
+}
+
+fn k10240_artifacts() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let root = std::env::var_os("BASANOS_PT2P_K10240_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                "/Users/colkitt/sith/toys/crypto/basanos/out/runs/rev8-k10240-template-2026-09-30/fixture/pt2p",
+            )
+        });
+    artifacts_at(root)
 }
 
 /// The compiler-v1 typed-decision position defaults to the retained K=35
@@ -1531,26 +1545,29 @@ async fn seal_pt2s(
 }
 
 async fn build() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, false, false, false).await
+    build_with_pre_fix_seal_processor(false, false, false, false, false).await
 }
 async fn build_f47() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, false, false, true).await
+    build_with_pre_fix_seal_processor(false, false, false, true, false).await
 }
 async fn build_honest_pt1x() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, true, false, true).await
+    build_with_pre_fix_seal_processor(false, true, false, false, true).await
+}
+async fn build_k10240_pre_admitted() -> Option<Fix> {
+    build_with_pre_fix_seal_processor(false, false, false, false, true).await
 }
 
 async fn build_with_swapped_roles() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, false, true, false).await
+    build_with_pre_fix_seal_processor(false, false, true, false, false).await
 }
 async fn build_f47_with_swapped_roles() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, false, true, true).await
+    build_with_pre_fix_seal_processor(false, false, true, true, false).await
 }
 
 #[cfg(feature = "test-rev8-before-payer-alias-fix")]
 
 async fn build_before_payer_alias_fix() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(true, false, false, false).await
+    build_with_pre_fix_seal_processor(true, false, false, false, false).await
 }
 
 async fn build_with_pre_fix_seal_processor(
@@ -1558,8 +1575,11 @@ async fn build_with_pre_fix_seal_processor(
     full_honest_setup: bool,
     swap_executor_and_challenger: bool,
     f47_fixture: bool,
+    k10240_fixture: bool,
 ) -> Option<Fix> {
-    let fixture = if f47_fixture {
+    let fixture = if k10240_fixture {
+        k10240_artifacts()
+    } else if f47_fixture {
         f47_artifacts()
     } else {
         artifacts()
@@ -1618,13 +1638,10 @@ async fn build_with_pre_fix_seal_processor(
             class_count(&view).unwrap(),
         )
     };
-    if full_honest_setup {
-        assert_eq!(
-            k, 10_240,
-            "full honest path uses the single K=10,240 template"
-        );
+    if k10240_fixture {
+        assert_eq!(k, 10_240, "K=10,240 path uses the retained large template");
     }
-    if full_honest_setup {
+    if k10240_fixture {
         // Fast local preflight of the exact admission walk. Keep a failing
         // class index and shape visible without spending minutes uploading
         // the PT1X fixture before finding a frozen-registry limit mismatch.
@@ -2018,7 +2035,7 @@ async fn build_with_pre_fix_seal_processor(
     );
     let pt2s_sha = sha256(&[&pt2s_image]);
     // The registry, by real instructions over the v7 golden's rows.
-    let (mut rows, census) = if full_honest_setup {
+    let (mut rows, census) = if k10240_fixture {
         k10240_registry_rows()
     } else {
         (
@@ -2230,7 +2247,7 @@ async fn build_with_pre_fix_seal_processor(
         }
     } else {
         assert_eq!(u32_at(&adm, 140), base_entries);
-        if full_honest_setup {
+        if k10240_fixture {
             // The K=10,240 retained compiler-v1 bundle has a different maximum
             // per-position entry count than the older capacity-80 fixture.
             adm[152..156].copy_from_slice(&u32::try_from(n_max).unwrap().to_le_bytes());
@@ -11466,6 +11483,40 @@ async fn commit_challenge_tree_with_route_witness(
     Vec<Vec<ChallengeNode>>,
     Vec<u8>,
 ) {
+    let fixture = artifacts().expect("the retained emission");
+    commit_challenge_tree_with_route_witness_from_artifacts(
+        f,
+        binding,
+        p,
+        ordinal,
+        target_local,
+        producer_local,
+        target_witness,
+        producer_witness,
+        fixture,
+    )
+    .await
+}
+
+async fn commit_challenge_tree_with_route_witness_from_artifacts(
+    f: &mut Fix,
+    binding: &Binding2,
+    p: u32,
+    ordinal: usize,
+    target_local: u32,
+    producer_local: u32,
+    target_witness: &[u8],
+    producer_witness: &[u8],
+    fixture: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
+) -> (
+    [u8; 32],
+    [Pubkey; 4],
+    Vec<[u8; 32]>,
+    u16,
+    u32,
+    Vec<Vec<ChallengeNode>>,
+    Vec<u8>,
+) {
     // This offline challenge fixture installs a complete DEA2 image directly
     // rather than running tag 160. Mark the two app-bound rows exactly as the
     // real app image's manifest-aware admission step would.
@@ -11474,7 +11525,7 @@ async fn commit_challenge_tree_with_route_witness(
     adm[6..8].copy_from_slice(&flags.to_le_bytes());
     f.ctx.set_account(&f.dea2, &shared(owned(&f.program, adm)));
     let descriptor = f.descriptor(binding, &f.terms_raw, 16);
-    let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
+    let (routes, geometry, payloads, pwr1, _) = fixture;
     let x = Pt2p::new(
         &routes,
         &geometry,
@@ -11517,11 +11568,18 @@ async fn commit_challenge_tree_with_route_witness(
         .collect::<Vec<_>>();
     roots[ordinal] = segment_root;
     let position_root = h::position_root(&descriptor, p, &table, &roots).unwrap();
-    let mut positions = f.position_roots[..f.k as usize].to_vec();
+    // The K=10,240 adapter measurement reuses the retained executor's 80
+    // published roots as an 80-position completion over the larger template.
+    let mut positions = f.position_roots.clone();
+    assert!(
+        (p as usize) < positions.len(),
+        "challenge position is landed"
+    );
     positions[p as usize] = position_root;
     let (actual_descriptor, created) = f.run_document_with_roots(binding, &positions).await;
     assert_eq!(actual_descriptor, descriptor);
-    f.finalize(&descriptor, created, f.k).await;
+    f.finalize(&descriptor, created, positions.len() as u32)
+        .await;
     (
         descriptor,
         created,
@@ -11792,6 +11850,50 @@ fn app_route_producer_witness_with(prefix: &[u8; 3]) -> Vec<u8> {
     witness.extend_from_slice(&[0; 2]);
     witness.extend_from_slice(&output);
     witness
+}
+
+fn app_route_producer_witness_padded(length: usize) -> Vec<u8> {
+    let span_count = 16.min(length.saturating_sub(12 + 256) / 9);
+    let fixed = 12 + span_count * 8 + 256;
+    assert!(
+        span_count > 0 && length >= fixed + span_count,
+        "every producer span must be nonempty"
+    );
+    let input_bytes = length - fixed;
+    let mut witness = Vec::with_capacity(length);
+    witness.extend_from_slice(b"ARW1");
+    witness.extend_from_slice(&1u16.to_le_bytes());
+    witness.push(span_count as u8);
+    witness.push(0);
+    witness.extend_from_slice(&256u16.to_le_bytes());
+    witness.extend_from_slice(&[0; 2]);
+    let short = input_bytes / 16;
+    let extra = input_bytes % 16;
+    for span in 0..span_count {
+        let span_len = short + if span < extra { 1 } else { 0 };
+        witness.extend_from_slice(&1u32.to_le_bytes());
+        witness.extend_from_slice(&1u16.to_le_bytes());
+        witness.extend_from_slice(&(span_len as u16).to_le_bytes());
+        witness.resize(witness.len() + span_len, span as u8);
+    }
+    let mut output = vec![0; 256];
+    output[..3].copy_from_slice(&[1, 2, 3]);
+    witness.extend_from_slice(&output);
+    assert_eq!(witness.len(), length);
+    witness
+}
+
+fn app_route_opening_900(path_height: u8) -> (Vec<u8>, Vec<u8>) {
+    let producer_length = 855usize
+        .checked_sub(32 * path_height as usize)
+        .expect("RWP1 path fits in the 900-byte witness");
+    let target = app_replay_witness(1, &[1, 2, 3], 6);
+    let producer = app_route_producer_witness_padded(producer_length);
+    assert_eq!(
+        target.len() + 14 + producer.len() + 32 * path_height as usize,
+        900
+    );
+    (target, producer)
 }
 
 async fn executor_opens_app_witness(f: &mut Fix, record: Pubkey, document: Pubkey, witness: &[u8]) {
@@ -12848,6 +12950,52 @@ async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
         FLAG_REFUTED
     );
 
+    // An identity upgrade cannot erase a recorded challenger win. Phase is
+    // checked before the app-identity branch, and settlement must still pay
+    // the winner already written by tag 169.
+    let mut changed_document = f.account(created[0]).await;
+    let app_identity = document::application_identity_v8(&changed_document)
+        .unwrap()
+        .expect("the challenged document is app-bound");
+    let option_count = changed_document[document::BINDING_AT_V8 + 151] as usize;
+    let identity_at = document::OPTION_REGION_AT + option_count * 4;
+    assert_eq!(
+        &changed_document[identity_at..identity_at + 64],
+        &app_identity
+    );
+    changed_document[identity_at + 4] ^= 1;
+    let document_lamports = f.lamports(created[0]).await;
+    f.ctx.set_account(
+        &created[0],
+        &shared(Account {
+            lamports: document_lamports,
+            data: changed_document,
+            owner: f.program,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+    let ruled_before_timeout = f.account(record).await;
+    let refused_timeout = send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        refused_timeout,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(733)
+        ))
+    ));
+    assert_eq!(f.account(record).await, ruled_before_timeout);
+
     let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
     let remainder = Pubkey::new_from_array(terms.bond_remainder);
     let record_rent_and_bond = f.lamports(record).await;
@@ -12979,6 +13127,50 @@ async fn rev8_bytesum_matching_honest_fastpath_enters_respond_sbf() {
     assert_eq!(u16_at(&ruled, 174), u16_at(&ruled, challenge::DEV2_AT + 24));
     assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
 
+    // The identity change must not erase an already-recorded executor win.
+    let mut changed_document = f.account(created[0]).await;
+    let app_identity = document::application_identity_v8(&changed_document)
+        .unwrap()
+        .expect("the challenged document is app-bound");
+    let option_count = changed_document[document::BINDING_AT_V8 + 151] as usize;
+    let identity_at = document::OPTION_REGION_AT + option_count * 4;
+    assert_eq!(
+        &changed_document[identity_at..identity_at + 64],
+        &app_identity
+    );
+    changed_document[identity_at + 4] ^= 1;
+    let document_lamports = f.lamports(created[0]).await;
+    f.ctx.set_account(
+        &created[0],
+        &shared(Account {
+            lamports: document_lamports,
+            data: changed_document,
+            owner: f.program,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+    let ruled_before_timeout = f.account(record).await;
+    let refused_timeout = send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        refused_timeout,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(733)
+        ))
+    ));
+    assert_eq!(f.account(record).await, ruled_before_timeout);
+
     let second_response = send_fresh_with(
         &mut f.ctx,
         &f.executor,
@@ -13005,6 +13197,132 @@ async fn rev8_bytesum_matching_honest_fastpath_enters_respond_sbf() {
     ));
     settle_and_close_standard_app_challenge(&mut f, record, created, descriptor, false, &terms)
         .await;
+}
+
+/// Tag 184's full staged-byte ceiling on the retained K=10,240 template. The
+/// 900-byte RWP1 opens a valid route on this test kernel, while the padded
+/// producer spans remain irrelevant to its committed output. This measures
+/// the routed adapter and plan view, not general kernel runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_app_respond_full_900_witness_k10240_sbf() {
+    let Some(mut f) = build_k10240_pre_admitted().await else {
+        eprintln!("needs_local_artifacts: retained K=10,240 PT2P fixture absent");
+        return;
+    };
+    if f.k != 10_240 || std::env::var_os("BASANOS_DCG_V8_SBF").is_none() {
+        eprintln!("needs_local_artifacts: set the K=10,240 PT2P root and SBF image");
+        return;
+    }
+    let (routes, geometry, payloads, pwr1, _) =
+        k10240_artifacts().expect("the retained K=10,240 emission");
+    let x = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        None,
+        pt2p::Program::decode(&pwr1).unwrap(),
+    )
+    .unwrap();
+    let mut target = None;
+    'positions: for position in 0..x.position_count.min(f.position_roots.len() as u32) {
+        for ordinal in 0..x.segment_count as usize {
+            let (segment, entries) = x.segment_row(position, ordinal).unwrap();
+            for local in 0..entries {
+                let Ok(index) = x.entry_index(position, segment, local) else {
+                    continue;
+                };
+                let Ok(entry) = x.entry(position, index) else {
+                    continue;
+                };
+                if entry.kernel_index != 22 || entry.read_count <= 7 {
+                    continue;
+                }
+                let Ok(route) = x.route(&entry, 7) else {
+                    continue;
+                };
+                let Ok(producer) = x.entry(position, route.producer_entry) else {
+                    continue;
+                };
+                let Ok(coordinate) = x.coordinate(position, route.producer_entry) else {
+                    continue;
+                };
+                if route.direction == 0
+                    && route.byte_length == 256
+                    && producer.kernel_index == 30
+                    && coordinate.segment == segment
+                    && coordinate.local < local
+                {
+                    target = Some((position, ordinal, segment, local, coordinate.local, entries));
+                    break 'positions;
+                }
+            }
+        }
+    }
+    let (position, ordinal, _target_segment, target_local, producer_local, entries) =
+        target.expect("the K=10,240 plan has a bound Form-22 route from Form 30");
+    let (consumer, producer) =
+        app_route_opening_900(dcg_program::root_only::path_height(entries).unwrap());
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.executor_bond_lamports = 500_000;
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 10_000;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
+    let binding = f.binding(29, 50);
+    let (descriptor, created, roots, segment, actual_target, levels, witness) =
+        commit_challenge_tree_with_route_witness_from_artifacts(
+            &mut f,
+            &binding,
+            position,
+            ordinal,
+            target_local,
+            producer_local,
+            &consumer,
+            &producer,
+            k10240_artifacts().expect("the retained K=10,240 emission"),
+        )
+        .await;
+    let doc_identity = document::application_identity_v8(&f.account(created[0]).await)
+        .unwrap()
+        .expect("the K=10,240 app-bound document stores ARI1");
+    assert_eq!(
+        &doc_identity[4..36],
+        &dcg_program::kernel::test_kernel::MANIFEST_APP.admission_identity_digest(),
+        "document and loaded SBF app identities agree before the fix-point"
+    );
+    assert_eq!(actual_target, target_local);
+    assert_eq!(witness.len(), 900);
+    let record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        position,
+        ordinal as u16,
+        segment,
+        actual_target,
+        &levels,
+        151,
+        false,
+        Some(&witness),
+    )
+    .await;
+    let descended = f.account(record).await;
+    assert_eq!(
+        descended[4],
+        challenge::PHASE_RESPOND,
+        "unexpected early rule: winner {}, cause {}, replay code {}",
+        descended[5],
+        descended[178],
+        u32_at(&descended, challenge::DEV2_AT + 8),
+    );
+    label("challenge-app-witness-respond-184-full900-k10240");
+    executor_opens_app_witness(&mut f, record, created[0], &witness).await;
+    let ruled = f.account(record).await;
+    assert_eq!(ruled[4], challenge::PHASE_RULED);
+    assert_eq!(ruled[5], 1);
+    assert_eq!(u32_at(&ruled, challenge::DEV2_AT + 8), 0);
 }
 
 /// A challenger who supplies a preimage that does not open the committed
@@ -13988,12 +14306,12 @@ async fn rev8_unbound_form_refuses_admission_on_sbf() {
     panic!("expected an unbound form to refuse before admission completed");
 }
 
-/// A DCM2 admitted under an older image can reach a challenge after the new
-/// image requires a form binding. The missing late binding is a neutral tag-169
-/// refusal and cannot convict the executor.
+/// A document may carry a stale app-wide digest while this selected form is
+/// not bound by the current image. Its non-app DCR1 stays v5 and follows the
+/// ordinary RESPOND timeout rule instead of ending neutrally.
 #[cfg(feature = "sbf-unbound-form-test")]
 #[tokio::test(flavor = "multi_thread")]
-async fn rev8_late_unbound_manifest_refuses_fixpoint_neutrally_on_sbf() {
+async fn rev8_stale_manifest_does_not_neutralize_non_app_fixpoint_on_sbf() {
     assert!(std::env::var_os("BASANOS_DCG_V8_SBF").is_some());
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
@@ -14002,8 +14320,7 @@ async fn rev8_late_unbound_manifest_refuses_fixpoint_neutrally_on_sbf() {
     let (descriptor, created, roots, segment, target, levels) =
         commit_challenge_tree(&mut f, &binding, 79, 1).await;
     // Represent a document admitted under a prior image whose static form
-    // table still included this route. A later image that no longer binds the
-    // form must settle neutrally at the fix-point.
+    // table differed. The selected challenge coordinate is not app-bound.
     let mut older_document = f.account(created[0]).await;
     let option_count = older_document[document::BINDING_AT_V8 + 151] as usize;
     let identity_at = document::OPTION_REGION_AT + 4 * option_count;
@@ -14042,7 +14359,7 @@ async fn rev8_late_unbound_manifest_refuses_fixpoint_neutrally_on_sbf() {
     assert_eq!(before[4], challenge::PHASE_DESCEND);
     assert_eq!(before[5], 0);
     let choice = final_position_choice(&levels, target);
-    label("late-binding-neutral-fixpoint-169");
+    label("stale-manifest-non-app-fixpoint-169");
     send_fresh_with(
         &mut f.ctx,
         &f.signer,
@@ -14060,17 +14377,35 @@ async fn rev8_late_unbound_manifest_refuses_fixpoint_neutrally_on_sbf() {
         ],
     )
     .await
-    .expect("the stale admission identity rules neutrally at tag 169");
+    .expect("the non-app coordinate follows its ordinary fix-point path");
     let after = f.account(record).await;
-    assert_eq!(after[4], challenge::PHASE_RULED);
+    assert_eq!(after[4], challenge::PHASE_RESPOND);
     assert_eq!(after[5], 0);
-    assert_eq!(after[178], events::CAUSE_APP_IDENTITY_CHANGED);
-    assert_eq!(
-        u32_at(&after, challenge::DEV2_AT + 8),
-        challenge::OUTCOME_IDENTITY_CHANGED as u32
+    assert_eq!(u16_at(&after, 6), 5, "the non-app DCR1 remains v5");
+    assert_ne!(after, before, "tag 169 records the ordinary fix-point");
+    let deadline = u64_at(&after, 148) + 1;
+    clock_to(&mut f, deadline).await;
+    send_fresh_with(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await
+    .expect("the ordinary non-app timeout path remains available");
+    let timed_out = f.account(record).await;
+    assert_eq!(timed_out[4], challenge::PHASE_RULED);
+    assert_eq!(timed_out[5], 2);
+    assert_eq!(timed_out[178], events::CAUSE_TIMEOUT);
+    assert_ne!(
+        u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
+        0,
+        "the non-app record takes its ordinary timeout ruling"
     );
-    assert_ne!(after, before, "the neutral ruling is recorded");
-    assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
 }
 
 /// Build only the real K=10,240 PT1X/PT2S registry and admission path. This
@@ -14087,10 +14422,10 @@ async fn rev8_pt1x_registry_and_admission_sbf() {
     assert_eq!(u32_at(&admission, 136), f.k);
 }
 
-/// The manifest-aware tag-160 walk must refuse a Form-22 class whose retained
-/// plan entry contains multiple graph reads, before recording any admission.
+/// The manifest-aware tag-160 walk admits a Form-22 class with multiple plan
+/// reads when its selected ordinal 7 is present at every bound instance.
 #[tokio::test(flavor = "multi_thread")]
-async fn rev8_multi_read_form_refuses_tag160_admission_sbf() {
+async fn rev8_multi_read_form_admits_selected_route_tag160_sbf() {
     assert!(std::env::var_os("BASANOS_DCG_V8_SBF").is_some());
     let Some(mut f) = build().await else {
         panic!("retained artifacts absent")
@@ -14113,6 +14448,21 @@ async fn rev8_multi_read_form_refuses_tag160_admission_sbf() {
                 .is_some_and(|shape| shape.form == 22)
         })
         .expect("the retained plan has a Form-22 class");
+    let key = dcg_program::unified::classes::key_of(&x, form22_index).unwrap();
+    let shape = dcg_program::unified::classes::class_shape(&x, key)
+        .unwrap()
+        .expect("the Form-22 class has an instance");
+    let index = x
+        .old_to_new(form22_index, shape.position)
+        .unwrap()
+        .expect("the Form-22 representative exists");
+    let entry = x.entry(shape.position, index).unwrap();
+    assert!(
+        entry.read_count > 1,
+        "the selected plan entry has extra reads"
+    );
+    assert!(entry.read_count > 7, "manifest route ordinal 7 exists");
+    assert!(x.route(&entry, 7).is_ok(), "route ordinal 7 is readable");
 
     let mut state = f.account(f.dea2).await;
     state[6..8].fill(0);
@@ -14139,16 +14489,13 @@ async fn rev8_multi_read_form_refuses_tag160_admission_sbf() {
         ],
     )
     .await;
-    assert!(matches!(
-        result,
-        Err(TransactionError::InstructionError(
-            _,
-            InstructionError::Custom(code)
-        )) if code == dcg_program::unified::APP_KERNEL_UNAVAILABLE
-    ));
+    result.expect("a declared selected route does not reject other plan reads");
     let after = f.account(f.dea2).await;
-    assert_eq!(u32_at(&after, 148), 0, "refusal admits no class");
-    assert!(after[admission::HEADER..].iter().all(|byte| *byte == 0));
+    assert_eq!(u32_at(&after, 148), 1, "tag 160 admits the class");
+    assert_ne!(
+        after[admission::HEADER + form22_index as usize / 8] & (1 << (form22_index % 8)),
+        0
+    );
 }
 
 /// Full real admission to final result on the extracted SBF image: actual

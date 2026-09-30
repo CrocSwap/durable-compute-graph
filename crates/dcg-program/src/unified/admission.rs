@@ -72,7 +72,6 @@ fn app_route_opening_bound(facts: AppRouteFacts) -> Result<usize, u32> {
     let fail = || super::APP_KERNEL_UNAVAILABLE;
     if facts.route_count != 1
         || facts.input_span_count != 1
-        || facts.read_count as usize != facts.route_count
         || facts.route_ordinal >= facts.read_count
         || facts.route_direction != 0
         || facts.binding_kind != 1
@@ -118,10 +117,14 @@ pub(crate) fn app_opening_bound(
     let binding = manifest
         .resolve_legacy_form(machine, entry.kernel_index)
         .ok_or_else(fail)?;
-    // Every graph read on an app-bound legacy form must have an opening in
-    // this adapter. Silently ignoring an extra read would leave a planned
-    // predecessor outside the coordinate-bound ARW1/RWP1 witness.
-    if entry.read_count as usize != binding.input_routes.len() {
+    // Manifest routes select the plan reads that become application inputs;
+    // other plan reads remain outside the app replay contract. Every selected
+    // ordinal must exist at this particular plan coordinate.
+    if binding
+        .input_routes
+        .iter()
+        .any(|route| route.ordinal >= entry.read_count)
+    {
         return Err(fail());
     }
     let consumer_bytes = ApplicationManifest::max_arw1_bytes(binding).ok_or_else(fail)?;
@@ -609,6 +612,25 @@ mod app_route_admission_tests {
     #[test]
     fn app_admission_accepts_a_bounded_same_segment_route() {
         assert_eq!(app_route_opening_bound(valid_route()), Ok(422));
+    }
+
+    #[test]
+    fn app_admission_accepts_one_selected_route_from_multiple_plan_reads() {
+        let mut facts = valid_route();
+        facts.read_count = 8;
+        facts.route_ordinal = 7;
+        assert_eq!(app_route_opening_bound(facts), Ok(422));
+    }
+
+    #[test]
+    fn app_admission_refuses_a_selected_ordinal_outside_plan_reads() {
+        let mut facts = valid_route();
+        facts.read_count = 7;
+        facts.route_ordinal = 7;
+        assert_eq!(
+            app_route_opening_bound(facts),
+            Err(super::super::APP_KERNEL_UNAVAILABLE)
+        );
     }
 
     #[test]

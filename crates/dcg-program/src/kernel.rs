@@ -51,9 +51,9 @@ pub struct ResourceLimits {
 }
 
 /// Transaction ceiling minus the measured worst-case tag-184 adapter cost
-/// (85,433 CU) and a 25,000-CU safety margin. A replay kernel declaring more
-/// cannot be selected for an admitted app-bound document.
-pub const APP_REPLAY_MEASURED_OVERHEAD_CU: u64 = 85_433;
+/// and the configured safety margin. A replay kernel declaring more cannot
+/// be selected for an admitted app-bound document.
+pub const APP_REPLAY_MEASURED_OVERHEAD_CU: u64 = 45_573;
 pub const APP_REPLAY_CU_MARGIN: u64 = 25_000;
 pub const MAX_TRANSACTION_COMPUTE_UNITS: u64 = 1_400_000;
 pub const MAX_DECLARED_KERNEL_COMPUTE_UNITS: u64 =
@@ -579,6 +579,14 @@ pub trait OptimisticReplay: Kernel {
         }
         self.replay(input.data, &[], claimed_output, &[])
     }
+
+    /// Explicit opt-in for bindings with no input spans. The default
+    /// `replay_input_spans` implementation requires exactly one span, so a
+    /// replay that handles `[]` must override this capability alongside that
+    /// method. Manifest validation refuses zero-span bindings otherwise.
+    fn accepts_empty_input_spans(&self) -> bool {
+        false
+    }
 }
 
 /// A statically linked replay implementation bound to one advertised mode.
@@ -1063,7 +1071,16 @@ impl ApplicationManifest {
                 .min(kernel_manifest.resources.max_input_bytes as usize);
             let output_limit = (kernel_manifest.output.max_bytes as usize)
                 .min(kernel_manifest.resources.max_output_bytes as usize);
+            let accepts_empty_input_spans = self
+                .resolve_optimistic_replay(
+                    binding.kernel_id,
+                    binding.semantic_version,
+                    binding.abi_version,
+                    binding.mode,
+                )
+                .is_some_and(|replay| replay.replay.accepts_empty_input_spans());
             if binding.claimed_output_bytes as usize > output_limit
+                || (binding.input_spans.is_empty() && !accepts_empty_input_spans)
                 || binding.input_spans.iter().any(|span| {
                     span.schema != kernel_manifest.input.id
                         || span.max_bytes == 0
@@ -1077,6 +1094,7 @@ impl ApplicationManifest {
                         route.length == 0
                             || route.offset.checked_add(route.length).is_none()
                             || route.length > binding.input_spans[route_index].max_bytes
+                            || route.length % kernel_manifest.input.alignment as u32 != 0
                             || binding
                                 .input_routes
                                 .iter()
@@ -1366,6 +1384,10 @@ pub mod test_kernel {
                 _ => Err(KernelError::InvalidInput),
             }
         }
+
+        fn accepts_empty_input_spans(&self) -> bool {
+            true
+        }
     }
 
     pub static KERNELS: [&'static dyn Kernel; 1] = [&BYTE_SUM];
@@ -1463,6 +1485,130 @@ pub mod test_kernel {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "test-kernel")]
+    static ALIGNMENT_PROBE_MODE: ModeId = ModeId { id: 77, version: 1 };
+    #[cfg(feature = "test-kernel")]
+    static ALIGNMENT_PROBE_MANIFEST: KernelManifest = KernelManifest {
+        id: KernelId([0xA7; 16]),
+        semantic_version: 1,
+        abi_version: 1,
+        input: PortLayout {
+            id: VersionedId { id: 1, version: 1 },
+            max_bytes: 64,
+            alignment: 4,
+        },
+        output: PortLayout {
+            id: VersionedId { id: 2, version: 1 },
+            max_bytes: 8,
+            alignment: 1,
+        },
+        state: None,
+        resources: ResourceLimits {
+            max_input_bytes: 64,
+            max_output_bytes: 8,
+            max_state_bytes: 0,
+            max_operations: 1,
+            max_compute_units: 10_000,
+        },
+        modes: &[ALIGNMENT_PROBE_MODE],
+    };
+    #[cfg(feature = "test-kernel")]
+    struct AlignmentProbe;
+    #[cfg(feature = "test-kernel")]
+    impl Kernel for AlignmentProbe {
+        fn manifest(&self) -> &'static KernelManifest {
+            &ALIGNMENT_PROBE_MANIFEST
+        }
+
+        fn execute(&self, _input: &[u8], _output: &mut [u8]) -> Result<usize, KernelError> {
+            Ok(0)
+        }
+    }
+    #[cfg(feature = "test-kernel")]
+    impl OptimisticReplay for AlignmentProbe {
+        fn replay_manifest(&self) -> &'static KernelManifest {
+            &ALIGNMENT_PROBE_MANIFEST
+        }
+
+        fn replay(
+            &self,
+            _input: &[u8],
+            _prior_state: &[u8],
+            _claimed_output: &[u8],
+            _claimed_state: &[u8],
+        ) -> Result<bool, KernelError> {
+            Ok(true)
+        }
+    }
+    #[cfg(feature = "test-kernel")]
+    static ALIGNMENT_PROBE: AlignmentProbe = AlignmentProbe;
+    #[cfg(feature = "test-kernel")]
+    static ALIGNMENT_PROBE_KERNELS: [&'static dyn Kernel; 1] = [&ALIGNMENT_PROBE];
+    #[cfg(feature = "test-kernel")]
+    static ALIGNMENT_PROBE_REPLAYS: [OptimisticReplayBinding; 1] = [OptimisticReplayBinding {
+        mode: ALIGNMENT_PROBE_MODE,
+        replay: &ALIGNMENT_PROBE,
+    }];
+
+    #[cfg(feature = "test-kernel")]
+    static ZERO_INPUT_BINDING: [LegacyFormBinding; 1] = [LegacyFormBinding {
+        machine_selector: Some(1),
+        form_id: 701,
+        kernel_id: KernelId([0xA7; 16]),
+        semantic_version: 1,
+        abi_version: 1,
+        mode: ALIGNMENT_PROBE_MODE,
+        input_spans: &[],
+        input_routes: &[],
+        claimed_output_bytes: 8,
+    }];
+    #[cfg(feature = "test-kernel")]
+    static ZERO_INPUT_APP: ApplicationManifest = ApplicationManifest {
+        application_id: b"dcg-zero-span-test/1",
+        version: 1,
+        kernels: &ALIGNMENT_PROBE_KERNELS,
+        optimistic_replays: &ALIGNMENT_PROBE_REPLAYS,
+        legacy_forms: &ZERO_INPUT_BINDING,
+        require_legacy_form_binding: true,
+        hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
+    };
+
+    #[cfg(feature = "test-kernel")]
+    static MISALIGNED_INPUT_SPANS: [ReplayInputLayout; 1] = [ReplayInputLayout {
+        schema: VersionedId { id: 1, version: 1 },
+        max_bytes: 64,
+    }];
+    #[cfg(feature = "test-kernel")]
+    static MISALIGNED_INPUT_ROUTES: [ReplayRouteBinding; 1] = [ReplayRouteBinding {
+        ordinal: 7,
+        offset: 0,
+        length: 3,
+    }];
+    #[cfg(feature = "test-kernel")]
+    static MISALIGNED_INPUT_BINDING: [LegacyFormBinding; 1] = [LegacyFormBinding {
+        machine_selector: Some(1),
+        form_id: 702,
+        kernel_id: KernelId([0xA7; 16]),
+        semantic_version: 1,
+        abi_version: 1,
+        mode: ALIGNMENT_PROBE_MODE,
+        input_spans: &MISALIGNED_INPUT_SPANS,
+        input_routes: &MISALIGNED_INPUT_ROUTES,
+        claimed_output_bytes: 8,
+    }];
+    #[cfg(feature = "test-kernel")]
+    static MISALIGNED_INPUT_APP: ApplicationManifest = ApplicationManifest {
+        application_id: b"dcg-misaligned-route-test/1",
+        version: 1,
+        kernels: &ALIGNMENT_PROBE_KERNELS,
+        optimistic_replays: &ALIGNMENT_PROBE_REPLAYS,
+        legacy_forms: &MISALIGNED_INPUT_BINDING,
+        require_legacy_form_binding: true,
+        hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
+    };
+
     const INVALID_LIMIT_ID: KernelId = KernelId([0xB7; 16]);
     static INVALID_LIMIT_MODES: [ModeId; 1] = [ModeId { id: 1, version: 1 }];
     static INVALID_LIMIT_KERNEL_MANIFEST: KernelManifest = KernelManifest {
@@ -1516,6 +1662,25 @@ mod tests {
         assert_eq!(
             INVALID_LIMIT_APP.validate(),
             Err(ManifestError::InvalidComputeLimit(INVALID_LIMIT_ID))
+        );
+    }
+
+    #[cfg(feature = "test-kernel")]
+    #[test]
+    fn manifest_rejects_zero_span_binding_without_explicit_replay_support() {
+        assert_eq!(
+            ZERO_INPUT_APP.validate(),
+            Err(ManifestError::InvalidLegacyForm(701))
+        );
+        assert_eq!(test_kernel::MANIFEST_APP.validate(), Ok(()));
+    }
+
+    #[cfg(feature = "test-kernel")]
+    #[test]
+    fn manifest_rejects_route_length_outside_input_alignment() {
+        assert_eq!(
+            MISALIGNED_INPUT_APP.validate(),
+            Err(ManifestError::InvalidLegacyForm(702))
         );
     }
 
