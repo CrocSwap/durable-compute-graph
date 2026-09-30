@@ -5,6 +5,187 @@
 //! migration tests compare the old lookup result without importing a model.
 
 use crate::kernel::{ClosedRegistryAdapter, ClosedRegistryRow, RegistryInheritance};
+use crate::unified::{
+    config::{TemplateLimits, TEMPLATE_SEAL},
+    registry::{RowV2, Shape, MAX_RS1_HEIGHT, POSITION_ROWS},
+    terms::{
+        Terms, Terms2, ABANDON_AFTER_SLOTS_FLOOR, BOND_ESCROW_RENT_EXEMPT, BOND_POLICY_CUSTOM,
+        BOND_POLICY_NONE, BPS_DENOMINATOR, CUSTOM_SETTLE_WINDOW_CAP, WINDOW_CAP,
+    },
+    DISPUTE_TERMS, FORM_ABSENT, OVER_CU, RANGE_BOUND, RESPOND_LIMIT, SHAPE_BOUND, WITHDRAW_ONLY,
+    WITNESS_DOMAIN,
+};
+use crate::{position_template::InstantiatedRoute, pt2p};
+use solana_program::program_error::ProgramError;
+
+/// Application-owned typed-decision selection for a route vector sealed in a
+/// PT2S document. The standalone compatibility selector has no producer and
+/// returns `None`; an application image can pass its own selector to the
+/// `pt2p_onchain::instantiate_with_selector` adapter.
+pub trait DecisionRouteSelector: Sync {
+    fn document_selected_routes(
+        &self,
+        pt2p: &pt2p::Pt2p<'_>,
+        entry: pt2p::Entry,
+        document: &[u8],
+        routes: &[u8],
+        payload_override: Option<&[u8]>,
+    ) -> Result<Option<Vec<InstantiatedRoute>>, ProgramError>;
+}
+
+/// Revision-8 record and admission policy hooks. The records own parsing and
+/// byte encoding; an application supplies checks for terms, template limits,
+/// and admitted registry classes.
+pub trait ApplicationHooks: DecisionRouteSelector {
+    fn check_terms_v1(&self, terms: &Terms, round_floor_slots: u64) -> Result<(), u32>;
+    fn check_terms_v2(&self, terms: &Terms2, round_floor_slots: u64) -> Result<(), u32>;
+    fn check_terms2_template(&self, terms: &Terms2, limits: &TemplateLimits) -> Result<(), u32>;
+    fn check_template_limits(&self, limits: &TemplateLimits, seal_slot: u64) -> Result<(), u32>;
+    fn check_registry_class(&self, row: Option<&RowV2>, shape: &Shape) -> u32;
+}
+
+/// Frozen revision-8 compatibility rules used by the current standalone
+/// dispatcher. New application images can provide another implementation
+/// without changing record encodings.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Revision8CompatibilityAdapter;
+
+pub const REVISION8_COMPATIBILITY: Revision8CompatibilityAdapter = Revision8CompatibilityAdapter;
+
+impl DecisionRouteSelector for Revision8CompatibilityAdapter {
+    fn document_selected_routes(
+        &self,
+        _pt2p: &pt2p::Pt2p<'_>,
+        _entry: pt2p::Entry,
+        _document: &[u8],
+        _routes: &[u8],
+        _payload_override: Option<&[u8]>,
+    ) -> Result<Option<Vec<InstantiatedRoute>>, ProgramError> {
+        Ok(None)
+    }
+}
+
+impl ApplicationHooks for Revision8CompatibilityAdapter {
+    fn check_terms_v1(&self, terms: &Terms, round_floor_slots: u64) -> Result<(), u32> {
+        let custom = terms.settlement_program != [0; 32];
+        if !(1..=WINDOW_CAP).contains(&terms.challenge_window_slots)
+            || !(round_floor_slots.max(1)..=WINDOW_CAP).contains(&terms.response_window_slots)
+            || terms.executor_reward_bps as u64 > BPS_DENOMINATOR
+            || custom != (terms.custom_settle_window_slots != 0)
+            || (custom
+                && !(1..=CUSTOM_SETTLE_WINDOW_CAP).contains(&terms.custom_settle_window_slots))
+            || !(1..=WINDOW_CAP).contains(&terms.result_retention_slots)
+        {
+            return Err(DISPUTE_TERMS);
+        }
+        Ok(())
+    }
+
+    fn check_terms_v2(&self, terms: &Terms2, round_floor_slots: u64) -> Result<(), u32> {
+        let custom = terms.settlement_program != [0; 32];
+        if !(1..=WINDOW_CAP).contains(&terms.challenge_window_slots)
+            || !(round_floor_slots.max(1)..=WINDOW_CAP).contains(&terms.response_window_slots)
+            || terms.executor_reward_bps as u64 > BPS_DENOMINATOR
+            || custom != (terms.custom_settle_window_slots != 0)
+            || (custom
+                && !(1..=CUSTOM_SETTLE_WINDOW_CAP).contains(&terms.custom_settle_window_slots))
+            || !(1..=WINDOW_CAP).contains(&terms.result_retention_slots)
+        {
+            return Err(DISPUTE_TERMS);
+        }
+        let kind = terms.bond_policy_kind;
+        if kind == BOND_POLICY_NONE
+            || kind > BOND_POLICY_CUSTOM
+            || terms.bond_slasher_bps as u64 > BPS_DENOMINATOR
+            || terms.bond_remainder == [0; 32]
+            || (kind == BOND_POLICY_CUSTOM) != custom
+            || (kind == BOND_POLICY_CUSTOM && terms.bond_slasher_bps != 0)
+            || (kind == BOND_POLICY_CUSTOM
+                && terms.executor_bond_lamports != 0
+                && terms.executor_bond_lamports < BOND_ESCROW_RENT_EXEMPT)
+        {
+            return Err(DISPUTE_TERMS);
+        }
+        if !(ABANDON_AFTER_SLOTS_FLOOR..=WINDOW_CAP).contains(&terms.abandon_after_slots) {
+            return Err(DISPUTE_TERMS);
+        }
+        Ok(())
+    }
+
+    fn check_terms2_template(&self, terms: &Terms2, limits: &TemplateLimits) -> Result<(), u32> {
+        if !(limits.min_abandon_after_slots..=limits.max_abandon_after_slots)
+            .contains(&terms.abandon_after_slots)
+            || terms.challenge_window_slots > limits.max_challenge_window_slots
+            || terms.response_window_slots > limits.max_response_window_slots
+            || terms.abandon_after_slots > limits.max_document_lifetime_slots
+        {
+            return Err(DISPUTE_TERMS);
+        }
+        Ok(())
+    }
+
+    fn check_template_limits(&self, limits: &TemplateLimits, seal_slot: u64) -> Result<(), u32> {
+        for limit in [
+            limits.max_challenge_window_slots,
+            limits.max_response_window_slots,
+            limits.max_document_lifetime_slots,
+            limits.max_abandon_after_slots,
+            limits.min_abandon_after_slots,
+        ] {
+            if limit == 0 || limit.checked_add(seal_slot).is_none() {
+                return Err(TEMPLATE_SEAL);
+            }
+        }
+        if limits.min_abandon_after_slots > limits.max_abandon_after_slots
+            || limits.max_abandon_after_slots > limits.max_document_lifetime_slots
+        {
+            return Err(TEMPLATE_SEAL);
+        }
+        Ok(())
+    }
+
+    fn check_registry_class(&self, row: Option<&RowV2>, shape: &Shape) -> u32 {
+        let Some(row) = row else { return FORM_ABSENT };
+        if row.respond_path != crate::envelope_seal::RESPOND_GENERIC {
+            return WITHDRAW_ONLY;
+        }
+        if !(1..=crate::envelope_seal::CU_LIMIT).contains(&row.execute_cu)
+            || !(1..=crate::envelope_seal::CU_LIMIT).contains(&row.respond_cu)
+        {
+            return OVER_CU;
+        }
+        if shape.reads > profile_v1::RESPOND_MAX_READS as u64
+            || shape.asserted
+            || shape.payload > profile_v1::RESPOND_MAX_PAYLOAD as u64
+            || shape.range_slots > profile_v1::MAX_RANGE_SLOTS as u64
+            || (shape.form == profile_v1::LINEAR_FORM_ID
+                && shape.write_bytes > profile_v1::RESPOND_MAX_LINEAR_OUTPUT as u64)
+        {
+            return RESPOND_LIMIT;
+        }
+        if shape.position >= row.position_limit
+            || (row.witness_kind == crate::envelope_seal::WITNESS_POSITION_ROW
+                && shape.position as u64 >= POSITION_ROWS)
+        {
+            return WITNESS_DOMAIN;
+        }
+        if shape.range_slots > row.max_range_slots as u64
+            || shape.rs1_height > row.max_rs1_height
+            || shape.rs1_height > MAX_RS1_HEIGHT
+        {
+            return RANGE_BOUND;
+        }
+        if shape.reads > row.max_reads as u64
+            || shape.writes > row.max_writes as u64
+            || shape.read_bytes > row.max_read_bytes as u64
+            || shape.write_bytes > row.max_write_bytes as u64
+            || shape.payload > row.max_payload_bytes as u64
+        {
+            return SHAPE_BOUND;
+        }
+        0
+    }
+}
 
 const FLY: &[u8] = b"basanos/fly31-int-v3/1";
 const ARGMAX: &[u8] = b"basanos/dcg-argmax-i64/2";
@@ -327,8 +508,6 @@ pub static BASANOS_REV8_REGISTRY: ClosedRegistryAdapter<'static> =
 /// Minimal revision-8 profile metadata retained for wire-compatibility checks.
 /// It does not link model implementations or typed-decision producers.
 pub mod profile_v1 {
-    use solana_program::program_error::ProgramError;
-
     pub const POSITION_ROWS: u64 = 32_768;
     pub const MAX_RANGE_SLOTS: usize = 64;
     pub const RESPOND_MAX_READS: usize = 128;
@@ -372,19 +551,6 @@ pub mod profile_v1 {
             2 | 10 | 13 | 16 | 18 | 19 | 21 | 28 | 30 => 3,
             _ => 0,
         }
-    }
-
-    /// The standalone image has no Basanos decision adapter. Ordinary sealed
-    /// route vectors therefore pass through unchanged; a Basanos image can
-    /// replace this hook with its compiled-in typed-decision selector.
-    pub(crate) fn document_selected_routes(
-        _pt2p: &crate::pt2p::Pt2p<'_>,
-        _entry: crate::pt2p::Entry,
-        _document: &[u8],
-        _routes: &[u8],
-        _payload_override: Option<&[u8]>,
-    ) -> Result<Option<Vec<crate::position_template::InstantiatedRoute>>, ProgramError> {
-        Ok(None)
     }
 }
 

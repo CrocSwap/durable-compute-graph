@@ -5,8 +5,11 @@
 //! a compile-time manifest; this repository includes a tiny test kernel only.
 
 pub(crate) mod closure_v2;
+pub(crate) mod closure_v2_accounts;
+#[cfg(feature = "legacy-hclosure-handlers")]
 pub(crate) mod closure_v2_bootstrap;
 pub mod closure_v2_response;
+pub(crate) mod closure_v2_tree;
 pub mod commit;
 pub mod compatibility;
 pub mod desc_upload;
@@ -23,6 +26,8 @@ pub mod root_only;
 pub mod root_only_challenge;
 pub mod root_only_sealed;
 pub mod seal;
+#[cfg(feature = "sbf-lifecycle-test")]
+pub mod test_lifecycle;
 pub mod unified;
 
 use solana_program::{
@@ -40,6 +45,10 @@ pub fn process_instruction(
     let Some(tag) = data.first().copied() else {
         return Err(ProgramError::InvalidInstructionData);
     };
+    #[cfg(feature = "sbf-lifecycle-test")]
+    if (240..=250).contains(&tag) {
+        return test_lifecycle::process(program_id, accounts, data);
+    }
     match tag {
         115 => closure_v2_response::begin(program_id, accounts, data),
         116 => closure_v2_response::grow(program_id, accounts, data),

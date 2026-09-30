@@ -1038,7 +1038,24 @@ fn sealed_state(s: &[u8]) -> Result<(), ProgramError> {
 /// tag-98 stream (`PT1O` header; stream header naming `entry_count(p)` when
 /// `first_entry == 0`) for entries `[first, first+count)` at `p`.
 pub fn instantiate(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    instantiate_with_mode(program, accounts, data, InstantiateMode::Write)
+    instantiate_with_selector(
+        program,
+        accounts,
+        data,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
+}
+
+/// tag 146 with the decision route selector supplied by the linking
+/// application. The default dispatcher uses the revision-8 compatibility
+/// selector, which refuses typed-decision selection without an app producer.
+pub fn instantiate_with_selector(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    selector: &dyn crate::compatibility::DecisionRouteSelector,
+) -> ProgramResult {
+    instantiate_with_mode(program, accounts, data, InstantiateMode::Write, selector)
 }
 
 /// Revision-8 tag 199 reserves the PT1O address used by tag 146. It accepts
@@ -1048,7 +1065,13 @@ pub fn reserve_pt1o(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
     if !cfg!(feature = "revision-8") {
         return Err(ProgramError::InvalidInstructionData);
     }
-    instantiate_with_mode(program, accounts, data, InstantiateMode::Reserve)
+    instantiate_with_mode(
+        program,
+        accounts,
+        data,
+        InstantiateMode::Reserve,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1063,6 +1086,7 @@ fn instantiate_with_mode(
     accounts: &[AccountInfo],
     data: &[u8],
     mode: InstantiateMode,
+    selector: &dyn crate::compatibility::DecisionRouteSelector,
 ) -> ProgramResult {
     if data.len() != 11 || !(6..=9).contains(&accounts.len()) {
         return Err(ProgramError::InvalidInstructionData);
@@ -1233,7 +1257,8 @@ fn instantiate_with_mode(
             {
                 return Err(err(pt::PT2_ROUTE_SET));
             }
-            crate::compatibility::profile_v1::document_selected_routes(&x, e, &doc, &routes, None)?
+            selector
+                .document_selected_routes(&x, e, &doc, &routes, None)?
                 .ok_or(err(pt::PT2_ROUTE_SET))?
                 .len()
         } else {
@@ -1332,7 +1357,8 @@ fn instantiate_with_mode(
             {
                 return Err(err(pt::PT2_ROUTE_SET));
             }
-            crate::compatibility::profile_v1::document_selected_routes(&x, e, &doc, &routes, None)?
+            selector
+                .document_selected_routes(&x, e, &doc, &routes, None)?
                 .ok_or(err(pt::PT2_ROUTE_SET))?
         } else {
             (0..e.route_count() as u16)
@@ -1375,7 +1401,13 @@ pub fn close_pt1o_reservation(
     if !cfg!(feature = "revision-8") {
         return Err(ProgramError::InvalidInstructionData);
     }
-    instantiate_with_mode(program, accounts, data, InstantiateMode::CloseReservation)
+    instantiate_with_mode(
+        program,
+        accounts,
+        data,
+        InstantiateMode::CloseReservation,
+        &crate::compatibility::REVISION8_COMPATIBILITY,
+    )
 }
 
 /// tag 147. Accounts: authority(s), document(w), pt2p_state, routes, geometry, payloads.

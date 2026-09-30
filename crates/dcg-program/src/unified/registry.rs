@@ -14,11 +14,10 @@
 //! 48 measured_positions:u32 | 52 reserved[12].
 
 use super::{
-    no, u16_at, u32_at, EPOCH, FORM_ABSENT, OVER_CU, RANGE_BOUND, REGISTRY_ACCOUNT, REGISTRY_EPOCH,
-    REGISTRY_ROOT, REGISTRY_STATE, RESPOND_LIMIT, ROW_CAPABILITY, ROW_MALFORMED, SHAPE_BOUND,
-    WITHDRAW_ONLY, WITNESS_DOMAIN,
+    no, u16_at, u32_at, EPOCH, REGISTRY_ACCOUNT, REGISTRY_EPOCH, REGISTRY_ROOT, REGISTRY_STATE,
+    ROW_CAPABILITY, ROW_MALFORMED,
 };
-use crate::envelope_seal::{self as esl, RESPOND_GENERIC, WITNESS_POSITION_ROW, WITNESS_TENSORS};
+use crate::envelope_seal::{self as esl, RESPOND_GENERIC, WITNESS_TENSORS};
 use crate::hash;
 use solana_program::{
     account_info::AccountInfo,
@@ -193,45 +192,17 @@ impl Shape {
 }
 
 /// `check(row, S)`: the first failing code of spec §3.2, else 0.
-pub fn check(row: Option<&RowV2>, s: &Shape) -> u32 {
-    let Some(row) = row else { return FORM_ABSENT };
-    if row.respond_path != RESPOND_GENERIC {
-        return WITHDRAW_ONLY;
-    }
-    if !(1..=esl::CU_LIMIT).contains(&row.execute_cu)
-        || !(1..=esl::CU_LIMIT).contains(&row.respond_cu)
-    {
-        return OVER_CU;
-    }
-    if s.reads > crate::compatibility::profile_v1::RESPOND_MAX_READS as u64
-        || s.asserted
-        || s.payload > crate::compatibility::profile_v1::RESPOND_MAX_PAYLOAD as u64
-        || s.range_slots > crate::compatibility::profile_v1::MAX_RANGE_SLOTS as u64
-        || (s.form == crate::compatibility::profile_v1::LINEAR_FORM_ID
-            && s.write_bytes > crate::compatibility::profile_v1::RESPOND_MAX_LINEAR_OUTPUT as u64)
-    {
-        return RESPOND_LIMIT;
-    }
-    if s.position >= row.position_limit
-        || (row.witness_kind == WITNESS_POSITION_ROW && s.position as u64 >= POSITION_ROWS)
-    {
-        return WITNESS_DOMAIN;
-    }
-    if s.range_slots > row.max_range_slots as u64
-        || s.rs1_height > row.max_rs1_height
-        || s.rs1_height > MAX_RS1_HEIGHT
-    {
-        return RANGE_BOUND;
-    }
-    if s.reads > row.max_reads as u64
-        || s.writes > row.max_writes as u64
-        || s.read_bytes > row.max_read_bytes as u64
-        || s.write_bytes > row.max_write_bytes as u64
-        || s.payload > row.max_payload_bytes as u64
-    {
-        return SHAPE_BOUND;
-    }
-    0
+pub fn check(row: Option<&RowV2>, shape: &Shape) -> u32 {
+    check_with(row, shape, &crate::compatibility::REVISION8_COMPATIBILITY)
+}
+
+/// Run the class-admission rules supplied by the linked application.
+pub fn check_with(
+    row: Option<&RowV2>,
+    shape: &Shape,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+) -> u32 {
+    hooks.check_registry_class(row, shape)
 }
 
 /// `name` NUL-padded to 64 bytes (`name` is at most 64 bytes).
@@ -540,7 +511,12 @@ pub fn freeze(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
 #[cfg(all(test, feature = "legacy-basanos-fixtures"))]
 mod tests {
     use super::*;
+    use crate::envelope_seal::WITNESS_POSITION_ROW;
     use crate::unified::classes::tests::{golden, unhex};
+    use crate::unified::{
+        FORM_ABSENT, OVER_CU, RANGE_BOUND, RESPOND_LIMIT, SHAPE_BOUND, WITHDRAW_ONLY,
+        WITNESS_DOMAIN,
+    };
 
     #[test]
     fn drp2_rows_and_table_root_match_the_golden() {

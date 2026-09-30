@@ -18,9 +18,11 @@ test-weakened-class-rule = []
 v7-cu-probe = []
 a16-kernel-probe = []
 decision-kernel-probe = []
-legacy-basanos-fixtures = []
+legacy-basanos-fixtures = ["legacy-hclosure-handlers"]
+legacy-hclosure-handlers = []
 pt2p-seal-profile = []
 test-kernel = []
+sbf-lifecycle-test = ["test-kernel"]
 
 [lib]
 name = "dcg_program"

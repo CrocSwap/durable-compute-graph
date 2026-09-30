@@ -20,6 +20,7 @@ use super::{
     address, d32, no, registry, u16_at, u32_at, CL_AUTHORITY, CL_MALFORMED, CL_OVERFLOW,
     PLAN_BINDING, REGISTRY_ACCOUNT,
 };
+use crate::compatibility::{ApplicationHooks, REVISION8_COMPATIBILITY};
 use crate::hash;
 use crate::pt2p_onchain as S;
 use solana_program::{
@@ -700,23 +701,11 @@ impl TemplateLimits {
     /// withdrawn, so a template may hold its counters for five minutes or for
     /// five centuries, and both are DCG's business to allow.
     pub fn check(&self, seal_slot: u64) -> Result<(), u32> {
-        for limit in [
-            self.max_challenge_window_slots,
-            self.max_response_window_slots,
-            self.max_document_lifetime_slots,
-            self.max_abandon_after_slots,
-            self.min_abandon_after_slots,
-        ] {
-            if limit == 0 || limit.checked_add(seal_slot).is_none() {
-                return Err(TEMPLATE_SEAL);
-            }
-        }
-        if self.min_abandon_after_slots > self.max_abandon_after_slots
-            || self.max_abandon_after_slots > self.max_document_lifetime_slots
-        {
-            return Err(TEMPLATE_SEAL);
-        }
-        Ok(())
+        self.check_with(seal_slot, &REVISION8_COMPATIBILITY)
+    }
+
+    pub fn check_with(&self, seal_slot: u64, hooks: &dyn ApplicationHooks) -> Result<(), u32> {
+        hooks.check_template_limits(self, seal_slot)
     }
 
     /// **The worst-case rent hold for one document under this template**, in

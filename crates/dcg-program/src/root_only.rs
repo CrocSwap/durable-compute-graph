@@ -653,7 +653,7 @@ pub fn land_producer_leaf<'a>(
     }
     let descriptor = *descriptor;
     let leaf = *leaf;
-    crate::closure_v2_bootstrap::doc_authority(program, &accounts[1], &accounts[0], &descriptor)?;
+    crate::closure_v2_accounts::doc_authority(program, &accounts[1], &accounts[0], &descriptor)?;
     let facts = h::authenticate_document(program, &accounts[1], &descriptor, false)?;
     h::authenticate_positions(
         program,
@@ -710,7 +710,7 @@ pub fn land_producer_leaf<'a>(
         coordinate.position,
         slots,
     )?;
-    crate::closure_v2_bootstrap::create(
+    crate::closure_v2_accounts::create(
         program,
         &accounts[0],
         &accounts[5],

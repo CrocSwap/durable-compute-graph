@@ -10,6 +10,7 @@ use crate::closure_v2::{
     dcm2_header, document_address, page_address, page_bytes, position_page_address, position_root,
     DCM2_HEADER, DCM2_V2_HEADER, DPR2_HEADER,
 };
+use crate::closure_v2_accounts::{create, doc_authority};
 use crate::envelope_seal;
 use crate::root_only;
 use solana_program::{
@@ -51,76 +52,6 @@ fn descriptor(data: &[u8]) -> Result<[u8; 32], ProgramError> {
         .try_into()
         .map_err(|_| refuse(FORM))
 }
-pub(crate) fn create<'a>(
-    program: &Pubkey,
-    payer: &AccountInfo<'a>,
-    account: &AccountInfo<'a>,
-    system: &AccountInfo<'a>,
-    seeds: &[&[u8]],
-    size: usize,
-    rent_size: usize,
-) -> ProgramResult {
-    if !payer.is_signer
-        || !payer.is_writable
-        || !account.is_writable
-        || *system.key != system_program::id()
-        || account.lamports() != 0
-    {
-        return Err(refuse(AUTHORITY));
-    }
-    let lamports = Rent::get()?.minimum_balance(rent_size);
-    let ix =
-        system_instruction::create_account(payer.key, account.key, lamports, size as u64, program);
-    invoke_signed(
-        &ix,
-        &[payer.clone(), account.clone(), system.clone()],
-        &[seeds],
-    )
-}
-pub(crate) fn doc_authority(
-    program: &Pubkey,
-    doc: &AccountInfo,
-    payer: &AccountInfo,
-    digest: &[u8; 32],
-) -> ProgramResult {
-    if !payer.is_signer || doc.owner != program || *doc.key != document_address(program, digest).0 {
-        return Err(refuse(AUTHORITY));
-    }
-    let raw = doc.try_borrow_data()?;
-    let segments = u16_at(&raw, 76)? as usize;
-    let positions = u32_at(&raw, 72)? as usize;
-    let version = u16_at(&raw, 4)?;
-    let expected = if version == 1 {
-        DCM2_HEADER.checked_add(segments.checked_mul(6).ok_or(refuse(FORM))?)
-    } else if matches!(version, 2 | 3 | 4) {
-        document_header(version)?.checked_add(
-            positions
-                .checked_mul(32 + segments.checked_mul(6).ok_or(refuse(FORM))?)
-                .ok_or(refuse(FORM))?,
-        )
-    } else {
-        None
-    }
-    .ok_or(refuse(FORM))?;
-    if segments == 0
-        || positions == 0
-        || positions > (1 << 19)
-        || raw.len() != expected
-        || raw[..4] != *b"DCM2"
-        || raw[8..40] != *digest
-        || raw[40..72] != payer.key.to_bytes()
-        || u16_at(&raw, 6)? & 1 == 0
-        || u32_at(&raw, 72)? == 0
-        || (version == 1 && u32_at(&raw, 80)? == 0)
-        || (version >= 2 && raw[80..84] != [0; 4])
-        || (version >= 2
-            && u64::from_le_bytes(raw[192..200].try_into().map_err(|_| refuse(FORM))?) == 0)
-    {
-        return Err(refuse(AUTHORITY));
-    }
-    Ok(())
-}
-
 /// tag 107: a one-position, one-segment test document using the same DCM2
 /// and DPR2 layouts as the live document. No existing account is resized.
 /// Data: descriptor32 | segment:u16 | entries:u32 | segment_table_root32 |

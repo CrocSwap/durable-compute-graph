@@ -20,25 +20,32 @@ account adapters:
 The 37 historical machine/form rows are retained as metadata in
 [`compatibility.rs`](crates/dcg-program/src/compatibility.rs). The profile
 adapter preserves the existing form limits and wire checks, but does not link
-model execution. The test image rejects legacy claim-dispute tags; the private
-HClosure support modules still combine reusable tree/account helpers with old
-handlers and remain a mixed area for a later extraction pass. The compiled
-entrypoint does not dispatch those handlers.
+model execution. HClosure tree commitments now live in
+[`closure_v2_tree.rs`](crates/dcg-program/src/closure_v2_tree.rs), while account
+and PDA helpers live in
+[`closure_v2_accounts.rs`](crates/dcg-program/src/closure_v2_accounts.rs).
+Legacy HClosure handlers compile only with the non-default
+`legacy-hclosure-handlers` feature; the default entrypoint does not dispatch
+them.
 
-Measured source inventory, using `wc -l` on the changed Rust files: 13,123
-lines across `unified/`; 22,461 lines across the other changed program modules;
-and 6,101 lines of tests. These counts include comments and inline tests. Of the
-non-`unified` program count, 3,431 lines remain in the private mixed HClosure
-support modules. The Basanos model kernels, argmax and typed-decision
-producers, claim lifecycle, Tier C request programs, and bond policy remain in
-Basanos. The generic escrow and transfer mechanics are in this crate.
+Measured current source inventory, using `wc -l` on Rust files: 13,071 lines
+under `unified/`; 23,689 under the other program source modules; and 6,539 in
+tests. These counts include comments and inline tests. The Basanos model
+kernels, argmax and typed-decision producers, claim lifecycle, Tier C request
+programs, and bond policy remain in Basanos. The generic escrow and transfer
+mechanics are in this crate.
 
-The compatibility boundary is still incomplete in three places: the old
-HClosure helpers and handlers share source files; v8 record/config modules
-retain fixed application terms and class checks for byte compatibility; and
-the decision route-selection hook returns `None` until an application links
-its compiled selector. The standalone test image therefore refuses tags
-120–124 and 126–129 and is not a replacement for Basanos's revision-8 image.
+Revision-8 terms, template limits, and registry-class admission now go through
+the `ApplicationHooks` interface. The default
+[`Revision8CompatibilityAdapter`](crates/dcg-program/src/compatibility.rs)
+preserves the existing checks and encodings. PT2P route selection has an
+explicit `DecisionRouteSelector` app seam; the standalone default selector
+returns `None` because no typed-decision producer is linked. The default test
+image therefore refuses tags 120–124 and 126–129 and is not a replacement for
+Basanos's revision-8 image.
+
+For a first-hour path through the kernel contract, manifest, SBF build, and
+lifecycle canary, see [`docs/getting-started.md`](docs/getting-started.md).
 
 ## Kernel contract: what a developer implements
 
@@ -75,14 +82,17 @@ resolve-check, and bond tests. Tests gated by the optional
 `legacy-basanos-fixtures` feature require historical Basanos v7/rung-D fixtures
 that are not included here.
 
-Measured on 2026-09-30: 87 tests passed with the command above.
+Measured on 2026-09-30: 87 tests passed with the default command above. The
+SBF-only lifecycle canary is a separate ProgramTest invocation and passed one
+test; its measured CU by instruction and image identity are in
+[`docs/experiments/bytesum-sbf-lifecycle-2026-09-30.md`](docs/experiments/bytesum-sbf-lifecycle-2026-09-30.md).
 
-Measured test image built with `cargo-build-sbf 3.0.15` and platform-tools
-v1.53: 684,984 bytes, SHA-256
-`8350fa2dda93734f4212c9dc3424b7e2a7a1f40804ac400e6216a1d6f1cc0416`. This is
-the standalone DCG core plus `ByteSum`; it does not reproduce the Basanos
-revision-8 image. The portable v8 TSV contents match the Basanos copies
-byte-for-byte.
+Measured lifecycle test image built with `cargo-build-sbf 3.0.15` and
+platform-tools v1.51: 792,056 bytes, SHA-256
+`860a3cb1a97555ac1fcbd423cb3a0f6188e2bc9a2233c45c2e21fc92df098b5b`. This is
+the standalone DCG test image with `ByteSum` and a feature-gated lifecycle
+canary; it does not reproduce the Basanos revision-8 image. The portable v8
+TSV contents match the Basanos copies byte-for-byte.
 
 Rust implementation code is GPL-3.0-only. Specifications and portable goldens
 are MIT. The vendored `curve25519-dalek` source keeps its original BSD 3-Clause

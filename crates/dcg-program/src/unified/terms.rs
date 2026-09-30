@@ -39,6 +39,7 @@
 //! Bonds are otherwise free `u64` values; a zero bond is admitted.
 
 use super::{CL_OVERFLOW, DISPUTE_TERMS};
+use crate::compatibility::{ApplicationHooks, REVISION8_COMPATIBILITY};
 
 pub const TERMS_BYTES: usize = 96;
 pub const TERMS_VERSION: u16 = 1;
@@ -76,6 +77,10 @@ pub struct Terms {
 impl Terms {
     /// Canonical decode plus the mechanical checks; 791 on any failure.
     pub fn decode(raw: &[u8]) -> Result<Self, u32> {
+        Self::decode_with(raw, &REVISION8_COMPATIBILITY)
+    }
+
+    pub fn decode_with(raw: &[u8], hooks: &dyn ApplicationHooks) -> Result<Self, u32> {
         if raw.len() != TERMS_BYTES
             || raw[..4] != *b"DDT2"
             || u16::from_le_bytes([raw[4], raw[5]]) != TERMS_VERSION
@@ -95,24 +100,21 @@ impl Terms {
             custom_settle_window_slots: u64_at(80),
             result_retention_slots: u64_at(88),
         };
-        terms.check(ROUND_FLOOR_SLOTS)?;
+        hooks.check_terms_v1(&terms, ROUND_FLOOR_SLOTS)?;
         Ok(terms)
     }
 
     /// The only checks the program applies to a term (spec §6.8), in order.
     pub fn check(&self, round_floor_slots: u64) -> Result<(), u32> {
-        let custom = self.settlement_program != [0; 32];
-        if !(1..=WINDOW_CAP).contains(&self.challenge_window_slots)
-            || !(round_floor_slots.max(1)..=WINDOW_CAP).contains(&self.response_window_slots)
-            || self.executor_reward_bps as u64 > BPS_DENOMINATOR
-            || custom != (self.custom_settle_window_slots != 0)
-            || (custom
-                && !(1..=CUSTOM_SETTLE_WINDOW_CAP).contains(&self.custom_settle_window_slots))
-            || !(1..=WINDOW_CAP).contains(&self.result_retention_slots)
-        {
-            return Err(DISPUTE_TERMS);
-        }
-        Ok(())
+        self.check_with(round_floor_slots, &REVISION8_COMPATIBILITY)
+    }
+
+    pub fn check_with(
+        &self,
+        round_floor_slots: u64,
+        hooks: &dyn ApplicationHooks,
+    ) -> Result<(), u32> {
+        hooks.check_terms_v1(self, round_floor_slots)
     }
 
     pub fn encode(&self) -> [u8; TERMS_BYTES] {
@@ -208,6 +210,10 @@ pub struct Terms2 {
 impl Terms2 {
     /// Canonical decode plus the mechanical checks; 791 on any failure.
     pub fn decode(raw: &[u8]) -> Result<Self, u32> {
+        Self::decode_with(raw, &REVISION8_COMPATIBILITY)
+    }
+
+    pub fn decode_with(raw: &[u8], hooks: &dyn ApplicationHooks) -> Result<Self, u32> {
         if raw.len() != TERMS_BYTES_V2
             || raw[..4] != *b"DDT2"
             || u16::from_le_bytes([raw[4], raw[5]]) != TERMS_VERSION_V2
@@ -232,7 +238,7 @@ impl Terms2 {
             bond_remainder: raw[96..128].try_into().unwrap(),
             abandon_after_slots: u64_at(128),
         };
-        terms.check(ROUND_FLOOR_SLOTS)?;
+        hooks.check_terms_v2(&terms, ROUND_FLOOR_SLOTS)?;
         Ok(terms)
     }
 
@@ -252,38 +258,15 @@ impl Terms2 {
     /// transaction, and DDT2 is hashed into the descriptor, so no document can
     /// exist whose terms were not compared against its template's limits.
     pub fn check(&self, round_floor_slots: u64) -> Result<(), u32> {
-        let custom = self.settlement_program != [0; 32];
-        // 1-6: revision 7's mechanical bounds.
-        if !(1..=WINDOW_CAP).contains(&self.challenge_window_slots)
-            || !(round_floor_slots.max(1)..=WINDOW_CAP).contains(&self.response_window_slots)
-            || self.executor_reward_bps as u64 > BPS_DENOMINATOR
-            || custom != (self.custom_settle_window_slots != 0)
-            || (custom
-                && !(1..=CUSTOM_SETTLE_WINDOW_CAP).contains(&self.custom_settle_window_slots))
-            || !(1..=WINDOW_CAP).contains(&self.result_retention_slots)
-        {
-            return Err(DISPUTE_TERMS);
-        }
-        // 7-11: the policy, its shares and its escrow floor.
-        let kind = self.bond_policy_kind;
-        if kind == BOND_POLICY_NONE
-            || kind > BOND_POLICY_CUSTOM
-            || self.bond_slasher_bps as u64 > BPS_DENOMINATOR
-            || self.bond_remainder == [0; 32]
-            || (kind == BOND_POLICY_CUSTOM) != custom
-            || (kind == BOND_POLICY_CUSTOM && self.bond_slasher_bps != 0)
-            || (kind == BOND_POLICY_CUSTOM
-                && self.executor_bond_lamports != 0
-                && self.executor_bond_lamports < BOND_ESCROW_RENT_EXEMPT)
-        {
-            return Err(DISPUTE_TERMS);
-        }
-        // 12: the structural grace floor, one slot. The grace itself is the
-        // template's (`min_abandon_after_slots`, checked in `check_template`).
-        if !(ABANDON_AFTER_SLOTS_FLOOR..=WINDOW_CAP).contains(&self.abandon_after_slots) {
-            return Err(DISPUTE_TERMS);
-        }
-        Ok(())
+        self.check_with(round_floor_slots, &REVISION8_COMPATIBILITY)
+    }
+
+    pub fn check_with(
+        &self,
+        round_floor_slots: u64,
+        hooks: &dyn ApplicationHooks,
+    ) -> Result<(), u32> {
+        hooks.check_terms_v2(self, round_floor_slots)
     }
 
     /// **Checks 17-20, the per-template comparison, refused 791** (spec §1.1,
@@ -310,15 +293,15 @@ impl Terms2 {
     /// same record. §3's rule is that an existing code is reused rather than
     /// reallocated, and there is nothing here a caller could act on differently.
     pub fn check_template(&self, limits: &super::config::TemplateLimits) -> Result<(), u32> {
-        if !(limits.min_abandon_after_slots..=limits.max_abandon_after_slots)
-            .contains(&self.abandon_after_slots)
-            || self.challenge_window_slots > limits.max_challenge_window_slots
-            || self.response_window_slots > limits.max_response_window_slots
-            || self.abandon_after_slots > limits.max_document_lifetime_slots
-        {
-            return Err(DISPUTE_TERMS);
-        }
-        Ok(())
+        self.check_template_with(limits, &REVISION8_COMPATIBILITY)
+    }
+
+    pub fn check_template_with(
+        &self,
+        limits: &super::config::TemplateLimits,
+        hooks: &dyn ApplicationHooks,
+    ) -> Result<(), u32> {
+        hooks.check_terms2_template(self, limits)
     }
 
     pub fn encode(&self) -> [u8; TERMS_BYTES_V2] {

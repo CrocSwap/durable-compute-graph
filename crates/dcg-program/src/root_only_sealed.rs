@@ -20,7 +20,7 @@
 use crate::closure_v2::{
     self as h, document_address, position_page_address, DCM2_V3_HEADER, DPR2_HEADER,
 };
-use crate::closure_v2_bootstrap::create;
+use crate::closure_v2_accounts::create;
 use crate::{hash, position_template as pt, root_only as r};
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,

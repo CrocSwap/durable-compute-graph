@@ -11,6 +11,7 @@ use crate::hash;
 
 /// A versioned identifier. The value and its version are independently
 /// committed by the application manifest.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VersionedId {
     pub id: u32,
@@ -94,7 +95,11 @@ pub trait StatefulKernel: Kernel {
 
 /// Optional optimistic replay. It is separate from statefulness and from the
 /// backend's challenge lifecycle.
-pub trait OptimisticReplay: StatefulKernel {
+pub trait OptimisticReplay: Kernel {
+    /// Repeat the kernel identity on the replay vtable so SBF callers never
+    /// need a trait-object upcast to call the inherited `Kernel::manifest`.
+    fn replay_manifest(&self) -> &'static KernelManifest;
+
     fn replay(
         &self,
         input: &[u8],
@@ -104,10 +109,20 @@ pub trait OptimisticReplay: StatefulKernel {
     ) -> Result<bool, KernelError>;
 }
 
+/// A statically linked replay implementation bound to one advertised mode.
+/// The kernel identity comes from `replay.replay_manifest()` so a descriptor cannot
+/// select a different implementation by changing an untrusted numeric kind.
+#[repr(C)]
+pub struct OptimisticReplayBinding {
+    pub mode: ModeId,
+    pub replay: &'static dyn OptimisticReplay,
+}
+
 pub struct ApplicationManifest {
     pub application_id: &'static [u8],
     pub version: u16,
     pub kernels: &'static [&'static dyn Kernel],
+    pub optimistic_replays: &'static [OptimisticReplayBinding],
 }
 
 impl ApplicationManifest {
@@ -139,6 +154,39 @@ impl ApplicationManifest {
                 && m.abi_version == abi_version
                 && m.modes.contains(&mode)
         })
+    }
+
+    /// Resolve replay only when this application image compiled the exact
+    /// kernel ABI and explicitly bound it to the requested versioned mode.
+    pub fn resolve_optimistic_replay(
+        &self,
+        id: KernelId,
+        semantic_version: u16,
+        abi_version: u16,
+        mode: ModeId,
+    ) -> Option<&'static OptimisticReplayBinding> {
+        let bindings: &'static [OptimisticReplayBinding] = self.optimistic_replays;
+        let mut index = 0;
+        while index < bindings.len() {
+            let binding = bindings.get(index)?;
+            let m = binding.replay.replay_manifest();
+            if binding.mode.id != mode.id
+                || binding.mode.version != mode.version
+                || m.id != id
+                || m.semantic_version != semantic_version
+                || m.abi_version != abi_version
+            {
+                index += 1;
+                continue;
+            }
+            for advertised in m.modes.iter() {
+                if advertised.id == mode.id && advertised.version == mode.version {
+                    return Some(binding);
+                }
+            }
+            index += 1;
+        }
+        None
     }
 
     /// Run one already-authenticated byte transition through a kernel that
@@ -218,6 +266,43 @@ impl ApplicationManifest {
                 }
             }
         }
+        for (i, binding) in self.optimistic_replays.iter().enumerate() {
+            let replay_manifest = binding.replay.replay_manifest();
+            let registered = self.kernels.iter().any(|kernel| {
+                let m = kernel.manifest();
+                m.id == replay_manifest.id
+                    && m.semantic_version == replay_manifest.semantic_version
+                    && m.abi_version == replay_manifest.abi_version
+            });
+            if !registered {
+                return Err(ManifestError::ReplayNotRegistered(replay_manifest.id));
+            }
+            let mode_advertised = self.kernels.iter().any(|kernel| {
+                let m = kernel.manifest();
+                m.id == replay_manifest.id
+                    && m.semantic_version == replay_manifest.semantic_version
+                    && m.abi_version == replay_manifest.abi_version
+                    && m.modes.contains(&binding.mode)
+            });
+            if !mode_advertised {
+                return Err(ManifestError::ReplayModeUnsupported(
+                    replay_manifest.id,
+                    binding.mode,
+                ));
+            }
+            if self.optimistic_replays.iter().skip(i + 1).any(|other| {
+                let m = other.replay.replay_manifest();
+                other.mode == binding.mode
+                    && m.id == replay_manifest.id
+                    && m.semantic_version == replay_manifest.semantic_version
+                    && m.abi_version == replay_manifest.abi_version
+            }) {
+                return Err(ManifestError::DuplicateReplay(
+                    replay_manifest.id,
+                    binding.mode,
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -229,6 +314,9 @@ pub enum ManifestError {
     InvalidAlignment(KernelId),
     ResourceExceedsLayout(KernelId),
     DuplicateMode(KernelId, ModeId),
+    ReplayNotRegistered(KernelId),
+    ReplayModeUnsupported(KernelId, ModeId),
+    DuplicateReplay(KernelId, ModeId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,7 +476,9 @@ pub mod test_kernel {
     };
     static MODES: [ModeId; 2] = [MODE_CONSENSUS_V1, MODE_OPTIMISTIC_V1];
 
-    pub struct ByteSum;
+    pub struct ByteSum {
+        _marker: u8,
+    }
 
     static MANIFEST: KernelManifest = KernelManifest {
         id: KernelId(*b"dcg-test-sum-v1\0"),
@@ -435,12 +525,38 @@ pub mod test_kernel {
         }
     }
 
-    pub static BYTE_SUM: ByteSum = ByteSum;
+    pub static BYTE_SUM: ByteSum = ByteSum { _marker: 0 };
+    impl OptimisticReplay for ByteSum {
+        fn replay_manifest(&self) -> &'static KernelManifest {
+            &MANIFEST
+        }
+
+        fn replay(
+            &self,
+            input: &[u8],
+            prior_state: &[u8],
+            claimed_output: &[u8],
+            claimed_state: &[u8],
+        ) -> Result<bool, KernelError> {
+            if !prior_state.is_empty() || !claimed_state.is_empty() {
+                return Err(KernelError::InvalidInput);
+            }
+            let mut expected = [0u8; 8];
+            self.execute(input, &mut expected)?;
+            Ok(claimed_output == expected)
+        }
+    }
+
     pub static KERNELS: [&'static dyn Kernel; 1] = [&BYTE_SUM];
+    pub static REPLAY_BINDINGS: [OptimisticReplayBinding; 1] = [OptimisticReplayBinding {
+        mode: MODE_OPTIMISTIC_V1,
+        replay: &BYTE_SUM,
+    }];
     pub static MANIFEST_APP: ApplicationManifest = ApplicationManifest {
         application_id: b"dcg-test-app/1",
         version: 1,
         kernels: &KERNELS,
+        optimistic_replays: &REPLAY_BINDINGS,
     };
 }
 
@@ -451,11 +567,11 @@ mod tests {
     #[cfg(feature = "test-kernel")]
     #[test]
     fn static_application_manifest_resolves_exact_semantic_and_abi_versions() {
-        use test_kernel::{ByteSum, MODE_CONSENSUS_V1};
+        use test_kernel::{BYTE_SUM, MODE_CONSENSUS_V1, MODE_OPTIMISTIC_V1};
         let m = &test_kernel::MANIFEST_APP;
         assert_eq!(m.validate(), Ok(()));
         let kernel = m.resolve(KernelId(*b"dcg-test-sum-v1\0"), 1, 1).unwrap();
-        assert_eq!(kernel.manifest().id, ByteSum.manifest().id);
+        assert_eq!(kernel.manifest().id, BYTE_SUM.manifest().id);
         let mut output = [0u8; 8];
         assert_eq!(
             m.execute(
@@ -469,13 +585,30 @@ mod tests {
             Ok(8)
         );
         assert_eq!(u64::from_le_bytes(output), 256);
-        assert!(m.supports_mode(ByteSum.manifest().id, 1, 1, MODE_CONSENSUS_V1));
-        assert!(!m.supports_mode(ByteSum.manifest().id, 1, 2, MODE_CONSENSUS_V1));
-        assert!(m.resolve(ByteSum.manifest().id, 2, 1).is_none());
-        assert!(m.resolve(ByteSum.manifest().id, 1, 2).is_none());
+        assert_eq!(
+            m.resolve_optimistic_replay(BYTE_SUM.manifest().id, 1, 1, MODE_OPTIMISTIC_V1)
+                .unwrap()
+                .replay
+                .replay(&[1, 2, 3, 250], &[], &output, &[]),
+            Ok(true)
+        );
+        assert_eq!(
+            m.resolve_optimistic_replay(BYTE_SUM.manifest().id, 1, 1, MODE_OPTIMISTIC_V1)
+                .unwrap()
+                .replay
+                .replay(&[1, 2, 3, 250], &[], &[0; 8], &[]),
+            Ok(false)
+        );
+        assert!(m
+            .resolve_optimistic_replay(BYTE_SUM.manifest().id, 1, 1, MODE_CONSENSUS_V1)
+            .is_none());
+        assert!(m.supports_mode(BYTE_SUM.manifest().id, 1, 1, MODE_CONSENSUS_V1));
+        assert!(!m.supports_mode(BYTE_SUM.manifest().id, 1, 2, MODE_CONSENSUS_V1));
+        assert!(m.resolve(BYTE_SUM.manifest().id, 2, 1).is_none());
+        assert!(m.resolve(BYTE_SUM.manifest().id, 1, 2).is_none());
         assert_eq!(
             m.execute(
-                ByteSum.manifest().id,
+                BYTE_SUM.manifest().id,
                 1,
                 1,
                 VersionedId { id: 99, version: 1 },
@@ -486,7 +619,7 @@ mod tests {
         );
         assert_eq!(
             m.execute(
-                ByteSum.manifest().id,
+                BYTE_SUM.manifest().id,
                 1,
                 1,
                 MODE_CONSENSUS_V1,
