@@ -1647,6 +1647,12 @@ fn process_v1_with_kernel(
 #[path = "stateful_v2.rs"]
 pub mod v2;
 
+/// Explicit stateful wire v3. It keeps v2 records available while adding
+/// primary headerless state, committed-prefix halt, resource-backed views, and
+/// resumable initialization.
+#[path = "stateful_v3.rs"]
+pub mod v3;
+
 /// Invoke the version named in the instruction's wire-version byte.
 pub fn process_with_kernel(
     program: &Pubkey,
@@ -1656,6 +1662,7 @@ pub fn process_with_kernel(
 ) -> ProgramResult {
     match data.get(1).copied() {
         Some(2) => v2::process_with_kernel(program, accounts, data, kernel),
+        Some(3) => v3::process_with_kernel(program, accounts, data, kernel),
         Some(WIRE_VERSION) => process_v1_with_kernel(program, accounts, data, kernel),
         _ => Err(ProgramError::InvalidInstructionData),
     }
