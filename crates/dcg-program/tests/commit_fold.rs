@@ -68,7 +68,9 @@ fn cases(rows: &[Vec<String>]) -> BTreeMap<String, BTreeMap<String, String>> {
     let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for row in rows {
         assert_eq!(row.len(), 3, "bad fold vector row: {row:?}");
-        out.entry(row[0].clone()).or_default().insert(row[1].clone(), row[2].clone());
+        out.entry(row[0].clone())
+            .or_default()
+            .insert(row[1].clone(), row[2].clone());
     }
     out
 }
@@ -96,20 +98,32 @@ fn every_fold_vector_row_matches_the_fold_module() {
         let reference = tree_root_reference(&leaves).unwrap();
         let carried = tree_root_frontier(&leaves).unwrap();
         assert_eq!(hex(&reference), fields["tree_root"], "{name}: tree_root");
-        assert_eq!(hex(&carried), fields["tree_root_frontier"], "{name}: frontier");
+        assert_eq!(
+            hex(&carried),
+            fields["tree_root_frontier"],
+            "{name}: frontier"
+        );
         assert_eq!(carried, reference, "{name}: frontier != reference");
         let root = closure_root(&descriptor(), 3, 5, count as u32, &reference);
         assert_eq!(hex(&root), fields["closure_root"], "{name}: closure_root");
         let index: usize = fields["proof_index"].parse().unwrap();
         let proof = membership_proof(&leaves, index).unwrap();
-        assert_eq!(proof.len().to_string(), fields["proof_depth"], "{name}: depth");
+        assert_eq!(
+            proof.len().to_string(),
+            fields["proof_depth"],
+            "{name}: depth"
+        );
         assert_eq!(path_text(&proof), fields["proof_path"], "{name}: path");
         assert_eq!(
             max_proof_depth(count as u32) as usize,
             proof.len(),
             "{name}: ceil(log2) depth"
         );
-        assert_eq!(membership_verify(&leaves[index], &proof), reference, "{name}: verify");
+        assert_eq!(
+            membership_verify(&leaves[index], &proof),
+            reference,
+            "{name}: verify"
+        );
     }
     assert_eq!(leaf_cases, 12, "fold_vectors_v1.tsv changed shape");
 }
@@ -121,7 +135,10 @@ fn closure_root_binds_document_family_window_and_count() {
     let base = tree_root_reference(&synthetic_leaves(8)).unwrap();
     let expected = [
         ("base", closure_root(&descriptor(), 3, 5, 8, &base)),
-        ("other_descriptor", closure_root(&sha256(&[b"other"]), 3, 5, 8, &base)),
+        (
+            "other_descriptor",
+            closure_root(&sha256(&[b"other"]), 3, 5, 8, &base),
+        ),
         ("other_family", closure_root(&descriptor(), 4, 5, 8, &base)),
         ("other_window", closure_root(&descriptor(), 3, 6, 8, &base)),
         ("other_count", closure_root(&descriptor(), 3, 5, 9, &base)),
@@ -170,7 +187,10 @@ fn the_naive_bag_the_peaks_collapse_disagrees_at_three_leaves() {
         "the wrong collapse must differ at three leaves"
     );
     // The right collapse is the reference.
-    assert_eq!(frontier.collapse().unwrap(), tree_root_reference(&three).unwrap());
+    assert_eq!(
+        frontier.collapse().unwrap(),
+        tree_root_reference(&three).unwrap()
+    );
 }
 
 #[test]
@@ -190,11 +210,19 @@ fn a_swapped_or_truncated_proof_does_not_rebuild_the_root() {
                     (flipped, *digest)
                 })
                 .collect();
-            assert_ne!(membership_verify(&leaves[count / 2], &swapped), root, "swapped {count}");
+            assert_ne!(
+                membership_verify(&leaves[count / 2], &swapped),
+                root,
+                "swapped {count}"
+            );
         }
         if !proof.is_empty() {
             let truncated = &proof[..proof.len() - 1];
-            assert_ne!(membership_verify(&leaves[count / 2], truncated), root, "truncated {count}");
+            assert_ne!(
+                membership_verify(&leaves[count / 2], truncated),
+                root,
+                "truncated {count}"
+            );
         }
     }
 }
@@ -239,9 +267,18 @@ fn a_bad_membership_proof_is_457_and_the_depth_bound_is_32() {
     let root = tree_root_reference(&leaves).unwrap();
     let proof = membership_proof(&leaves, 2).unwrap();
     check_membership(&leaves[2], &proof, &root).unwrap();
-    assert_eq!(check_membership(&leaves[1], &proof, &root).unwrap_err().0, 457);
+    assert_eq!(
+        check_membership(&leaves[1], &proof, &root).unwrap_err().0,
+        457
+    );
     // A path deeper than the frontier bound is refused, even if it verifies.
-    let too_deep: Vec<(Side, [u8; 32])> =
-        std::iter::repeat((Side::Right, root)).take(MAX_RECORD_PROOF_DEPTH + 1).collect();
-    assert_eq!(check_membership(&leaves[0], &too_deep, &root).unwrap_err().0, 457);
+    let too_deep: Vec<(Side, [u8; 32])> = std::iter::repeat((Side::Right, root))
+        .take(MAX_RECORD_PROOF_DEPTH + 1)
+        .collect();
+    assert_eq!(
+        check_membership(&leaves[0], &too_deep, &root)
+            .unwrap_err()
+            .0,
+        457
+    );
 }

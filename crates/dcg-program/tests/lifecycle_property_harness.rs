@@ -24,6 +24,88 @@ use solana_transaction::Transaction;
 use solana_transaction_error::TransactionError;
 use std::collections::BTreeSet;
 
+#[cfg(feature = "test-kernel")]
+mod kernel_lifecycle {
+    use dcg_program::kernel::{
+        test_kernel::{BYTE_SUM, MANIFEST_APP, MODE_OPTIMISTIC_V1},
+        Commitment, Kernel, KernelId, ResolutionBackend, ResolutionStatus,
+    };
+
+    struct State {
+        claim: Commitment,
+        status: ResolutionStatus,
+    }
+
+    struct ObserveBackend;
+
+    impl ResolutionBackend for ObserveBackend {
+        type State = State;
+        type Transition = Vec<u8>;
+        type Error = ();
+
+        fn mode(&self) -> dcg_program::kernel::ModeId {
+            MODE_OPTIMISTIC_V1
+        }
+
+        fn start(&self, claimed_output: Commitment) -> Result<Self::State, Self::Error> {
+            Ok(State {
+                claim: claimed_output,
+                status: ResolutionStatus::Pending,
+            })
+        }
+
+        fn advance(
+            &self,
+            state: &mut Self::State,
+            observed_output: Self::Transition,
+        ) -> Result<ResolutionStatus, Self::Error> {
+            if state.status != ResolutionStatus::Pending {
+                return Ok(state.status);
+            }
+            state.status = if Commitment::sha256(&observed_output) == state.claim {
+                ResolutionStatus::Final
+            } else {
+                ResolutionStatus::Refuted
+            };
+            Ok(state.status)
+        }
+    }
+
+    #[test]
+    fn test_kernel_runs_through_static_registry_commitment_and_lifecycle() {
+        let app = &MANIFEST_APP;
+        let kernel_id = KernelId(*b"dcg-test-sum-v1\0");
+        let mut output = [0u8; 8];
+        let written = app
+            .execute(
+                kernel_id,
+                1,
+                1,
+                MODE_OPTIMISTIC_V1,
+                &[1, 2, 3, 250],
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(written, 8);
+        assert_eq!(u64::from_le_bytes(output), 256);
+
+        let backend = ObserveBackend;
+        let mut honest = backend.start(Commitment::sha256(&output)).unwrap();
+        assert_eq!(backend.mode(), MODE_OPTIMISTIC_V1);
+        assert_eq!(
+            backend.advance(&mut honest, output.to_vec()).unwrap(),
+            ResolutionStatus::Final
+        );
+
+        let mut malformed = backend.start(Commitment::sha256(&[0u8; 8])).unwrap();
+        assert_eq!(
+            backend.advance(&mut malformed, output.to_vec()).unwrap(),
+            ResolutionStatus::Refuted
+        );
+        assert_eq!(BYTE_SUM.manifest().id, kernel_id);
+    }
+}
+
 const PROGRAM: Pubkey = Pubkey::new_from_array([0xD8; 32]);
 const LONG_STEPS: usize = 1_024;
 const DEFAULT_STEPS: usize = 96;

@@ -90,7 +90,10 @@ pub fn tree_root_reference(leaves: &[Digest]) -> Option<Digest> {
         if level.len() % 2 == 1 {
             level.push(level[level.len() - 1]);
         }
-        level = level.chunks(2).map(|pair| node(&pair[0], &pair[1])).collect();
+        level = level
+            .chunks(2)
+            .map(|pair| node(&pair[0], &pair[1]))
+            .collect();
     }
     Some(level[0])
 }
@@ -114,7 +117,10 @@ impl Default for Frontier {
 
 impl Frontier {
     pub const fn new() -> Self {
-        Self { levels: [None; COMMIT_FRONTIER_LEVELS], leaf_cursor: 0 }
+        Self {
+            levels: [None; COMMIT_FRONTIER_LEVELS],
+            leaf_cursor: 0,
+        }
     }
 
     /// Load a stored frontier: the 32 levels plus the cursor whose bits must
@@ -127,7 +133,10 @@ impl Frontier {
         levels: [Option<Digest>; COMMIT_FRONTIER_LEVELS],
         leaf_cursor: u32,
     ) -> Self {
-        Self { levels, leaf_cursor }
+        Self {
+            levels,
+            leaf_cursor,
+        }
     }
 
     /// Leaves posted so far; its bits are the occupancy mask.
@@ -180,15 +189,19 @@ impl Frontier {
         self.check()?;
         let mut carry = *leaf;
         for i in 0..level {
-            let peak = self.levels[i].take().ok_or(DcgError(err::CLOSURE_FRONTIER))?;
+            let peak = self.levels[i]
+                .take()
+                .ok_or(DcgError(err::CLOSURE_FRONTIER))?;
             carry = node(&peak, &carry);
         }
         if self.levels[level].is_some() {
             return Err(DcgError(err::CLOSURE_FRONTIER));
         }
         self.levels[level] = Some(carry);
-        self.leaf_cursor =
-            self.leaf_cursor.checked_add(1).ok_or(DcgError(err::CLOSURE_FRONTIER))?;
+        self.leaf_cursor = self
+            .leaf_cursor
+            .checked_add(1)
+            .ok_or(DcgError(err::CLOSURE_FRONTIER))?;
         Ok(())
     }
 
@@ -260,7 +273,14 @@ pub fn closure_root(
     let family = family_id.to_le_bytes();
     let window = window_index.to_le_bytes();
     let count = leaf_count.to_le_bytes();
-    sha256(&[TAG_CLOSURE_ROOT, descriptor_digest, &family, &window, &count, tree_root])
+    sha256(&[
+        TAG_CLOSURE_ROOT,
+        descriptor_digest,
+        &family,
+        &window,
+        &count,
+        tree_root,
+    ])
 }
 
 /// The sibling path for `leaves[index]`, from the leaf upward, as
@@ -281,8 +301,18 @@ pub fn membership_proof(leaves: &[Digest], index: usize) -> Option<Vec<(Side, Di
             level.push(level[level.len() - 1]);
         }
         let sibling = level[pos ^ 1];
-        proof.push((if pos % 2 == 1 { Side::Left } else { Side::Right }, sibling));
-        level = level.chunks(2).map(|pair| node(&pair[0], &pair[1])).collect();
+        proof.push((
+            if pos % 2 == 1 {
+                Side::Left
+            } else {
+                Side::Right
+            },
+            sibling,
+        ));
+        level = level
+            .chunks(2)
+            .map(|pair| node(&pair[0], &pair[1]))
+            .collect();
         pos /= 2;
     }
     Some(proof)

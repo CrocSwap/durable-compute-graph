@@ -40,8 +40,7 @@ const PORTABLE_VECTORS: &[(&str, &str)] = &[
 
 #[test]
 fn revision_8_portable_vectors_match_the_frozen_bytes() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/golden/dcg");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/dcg");
     for (relative, expected) in PORTABLE_VECTORS {
         let path = root.join(relative);
         let bytes = fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}"));
