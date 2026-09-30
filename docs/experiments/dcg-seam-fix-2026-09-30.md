@@ -311,16 +311,16 @@ Round 5; the retained Round 5 log records the failure and source/image hashes.
 The final program source is commit
 `db4004a7dc7988b00bed71717bb7914eef9c83b5`; the source tree hash for
 `crates/dcg-program/src` is
-`f930379cdc403091a6e4070164ee4a4de76debd9`. The three fresh SBF images below
+`51260a25e33703ec692cbf737ec63442d82393be`. The three fresh SBF images below
 were built from that same program source with `cargo-build-sbf 3.0.15`,
 platform-tools v1.51, and SDK
 `/private/tmp/basanos-sbf-sdk-v151-20260920`.
 
 | Image | Feature | Bytes | ELF SHA-256 | Program source tree hash |
 | --- | --- | ---: | --- | --- |
-| App lifecycle | `sbf-real-lifecycle-test` | 1,409,384 | `35550c81e59aac52381223f8ac871debbb7ac7e290d112975ea50bc618176de2` | `f930379cdc403091a6e4070164ee4a4de76debd9` |
-| Empty compatibility | `revision-8` | 801,544 | `b8d046c881d1fbcdca63c0d7fc90a78bf11de75189d141cef70b7bdc1c08da47` | `f930379cdc403091a6e4070164ee4a4de76debd9` |
-| Unbound admission | `sbf-unbound-form-test` | 1,233,872 | `d931c5763fa3a8813be3bbbe783a3c6465380487259390a1ce7f0c521b55ea40` | `f930379cdc403091a6e4070164ee4a4de76debd9` |
+| App lifecycle | `sbf-real-lifecycle-test` | 1,409,384 | `35550c81e59aac52381223f8ac871debbb7ac7e290d112975ea50bc618176de2` | `51260a25e33703ec692cbf737ec63442d82393be` |
+| Empty compatibility | `revision-8` | 801,544 | `b8d046c881d1fbcdca63c0d7fc90a78bf11de75189d141cef70b7bdc1c08da47` | `51260a25e33703ec692cbf737ec63442d82393be` |
+| Unbound admission | `sbf-unbound-form-test` | 1,233,872 | `d931c5763fa3a8813be3bbbe783a3c6465380487259390a1ce7f0c521b55ea40` | `51260a25e33703ec692cbf737ec63442d82393be` |
 
 The app-aware K=10,240 admission was rerun with the app lifecycle image and
 the retained compiler-v1 fixture at
