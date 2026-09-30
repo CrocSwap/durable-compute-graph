@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+
+Files: crates/dcg-program/src/hash.rs crates/dcg-program/src/commit/fold.rs crates/dcg-program/tests/commit_fold.rs crates/dcg-program/tests/lifecycle_property_harness.rs
+Copyright: 2026 Basanos Project
+License: GPL-3.0-only
+
+Files: tests/golden/dcg/commit/* tests/golden/dcg/unified_v8/*
+Copyright: 2026 Basanos Project
+License: MIT
+
+Files: crates/dcg-program/vendor/**
+Copyright: 2016-2021 isis agora lovecruft; 2016-2021 Henry de Valence
+License: BSD-3-Clause

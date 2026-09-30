@@ -1,0 +1,113 @@
+name	value	kind	label	note
+TERMS_BYTES	136	bytes	derived	DDT2 v2; 96 in revision 7
+ABANDON_AFTER_SLOTS_AT	128	offset	designed	the appended field, so every offset DDT2 v2 already had keeps its value
+TEMPLATE_LIMITS.max_challenge_window_slots	67108864	slots	owner-set	DTU1 88, the EXAMPLE template's own cap on a document's challenge window.  **Not a protocol constant**: it was CHALLENGE_WINDOW_SLOTS_MAX and the user withdrew it on 2026-09-26 as 'way too high', because the rent a long document holds is the TEMPLATE OWNER's.  Checked against a document's own term at init (check 18, 791).  2^26 = 31.19 days on Fogo
+TEMPLATE_LIMITS.max_response_window_slots	8388608	slots	owner-set	DTU1 96, the example template's cap on the PER-ROUND response window (check 19, 791).  Rows 1 and 3 of the close both need open_challenges = 0, so this is the bound that keeps a silent challenger from holding a document open.  2^23 = 3.90 days per round
+TEMPLATE_LIMITS.max_document_lifetime_slots	134217728	slots	owner-set	DTU1 104, the example template's cap on ONE document's total hold from init_slot.  It is the clamp's ceiling at tags 162 and 165 and the ceiling of finalize's attestation budget, and it was the protocol constant DOCUMENT_LIFETIME_MAX
+TEMPLATE_LIMITS.max_abandon_after_slots	134217728	slots	owner-set	DTU1 112, the example template's cap on a document's production grace (check 17, 791).  It bounds the IDLE hold only -- the deadline is rewritten at every landing -- and must be at or below the lifetime, which is the seal's own rule 3
+TEMPLATE_LIMITS.min_abandon_after_slots	2592000	slots	owner-set	DTU1 120, the example template's FLOOR on a document's production grace (check 17, 791), and what terms check 12's 2,592,000 protocol floor was.  'One month' was the nominal 1 s/slot conversion; 2,592,000 slots is 28.91 h on Fogo at the measured 40.157 ms/slot
+TEMPLATE_LIMITS_SHORT.max_document_lifetime_slots	4096000	slots	owner-set	a SECOND template, whose limits the withdrawn constants made impossible: a 1.90-day lifetime, a 0.46-day challenge window and a half-hour round.  DCG checks no magnitude, so the protocol admits this and the 62.38-day example together -- the two rows are the user's decision
+ABANDON_AFTER_SLOTS_FLOOR	1	slots	designed	terms check 12 after the 2026-09-26 decision: the only grace floor DCG keeps, and it is **structural** -- a zero grace would make row 2 of the close fire in the document's own init slot, so any third party holding the fee could close an in-progress document at once.  One slot is the whole bound; the grace itself is the template's min_abandon_after_slots, refused 791 at init
+DTU1	168	bytes	derived	88 + 40 limits + 32 payer + 8 bumps: rent-exempt minimum `(128 + 168) * 6,960 = 2,060,160` lamports
+DTU1_MAX_CHALLENGE_AT	88	offset	designed	where the five limits start; the last is at 120
+DTU1_PAYER_AT	128	offset	designed	immutable original creator who receives DTU1 rent
+DTU1_BUMPS_AT	160	offset	designed	DTA1 bump at 160 and DEA2 bump at 162; reserved bump bytes are zero
+DEA2_HEADER	192	bytes	designed	tag-159 revision-8 DEA2 v3 header; revision-7 DEA2 v2 leaves bytes 157..192 zero
+DTU1_MIN_ABANDON_AT	120	offset	designed	the owner's grace FLOOR, the fifth limit
+CHALLENGE_ROUNDS_MAX	10	rounds	derived	the round term of the worst case, named in round 4 (High B).  Revision 7 7.8 derives 9 round deadlines for the longest position dispute at h = 12 'plus the replay'; revision 7 imposes NO cap on the count, and what bounds it is the committed tree height.  **The one window-shaped number DCG still keeps**, because it is in no record and no template can choose it: it counts deadlines the protocol computes rather than durations anybody picks
+WORST_CASE_HOLD_SLOTS	285212672	slots	derived	the worst-case rent hold for one document under the EXAMPLE template, and a FUNCTION of that template's own limits: its max_document_lifetime_slots + its max_challenge_window_slots + CHALLENGE_ROUNDS_MAX * its max_response_window_slots = 285,212,672 = 132.56 days on Fogo at the measured 40.157 ms/slot.  **There is no protocol-wide figure**: the exposure is whatever the DTU1 says, and a reader who wants to know what a template can be made to cost reads it
+WORST_CASE_HOLD_SLOTS_SHORT	5505600	slots	derived	the same formula over the short-lived template's own limits: 5,505,600 = 2.56 days, 52x tighter than the example's.  Two templates, one formula, no protocol number in either
+FOGO_SLOT_MS	40.157	ms	measured	M1029, docs/experiments/fogo-mainnet-probe-2026-09-09.md:119; the only cadence figure used here, and every day/hour figure in this file is DERIVED over it
+TERMS_VERSION	2	u16	designed	the reader split (D10)
+BINDING_BYTES	196	bytes	derived	DRB1 v2; 160 in revision 7
+BINDING_VERSION	2	u16	designed	the reader split (D7)
+PEAKS_AT	562	offset	derived	536 in revision 7; D11's 32 bytes
+TERMS_AT	1842	offset	derived	1816 in revision 7
+BINDING_AT	1978	offset	derived	1912 in revision 7
+STOP_PLUS_ONE_AT	2134	offset	derived	the stop value is read here and nowhere else
+DCM2_ABANDON_DEADLINE_AT	2174	offset	designed	appended to the fixed header, after the binding, so PEAKS_AT/TERMS_AT/BINDING_AT do not move
+OPTION_REGION_AT	2182	offset	derived	4*option_count bytes, write-once at init
+FORM47_OPTION_CAP	80	options	owner-set	Revision-8 typed decisions; selected from the measured 1,261,644-CU tag-121 cost at 80 reads on K=10,240. Compiler-v1 retains a 128-slot gather layout.
+DCM2_V7_BYTES	2182	bytes	derived	a completion document
+DCM2_VERSION	7	u16	designed	the rev-8 image refuses v6
+DCR2_HEADER	416	bytes	derived	336 in revision 7
+DCR2_VERSION	6	u16	designed	the rev-8 image refuses v5
+DCR2_POSITION_LENGTH_AT	212	offset	designed	inside v5's zero[7]
+DCR2_WINNER_AT	352	offset	derived	the close's copy, so tag 187 can read it
+DCR2_BOND_STATE_AT	408	offset	designed	mirrors DCM2 529; 4 here is what makes a DCRZ v2 tombstone mandatory, and it is the WHOLE of that test -- the status byte is not read (round-3 High 1)
+DCR2_BOND_CAUSE_AT	409	offset	designed	why the policy ran, so tag 187's BSS1 record can be built after DCR2 is gone
+DCRZ_V2_CAUSE_AT	96	offset	designed	the same cause, in the padding the v1 tombstone left at 96..104
+DCRZ_V2_RENT_EXEMPT	2282880	lamports	derived	minimum_balance(200) = (128 + 200) * 6,960; tag 185 keeps this on a v2 and does NOT trim to the 96-byte minimum (round-3 Medium 3)
+DCR2_STATUS_WITHHELD	4	u8	designed	the fifth DCR2 status value, revision 8: a finalized, unrefuted document closed on close row 3 because the executor withheld its attestation.  A never-attested document is therefore never SETTLED (round-3 High 1).  The 4 is in a different field from BOND_STATE_ESCROWED, which is also 4
+DPD2_BYTES	755	bytes	derived	679 in revision 7
+DPD2_DESCRIPTOR_DOMAIN	/5	domain	designed	revision 7 is /4
+UNIFIED_VERSION	3	u16	designed	2 in revision 7
+PT2P_COMPILER_VERSION	1	u8	measured	D8: derived from the PWR1 rung tuple (35,2,4)
+PT1X_TEMPLATE_CAPACITY	10240	positions	designed	one compiler-v1 PT1X serves every document that fits
+PT2S_OUTPUT_LOCATOR_AT	426	offset	designed	D7: six previously dead bytes inside the header
+PT2S_PWR1_AT	432	offset	measured	unchanged
+DCRZ_V1_BYTES	96	bytes	measured	revision 7's retention tombstone
+DCRZ_V2_BYTES	200	bytes	derived	tombstone + the settlement block tag 187 needs
+BOND_ESCROW_RENT_EXEMPT	890880	lamports	derived	minimum_balance(0); DDT2 check 11 refuses a smaller nonzero CUSTOM bond (finding 2)
+CUSTOM_BOND_FLOOR	890880	lamports	designed	kind = 2 requires executor_bond_lamports = 0 or >= this
+TIERC_DCM2_TERMS	1842	offset	derived	the Tier C request_program.rs:49 constant; 1,816 in revision 7
+TIERC_DCM2_BYTES	2182	bytes	derived	the Tier C request_program.rs:48 constant
+TIERC_DCM2_BINDING	1978	offset	derived	the Tier C request_program.rs:50 constant; 1,912 in revision 7
+TIERC_RESULT_HEADER	416	offset	derived	request_program.rs:46; 336 in revision 7
+TIERC_TOKEN_WIDTH	16	u8	measured	request_program.rs:54, used at :1285, :1466, :1486 and :1839: a CONSTANT today, which is the branch the Tier C table missed (Medium 7); on revision 8 the parse reads the record's own width from DCR2 208 and compares it with the rebuilt binding
+TIERC_TRQ1_BYTES	416	bytes	derived	request_program.rs:34 was 376; + the DDT2 v2 growth
+TIERC_REQUEST_BYTES	1112	bytes	derived	request_program.rs:43 was 1,072; + the DDT2 v2 growth
+TIERC_CONSUMER_DOMAIN	basanos/tierc-request/3	domain	designed	/2 in revision 7, so no rev-7 digest is a rev-8 digest
+DCRZ_V2_WINNER_AT	168	offset	derived	the tombstone's conviction_winner
+DLE1_VERSION	3	u16	designed	2 in revision 7
+BOND_ESCROW_BYTES	0	bytes	derived	D12
+BOND_ESCROW_SEED	dcg-hcl-bond-escrow	seed	designed	D12, with descriptor as the second seed
+SEAL_METAS	11	accounts	derived	tag 176 action 1: sealer (s, w; pays), DCF1, DTA1 (w), PT2S, DTU1 (w), PT1X, geometry, routes, payloads, system, DRP2. One K=10,240 PT1X template covers every document that fits; no shared-base/refcount records are created. no template account carries, so it is a meta and it is CHECKED, not trusted
+SEAL_ADMIN_METAS	5	accounts	derived	tag 176 actions 2/3: sealer, DCF1, DTA1, PT2S and DTU1
+SEAL_APPROVE_BYTES	42	bytes	derived	tag 176 action 1: tag | action:u8 | five u64 limits.  The revision-7 two-byte approve is REFUSED 793 on a revision-8 program -- a DTU1 with no limits is not a template and DCG has no protocol-wide windows to fall back on -- so the reader split is the data length
+SEAL_ADMIN_BYTES	2	bytes	derived	tag 176 actions 2 (revoke) and 3 (retire): tag | action, and neither carries a limit or a registry because neither publishes one
+SEAL_ACTION_RETIRED	3	u8	designed	C4's numbering for the 'Open for C4' gap: 1 approve, 2 revoke, 3 retire, both administrative actions on the 2-byte form
+CU_INSTRUCTION_CAP	1400000	CU	measured	Solana's per-instruction cap, which the seal's capacity bound is measured against
+CLOSE_OWN_CU	40000	CU	measured-local	fixed close cost, rounded up above the maximum honest SBF row; the separate DPR2 clear is linear
+DPR2_ZERO_MCU_PER_BYTE	5	milli-CU/byte	measured-local	SBF DPR2 zeroing slope rounded upward; the full 48 + 32*K bytes are charged at capacity
+CU_MARGIN	70000	CU	designed	C4: 5% of the cap, and the reason the model is a fit rather than a measurement
+MAX_POSITION_CAPACITY	57266	outputs	derived	largest width-16 capacity whose fixed close + DPR2 zeroing + resolve check at L = count fits 1,400,000 - 70,000 CU. Inputs are measured-local; the boundary is derived. A template whose locator width is not 16 is charged for the bitmap alone, because stop_plus_one != 0 => output_width == 16 is refused 794 at init, so the cell scan is unreachable there; the seal refuses one over the bound with 793
+CLOSE_METAS_STANDARD	10	accounts	derived	signer, DCM2, DPR2, DFS2, DCR2, payer, DTU1, winner, remainder, incinerator
+CLOSE_METAS_CUSTOM	10	accounts	derived	signer, DCM2, DPR2, DFS2, DCR2, payer, DTU1, escrow, system, incinerator
+SETTLE_METAS	9	accounts	derived	tag 131 under either kind: revision 7's seven (DCR1, DRU1, winner, record executor, DCM2, incinerator, record challenger) plus policy_winner + remainder under STANDARD, or bond_escrow + system under CUSTOM; no CPI on a revision-8 settle (Medium 4)
+RETRY_METAS	8	accounts	derived	tag 187, permissionless; seven of them are the BSS1 meta list
+BSS1_CAUSE4_METAS	7	accounts	derived	program, escrow, winner, remainder, executor, DCR2, system
+CLOSE_TEMPLATE_METAS	15	accounts	derived	single-phase tag 186 drains the template, four PT1X resources, PT2S, DTA1, DTU1 and any DEA2
+BOND_STATE_ESCROWED	4	u8	designed	D12: a new executor_bond_state, written by the two routes that escrow -- a CUSTOM close and a CUSTOM challenge settle (round 2, High 2)
+BOND_CAUSE_CONVICTION	4	u8	designed	BSS1 cause 4: the document was refuted
+BOND_CAUSE_WITHHELD	5	u8	designed	BSS1 cause 5, NEW in round 2: the executor withheld its attestation.  A policy event with a named cause, not a penalty DCG chose (High 3)
+CLOSE_CAUSE_AT	67	offset	designed	the CLOSE event's cause byte, in v2's padding: the body stays 72 bytes
+CLOSE_DISPOSITION_ESCROWED	3	u8	designed	the CLOSE event's bond_disposition for that state
+BOND_RETRY_OUTCOME_SETTLED	1	u8	designed	the only outcome; 0 is unassigned (599 refuses the no-op case)
+PT1O_RESERVE_STEP_BYTES	10240	bytes	measured-runtime-limit	maximum PT1O data growth in one instruction; tag 199 caps each allocation step at this size
+PT1O_RESERVATION_REQUIRED	605	u32	designed	tag 146 refuses a large PT1O unless tag 199 has reserved its exact size
+TAG_ATTEST_OUTPUT	177	u8	designed	unchanged
+TAG_CLOSE_DOCUMENT	172	u8	designed	unchanged
+TAG_CLOSE_PT1O_RESERVATION	200	u8	designed	new revision-8 instruction
+TAG_CLOSE_TEMPLATE	186	u8	designed	new revision-8 instruction
+TAG_FINALIZE_DOCUMENT	165	u8	designed	unchanged
+TAG_LAND_POSITION_ROOTS	162	u8	designed	unchanged
+TAG_RESERVE_PT1O	199	u8	designed	new revision-8 instruction
+TAG_RESOLVE_RESULT	178	u8	designed	unchanged
+TAG_RETRY_BOND_SETTLEMENT	187	u8	designed	new revision-8 instruction
+TAG_UNIFIED_INIT	161	u8	designed	unchanged
+SEED_BOND_ESCROW	dcg-hcl-bond-escrow	bytes	designed	new in revision 8 (D12)
+SEED_CHALLENGE	dcg-unified-challenge	bytes	designed	unchanged
+SEED_DOCUMENT	dcg-hcl-document	bytes	designed	unchanged
+SEED_FAMILY_SLOTS	dcg-hcl-family-slots	bytes	designed	unchanged
+SEED_POSITIONS	dcg-hcl-positions	bytes	designed	unchanged
+SEED_RESULT	dcg-hcl-result	bytes	designed	unchanged
+SEED_SETTLEMENT_ESCROW	dcg-hcl-settlement	bytes	designed	unchanged
+SEED_TEMPLATE_SEAL	dcg-template-seal	bytes	designed	unchanged
+SEED_TEMPLATE_USE	dcg-template-use	bytes	designed	unchanged
+DOMAIN_DESCRIPTOR	basanos/dcg-unified-descriptor/5	bytes	designed	the descriptor's changes in revision 8
+DOMAIN_MMR_DOCUMENT	basanos/dcg-hclosure-incremental-document/1	bytes	designed	unchanged
+DOMAIN_MMR_LEAF	basanos/dcg-hclosure-incremental-leaf/1	bytes	designed	unchanged
+DOMAIN_MMR_NODE	basanos/dcg-hclosure-incremental-node/1	bytes	designed	unchanged
+DOMAIN_RS1_TABLE	basanos/dcg-rs1-table/1	bytes	designed	unchanged
+DOMAIN_WITNESS_DOMAIN	basanos/dcg-witness-domain/1	bytes	designed	unchanged

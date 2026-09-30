@@ -1,0 +1,50 @@
+object	expression	bytes	label	note
+DCM2 v7	PEAKS_AT 562 + 40*32 peaks + 136 terms + 196 binding + 8 abandon_deadline	2182	derived	a completion document; a decision document adds 4*option_count
+DCM2 v7	with option_count = 4	2198	derived	a decision document
+DCM2 v7	with option_count = 80	2502	derived	the revision-8 form-47 option cap
+DCR2 v6	header	416	derived	216 terms + 32 winner + 24 retention + 8 (bond state and cause)
+DCR2 v6	with 224 outputs of 16	4028	derived	the alpha's run
+DCR2 v6	with 10240 outputs of 16	165536	derived	the 10,240 cap
+DCR2 v6	a decision: 5 outputs of 4	437	derived	1 + option_count cells of 4 bytes at one position (finding 8)
+DCR2 v6	a decision: 81 outputs of 4	751	derived	option_count = 80, the owner-set form-47 cap
+DCRZ v1	tombstone	96	measured	revision 7's, unchanged
+DCRZ v2	tombstone + settlement block	200	derived	finding 3: 96 + 104, so tag 187 still works after retention
+DCRZ v2 - v1	rent delta per unsettled bond	723840	derived	104 * 6,960 = 723,840 lamports, against 72.9 FOGO of DCR2 rent that refusing tag 185 would pin; the 8-byte cause rides in v1's padding, so it costs nothing
+DCRZ v2	rent-exempt minimum kept by tag 185	2282880	derived	minimum_balance(200) = (128 + 200) * 6,960: revision 7 trims a tombstone to its own 96-byte minimum, and a v2 must NOT be trimmed (round-3 Medium 3), because tag 187 reads the settlement block out of those 104 bytes
+template limit	min_abandon_after_slots, example template: 2,592,000 slots = 28.91 h = 1.20 d at 40.157 ms/slot	2592000	derived	DTU1 120, **the template owner's floor on a document's production grace** -- and what terms check 12's protocol floor of 2,592,000 was before the user withdrew it (2026-09-26).  'One month' was the nominal 1 s/slot conversion and was withdrawn earlier: 2,592,000 slots at the MEASURED Fogo interval (M1029) is 28.91 h.  A 10,240-attestation run is ~2.84 h at one second per transaction (estimated), so this floor is about 10x the budget it exists for. **A TEMPLATE OWNER'S NUMBER, NOT A PROTOCOL CONSTANT**
+template limit	max_abandon_after_slots, example template: 134,217,728 slots = 62.38 d at 40.157 ms/slot	134217728	derived	DTU1 112, the owner's cap on a document's production grace, at the measured 40.157 ms/slot.  This was terms check 14's cap and is the owner's now, and it bounded the IDLE hold only (the window is rewritten at every landing), which is why the *lifetime* row is the one that bounds the total.  **A TEMPLATE OWNER'S NUMBER**
+template limit	max_challenge_window_slots, example template: 67,108,864 slots = 31.19 d at 40.157 ms/slot	67108864	derived	DTU1 88, the owner's cap on the window that gates every close row; revision 7 allowed 2^62 (~5.9e9 years), and the withdrawn protocol cap of 2^26 was 'too high' (user, 2026-09-26).  The opening window only.  **A TEMPLATE OWNER'S NUMBER**
+template limit	max_response_window_slots, example template: 8,388,608 slots = 3.90 d at 40.157 ms/slot	8388608	derived	DTU1 96, the owner's cap on the PER-ROUND window, which gates the close as much as the challenge window does because rows 1 and 3 both need open_challenges = 0.  **A TEMPLATE OWNER'S NUMBER**
+template limit	max_document_lifetime_slots, example template: 134,217,728 slots = 62.38 d at 40.157 ms/slot	134217728	derived	DTU1 104, the TOTAL hold: every write of abandon_deadline after init is clamped to init_slot + this, and finalize is refused 736 at or after its own production deadline.  It was the protocol constant DOCUMENT_LIFETIME_MAX and is now the one number tags 162 and 165 read from the template.  **A TEMPLATE OWNER'S NUMBER**
+template limit	the short-lived template: lifetime 4,096,000 = 1.90 d, challenge 1,000,000 = 0.46 d, response 40,960 = 0.02 d	4096000	derived	DTU1 104 for a **second** template whose limits the withdrawn constants made impossible.  The protocol admits both this and the 132.56-day example above, and the difference between them is entirely the owner's decision: DCG checks no magnitude at all
+challenge rounds	one challenge's round deadlines: revision 7 7.8's 9 plus the replay	10	derived	the round term of the worst case.  Revision 7 imposes no cap (7.8: 'the program imposes neither'); what bounds it is the committed tree height -- ceil(h/4) descents for a position challenge, ceil(H/4) for a summary one -- and h = 12 is the frozen 3,244-entry segment.  Named, not enforced by a program constant; the spec records the residual
+WORST-CASE rent hold	the EXAMPLE template's: its lifetime + its challenge window + rounds * its response window	285212672	derived	285,212,672 slots = 132.56 d at 40.157 ms/slot: 62.38 + 31.19 + 10 * 3.90.  The bound on one document's hold on ITS template's counters -- and **there is no protocol-wide figure any more** (user, 2026-09-26), so this number is a property of the DTU1 that published it. The arithmetic is round 4 High A's and is unchanged; only its owner is different
+WORST-CASE rent hold	the SHORT-LIVED template's, same formula	5505600	derived	5,505,600 slots = 2.56 d at 40.157 ms/slot: 1.90 + 0.46 + 10 * 0.02.  The same formula over a second template's own limits, 52x tighter than the example's, and the protocol admits both: that is the whole of the user's decision in two rows
+abandon window	writers: 1 + 1 + position_capacity	10242	derived	one write at init, one per landing (landings stop at position_capacity) and one at finalize: 10,242 at the 10,240 freeze.  AttestOutputV5 is no longer a writer (round 4, High A), and every write is clamped to init_slot + the template's lifetime limit, so the push count is a cost, not a bound
+DPD2 /5	preimage	755	derived	679 + 40 (DDT2 v2) + 36 (DRB1 v2)
+DPR2 v1	48 + 32*n at the capacity	327728	derived	D4: grown to n, not allocated at K
+DDT2 v2	record	136	derived	96 + 32 (the policy) + 8 (abandon_after_slots)
+DDT2 v2 - v1	rent delta per document	278400	derived	40 bytes: 32 of policy fields and 8 for the abandonment window
+TRQ1 v8 request block	376 + 40 (the DDT2 v2 growth)	416	derived	Tier C: a decision's option_count and option table still need a home here; spec 2.4 names that as the one open framing item
+TCR1 v8 request record	1,072 + 40 (the DDT2 v2 growth)	1112	derived	Tier C; the option table's framing is the same open item
+DRB1 v2	record	196	derived	160 + 36
+PT2S	432 + len(PWR1 v1)	760	measured	unchanged: the locator is six dead bytes inside the header
+finalize data	39 + 32*F at F = 16	551	derived	instruction data, not the transaction
+finalize data	39 + 32*F at F = 24	807	derived	instruction data, not the transaction
+DLE1 init body	event body	92	derived	80 in revision 7
+DLE1 finalize body	event body	80	derived	72 in revision 7
+DLE1 close body	event body	72	derived	56 in revision 7
+DLE1 bond_retry body	event body	96	derived	new event kind 12
+DTU1	record	168	derived	single-base template rent, paid to its recorded creator at tag 186
+bond escrow	record	0	derived	D12: 0 bytes, system-owned
+bond escrow	rent-exempt minimum	890880	derived	minimum_balance(0) = (128 + 0) * 6,960, NOT 0: Solana's 128-byte overhead is charged on every account, which is why DDT2 check 11 refuses 0 < bond < 890,880 under kind = 2
+BSS1 cause 4	record	200	derived	the same length as the challenge route's
+DCM2 v7 rent	completion document	16077600	derived	minimum_balance(2,182); refunded in full at close
+DCM2 v6 rent	completion document	15312000	derived	the measured revision-7 figure
+DCM2 v7 - v6	rent delta per document	765600	derived	102 bytes: 36 (DRB1) + 40 (terms) + 26 (D11's peaks shift) and 8 (abandon_deadline)
+credit rule	a 0-byte system destination's floor	890880	derived	the same 890,880 as the escrow: a credited account holding 0 lamports needs it (Medium 5)
+credit rule	a 200-byte program destination's floor	2282880	derived	the rule asks the destination's own data length, so a program-owned account is not exempted
+DCR2 v6 rent	224 outputs of 16	28925760	derived	the example document's result record, 0.029 FOGO
+DCR2 v6 rent	10240 outputs of 16	1153021440	derived	1.153 FOGO at the 10,240 capacity
+DCR2 v6 rent	the 10 MiB account cap	72981780480	derived	72.98 FOGO, the worst case that 'refuse tag 185 while the escrow holds' would have pinned; against 0.000724 FOGO for the DCRZ v2 that keeps tag 187 alive
+DTU1 rent	one template record	2060160	derived	returned to DTU1's recorded creator during the single-phase close

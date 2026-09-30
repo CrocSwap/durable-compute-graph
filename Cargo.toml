@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/dcg-program"]
+default-members = ["crates/dcg-program"]
+
+[patch.crates-io]
+curve25519-dalek = { path = "crates/dcg-program/vendor" }
+
+[profile.release]
+overflow-checks = false
+lto = true
+codegen-units = 1
+
+[profile.fasttest]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
