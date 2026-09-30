@@ -50,6 +50,11 @@ pub struct ResourceLimits {
     pub max_compute_units: u64,
 }
 
+/// Highest compute budget a single kernel invocation may declare for the
+/// current SVM transaction profile. Multi-step callers multiply this checked
+/// ceiling by their declared operation count before starting a transition.
+pub const MAX_DECLARED_KERNEL_COMPUTE_UNITS: u64 = 1_400_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelManifest {
     pub id: KernelId,
@@ -77,6 +82,29 @@ pub struct AccountSpan<'a> {
     pub schema: VersionedId,
     pub offset: u32,
     pub data: &'a [u8],
+}
+
+/// A mutable, invocation-local state region authenticated by the stateful SVM
+/// adapter. `data` borrows account bytes for this call; the borrow is never
+/// serialized into an engine-state account.
+#[derive(Debug)]
+pub struct StateSpanMut<'a> {
+    pub key: [u8; 32],
+    pub owner: [u8; 32],
+    pub schema: VersionedId,
+    /// Offset in the kernel's canonical state byte string.
+    pub offset: u32,
+    pub data: &'a mut [u8],
+}
+
+/// A statically bound, versioned output ABI that a stateful application may
+/// expose as a view. `role` is application data, while the view's wire role
+/// and lifetime are enforced by the DCG adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewAbi {
+    pub role: u8,
+    pub id: [u8; 32],
+    pub max_bytes: u32,
 }
 
 impl AccountSpan<'_> {
@@ -172,6 +200,36 @@ pub trait StatefulKernel: Kernel {
         output: &mut [u8],
         next_state: &mut [u8],
     ) -> Result<(usize, usize), KernelError>;
+
+    /// Initialise a canonical state value split over authenticated account
+    /// spans. Large stateful kernels override this method to write in place
+    /// without flattening the state into a temporary allocation. The account
+    /// data borrows are invocation-local and are rolled back by the SVM
+    /// transaction if any later step refuses.
+    fn initial_state_spans(&self, spans: &mut [StateSpanMut<'_>]) -> Result<usize, KernelError> {
+        let _ = spans;
+        Err(KernelError::Refused)
+    }
+
+    /// Apply one deterministic transition to a versioned, split state. A
+    /// caller may invoke this at most `manifest().resources.max_operations`
+    /// times in one transaction. The runtime persists the bytes atomically
+    /// with the cursor update.
+    fn transition_spans(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        let _ = (input, state, output);
+        Err(KernelError::Refused)
+    }
+
+    /// The output ABIs this application image permits for state views.
+    /// Unknown ABI ids are refused when a view account is declared.
+    fn view_abis(&self) -> &'static [ViewAbi] {
+        &[]
+    }
 }
 
 /// Optional optimistic replay. It is separate from statefulness and from the
@@ -453,6 +511,12 @@ impl ApplicationManifest {
             {
                 return Err(ManifestError::ResourceExceedsLayout(a.id));
             }
+            if a.resources.max_operations == 0
+                || a.resources.max_compute_units == 0
+                || a.resources.max_compute_units > MAX_DECLARED_KERNEL_COMPUTE_UNITS
+            {
+                return Err(ManifestError::InvalidComputeLimit(a.id));
+            }
             for (mode_index, mode) in a.modes.iter().enumerate() {
                 if a.modes
                     .iter()
@@ -565,6 +629,7 @@ pub enum ManifestError {
     NoModes(KernelId),
     InvalidAlignment(KernelId),
     ResourceExceedsLayout(KernelId),
+    InvalidComputeLimit(KernelId),
     DuplicateMode(KernelId, ModeId),
     ReplayNotRegistered(KernelId),
     ReplayModeUnsupported(KernelId, ModeId),
@@ -882,10 +947,8 @@ pub mod test_kernel {
         spans: &BYTE_SUM_FORM_256_SPANS,
     }];
     #[cfg(feature = "sbf-real-lifecycle-test")]
-    pub static BYTE_SUM_REAL_LIFECYCLE_FORMS: [LegacyFormBinding; 2] = [
-        BYTE_SUM_LEGACY_FORMS[0],
-        BYTE_SUM_FORM_256_BINDING[0],
-    ];
+    pub static BYTE_SUM_REAL_LIFECYCLE_FORMS: [LegacyFormBinding; 2] =
+        [BYTE_SUM_LEGACY_FORMS[0], BYTE_SUM_FORM_256_BINDING[0]];
     pub static MANIFEST_APP: ApplicationManifest = ApplicationManifest {
         application_id: b"dcg-test-app/1",
         version: 1,
@@ -902,6 +965,60 @@ pub mod test_kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const INVALID_LIMIT_ID: KernelId = KernelId([0xB7; 16]);
+    static INVALID_LIMIT_MODES: [ModeId; 1] = [ModeId { id: 1, version: 1 }];
+    static INVALID_LIMIT_KERNEL_MANIFEST: KernelManifest = KernelManifest {
+        id: INVALID_LIMIT_ID,
+        semantic_version: 1,
+        abi_version: 1,
+        input: PortLayout {
+            id: VersionedId { id: 1, version: 1 },
+            max_bytes: 1,
+            alignment: 1,
+        },
+        output: PortLayout {
+            id: VersionedId { id: 2, version: 1 },
+            max_bytes: 1,
+            alignment: 1,
+        },
+        state: None,
+        resources: ResourceLimits {
+            max_input_bytes: 1,
+            max_output_bytes: 1,
+            max_state_bytes: 0,
+            max_operations: 1,
+            max_compute_units: MAX_DECLARED_KERNEL_COMPUTE_UNITS + 1,
+        },
+        modes: &INVALID_LIMIT_MODES,
+    };
+    struct InvalidLimitKernel;
+    impl Kernel for InvalidLimitKernel {
+        fn manifest(&self) -> &'static KernelManifest {
+            &INVALID_LIMIT_KERNEL_MANIFEST
+        }
+
+        fn execute(&self, _input: &[u8], _output: &mut [u8]) -> Result<usize, KernelError> {
+            Err(KernelError::Refused)
+        }
+    }
+    static INVALID_LIMIT_KERNELS: [&dyn Kernel; 1] = [&InvalidLimitKernel];
+    static INVALID_LIMIT_APP: ApplicationManifest = ApplicationManifest {
+        application_id: b"dcg-invalid-limit-test/1",
+        version: 1,
+        kernels: &INVALID_LIMIT_KERNELS,
+        optimistic_replays: &[],
+        legacy_forms: &[],
+        require_legacy_form_binding: false,
+    };
+
+    #[test]
+    fn manifest_rejects_over_budget_kernel_compute_declarations() {
+        assert_eq!(
+            INVALID_LIMIT_APP.validate(),
+            Err(ManifestError::InvalidComputeLimit(INVALID_LIMIT_ID))
+        );
+    }
 
     #[cfg(feature = "test-kernel")]
     #[test]
@@ -945,9 +1062,7 @@ mod tests {
         assert!(!m.supports_mode(BYTE_SUM.manifest().id, 1, 2, MODE_CONSENSUS_V1));
         assert!(m.resolve(BYTE_SUM.manifest().id, 2, 1).is_none());
         assert!(m.resolve(BYTE_SUM.manifest().id, 1, 2).is_none());
-        assert!(m
-            .resolve(KernelId(*b"dcg-missing-v1\0\0"), 1, 1)
-            .is_none());
+        assert!(m.resolve(KernelId(*b"dcg-missing-v1\0\0"), 1, 1).is_none());
         assert_eq!(
             m.execute(
                 BYTE_SUM.manifest().id,
@@ -1027,7 +1142,9 @@ mod tests {
     #[cfg(all(test, feature = "sbf-real-lifecycle-test"))]
     #[test]
     fn form_256_test_app_binding_uses_the_declared_zero_spans() {
-        let binding = test_kernel::MANIFEST_APP.resolve_legacy_form(1, 256).unwrap();
+        let binding = test_kernel::MANIFEST_APP
+            .resolve_legacy_form(1, 256)
+            .unwrap();
         assert_eq!(binding.input_span_count, 1);
         assert_eq!(binding.spans.len(), 2);
         assert_eq!(

@@ -4,6 +4,9 @@
 //! bounded SVM adapter modules live here. Applications provide kernels through
 //! a compile-time manifest; this repository includes a tiny test kernel only.
 
+#[cfg(feature = "sbf-real-lifecycle-test")]
+pub mod closure_v2;
+#[cfg(not(feature = "sbf-real-lifecycle-test"))]
 pub(crate) mod closure_v2;
 pub(crate) mod closure_v2_accounts;
 #[cfg(feature = "legacy-hclosure-handlers")]
@@ -27,6 +30,9 @@ pub mod root_only;
 pub mod root_only_challenge;
 pub mod root_only_sealed;
 pub mod seal;
+pub mod stateful;
+#[cfg(feature = "sbf-real-lifecycle-test")]
+pub mod stateful_test;
 #[cfg(feature = "sbf-lifecycle-test")]
 pub mod test_lifecycle;
 pub mod unified;
@@ -61,6 +67,10 @@ pub fn process_instruction_with_manifest(
     #[cfg(feature = "sbf-lifecycle-test")]
     if (240..=250).contains(&tag) {
         return test_lifecycle::process(program_id, accounts, data);
+    }
+    #[cfg(feature = "sbf-real-lifecycle-test")]
+    if (230..=239).contains(&tag) {
+        return stateful_test::process(program_id, accounts, data);
     }
     match tag {
         115 => closure_v2_response::begin(program_id, accounts, data),
