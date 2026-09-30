@@ -228,6 +228,14 @@ pub fn step_with_manifest(
     if v.complete || end > v.base_classes + v.generated_classes {
         return Err(no(ADMISSION_STATE));
     }
+    if let Some(manifest) = manifest {
+        // The app image's resource declarations are part of admission. A
+        // kernel whose declared per-invocation CU ceiling exceeds the
+        // transaction profile cannot be selected by a committed document.
+        manifest
+            .validate()
+            .map_err(|_| no(super::APP_KERNEL_UNAVAILABLE))?;
+    }
     if accounts[1].key.as_ref() != v.registry {
         return Err(no(REGISTRY_ROOT));
     }
@@ -297,14 +305,42 @@ mod tests {
     #[test]
     fn required_app_binding_is_an_admission_refusal() {
         let manifest = &crate::kernel::test_kernel::MANIFEST_APP;
-        assert_eq!(check_app_binding(manifest, Some(1), 256), Ok(()));
-        assert_eq!(
-            check_app_binding(manifest, Some(1), 257),
-            Err(no(super::super::APP_KERNEL_UNAVAILABLE))
-        );
-        assert_eq!(
-            check_app_binding(manifest, None, 256),
-            Err(no(super::super::APP_KERNEL_UNAVAILABLE))
-        );
+        #[cfg(all(
+            not(feature = "sbf-real-lifecycle-test"),
+            not(feature = "sbf-unbound-form-test")
+        ))]
+        {
+            assert_eq!(check_app_binding(manifest, Some(1), 22), Ok(()));
+            assert_eq!(
+                check_app_binding(manifest, Some(1), 23),
+                Err(no(super::super::APP_KERNEL_UNAVAILABLE))
+            );
+            assert_eq!(
+                check_app_binding(manifest, None, 22),
+                Err(no(super::super::APP_KERNEL_UNAVAILABLE))
+            );
+        }
+        #[cfg(all(
+            feature = "sbf-real-lifecycle-test",
+            not(feature = "sbf-unbound-form-test")
+        ))]
+        {
+            assert_eq!(check_app_binding(manifest, Some(1), 22), Ok(()));
+            assert_eq!(check_app_binding(manifest, Some(1), 30), Ok(()));
+            assert_eq!(check_app_binding(manifest, Some(1), 257), Ok(()));
+            assert_eq!(check_app_binding(manifest, None, 22), Ok(()));
+        }
+        #[cfg(feature = "sbf-unbound-form-test")]
+        {
+            assert_eq!(check_app_binding(manifest, Some(1), u16::MAX), Ok(()));
+            assert_eq!(
+                check_app_binding(manifest, Some(1), 22),
+                Err(no(super::super::APP_KERNEL_UNAVAILABLE))
+            );
+            assert_eq!(
+                check_app_binding(manifest, Some(1), 257),
+                Err(no(super::super::APP_KERNEL_UNAVAILABLE))
+            );
+        }
     }
 }

@@ -114,3 +114,89 @@ BASANOS_DCG_V8_SBF=1 BPF_OUT_DIR=/private/tmp/dcg-seam-fix-unbound-sbf \
     --features sbf-unbound-form-test --test unified_v8_document \
     rev8_unbound_form_refuses_admission_on_sbf -- --nocapture --test-threads=1
 ```
+
+## Round 2 retest: executor opens through RESPOND
+
+This section supersedes the ruling rules and ProgramTest measurements above;
+those figures describe the previous challenger-only replay path.
+
+The challenger witness is now an optional fast path. A matching, route-valid
+opening that demonstrates a wrong output convicts the executor immediately
+(800). A missing, mismatching, malformed, or route-unproven fast-path opening
+leaves the fix-point in RESPOND. The executor uploads the preimage in ordered
+tag-183 chunks and tag 184 checks its coordinate-bound digest, DCR1 v6 app
+identity, predecessor route opening, and the selected kernel replay. An
+incomplete or non-matching response is refused (730), so the executor must
+provide the correct opening before timeout. A digest-matching decode/kernel
+failure or input that differs from the proved predecessor output convicts the
+executor (799); a matching successful replay rules for the challenger.
+
+The route adapter currently supports one declared input route whose producer
+is earlier in the same position and segment. Its RWP1 path proves the
+producer's ARW1 output leaf into the saved segment root and compares the exact
+route slice with the consumer input. Unsupported provenance and malformed
+route paths are neutral refusals (730). Cross-position, cross-segment, and
+document-input route adapters remain open.
+
+`ApplicationManifest::validate()` now checks the declared per-kernel CU ceiling
+and route bindings during every admission step. The reproducible SBF wrapper
+also runs a host test of the exact feature-selected static application
+manifest before linking the SBF image, including `EMPTY_APPLICATION`. The
+declared ceiling is designed to be at most 1.4 million CU per kernel; this is a
+manifest bound, not a measured proof of every kernel's worst-case runtime.
+
+### Measured SBF images and ProgramTest results
+
+Images were built with cargo-build-sbf 3.0.15, platform-tools v1.51, and the
+pinned SDK at `/private/tmp/basanos-sbf-sdk-v151-20260920`. CU totals include
+the test's Compute Budget instruction.
+
+| Image | Features | Size (bytes) | SHA-256 |
+| --- | --- | ---: | --- |
+| Replay lifecycle | `sbf-real-lifecycle-test` | 863,744 | `ceb685a5b2aa11b7259efcb7959e4adf1287f080c9c889119811c3b5586054fd` |
+| Empty compatibility | `revision-8` | 786,376 | `5cf11c2552613627f5fd1ae9d67ba8feaa9775334f4d5f656dcd27c81dae96e6` |
+| Unbound admission | `sbf-unbound-form-test` | 863,672 | `28b1ef2d8848bda11fb3dde0175a5c08c33357e376e3da3003b0e2cc680316ed` |
+
+| Scenario | Tags | Measured payload sizes | Measured CU / result |
+| --- | --- | --- | --- |
+| Wrong-output optional fast path | 169 | 635 bytes | 218,143; executor loses with 800 |
+| Matching honest fast path | 169, 183, 184 | tag 169: 635 bytes; 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 220,672 enters RESPOND; tag 184: 79,792, challenger loses |
+| Honest executor defeats non-matching malicious challenger | 169, 183, 184 | tag 169: 635 bytes; 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 170,293 enters RESPOND; tag 184: 64,792, challenger loses |
+| Fake `[4,5,6]` input with its correct sum against proved `[1,2,3]` predecessor bytes | 169, 183, 184 | 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 172,550 enters RESPOND; tag 184: 70,468; executor loses with 799 |
+| Schema-invalid committed input | 169, 183, 184 | tag 169: 635 bytes; 405 + 238 byte stage instructions; 633-byte witness total | tag 169: 223,291; tag 184: 85,433, executor loses with 799 |
+| Oversize executor witness | 169, 183 | 906-byte instruction carrying a declared 901-byte witness | tag 183: 3,972; refused with 730 |
+| Random and wrong-coordinate openings | 169, 183, 184, 132 | 20 and 638 byte stage instructions | tag 184: 27,572 and 53,541; both refused with 730; tag 132 timeout awards challenger (13,539 CU) |
+| Random opening against a committed non-ARW1 leaf | 169, 183, 184, 132 | 27-byte tag-183 instruction carrying 23 bytes; tag 184 has 1 byte | tag 169: 172,550 enters RESPOND; tag 183: 3,534; tag 184: 29,073 refused with 730; tag 132: 19,539, challenger wins on timeout |
+| Empty app: appended data at tag 166 | 166 | 723 bytes | 89,381; refused with 730 |
+| Empty app: tag-168 k=0 length guard | 168 | 65 bytes | 27,974; refused with 730 |
+| Empty app: appended data then exact tag-169 retry | 169 | 635 bytes then 2 bytes | 169,955 refused with 730; 170,791 enters RESPOND |
+| Required but unbound form | 160 | 7 bytes | 24,643; admission refuses with 799 |
+| Previously admitted DCM2 fixture under an image that now requires a missing binding | 169 | 2 bytes | 37,357; refused with 730, DCR1 unchanged and DCM2 unrefuted |
+
+The **measured** executor witness in the route tests is 633 bytes, uploaded in
+two tag-183 transactions. The **designed** staged witness cap is 900 bytes;
+each chunked instruction stays independently bounded. The **measured** test
+suite results were five `rev8_bytesum_` tests, two malformed-opening/timeout
+tests, one empty-application compatibility test, and two unbound-form tests
+(admission refusal and late-binding neutrality), all passing on their named
+SBF images. Kernel manifest tests passed in the `test-kernel` (5 tests),
+`sbf-real-lifecycle-test` (6 tests), and `sbf-unbound-form-test` (5 tests)
+feature sets; one admission test passed in each feature set. All three
+reproducible SBF builds passed the exact-feature manifest preflight.
+
+Raw build, preflight, and ProgramTest logs are retained at
+`/Users/colkitt/sith/toys/crypto/basanos/.fadeno/local/worktrees/dcg-seam-fix-2/out/runs/dcg-seam-fix-2-20260930/`;
+its README lists each log's image and feature configuration.
+
+Across the Round 2 SBF runs, the exact tags sent were 131, 132, 145, 156,
+157, 158, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 172, 176,
+177, 183, and 184. Tags 183/184 stage and verify the executor opening; tag 132 is
+the RESPOND timeout handler.
+
+The retained K=80 plan has no singleton segment. A synthetic tag-168 k=0
+attempt against a multi-entry segment was refused by the existing path-height
+check (586), so a valid singleton tag-168 fix-point with no witness remains
+**unverified**. The compatibility test verifies its empty-app trailing-data
+guard before proof processing, but does not replace that missing singleton
+fixture. Cross-position/document-input route proofs, a validator run, and the
+full offline suite were also not tested.

@@ -64,6 +64,9 @@ pub const TAG_REVEAL_FAMILY_TABLE: u8 = 173;
 /// CloseResponseV5 (revision 6, spec §7.4): drain a ruled record's DRU1 to
 /// the executor.
 pub const TAG_CLOSE_RESPONSE: u8 = 182;
+/// App-kernel opening transport for a fix-point left in RESPOND.
+pub const TAG_STAGE_APP_WITNESS: u8 = 183;
+pub const TAG_RESPOND_APP_WITNESS: u8 = 184;
 pub const TAG_CLOSE_RESULT: u8 = 185;
 /// `CloseTemplateV5` (revision 8, spec §1.7): one instruction closes a template.
 pub const TAG_CLOSE_TEMPLATE: u8 = 186;
@@ -229,6 +232,10 @@ fn process_inner(
         TAG_REVEAL => challenge::reveal_with_manifest(program, accounts, data, manifest),
         TAG_DESCEND => challenge::descend_with_manifest(program, accounts, data, manifest),
         TAG_REVEAL_FAMILY_TABLE => challenge::reveal_family_table(program, accounts, data),
+        TAG_STAGE_APP_WITNESS => challenge::stage_app_witness(program, accounts, data),
+        TAG_RESPOND_APP_WITNESS => {
+            challenge::respond_app_witness(program, accounts, data, manifest)
+        }
         TAG_CLOSE_RESPONSE => challenge::close_response(program, accounts, data),
         TAG_CLOSE_RESULT => {
             result::close_result_with_hooks(program, accounts, data, application_hooks(manifest))
@@ -324,6 +331,10 @@ fn process_inner(
         TAG_REVEAL => challenge::reveal_with_manifest(program, accounts, data, manifest),
         TAG_DESCEND => challenge::descend_with_manifest(program, accounts, data, manifest),
         TAG_REVEAL_FAMILY_TABLE => challenge::reveal_family_table(program, accounts, data),
+        TAG_STAGE_APP_WITNESS => challenge::stage_app_witness(program, accounts, data),
+        TAG_RESPOND_APP_WITNESS => {
+            challenge::respond_app_witness(program, accounts, data, manifest)
+        }
         // CloseResponseV5 is a revision-7-only path. Claim its tag so it cannot
         // fall through to the legacy root-only dispatcher, but do not link the
         // revision-7 reader into the revision-8 image.

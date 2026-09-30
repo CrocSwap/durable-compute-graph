@@ -11104,7 +11104,7 @@ fn challenge_tree_with_replay_leaf(
         #[cfg(feature = "sbf-real-lifecycle-test")]
         {
             let app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
-            let binding = app.resolve_legacy_form(1, 256).unwrap();
+            let binding = app.resolve_legacy_form(1, 22).unwrap();
             app.replay_leaf_digest(binding, descriptor, position, segment, entries - 1, witness)
         }
         #[cfg(not(feature = "sbf-real-lifecycle-test"))]
@@ -11172,6 +11172,108 @@ fn challenge_tree_with_replay_leaf(
         levels.push(level.clone());
     }
     levels
+}
+
+fn challenge_tree_with_route_leaves(
+    descriptor: &[u8; 32],
+    position: u32,
+    segment: u16,
+    entries: u32,
+    target_local: u32,
+    target_witness: &[u8],
+    producer_local: u32,
+    producer_witness: &[u8],
+) -> (Vec<Vec<ChallengeNode>>, Vec<u8>) {
+    let app = &dcg_program::kernel::test_kernel::MANIFEST_APP;
+    let target_binding = app.resolve_legacy_form(1, 22).unwrap();
+    let producer_binding = app.resolve_legacy_form(1, 30).unwrap();
+    let target_digest = app.replay_leaf_digest(
+        target_binding,
+        descriptor,
+        position,
+        segment,
+        target_local,
+        target_witness,
+    );
+    let producer_digest = app.replay_leaf_digest(
+        producer_binding,
+        descriptor,
+        position,
+        segment,
+        producer_local,
+        producer_witness,
+    );
+    let mut level: Vec<ChallengeNode> = (0..entries)
+        .map(|local| ChallengeNode {
+            digest: if local == target_local {
+                target_digest
+            } else if local == producer_local {
+                producer_digest
+            } else {
+                h::hash(
+                    b"c5-challenge-leaf",
+                    &[
+                        descriptor,
+                        &position.to_le_bytes(),
+                        &segment.to_le_bytes(),
+                        &local.to_le_bytes(),
+                    ],
+                )
+            },
+            first: local,
+            end: local + 1,
+        })
+        .collect();
+    let mut levels = vec![level.clone()];
+    let mut height = 0u8;
+    while level.len() > 1 {
+        height += 1;
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for pair in level.chunks(2) {
+            let left = pair[0];
+            let right = *pair.get(1).unwrap_or(&left);
+            next.push(ChallengeNode {
+                digest: h::hash(
+                    b"node/2",
+                    &[
+                        descriptor,
+                        &[1],
+                        &position.to_le_bytes(),
+                        &left.first.to_le_bytes(),
+                        &right.end.to_le_bytes(),
+                        &[height, 1],
+                        &left.digest,
+                        &right.digest,
+                    ],
+                ),
+                first: left.first,
+                end: right.end,
+            });
+        }
+        level = next;
+        levels.push(level.clone());
+    }
+    let mut path = Vec::new();
+    let mut index = producer_local as usize;
+    for level in levels.iter().take(levels.len() - 1) {
+        let sibling = if index ^ 1 < level.len() {
+            index ^ 1
+        } else {
+            index
+        };
+        path.extend_from_slice(&level[sibling].digest);
+        index /= 2;
+    }
+    let mut opened = target_witness.to_vec();
+    opened.extend_from_slice(b"RWP1");
+    opened.extend_from_slice(&7u16.to_le_bytes());
+    opened.extend_from_slice(&producer_local.to_le_bytes());
+    opened.push((path.len() / 32) as u8);
+    opened.push(0);
+    opened.extend_from_slice(&(producer_witness.len() as u16).to_le_bytes());
+    opened.extend_from_slice(producer_witness);
+    opened.extend_from_slice(&path);
+    (levels, opened)
 }
 
 /// A locally committed segment tree on the retained rung-D plan. Its root is
@@ -11248,6 +11350,84 @@ async fn commit_challenge_tree_with_witness(
     assert_eq!(actual_descriptor, descriptor);
     f.finalize(&descriptor, created, f.k).await;
     (descriptor, created, roots, segment, entries - 1, levels)
+}
+
+async fn commit_challenge_tree_with_route_witness(
+    f: &mut Fix,
+    binding: &Binding2,
+    p: u32,
+    ordinal: usize,
+    target_local: u32,
+    producer_local: u32,
+    target_witness: &[u8],
+    producer_witness: &[u8],
+) -> (
+    [u8; 32],
+    [Pubkey; 4],
+    Vec<[u8; 32]>,
+    u16,
+    u32,
+    Vec<Vec<ChallengeNode>>,
+    Vec<u8>,
+) {
+    let descriptor = f.descriptor(binding, &f.terms_raw, 16);
+    let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
+    let x = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        None,
+        pt2p::Program::decode(&pwr1).unwrap(),
+    )
+    .unwrap();
+    let (segment, entries) = x.segment_row(p, ordinal).unwrap();
+    let (levels, witness) = challenge_tree_with_route_leaves(
+        &descriptor,
+        p,
+        segment,
+        entries,
+        target_local,
+        target_witness,
+        producer_local,
+        producer_witness,
+    );
+    let tree = levels.last().unwrap()[0].digest;
+    let segment_root = h::hash(
+        b"segment-root/2",
+        &[
+            &descriptor,
+            &p.to_le_bytes(),
+            &segment.to_le_bytes(),
+            &entries.to_le_bytes(),
+            &tree,
+            &[1],
+        ],
+    );
+    let table = x.segment_table_root(p).unwrap();
+    let mut roots = (0..f.segments)
+        .map(|i| {
+            h::hash(
+                b"c5-unselected-segment",
+                &[&descriptor, &p.to_le_bytes(), &i.to_le_bytes()],
+            )
+        })
+        .collect::<Vec<_>>();
+    roots[ordinal] = segment_root;
+    let position_root = h::position_root(&descriptor, p, &table, &roots).unwrap();
+    let mut positions = f.position_roots[..f.k as usize].to_vec();
+    positions[p as usize] = position_root;
+    let (actual_descriptor, created) = f.run_document_with_roots(binding, &positions).await;
+    assert_eq!(actual_descriptor, descriptor);
+    f.finalize(&descriptor, created, f.k).await;
+    (
+        descriptor,
+        created,
+        roots,
+        segment,
+        target_local,
+        levels,
+        witness,
+    )
 }
 
 fn challenge_position_data(descriptor: &[u8; 32], p: u32, nonce: u32) -> Vec<u8> {
@@ -11491,6 +11671,62 @@ fn app_replay_witness(schema_id: u32, input: &[u8], claimed_output: u64) -> Vec<
     witness.extend_from_slice(input);
     witness.extend_from_slice(&claimed_output.to_le_bytes());
     witness
+}
+
+fn app_route_producer_witness() -> Vec<u8> {
+    let mut output = vec![0u8; 256];
+    output[..3].copy_from_slice(&[1, 2, 3]);
+    let mut witness = Vec::with_capacity(12 + output.len());
+    witness.extend_from_slice(b"ARW1");
+    witness.extend_from_slice(&1u16.to_le_bytes());
+    witness.push(0);
+    witness.push(0);
+    witness.extend_from_slice(&(output.len() as u16).to_le_bytes());
+    witness.extend_from_slice(&[0; 2]);
+    witness.extend_from_slice(&output);
+    witness
+}
+
+async fn executor_opens_app_witness(f: &mut Fix, record: Pubkey, document: Pubkey, witness: &[u8]) {
+    for (offset, chunk) in witness.chunks(400).enumerate() {
+        let offset = offset * 400;
+        let mut data = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+        data.extend_from_slice(&(witness.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(offset as u16).to_le_bytes());
+        data.extend_from_slice(chunk);
+        label("challenge-app-witness-stage-183");
+        send(
+            &mut f.ctx,
+            &f.executor,
+            f.program,
+            data,
+            vec![
+                AccountMeta::new(record, false),
+                AccountMeta::new(f.executor.pubkey(), true),
+            ],
+        )
+        .await
+        .expect("tag 183 stages the executor's opening");
+    }
+    label("challenge-app-witness-respond-184");
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::unified::TAG_RESPOND_APP_WITNESS],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(document, false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+            AccountMeta::new_readonly(f.drp2, false),
+            AccountMeta::new_readonly(f.pt1s_index, false),
+        ],
+    )
+    .await
+    .expect("tag 184 authenticates and replays the executor's opening");
 }
 
 fn challenge_leaf_packet(f: &Fix, descriptor: &[u8; 32], proof: &Rekeyed, nonce: u32) -> Vec<u8> {
@@ -12177,15 +12413,19 @@ async fn rev8_position_challenge_rounds_reach_an_admitted_fixpoint() {
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 4;
     let witness = app_replay_witness(1, &[1, 2, 3], 6);
-    let (descriptor, created, roots, segment, target, levels) =
-        commit_challenge_tree_with_witness(&mut f, &binding, 79, 0, Some(&witness)).await;
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, witness) =
+        commit_challenge_tree_with_route_witness(
+            &mut f, &binding, 79, 1, 235, 207, &witness, &producer,
+        )
+        .await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
         &descriptor,
         &roots,
         79,
-        0,
+        1,
         segment,
         target,
         &levels,
@@ -12194,12 +12434,14 @@ async fn rev8_position_challenge_rounds_reach_an_admitted_fixpoint() {
         Some(&witness),
     )
     .await;
+    #[cfg(feature = "test-kernel")]
+    executor_opens_app_witness(&mut f, record, created[0], &witness).await;
     let dcr1 = f.account(record).await;
     #[cfg(feature = "test-kernel")]
     {
         assert_eq!(u16_at(&dcr1, 6), challenge::APP_REPLAY_VERSION);
         assert_eq!(dcr1[4], challenge::PHASE_RULED);
-        assert_eq!(dcr1[5], 1, "an honest replay defeats the challenger");
+        assert_eq!(dcr1[5], 1, "the executor's opening defeats the challenger");
         assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
         assert_eq!(u32_at(&dcr1, challenge::DEV2_AT + 8), 0);
         assert_eq!(
@@ -12221,7 +12463,7 @@ async fn rev8_position_challenge_rounds_reach_an_admitted_fixpoint() {
     }
 }
 
-/// The extracted SBF app replays the terminal Form-256 fix-point through its
+/// The extracted SBF app replays the terminal Form-22 fix-point through its
 /// static ByteSum manifest. The committed output is wrong, so tag 169 records
 /// an immediate app-replay ruling (800); tag 131 settles the STANDARD bond,
 /// and tag 172 refunds the document rent to the original payer.
@@ -12241,8 +12483,12 @@ async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 1;
     let witness = app_replay_witness(1, &[1, 2, 3], 7);
-    let (descriptor, created, roots, segment, target, levels) =
-        commit_challenge_tree_with_witness(&mut f, &binding, 79, 0, Some(&witness)).await;
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, witness) =
+        commit_challenge_tree_with_route_witness(
+            &mut f, &binding, 79, 1, 235, 207, &witness, &producer,
+        )
+        .await;
     let nonce = 90;
     let record = descend_position_challenge_with_witness(
         &mut f,
@@ -12250,7 +12496,7 @@ async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
         &descriptor,
         &roots,
         79,
-        0,
+        1,
         segment,
         target,
         &levels,
@@ -12382,9 +12628,61 @@ async fn rev8_bytesum_wrong_output_rules_and_settles_sbf() {
     assert_eq!(f.account(created[3]).await[6], result::STATUS_REFUTED);
 }
 
+/// A matching challenger fast-path witness with a correct output must not
+/// convict. The fix-point stays in RESPOND, and the executor opens the same
+/// witness to defeat the challenge.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_bytesum_matching_honest_fastpath_enters_respond_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let mut binding = f.binding(29, 50);
+    binding.request_id[0] = 4;
+    let witness_base = app_replay_witness(1, &[1, 2, 3], 6);
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, committed) =
+        commit_challenge_tree_with_route_witness(
+            &mut f,
+            &binding,
+            79,
+            1,
+            235,
+            207,
+            &witness_base,
+            &producer,
+        )
+        .await;
+    let record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        95,
+        false,
+        Some(&committed),
+    )
+    .await;
+    let pending = f.account(record).await;
+    assert_eq!(pending[4], challenge::PHASE_RESPOND);
+    assert_eq!(pending[5], 0, "honest replay does not punish the executor");
+
+    executor_opens_app_witness(&mut f, record, created[0], &committed).await;
+    let ruled = f.account(record).await;
+    assert_eq!(ruled[4], challenge::PHASE_RULED);
+    assert_eq!(ruled[5], 1, "the honest executor defeats the challenge");
+    assert_eq!(ruled[178], events::CAUSE_APP_REPLAY);
+    assert_eq!(u32_at(&ruled, challenge::DEV2_AT + 8), 0);
+    assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
+}
+
 /// A challenger who supplies a preimage that does not open the committed
-/// app-replay leaf loses the fix-point immediately, even though the executor's
-/// committed output is honest.
+/// app-replay leaf has not proved anything. The executor opens the committed
+/// preimage in RESPOND and defeats the challenge.
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_bytesum_malicious_challenger_loses_app_replay_sbf() {
     let Some(mut f) = build().await else {
@@ -12392,17 +12690,30 @@ async fn rev8_bytesum_malicious_challenger_loses_app_replay_sbf() {
     };
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 2;
-    let committed = app_replay_witness(1, &[1, 2, 3], 6);
-    let forged = app_replay_witness(1, &[1, 2, 3], 8);
-    let (descriptor, created, roots, segment, target, levels) =
-        commit_challenge_tree_with_witness(&mut f, &binding, 79, 0, Some(&committed)).await;
+    let committed_base = app_replay_witness(1, &[1, 2, 3], 6);
+    let forged_base = app_replay_witness(1, &[1, 2, 3], 8);
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, committed) =
+        commit_challenge_tree_with_route_witness(
+            &mut f,
+            &binding,
+            79,
+            1,
+            235,
+            207,
+            &committed_base,
+            &producer,
+        )
+        .await;
+    let mut forged = forged_base;
+    forged.extend_from_slice(&committed[committed_base.len()..]);
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
         &descriptor,
         &roots,
         79,
-        0,
+        1,
         segment,
         target,
         &levels,
@@ -12411,15 +12722,13 @@ async fn rev8_bytesum_malicious_challenger_loses_app_replay_sbf() {
         Some(&forged),
     )
     .await;
+    executor_opens_app_witness(&mut f, record, created[0], &committed).await;
     let dcr1 = f.account(record).await;
     assert_eq!(u16_at(&dcr1, 6), challenge::APP_REPLAY_VERSION);
     assert_eq!(dcr1[4], challenge::PHASE_RULED);
     assert_eq!(dcr1[5], 1, "the malicious challenger loses");
     assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
-    assert_eq!(
-        u32_at(&dcr1, challenge::DEV2_AT + 8),
-        dcg_program::unified::DCR1_PROOF
-    );
+    assert_eq!(u32_at(&dcr1, challenge::DEV2_AT + 8), 0);
     assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
 }
 
@@ -12434,15 +12743,19 @@ async fn rev8_bytesum_malformed_committed_input_rules_executor_sbf() {
     let mut binding = f.binding(29, 50);
     binding.request_id[0] = 3;
     let malformed = app_replay_witness(2, &[1, 2, 3], 6);
-    let (descriptor, created, roots, segment, target, levels) =
-        commit_challenge_tree_with_witness(&mut f, &binding, 79, 0, Some(&malformed)).await;
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, malformed) =
+        commit_challenge_tree_with_route_witness(
+            &mut f, &binding, 79, 1, 235, 207, &malformed, &producer,
+        )
+        .await;
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
         &descriptor,
         &roots,
         79,
-        0,
+        1,
         segment,
         target,
         &levels,
@@ -12451,6 +12764,7 @@ async fn rev8_bytesum_malformed_committed_input_rules_executor_sbf() {
         Some(&malformed),
     )
     .await;
+    executor_opens_app_witness(&mut f, record, created[0], &malformed).await;
     let dcr1 = f.account(record).await;
     assert_eq!(u16_at(&dcr1, 6), challenge::APP_REPLAY_VERSION);
     assert_eq!(dcr1[4], challenge::PHASE_RULED);
@@ -12460,6 +12774,516 @@ async fn rev8_bytesum_malformed_committed_input_rules_executor_sbf() {
     assert_eq!(
         u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
         FLAG_REFUTED
+    );
+}
+
+/// The input schema and ByteSum result are valid, but the committed input
+/// differs from the exact bytes proved by its producer route. The executor
+/// therefore loses even though it committed the matching sum for its fake
+/// input.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_bytesum_fake_input_against_predecessor_loses_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let binding = f.binding(29, 50);
+    let fake = app_replay_witness(1, &[4, 5, 6], 15);
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, fake) =
+        commit_challenge_tree_with_route_witness(
+            &mut f, &binding, 79, 1, 235, 207, &fake, &producer,
+        )
+        .await;
+    let record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        94,
+        false,
+        None,
+    )
+    .await;
+
+    executor_opens_app_witness(&mut f, record, created[0], &fake).await;
+    let dcr1 = f.account(record).await;
+    assert_eq!(dcr1[4], challenge::PHASE_RULED);
+    assert_eq!(dcr1[5], 2, "the executor loses for fake predecessor bytes");
+    assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
+    assert_eq!(u32_at(&dcr1, challenge::DEV2_AT + 8), 799);
+    assert_eq!(
+        u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED,
+        FLAG_REFUTED
+    );
+}
+
+/// Missing and malformed executor openings keep the fix-point in RESPOND.
+/// Neither a random payload nor a well-formed ARW1 from another coordinate
+/// rules against the executor; timeout then awards the challenger.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_app_respond_rejects_bad_openings_and_timeout_favors_challenger_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let binding = f.binding(29, 50);
+    let witness_base = app_replay_witness(1, &[1, 2, 3], 6);
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, committed) =
+        commit_challenge_tree_with_route_witness(
+            &mut f,
+            &binding,
+            79,
+            1,
+            235,
+            207,
+            &witness_base,
+            &producer,
+        )
+        .await;
+    let record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        93,
+        false,
+        None,
+    )
+    .await;
+    let opened = f.account(record).await;
+    assert_eq!(opened[4], challenge::PHASE_RESPOND);
+    assert_eq!(opened[5], 0, "an unanswered fix-point has no winner");
+
+    let mut oversize = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+    oversize.extend_from_slice(&901u16.to_le_bytes());
+    oversize.extend_from_slice(&0u16.to_le_bytes());
+    oversize.resize(5 + 901, 0xff);
+    let oversize_result = send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        oversize,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        oversize_result,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(730)
+        ))
+    ));
+
+    let mut other_coordinate = committed.clone();
+    other_coordinate[witness_base.len() + 6..witness_base.len() + 10]
+        .copy_from_slice(&206u32.to_le_bytes());
+    for bad_opening in [b"random-not-arw1".as_slice(), other_coordinate.as_slice()] {
+        let mut stage = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+        stage.extend_from_slice(&(bad_opening.len() as u16).to_le_bytes());
+        stage.extend_from_slice(&0u16.to_le_bytes());
+        stage.extend_from_slice(bad_opening);
+        send_fresh_with(
+            &mut f.ctx,
+            &f.executor,
+            f.program,
+            stage,
+            vec![
+                AccountMeta::new(record, false),
+                AccountMeta::new(f.executor.pubkey(), true),
+            ],
+        )
+        .await
+        .expect("tag 183 stages a bounded opening candidate");
+        let response = send_fresh_with(
+            &mut f.ctx,
+            &f.executor,
+            f.program,
+            vec![dcg_program::unified::TAG_RESPOND_APP_WITNESS],
+            vec![
+                AccountMeta::new(record, false),
+                AccountMeta::new(f.executor.pubkey(), true),
+                AccountMeta::new(created[0], false),
+                AccountMeta::new_readonly(f.pt2s, false),
+                AccountMeta::new_readonly(f.routes, false),
+                AccountMeta::new_readonly(f.geometry, false),
+                AccountMeta::new_readonly(f.drp2, false),
+                AccountMeta::new_readonly(f.pt1s_index, false),
+            ],
+        )
+        .await;
+        assert!(matches!(
+            response,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::Custom(730)
+            ))
+        ));
+        assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
+    }
+
+    let deadline = u64_at(&f.account(record).await, 148) + 1;
+    clock_to(&mut f, deadline).await;
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await
+    .expect("an unanswered executor loses at timeout");
+    let ruled = f.account(record).await;
+    assert_eq!(ruled[4], challenge::PHASE_RULED);
+    assert_eq!(ruled[5], 2);
+    assert_eq!(ruled[178], events::CAUSE_TIMEOUT);
+}
+
+/// A committed non-ARW1 preimage cannot be opened by a different executor
+/// payload. The refusal leaves RESPOND open, and timeout awards the challenger.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_non_arw1_committed_leaf_executor_timeout_favors_challenger_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let binding = f.binding(29, 50);
+    let invalid_preimage = b"committed-random-leaf";
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, _unused_opening) =
+        commit_challenge_tree_with_route_witness(
+            &mut f,
+            &binding,
+            79,
+            1,
+            235,
+            207,
+            invalid_preimage,
+            &producer,
+        )
+        .await;
+    let record = descend_position_challenge_with_witness(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        99,
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
+
+    let random = b"not-the-committed-leaf";
+    let mut stage = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+    stage.extend_from_slice(&(random.len() as u16).to_le_bytes());
+    stage.extend_from_slice(&0u16.to_le_bytes());
+    stage.extend_from_slice(random);
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        stage,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+        ],
+    )
+    .await
+    .expect("tag 183 stages the mismatching random opening");
+    let response = send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::unified::TAG_RESPOND_APP_WITNESS],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+            AccountMeta::new_readonly(f.drp2, false),
+            AccountMeta::new_readonly(f.pt1s_index, false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        response,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(730)
+        ))
+    ));
+    assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
+
+    let deadline = u64_at(&f.account(record).await, 148) + 1;
+    clock_to(&mut f, deadline).await;
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await
+    .expect("tag 132 awards the challenger after the executor cannot open the leaf");
+    let ruled = f.account(record).await;
+    assert_eq!(ruled[4], challenge::PHASE_RULED);
+    assert_eq!(ruled[5], 2);
+    assert_eq!(ruled[178], events::CAUSE_TIMEOUT);
+}
+
+/// The empty compatibility image preserves its old exact data lengths for
+/// tags 166, 168, and 169. A trailing replay witness is refused with 730; an
+/// exact tag-169 retry enters RESPOND.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_empty_application_refuses_witness_tails_for_166_168_169_sbf() {
+    assert!(std::env::var_os("BASANOS_DCG_V8_SBF").is_some());
+
+    // Tag 166: a valid ROOT_ONLY challenge leaf plus any replay tail is not a
+    // compatible legacy instruction when EMPTY_APPLICATION has no form map.
+    let Some(mut leaf_fix) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let leaf_binding = leaf_fix.binding(29, 50);
+    let (leaf_descriptor, leaf_doc, proofs) =
+        attest_all(&mut leaf_fix, &leaf_binding, 31, &[], 96).await;
+    let leaf_nonce = 96;
+    let mut leaf_data = challenge_leaf_packet(&leaf_fix, &leaf_descriptor, &proofs[0], leaf_nonce);
+    leaf_data.extend_from_slice(&app_replay_witness(1, &[1, 2, 3], 6));
+    let leaf_record = address::challenge(
+        &leaf_fix.program,
+        &leaf_descriptor,
+        &leaf_fix.signer.pubkey(),
+        leaf_nonce,
+    )
+    .0;
+    let leaf_metas = challenge_leaf_metas(&leaf_fix, leaf_doc, leaf_record);
+    let refused = send_fresh_with(
+        &mut leaf_fix.ctx,
+        &leaf_fix.signer,
+        leaf_fix.program,
+        leaf_data,
+        leaf_metas,
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(730)
+        ))
+    ));
+
+    // Tag 168, k=0: start a real position challenge and select the segment.
+    // The retained fixture has no singleton segment, so set only the state
+    // discriminator needed to reach the empty-app length guard. The guard
+    // runs before the deliberately absent tree proof is examined.
+    let Some(mut zero_fix) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let zero_binding = zero_fix.binding(29, 50);
+    let (descriptor, created, roots, _segment, _target, _levels) =
+        commit_challenge_tree(&mut zero_fix, &zero_binding, 79, 1).await;
+    let nonce = 97;
+    let record = address::challenge(
+        &zero_fix.program,
+        &descriptor,
+        &zero_fix.signer.pubkey(),
+        nonce,
+    )
+    .0;
+    let zero_open_metas = challenge_position_metas(&zero_fix, created, record);
+    send(
+        &mut zero_fix.ctx,
+        &zero_fix.signer,
+        zero_fix.program,
+        challenge_position_data(&descriptor, 79, nonce),
+        zero_open_metas,
+    )
+    .await
+    .expect("tag 167 opens the position challenge");
+    let mut position_roots = vec![TAG_REVEAL_POSITION, 0, 0, roots.len() as u8];
+    for root in &roots {
+        position_roots.extend_from_slice(root);
+    }
+    send(
+        &mut zero_fix.ctx,
+        &zero_fix.executor,
+        zero_fix.program,
+        position_roots,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(zero_fix.executor.pubkey(), true),
+            AccountMeta::new_readonly(created[0], false),
+            AccountMeta::new_readonly(created[1], false),
+            AccountMeta::new_readonly(zero_fix.pt2s, false),
+            AccountMeta::new_readonly(zero_fix.routes, false),
+            AccountMeta::new_readonly(zero_fix.geometry, false),
+        ],
+    )
+    .await
+    .expect("tag 163 reveals segment roots");
+    let mut select = vec![TAG_SELECT_SEGMENT];
+    select.extend_from_slice(&1u16.to_le_bytes());
+    send(
+        &mut zero_fix.ctx,
+        &zero_fix.signer,
+        zero_fix.program,
+        select,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(zero_fix.signer.pubkey(), true),
+            AccountMeta::new_readonly(created[0], false),
+            AccountMeta::new_readonly(zero_fix.pt2s, false),
+            AccountMeta::new_readonly(zero_fix.routes, false),
+            AccountMeta::new_readonly(zero_fix.geometry, false),
+        ],
+    )
+    .await
+    .expect("tag 164 selects the segment");
+    let mut raw = zero_fix.account(record).await;
+    raw[challenge::HEADER + 40] = 0;
+    zero_fix
+        .ctx
+        .set_account(&record, &shared(owned(&zero_fix.program, raw)));
+    let witness = app_replay_witness(1, &[1, 2, 3], 6);
+    let mut extended = vec![dcg_program::unified::TAG_REVEAL, 0];
+    extended.extend_from_slice(&[0x6b; 32]);
+    extended.extend_from_slice(&witness);
+    let refused = send_fresh_with(
+        &mut zero_fix.ctx,
+        &zero_fix.executor,
+        zero_fix.program,
+        extended,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(zero_fix.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new_readonly(zero_fix.pt2s, false),
+            AccountMeta::new_readonly(zero_fix.routes, false),
+            AccountMeta::new_readonly(zero_fix.geometry, false),
+            AccountMeta::new_readonly(zero_fix.drp2, false),
+            AccountMeta::new_readonly(zero_fix.pt1s_index, false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(730)
+        ))
+    ));
+    assert_eq!(zero_fix.account(record).await[4], challenge::PHASE_REVEAL);
+
+    // Tag 169: a descended leaf rejects an appended fast-path witness on the
+    // empty image, then the same exact two-byte command enters RESPOND.
+    let Some(mut descend_fix) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let descend_binding = descend_fix.binding(29, 50);
+    let committed = app_replay_witness(1, &[1, 2, 3], 6);
+    let producer = app_route_producer_witness();
+    let (descriptor, created, roots, segment, target, levels, witness) =
+        commit_challenge_tree_with_route_witness(
+            &mut descend_fix,
+            &descend_binding,
+            79,
+            1,
+            235,
+            207,
+            &committed,
+            &producer,
+        )
+        .await;
+    let record = descend_position_challenge_with_witness(
+        &mut descend_fix,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        98,
+        true,
+        None,
+    )
+    .await;
+    let choice = final_position_choice(&levels, target);
+    let mut extended = vec![TAG_DESCEND, choice];
+    extended.extend_from_slice(&witness);
+    let metas = vec![
+        AccountMeta::new(record, false),
+        AccountMeta::new(descend_fix.signer.pubkey(), true),
+        AccountMeta::new(created[0], false),
+        AccountMeta::new_readonly(descend_fix.pt2s, false),
+        AccountMeta::new_readonly(descend_fix.routes, false),
+        AccountMeta::new_readonly(descend_fix.geometry, false),
+        AccountMeta::new_readonly(descend_fix.drp2, false),
+        AccountMeta::new_readonly(descend_fix.pt1s_index, false),
+    ];
+    let refused = send_fresh_with(
+        &mut descend_fix.ctx,
+        &descend_fix.signer,
+        descend_fix.program,
+        extended,
+        metas,
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(730)
+        ))
+    ));
+    send(
+        &mut descend_fix.ctx,
+        &descend_fix.signer,
+        descend_fix.program,
+        vec![TAG_DESCEND, choice],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(descend_fix.signer.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new_readonly(descend_fix.pt2s, false),
+            AccountMeta::new_readonly(descend_fix.routes, false),
+            AccountMeta::new_readonly(descend_fix.geometry, false),
+            AccountMeta::new_readonly(descend_fix.drp2, false),
+            AccountMeta::new_readonly(descend_fix.pt1s_index, false),
+        ],
+    )
+    .await
+    .expect("the exact tag-169 instruction enters RESPOND");
+    assert_eq!(
+        descend_fix.account(record).await[4],
+        challenge::PHASE_RESPOND
     );
 }
 
@@ -12516,6 +13340,68 @@ async fn rev8_unbound_form_refuses_admission_on_sbf() {
         }
     }
     panic!("expected an unbound form to refuse before admission completed");
+}
+
+/// A DCM2 admitted under an older image can reach a challenge after the new
+/// image requires a form binding. The missing late binding is a neutral tag-169
+/// refusal and cannot convict the executor.
+#[cfg(feature = "sbf-unbound-form-test")]
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_late_unbound_manifest_refuses_fixpoint_neutrally_on_sbf() {
+    assert!(std::env::var_os("BASANOS_DCG_V8_SBF").is_some());
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let binding = f.binding(29, 50);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_challenge_tree(&mut f, &binding, 79, 1).await;
+    let record = descend_position_challenge(
+        &mut f,
+        created,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        100,
+        true,
+    )
+    .await;
+    assert!(target < levels[0].len() as u32);
+    let before = f.account(record).await;
+    assert_eq!(before[4], challenge::PHASE_DESCEND);
+    assert_eq!(before[5], 0);
+    let choice = final_position_choice(&levels, target);
+    label("late-binding-neutral-fixpoint-169");
+    let result = send_fresh_with(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        vec![TAG_DESCEND, choice],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.signer.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+            AccountMeta::new_readonly(f.drp2, false),
+            AccountMeta::new_readonly(f.pt1s_index, false),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::Custom(730)
+        ))
+    ));
+    let after = f.account(record).await;
+    assert_eq!(after, before, "the late-binding refusal is neutral");
+    assert_eq!(u16_at(&f.account(created[0]).await, 6) & FLAG_REFUTED, 0);
 }
 
 /// Build only the real K=10,240 PT1X/PT2S registry and admission path. This
