@@ -134,6 +134,30 @@ pub struct ViewPhase {
     pub compute_units: u32,
 }
 
+/// Result of one stateful v3 transition callback. `HaltBefore` leaves the
+/// current command unconsumed and requires the kernel to leave state unchanged.
+/// `HaltAfter` commits the current command's state and consumes that command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionDisposition {
+    Continue,
+    HaltBefore { reason: u32 },
+    HaltAfter { reason: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransitionOutcome {
+    pub output_bytes: usize,
+    pub disposition: TransitionDisposition,
+}
+
+/// Bounded, resumable initialization of a canonical state value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitializationPhase {
+    pub cursor: u32,
+    pub total_bytes: u32,
+    pub compute_units: u32,
+}
+
 /// A statically bound, versioned output ABI that a stateful application may
 /// expose as a view. `role` is application data, while the view's wire role
 /// and lifetime are enforced by the DCG adapter.
@@ -413,6 +437,69 @@ pub trait StatefulKernel: Kernel {
     ) -> Result<usize, KernelError> {
         let _ = (input, state, output);
         Err(KernelError::Refused)
+    }
+
+    /// Stateful wire v3 transition hook. Existing kernels keep v2 behavior
+    /// through this default adapter. A halt result commits the prefix ending
+    /// at the callback's declared boundary and records its reason atomically.
+    fn transition_spans_with_outcome(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<TransitionOutcome, KernelError> {
+        self.transition_spans(input, state, output)
+            .map(|output_bytes| TransitionOutcome {
+                output_bytes,
+                disposition: TransitionDisposition::Continue,
+            })
+    }
+
+    /// Largest deterministic state-initialization chunk accepted per call.
+    fn max_initialization_phase_bytes(&self) -> u32 {
+        65_536
+    }
+
+    /// Static CU declaration required on phased initialization calls.
+    fn initialization_phase_compute_units(&self) -> u32 {
+        self.manifest().resources.max_compute_units as u32
+    }
+
+    /// Write the exact logical state byte range beginning at `phase.cursor`.
+    /// The callback must use only session-authenticated resources and must
+    /// write exactly `min(max_initialization_phase_bytes, remaining)` bytes.
+    fn initialize_state_phase(
+        &self,
+        _phase: InitializationPhase,
+        _resources: &[AccountSpan<'_>],
+        _commitment: &[u8; 32],
+        _state: &mut [StateSpanMut<'_>],
+    ) -> Result<usize, KernelError> {
+        Err(KernelError::Refused)
+    }
+
+    /// Maximum declared mutable renderer workspace. Zero disables v3 view
+    /// rendering for this kernel.
+    fn max_view_workspace_bytes(&self) -> u32 {
+        0
+    }
+
+    /// Render with the session's read-only authenticated resources and its
+    /// declared writable workspace. The default retains resource-free v2
+    /// rendering behavior.
+    fn render_view_phase_with_resources(
+        &self,
+        phase: ViewPhase,
+        state: &[AccountSpan<'_>],
+        resources: &[AccountSpan<'_>],
+        commitment: &[u8; 32],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        if !resources.is_empty() || *commitment != [0; 32] || !workspace.is_empty() {
+            return Err(KernelError::Refused);
+        }
+        self.render_view_phase(phase, state, output)
     }
 
     /// The output ABIs this application image permits for state views.
