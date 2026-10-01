@@ -22,3 +22,6 @@ tag 146 and then refused with `IncorrectProgramId`; the Form-47 dispute and
 Form-48 gather tests continued to tag 120 and then refused with
 `InvalidInstructionData`. Their stdout receipts are in Basanos at
 `out/runs/dcg-f47-geometry-fix-2026-10-01/`. No chain transactions were sent.
+
+Parity-fix-2 follow-up receipt: Basanos
+`out/runs/dcg-r8-parity-fix-2-2026-10-01/`.

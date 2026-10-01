@@ -296,11 +296,21 @@ impl Terms2 {
         self.check_template_with(limits, &REVISION8_COMPATIBILITY)
     }
 
+    /// Enforce the core revision-8 template comparisons before an application
+    /// hook can add narrower policy. The hook cannot waive these four limits.
     pub fn check_template_with(
         &self,
         limits: &super::config::TemplateLimits,
         hooks: &dyn ApplicationHooks,
     ) -> Result<(), u32> {
+        if self.abandon_after_slots < limits.min_abandon_after_slots
+            || self.abandon_after_slots > limits.max_abandon_after_slots
+            || self.challenge_window_slots > limits.max_challenge_window_slots
+            || self.response_window_slots > limits.max_response_window_slots
+            || self.abandon_after_slots > limits.max_document_lifetime_slots
+        {
+            return Err(DISPUTE_TERMS);
+        }
         hooks.check_terms2_template(self, limits)
     }
 
@@ -574,6 +584,76 @@ mod tests {
         assert_eq!(
             executor_bond_split(u64::MAX, 1),
             (u64::MAX / 10_000, u64::MAX - u64::MAX / 10_000)
+        );
+    }
+}
+
+#[cfg(test)]
+mod template_hook_contract_tests {
+    use super::*;
+    use crate::compatibility::ApplicationHooks;
+    use crate::unified::config::TemplateLimits;
+    use crate::unified::registry::{RowV2, Shape};
+
+    struct PermissiveHooks;
+
+    impl ApplicationHooks for PermissiveHooks {
+        fn check_terms_v1(&self, _terms: &Terms, _round_floor_slots: u64) -> Result<(), u32> {
+            Ok(())
+        }
+
+        fn check_terms_v2(&self, _terms: &Terms2, _round_floor_slots: u64) -> Result<(), u32> {
+            Ok(())
+        }
+
+        fn check_terms2_template(
+            &self,
+            _terms: &Terms2,
+            _limits: &TemplateLimits,
+        ) -> Result<(), u32> {
+            Ok(())
+        }
+
+        fn check_template_limits(
+            &self,
+            _limits: &TemplateLimits,
+            _seal_slot: u64,
+        ) -> Result<(), u32> {
+            Ok(())
+        }
+
+        fn check_registry_class(&self, _row: Option<&RowV2>, _shape: &Shape) -> u32 {
+            0
+        }
+    }
+
+    #[test]
+    fn permissive_application_hook_cannot_widen_revision8_template_limits() {
+        let limits = TemplateLimits {
+            max_challenge_window_slots: 100,
+            max_response_window_slots: 80,
+            max_document_lifetime_slots: 1_000,
+            max_abandon_after_slots: 500,
+            min_abandon_after_slots: 10,
+        };
+        let terms = Terms2 {
+            challenge_window_slots: 101,
+            response_window_slots: 80,
+            challenger_bond_lamports: 1,
+            executor_bond_lamports: 0,
+            executor_reward_bps: 0,
+            bond_policy_kind: BOND_POLICY_STANDARD,
+            bond_slasher_bps: 0,
+            settlement_program: [0; 32],
+            custom_settle_window_slots: 0,
+            result_retention_slots: 100,
+            bond_remainder: [1; 32],
+            abandon_after_slots: 100,
+        };
+
+        assert_eq!(
+            terms.check_template_with(&limits, &PermissiveHooks),
+            Err(DISPUTE_TERMS)
         );
     }
 }

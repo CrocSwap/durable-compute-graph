@@ -239,22 +239,39 @@ fn k10240_registry_rows() -> (Vec<u8>, [u8; 32]) {
 /// The measured compiler-v1 registry input retained with the typed-decision
 /// fixture. Unlike the older frozen census golden, it includes the measured
 /// Form-47 and Form-48 rows needed to drive the real tag-157/tag-160 path.
-fn f47_registry_rows() -> (Vec<u8>, [u8; 32]) {
-    let path = std::env::var_os("BASANOS_DCG_F47_REGISTRY_INPUT")
-        .map(PathBuf::from)
-        .expect("set BASANOS_DCG_F47_REGISTRY_INPUT to the retained registry-input.json");
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path).expect("read retained registry input"))
-            .expect("parse retained registry input");
-    assert_eq!(value["schema"], "basanos/rev8-g3-registry-input/1");
-    let rows = unhex(value["rows"].as_str().expect("registry rows"));
-    let census = unhex(value["census_digest"].as_str().expect("census digest"))
-        .try_into()
-        .expect("32-byte census digest");
-    assert_eq!(
-        rows.len(),
-        value["row_count"].as_u64().unwrap() as usize * registry::ROW_BYTES
-    );
+fn decision_registry_rows() -> (Vec<u8>, [u8; 32]) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/dcg/rev8_census_registry_rows_v2.tsv");
+    let text = std::fs::read_to_string(path).expect("read the retained decision registry golden");
+    let census: [u8; 32] = text
+        .lines()
+        .find_map(|line| line.strip_prefix("# source_census_digest\t"))
+        .map(|hex| unhex(hex).try_into().expect("32-byte census digest"))
+        .expect("decision census digest");
+    let expected_census: [u8; 32] =
+        unhex("349c5d5e0e94b632295432e6b471a9d5024289a9f4d1bea675abd6e31011b400")
+            .try_into()
+            .unwrap();
+    assert_eq!(census, expected_census);
+    let mut rows = Vec::new();
+    let mut row_count = 0usize;
+    for line in text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(columns.len(), 2, "form_id and row_hex columns");
+        let row = unhex(columns[1]);
+        assert_eq!(row.len(), registry::ROW_BYTES);
+        assert_eq!(
+            u16::from_le_bytes(row[..2].try_into().unwrap()),
+            columns[0].parse::<u16>().expect("form id"),
+            "form id column matches encoded row"
+        );
+        rows.extend_from_slice(&row);
+        row_count += 1;
+    }
+    assert_eq!(row_count, 31, "the measured registry has 31 rows");
     let gather = registry::find_row(&rows, decision::GATHER_FORM_ID)
         .unwrap()
         .expect("measured Form-48 registry row");
@@ -293,20 +310,27 @@ fn artifacts() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
 
 fn f47_artifacts() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
     let root = std::env::var_os("BASANOS_PT2P_F47_ROOT").map(PathBuf::from)?;
-    let fixture = artifacts_at(root)?;
-    pt::route_header_v4_shallow(&fixture.0).ok()?.2.as_ref()?;
+    let fixture = artifacts_at(root)
+        .unwrap_or_else(|| panic!("BASANOS_PT2P_F47_ROOT points at an invalid PT2P fixture"));
+    let pxr1 = pt::route_header_v4_shallow(&fixture.0)
+        .expect("BASANOS_PT2P_F47_ROOT has a valid compiler-v1 route header")
+        .2;
+    assert!(
+        pxr1.is_some(),
+        "BASANOS_PT2P_F47_ROOT must carry a PXR1 decision tail"
+    );
     Some(fixture)
 }
 
 fn k10240_artifacts() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let root = std::env::var_os("BASANOS_PT2P_K10240_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                "/Users/colkitt/sith/toys/crypto/basanos/out/runs/rev8-k10240-template-2026-09-30/fixture/pt2p",
-            )
-        });
-    artifacts_at(root)
+    if let Some(root) = std::env::var_os("BASANOS_PT2P_K10240_ROOT") {
+        return Some(artifacts_at(PathBuf::from(root)).unwrap_or_else(|| {
+            panic!("BASANOS_PT2P_K10240_ROOT points at an invalid PT2P fixture")
+        }));
+    }
+    artifacts_at(PathBuf::from(
+        "/Users/colkitt/sith/toys/crypto/basanos/out/runs/rev8-k10240-template-2026-09-30/fixture/pt2p",
+    ))
 }
 
 /// The compiler-v1 typed-decision position defaults to the retained K=35
@@ -428,6 +452,37 @@ struct QuietSendCache {
     nonce: u64,
 }
 
+async fn retry_with_fresh_blockhash<F>(
+    ctx: &mut ProgramTestContext,
+    cache: &mut QuietSendCache,
+    data: &[u8],
+    make_transaction: &F,
+) -> Result<(), TransactionError>
+where
+    F: Fn(solana_program::hash::Hash) -> Transaction,
+{
+    cache.blockhash = Some(ctx.banks_client.get_latest_blockhash().await.unwrap());
+    cache.uses = 0;
+    let inner = ctx
+        .banks_client
+        .process_transaction_with_metadata(make_transaction(cache.blockhash.unwrap()))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("the banks client refused the refreshed transaction: {error:?}")
+        });
+    if matches!(data.first().copied(), Some(140..=147 | 156..=160 | 176)) {
+        if let Some(metadata) = inner.metadata.as_ref() {
+            eprintln!(
+                "CU tag {} data {} cu {}",
+                data[0],
+                data.len(),
+                metadata.compute_units_consumed
+            );
+        }
+    }
+    inner.result
+}
+
 /// Quiet setup sender that refreshes its recent blockhash every 32
 /// transactions and gives each transaction a unique, near-maximum compute
 /// limit. The budget does not change the program instruction; it prevents
@@ -498,50 +553,12 @@ async fn send_quiet_cached(
             // Long SBF upload/hash walks can age a 32-transaction cache out of
             // the bank's recent-blockhash window. Refresh and retry once rather
             // than making a valid fixture depend on test-runner timing.
-            cache.blockhash = Some(ctx.banks_client.get_latest_blockhash().await.unwrap());
-            cache.uses = 0;
-            let inner = ctx
-                .banks_client
-                .process_transaction_with_metadata(make_transaction(cache.blockhash.unwrap()))
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("the banks client refused the refreshed transaction: {error:?}")
-                });
-            if matches!(data.first().copied(), Some(140..=147 | 156..=160 | 176)) {
-                if let Some(metadata) = inner.metadata.as_ref() {
-                    eprintln!(
-                        "CU tag {} data {} cu {}",
-                        data[0],
-                        data.len(),
-                        metadata.compute_units_consumed
-                    );
-                }
-            }
-            inner.result
+            retry_with_fresh_blockhash(ctx, cache, &data, &make_transaction).await
         }
         Err(error) => panic!("the banks client refused the cached transaction: {error:?}"),
     };
     if matches!(&result, Err(TransactionError::BlockhashNotFound)) {
-        cache.blockhash = Some(ctx.banks_client.get_latest_blockhash().await.unwrap());
-        cache.uses = 0;
-        let inner = ctx
-            .banks_client
-            .process_transaction_with_metadata(make_transaction(cache.blockhash.unwrap()))
-            .await
-            .unwrap_or_else(|error| {
-                panic!("the banks client refused the refreshed transaction: {error:?}")
-            });
-        if matches!(data.first().copied(), Some(140..=147 | 156..=160 | 176)) {
-            if let Some(metadata) = inner.metadata.as_ref() {
-                eprintln!(
-                    "CU tag {} data {} cu {}",
-                    data[0],
-                    data.len(),
-                    metadata.compute_units_consumed
-                );
-            }
-        }
-        result = inner.result;
+        result = retry_with_fresh_blockhash(ctx, cache, &data, &make_transaction).await;
     }
     if matches!(&result, Err(TransactionError::AlreadyProcessed)) {
         let slot = ctx
@@ -1735,6 +1752,10 @@ async fn build_with_pre_fix_seal_processor(
         }
         return None;
     };
+    let has_pxr1 = pt::route_header_v4_shallow(&routes)
+        .expect("PT2P route header is valid")
+        .2
+        .is_some();
     let g = v7_golden();
     let e = executor();
     // Stable account identities keep SBF CU comparisons on the same fixture
@@ -1818,7 +1839,11 @@ async fn build_with_pre_fix_seal_processor(
         // Fast local preflight of the exact admission walk. Keep a failing
         // class index and shape visible without spending minutes uploading
         // the PT1X fixture before finding a frozen-registry limit mismatch.
-        let (mut preflight_rows, _) = k10240_registry_rows();
+        let (mut preflight_rows, _) = if has_pxr1 {
+            decision_registry_rows()
+        } else {
+            k10240_registry_rows()
+        };
         for row in preflight_rows.chunks_exact_mut(registry::ROW_BYTES) {
             if u16::from_le_bytes(row[..2].try_into().unwrap()) == registry::FORM_RS1_SUMMARY {
                 row[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
@@ -1857,9 +1882,6 @@ async fn build_with_pre_fix_seal_processor(
             );
         }
     }
-    let has_pxr1 = pt::route_header_v4_shallow(&routes)
-        .map(|(_, _, pxr)| pxr.is_some())
-        .unwrap_or(false);
     // Compiler-v1's decision fixture places Form 47 last at the configured
     // prompt position. The retained rung-D template keeps its original locator.
     let (base_entry, output_write, output_width) = if has_pxr1 {
@@ -2208,8 +2230,8 @@ async fn build_with_pre_fix_seal_processor(
     );
     let pt2s_sha = sha256(&[&pt2s_image]);
     // The registry, by real instructions over the v7 golden's rows.
-    let (mut rows, census) = if admit_form48_only {
-        f47_registry_rows()
+    let (mut rows, census) = if has_pxr1 {
+        decision_registry_rows()
     } else if k10240_fixture {
         k10240_registry_rows()
     } else {
@@ -4372,7 +4394,8 @@ async fn unified_init_rejects_prompt_shorter_than_template_producer_delta() {
 
 /// The compiler-v1 PXR1 decision lane accepts a complete option table through
 /// UnifiedInit at each supported boundary count, including both read-key
-/// boundary sizes around tag 120's 48-account limit.
+/// boundary sizes around tag 120's 48-account limit. Tag 146 reaches the
+/// Form-47 route and refuses with 603 while the app route selector is pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn f47_compiler_v1_unified_init_accepts_option_counts_1_47_48_80() {
     let Some(mut f) = build_f47().await else {
@@ -4437,9 +4460,64 @@ async fn f47_compiler_v1_unified_init_accepts_option_counts_1_47_48_80() {
             FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
             "UnifiedInit document finalizes at K = {k}"
         );
+        if variant == 0 {
+            let decision_entry = f.base_entry;
+            assert_eq!(
+                template.entry(29, decision_entry).unwrap().kernel_index,
+                decision::FORM_ID
+            );
+            let decision_keys = [
+                f.pt2s,
+                f.pt1s_index,
+                f.routes,
+                f.geometry,
+                f.payloads,
+                created[0],
+            ];
+            let decision_key_refs = decision_keys.iter().collect::<Vec<_>>();
+            let decision_binding = dcg_program::pt1_onchain::pt1x_output_binding(
+                &f.program,
+                &decision_key_refs,
+                29,
+                decision_entry,
+                1,
+            );
+            let (decision_output, _) =
+                dcg_program::pt1_onchain::pt1x_output_address(&f.program, &decision_binding);
+            f.ctx
+                .set_account(&decision_output, &shared(system_funded()));
+            let mut decision_data = vec![S::TAG_INSTANTIATE];
+            decision_data.extend_from_slice(&29u32.to_le_bytes());
+            decision_data.extend_from_slice(&decision_entry.to_le_bytes());
+            decision_data.extend_from_slice(&1u16.to_le_bytes());
+            assert_eq!(
+                custom(
+                    send_with_signers(
+                        &mut f.ctx,
+                        &f.executor,
+                        &[],
+                        f.program,
+                        decision_data,
+                        vec![
+                            AccountMeta::new_readonly(f.pt2s, false),
+                            AccountMeta::new_readonly(f.pt1s_index, false),
+                            AccountMeta::new_readonly(f.routes, false),
+                            AccountMeta::new_readonly(f.geometry, false),
+                            AccountMeta::new_readonly(f.payloads, false),
+                            AccountMeta::new(decision_output, false),
+                            AccountMeta::new_readonly(created[0], false),
+                            AccountMeta::new_readonly(SYSTEM, false),
+                            AccountMeta::new(f.executor.pubkey(), true),
+                        ],
+                    )
+                    .await
+                ),
+                603,
+                "tag 146 on Form 47 remains pending the application route selector"
+            );
+        }
         // Tag 146 resolves a non-decision entry against the immutable
-        // document. Typed-decision route selection remains pending 2b: the
-        // standalone dispatcher has no application route producer.
+        // document; the Form-47 control above covers the pending app selector.
         {
             let entry = output_entry;
             let output_keys = [
@@ -15171,6 +15249,7 @@ async fn rev8_non_arw1_committed_leaf_executor_timeout_favors_challenger_sbf() {
 /// The empty compatibility image preserves its old exact data lengths for
 /// tags 166, 168, and 169. A trailing replay witness is refused with 730; an
 /// exact tag-169 retry enters RESPOND.
+#[cfg(not(feature = "test-kernel"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_empty_application_refuses_witness_tails_for_166_168_169_sbf() {
     assert!(std::env::var_os("BASANOS_DCG_V8_SBF").is_some());

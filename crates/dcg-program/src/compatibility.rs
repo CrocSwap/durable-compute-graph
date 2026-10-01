@@ -35,7 +35,9 @@ pub trait DecisionRouteSelector: Sync {
 
 /// Revision-8 record and admission policy hooks. The records own parsing and
 /// byte encoding; an application supplies checks for terms, template limits,
-/// and admitted registry classes.
+/// and admitted registry classes. The core always applies its frozen
+/// revision-8 checks before `check_terms2_template`; an application hook may
+/// add refusals, but cannot widen the core's template window.
 pub trait ApplicationHooks: Sync {
     fn check_terms_v1(&self, terms: &Terms, round_floor_slots: u64) -> Result<(), u32>;
     fn check_terms_v2(&self, terms: &Terms2, round_floor_slots: u64) -> Result<(), u32>;
