@@ -142,10 +142,11 @@ fn response<'a>(
         },
     )
     .map_err(|_| no(PROOF))?;
-    let total = u32_at(
+    let total = usize::try_from(u32_at(
         &account.try_borrow_data()?,
         closure_v2_response::DECLARED_LEN_AT,
-    )? as usize;
+    )?)
+    .map_err(|_| no(MALFORMED))?;
     if total > closure_v2_response::MAX_BODY || account.data_len() > RESPONSE_BYTES {
         return Err(no(MALFORMED));
     }
@@ -300,7 +301,7 @@ impl<'a> Body<'a> {
             2 => 36,
             _ => return Err(no(MALFORMED)),
         };
-        let read_count = u16_at(raw, 6)? as usize;
+        let read_count = usize::from(u16_at(raw, 6)?);
         if read_count > MAX_READS || raw.len() < head {
             return Err(no(MALFORMED));
         }
@@ -380,10 +381,11 @@ impl<'a> Body<'a> {
             .checked_add(index.checked_mul(4).ok_or(no(MALFORMED))?)
             .ok_or(no(MALFORMED))?;
         let at = usize::try_from(u32_at(self.raw, directory_at)?).map_err(|_| no(MALFORMED))?;
-        let end = if index + 1 < self.read_count {
+        let next_index = index.checked_add(1).ok_or(no(MALFORMED))?;
+        let end = if next_index < self.read_count {
             let next_at = self
                 .head
-                .checked_add((index + 1).checked_mul(4).ok_or(no(MALFORMED))?)
+                .checked_add(next_index.checked_mul(4).ok_or(no(MALFORMED))?)
                 .ok_or(no(MALFORMED))?;
             usize::try_from(u32_at(self.raw, next_at)?).map_err(|_| no(MALFORMED))?
         } else {
@@ -448,9 +450,9 @@ impl<'a> Cursor<'a> {
 
     /// u16-prefixed producer preimage, then u8-counted leaf path siblings.
     pub(crate) fn producer(&mut self) -> Result<(&'a [u8], &'a [u8]), ProgramError> {
-        let preimage_len = self.u16()? as usize;
+        let preimage_len = usize::from(self.u16()?);
         let preimage = self.take(preimage_len)?;
-        let siblings = self.u8()? as usize;
+        let siblings = usize::from(self.u8()?);
         let sibling_bytes = siblings.checked_mul(32).ok_or(no(MALFORMED))?;
         Ok((preimage, self.take(sibling_bytes)?))
     }
@@ -518,6 +520,19 @@ mod tests {
         assert_eq!(body.section_exact(0).unwrap(), (&[0xCC][..], 1, &[][..]));
         assert!(body.row(1).is_err());
         assert!(body.section(1).is_err());
+
+        let mut out_of_bounds = raw.clone();
+        out_of_bounds[head..head + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Body::parse(&out_of_bounds)
+            .unwrap()
+            .section_exact(0)
+            .is_err());
+        let mut overlaps_directory = raw;
+        overlaps_directory[head..head + 4].copy_from_slice(&(head as u32).to_le_bytes());
+        assert!(Body::parse(&overlaps_directory)
+            .unwrap()
+            .section_exact(0)
+            .is_err());
     }
 
     #[test]

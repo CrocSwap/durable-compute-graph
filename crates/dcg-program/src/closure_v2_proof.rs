@@ -91,8 +91,9 @@ fn page_leaf(page: &[u8], local: u32) -> Result<&[u8], ProgramError> {
     if local >= count || u32_at(page, 52)? != count {
         return Err(no(PROOF));
     }
+    let local = usize::try_from(local).map_err(|_| no(PROOF))?;
     let at = 96usize
-        .checked_add((local as usize).checked_mul(32).ok_or(no(PROOF))?)
+        .checked_add(local.checked_mul(32).ok_or(no(PROOF))?)
         .ok_or(no(PROOF))?;
     let end = at.checked_add(32).ok_or(no(PROOF))?;
     page.get(at..end).ok_or(no(PROOF))
@@ -249,7 +250,7 @@ pub fn verify_finalized_leaf(
     if doc.len() < 40 || &doc[..4] != b"DCM2" || &doc[8..40] != descriptor {
         return Err(no(PROOF));
     }
-    let segments = u16_at(&doc, 76)? as usize;
+    let segments = usize::from(u16_at(&doc, 76)?);
     let version = u16_at(&doc, 4)?;
     let header = closure_v2::dcm2_header(version).ok_or(no(PROOF))?;
     let stride = segments
@@ -268,11 +269,12 @@ pub fn verify_finalized_leaf(
         .checked_mul(32)
         .and_then(|n| n.checked_add(48))
         .ok_or(no(PROOF))?;
+    let position_index = usize::try_from(coordinate.position).map_err(|_| no(PROOF))?;
     if segments == 0
         || doc.len() != expected_len
         || u16_at(&doc, 6)? & 1 == 0
         || coordinate.position >= u32_at(&doc, 84)?
-        || coordinate.position as usize >= positions_count
+        || position_index >= positions_count
         || pos.len() != expected_positions_len
         || &pos[..4] != b"DPR2"
         || u16_at(&pos, 4)? != 1
@@ -287,11 +289,7 @@ pub fn verify_finalized_leaf(
         &doc[192..]
     } else {
         let base = header
-            .checked_add(
-                (coordinate.position as usize)
-                    .checked_mul(stride)
-                    .ok_or(no(PROOF))?,
-            )
+            .checked_add(position_index.checked_mul(stride).ok_or(no(PROOF))?)
             .ok_or(no(PROOF))?;
         let table_start = base.checked_add(32).ok_or(no(PROOF))?;
         let table_end = base.checked_add(stride).ok_or(no(PROOF))?;
@@ -337,12 +335,16 @@ pub fn verify_finalized_leaf(
             .checked_mul(32)
             .and_then(|n| n.checked_add(48))
             .ok_or(no(PROOF))?;
+        let root_at = segment_index.checked_mul(32).ok_or(no(PROOF))?;
+        let root_end = root_at.checked_add(32).ok_or(no(PROOF))?;
+        let roots_start = 48usize.checked_add(root_at).ok_or(no(PROOF))?;
+        let roots_end = 48usize.checked_add(root_end).ok_or(no(PROOF))?;
         if roots.len() != roots_len
             || &roots[..4] != b"DSR2"
             || &roots[8..40] != descriptor
             || u32_at(&roots, 40)? != coordinate.position
-            || u16_at(&roots, 6)? as usize != segments
-            || &page[64..96] != &roots[48 + segment_index * 32..48 + (segment_index + 1) * 32]
+            || usize::from(u16_at(&roots, 6)?) != segments
+            || &page[64..96] != &roots[roots_start..roots_end]
         {
             return Err(no(PROOF));
         }
@@ -355,11 +357,7 @@ pub fn verify_finalized_leaf(
         doc[152..184].try_into().map_err(|_| no(PROOF))?
     } else {
         let base = header
-            .checked_add(
-                (coordinate.position as usize)
-                    .checked_mul(stride)
-                    .ok_or(no(PROOF))?,
-            )
+            .checked_add(position_index.checked_mul(stride).ok_or(no(PROOF))?)
             .ok_or(no(PROOF))?;
         let end = base.checked_add(32).ok_or(no(PROOF))?;
         doc.get(base..end)
@@ -370,11 +368,7 @@ pub fn verify_finalized_leaf(
     let calculated =
         closure_v2::position_root(descriptor, coordinate.position, table_root, &segment_roots)?;
     let at = 48usize
-        .checked_add(
-            (coordinate.position as usize)
-                .checked_mul(32)
-                .ok_or(no(PROOF))?,
-        )
+        .checked_add(position_index.checked_mul(32).ok_or(no(PROOF))?)
         .ok_or(no(PROOF))?;
     let end = at.checked_add(32).ok_or(no(PROOF))?;
     if pos.get(at..end).ok_or(no(PROOF))? != calculated {
@@ -407,7 +401,7 @@ pub(crate) fn preimage_fields<'a>(
     {
         return Err(no(PROOF));
     }
-    let writes = u16_at(preimage, base + 116)? as usize;
+    let writes = usize::from(u16_at(preimage, base + 116)?);
     let writes_bytes = writes.checked_mul(WRITE_ROW_BYTES).ok_or(no(PROOF))?;
     let expected_len = base
         .checked_add(120)
@@ -454,7 +448,7 @@ pub fn verify_producer_route<'t>(
         || u16_at(read_row, 0)? != route.region_id
         || u64_at(read_row, 8)? != route.effective_offset
         || u32_at(read_row, 16)? != route.byte_length
-        || input.len() != route.byte_length as usize
+        || input.len() != usize::try_from(route.byte_length).map_err(|_| no(ROUTE))?
     {
         return Err(no(ROUTE));
     }
@@ -462,8 +456,12 @@ pub fn verify_producer_route<'t>(
     let (position, segment, local, kernel, _, writes) =
         preimage_fields(producer_preimage, descriptor)?;
     let producer = template.entry(route.producer_entry).map_err(no)?;
-    if route.producer_write_ordinal as u16 >= producer.write_count
-        || writes.len() != producer.write_count as usize * WRITE_ROW_BYTES
+    let producer_writes = usize::from(producer.write_count);
+    let expected_writes_len = producer_writes
+        .checked_mul(WRITE_ROW_BYTES)
+        .ok_or(no(ROUTE))?;
+    if u16::from(route.producer_write_ordinal) >= producer.write_count
+        || writes.len() != expected_writes_len
     {
         return Err(no(ROUTE));
     }
@@ -472,10 +470,10 @@ pub fn verify_producer_route<'t>(
         .map_err(no)?;
     let producer_write_route = producer
         .read_count
-        .checked_add(route.producer_write_ordinal as u16)
+        .checked_add(u16::from(route.producer_write_ordinal))
         .ok_or(no(ROUTE))?;
     let declared_write = producer_inst.route(producer_write_route).map_err(no)?;
-    let write_at = (route.producer_write_ordinal as usize)
+    let write_at = usize::from(route.producer_write_ordinal)
         .checked_mul(WRITE_ROW_BYTES)
         .ok_or(no(ROUTE))?;
     let write_end = write_at.checked_add(WRITE_ROW_BYTES).ok_or(no(ROUTE))?;
@@ -537,7 +535,10 @@ mod tests {
         let descriptor = [7u8; 32];
         let wrong_document_key = Pubkey::new_unique();
         let arbitrary_key = Pubkey::new_unique();
-        let mut lamports = [1u64; 5];
+        let mut document_lamports = 1;
+        let mut positions_lamports = 1;
+        let mut page_lamports = 1;
+        let mut roots_lamports = 1;
         let mut document_data = [0u8; 40];
         document_data[..4].copy_from_slice(b"DCM2");
         let mut positions_data = [0u8; 48];
@@ -547,7 +548,7 @@ mod tests {
             &wrong_document_key,
             false,
             false,
-            &mut lamports[0],
+            &mut document_lamports,
             &mut document_data,
             &program,
             false,
@@ -557,7 +558,7 @@ mod tests {
             &arbitrary_key,
             false,
             false,
-            &mut lamports[1],
+            &mut positions_lamports,
             &mut positions_data,
             &program,
             false,
@@ -567,7 +568,7 @@ mod tests {
             &arbitrary_key,
             false,
             false,
-            &mut lamports[2],
+            &mut page_lamports,
             &mut page_data,
             &program,
             false,
@@ -577,7 +578,7 @@ mod tests {
             &arbitrary_key,
             false,
             false,
-            &mut lamports[3],
+            &mut roots_lamports,
             &mut roots_data,
             &program,
             false,
