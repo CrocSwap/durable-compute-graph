@@ -144,7 +144,7 @@ pub fn process_instruction_with_manifest(
                 &application,
             )
         }
-        209..=219 => graph_v2::process(program_id, accounts, data),
+        208..=219 => graph_v2::process(program_id, accounts, data),
         140 => pt1_onchain::init_fresh(program_id, accounts, data),
         141 => pt1_onchain::upload(program_id, accounts, data),
         142 => pt1_onchain::seal(program_id, accounts, data),

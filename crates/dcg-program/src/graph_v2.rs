@@ -122,6 +122,7 @@ fn owned(program_id: &Pubkey, account: &AccountInfo) -> ProgramResult {
 
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     match data[0] {
+        208 => raw_write(program_id, accounts, data),
         209 => close_run(program_id, accounts),
         210 => blob_create(program_id, accounts, data),
         211 => blob_write(program_id, accounts, data),
@@ -295,7 +296,7 @@ fn admit_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         }
     }
     let image_id = sha256(&[b"dcg.app.image.v2\x00", program_id.as_ref()]);
-    let template_id = sha256(&[TEMPLATE_DOMAIN, &graph_id, &plan_id, &image_id, &manifest_root, &table_id]);
+    let template_id = sha256(&[TEMPLATE_DOMAIN, &graph_id, &plan_id, &image_id, &manifest_root, &table_id, &data[1..11]]);
     create_pda(program_id, admitter, template, system, &[b"dcg2tmpl", &template_id], TEMPLATE_BYTES)?;
     let mut d = template.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"DCT2");
@@ -578,5 +579,25 @@ fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     **run.try_borrow_mut_lamports()? = 0;
     **payer.try_borrow_mut_lamports()? += lamports;
     run.try_borrow_mut_data()?.fill(0);
+    Ok(())
+}
+
+// 208: [account(s,w)] tag offset:u32 bytes. Raw bytes into a keypair account
+// this program owns (e.g. a large immutable resource source). The account
+// must sign, so a program-derived account can never be targeted.
+fn raw_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [account, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    owned(program_id, account)?;
+    if !account.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let offset = u32_at(data, 1)? as usize;
+    let bytes = &data[5..];
+    let mut d = account.try_borrow_mut_data()?;
+    let end = offset.checked_add(bytes.len()).ok_or(err(7))?;
+    if end > d.len() {
+        return Err(err(7));
+    }
+    d[offset..end].copy_from_slice(bytes);
     Ok(())
 }

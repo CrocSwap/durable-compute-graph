@@ -1456,6 +1456,8 @@ class Sequencer:
         return time.time() - lease.fetched_at_unix >= lifetime
 
     def _packet_lease_expired(self, packet: _PacketState) -> bool:
+        # M2 (open): a lagging load-balanced node can report BlockhashExpired
+        # for a fresh blockhash; the tests still treat the report as proof.
         return packet.last_send_error == BlockhashExpired.__name__ or self._lease_expired(packet.lease)
 
     async def _confirm(
@@ -1573,6 +1575,7 @@ class SequencerStream:
         self._latest_by_lock: dict[str, tuple[int, str]] = {}
         self._lane_prev: dict[str, frozenset[str]] = {}
         self._completed: set[str] = set()
+        self._resumed_seen: dict[tuple[str, int], float] = {}
         self._last_observations: dict[tuple[str, int], tuple[Any, ...]] = {}
         self._leases: dict[tuple[str, int], BlockhashLease] = {}
         self._conditions = asyncio.Condition()
@@ -2071,7 +2074,19 @@ class SequencerStream:
                 continue
 
             lease = self._leases.get((step.step_id, packet_record.generation))
-            expired = lease is not None and self.sequencer._lease_expired(lease)
+            if lease is not None:
+                expired = self.sequencer._lease_expired(lease)
+            else:
+                # H3: a packet resumed from the journal has no in-memory lease.
+                # Its blockhash was fetched before this process saw it, so one
+                # full lifetime after first sight is a safe upper bound.
+                first_seen = self._resumed_seen.setdefault(
+                    (step.step_id, packet_record.generation), self.sequencer.config.monotonic_clock()
+                )
+                expired = (
+                    self.sequencer.config.monotonic_clock() - first_seen
+                    > self.sequencer.config.blockhash_lifetime_seconds
+                )
             if expired and status is None and postcondition.satisfied is not True:
                 evidence = RecoveryEvidence(
                     packet_record.signature,

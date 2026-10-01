@@ -130,7 +130,7 @@ class GraphClient:
         ids = {**graph.ids(), "table": hashlib.sha256(TABLE_DOMAIN + table).digest()}
         image_id = hashlib.sha256(b"dcg.app.image.v2\x00" + bytes(self.program_id)).digest()
         template_id = hashlib.sha256(TEMPLATE_DOMAIN + ids["graph"] + ids["plan"] + image_id + manifest_root
-                                     + ids["table"]).digest()
+                                     + ids["table"] + policy[3:]).digest()
         template = self.pda(b"dcg2tmpl", template_id)
         if self.account(template) is None:
             self.send(bytes([213, MODES[mode], samples]) + struct.pack("<Q", window_slots) + manifest_root,
