@@ -378,3 +378,68 @@ test edits. `test-kernel` also passed both
 test receipts, including each ELF and the app-aware admission failure, are
 retained under `out/runs/dcg-seam-fix-5-2026-09-30/`; its README records the
 source hashes, test names, and log names.
+
+## Round 6 prerequisite review fixes (2026-10-01)
+
+The revision-8 account-provenance and challenge fixes are in DCG commit
+`16e3a68`. The Basanos mirror of byte 219 is recorded in its own
+`docs/spec/dcg-unified-v8.md`. This round also removes six duplicate PDA
+searches from the document/admission/config readers and fixes the app-account
+rules, stored-bump type boundary, `RESOURCE_CHUNK_TAG` constant, and portable
+golden rows.
+
+### Seeded admission and response measurements
+
+The SBF images below use cargo-build-sbf 3.0.15, platform-tools v1.51, and the
+pinned SDK at `/private/tmp/basanos-sbf-sdk-v151-20260920`. The baseline image
+is built from DCG `5e65bbe`; the current images are built from `16e3a68`. The
+baseline test harness used the same seeded fixture keys as the current harness
+for the A/B measurements. CU totals include the Compute Budget instruction.
+
+| Image | Feature | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| Baseline, empty application | default revision-8 features | 815,560 | `3f1cf251165860455da09d0b021067e80049d0cfd234126e2deeacc92b53e1a7` |
+| Current, empty application | default revision-8 features | 815,272 | `c03ba664259e24a9ad1b3a16a5555044ac8c0ebc6f9995a0a23c6dcb59403ef9` |
+| Current app lifecycle | `sbf-real-lifecycle-test` | 1,250,896 | `0aec3ca386f3d12525a3dabac78ce62bf3c9a22b1d8da643f83d29d6d5ad9eac` |
+
+| Workload | Image and fixture | Measured CU / result |
+| --- | --- | --- |
+| `rev8_pt1x_registry_and_admission_sbf`, tag 160, 16 classes per step | Current empty-application image; K=10,240 compiler-v1 fixture | 722,570 peak across 1,801 tag-160 calls; passed |
+| App-bound K=10,240 admission, 16 classes per step | Current app-lifecycle image; K=10,240 compiler-v1 fixture | Failed at the 1,400,000 CU transaction limit in each of the two full-path admission tests |
+| `rev8_pt1x_real_admission_to_resolve_sbf`, tag 161, 609-byte instruction | Baseline empty-application image; seeded K=10,240 fixture | 330,165; passed |
+| Same tag-161 path and fixture | Current empty-application image; seeded K=10,240 fixture | 310,788; passed |
+
+The six avoided searches reduced this seeded tag-161 path by **19,377 CU
+(5.87%)**, measured on the two named images. This is one fixture path, not a
+general CU bound. The empty-application tag-160 path fits at 16 classes per
+step. App-bound admission still needs a position cursor so one class can span
+transactions; that follow-up was not implemented in this round.
+
+### Revision-8 lifecycle verification
+
+The full `unified_v8_document` SBF target ran against the current app-lifecycle
+image: 61 tests passed and 7 failed. Four retained Form-47/Form-48 cases refused
+the tag-145 template seal with custom error 813; the Form-47 template-seal
+refusal was reproduced against the baseline lifecycle image as well. Two
+K=10,240 app-bound admission cases reached `ComputationalBudgetExceeded` at
+tag 160. The empty-application trailing-witness case also cannot use the
+app-lifecycle image, because that image has the test application manifest and
+accepts the valid tag-169 witness. Running that same test against the current
+default-feature image passed.
+
+All four byte-219 settlement paths passed on SBF: an honest tag-166 challenge
+continues through tag 115; an immediate tag-166 conviction settles through
+tag 131; a tag-167 POSITION_REVEAL timeout settles through tag 131; and a
+SELECT timeout settles through tag 131. The latter exercises the new
+revision-8 tag-132 copy from byte 181 to byte 219.
+
+The `stateful_v3_sbf_workload` target passed 12 tests against the current
+app-lifecycle image. In its measured traces, the 10 MB state-growth workload
+used 1,220 calls and peaked at 47,390 CU per call; the 4.4 MB resource copy
+used 537 growth calls (26,936 CU peak) and 68 resource-chunk uploads (41,718 CU
+peak). These are workload-path measurements, not worst-case bounds.
+
+The default offline `dcg-program` suite passed, including the portable and
+revision-8 record goldens. The full lifecycle target's seven failures and the
+focused empty-application pass are retained with the SBF build and test logs in
+`/Users/colkitt/sith/toys/crypto/basanos/out/runs/dcg-prereq-2a-fix-2026-10-01/`.

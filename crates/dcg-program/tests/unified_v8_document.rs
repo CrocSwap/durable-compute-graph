@@ -12701,13 +12701,9 @@ async fn rev8_honest_leaf_challenge_uses_v7_document_reader_and_refuses_a_cheati
     let (_, expected_response_bump) =
         dcg_program::closure_v2_response::address(&f.program, &record);
     assert_eq!(
-        dcr1[challenge::RESPONSE_BUMP_STAGED_AT],
-        expected_response_bump.value()
-    );
-    assert_eq!(
         dcr1[challenge::RESPONSE_BUMP_AT],
         expected_response_bump.value(),
-        "tag 166 initializes the stable response bump at open"
+        "tag 166 keeps the stable response bump through the fix-point scratch clear"
     );
     assert_eq!(
         dcr1[4],
@@ -14766,13 +14762,7 @@ async fn rev8_empty_application_refuses_witness_tails_for_166_168_169_sbf() {
         leaf_metas,
     )
     .await;
-    assert!(matches!(
-        refused,
-        Err(TransactionError::InstructionError(
-            _,
-            InstructionError::Custom(730)
-        ))
-    ));
+    assert_eq!(custom(refused), 730, "tag 166 rejects replay tails");
 
     // Tag 168, k=0: start a real position challenge and select the segment.
     // The retained fixture has no singleton segment, so set only the state
@@ -14932,13 +14922,7 @@ async fn rev8_empty_application_refuses_witness_tails_for_166_168_169_sbf() {
         metas,
     )
     .await;
-    assert!(matches!(
-        refused,
-        Err(TransactionError::InstructionError(
-            _,
-            InstructionError::Custom(730)
-        ))
-    ));
+    assert_eq!(custom(refused), 730, "tag 169 rejects replay tails");
     send(
         &mut descend_fix.ctx,
         &descend_fix.signer,
@@ -15215,12 +15199,13 @@ async fn rev8_select_timeout_preserves_response_bump_for_settlement_sbf() {
         commit_challenge_tree(&mut f, &binding, 79, 0).await;
     let nonce = 121;
     let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), nonce).0;
+    let position_metas = challenge_position_metas(&f, created, record);
     send(
         &mut f.ctx,
         &f.signer,
         f.program,
         challenge_position_data(&descriptor, 79, nonce),
-        challenge_position_metas(&f, created, record),
+        position_metas,
     )
     .await
     .expect("tag 167 opens the position challenge");
@@ -15277,8 +15262,31 @@ async fn rev8_select_timeout_preserves_response_bump_for_settlement_sbf() {
         dcr1[challenge::RESPONSE_BUMP_AT],
         expected_response_bump.value()
     );
-    settle_and_close_standard_app_challenge(&mut f, record, created, descriptor, false, &terms)
-        .await;
+    let third_party = Keypair::new();
+    f.ctx
+        .set_account(&third_party.pubkey(), &shared(system_funded()));
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    send_fresh_with(
+        &mut f.ctx,
+        &third_party,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_SETTLE],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(response, false),
+            AccountMeta::new(f.executor.pubkey(), false),
+            AccountMeta::new(f.executor.pubkey(), false),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(incinerator::ID, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(incinerator::ID, false),
+            AccountMeta::new(Pubkey::new_from_array(terms.bond_remainder), false),
+        ],
+    )
+    .await
+    .expect("tag 131 settles the SELECT-timeout executor ruling");
+    assert_eq!(f.lamports(record).await, 0);
+    assert_eq!(u32_at(&f.account(created[0]).await, 128), 0);
 }
 
 /// Tag 166's app replay fast path can rule immediately. Its open-time stable
@@ -15313,32 +15321,52 @@ async fn rev8_app_leaf_fast_conviction_settles_from_open_bump_sbf() {
         nonce,
         &witness,
     );
-    send(
-        &mut f.ctx,
-        &f.signer,
-        f.program,
-        packet,
-        challenge_leaf_metas(&f, created, record),
-    )
-    .await
-    .expect("tag 166 fast replay convicts the executor");
+    let leaf_metas = challenge_leaf_metas(&f, created, record);
+    send(&mut f.ctx, &f.signer, f.program, packet, leaf_metas)
+        .await
+        .expect("tag 166 fast replay convicts the executor");
     let dcr1 = f.account(record).await;
     assert_eq!(dcr1[4], challenge::PHASE_RULED);
     assert_eq!(dcr1[5], 2);
     assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
-    assert_eq!(
-        dcr1[challenge::RESPONSE_BUMP_AT],
-        dcr1[challenge::RESPONSE_BUMP_STAGED_AT],
-        "tag 166 initializes the stable bump before its immediate ruling"
-    );
     let (_, expected_response_bump) =
         dcg_program::closure_v2_response::address(&f.program, &record);
     assert_eq!(
         dcr1[challenge::RESPONSE_BUMP_AT],
         expected_response_bump.value()
     );
-    settle_and_close_standard_app_challenge(&mut f, record, created, descriptor, true, &terms)
-        .await;
+    let third_party = Keypair::new();
+    f.ctx
+        .set_account(&third_party.pubkey(), &shared(system_funded()));
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let record_balance = f.lamports(record).await;
+    let challenger_before = f.lamports(f.signer.pubkey()).await;
+    send_fresh_with(
+        &mut f.ctx,
+        &third_party,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_SETTLE],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(response, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(f.executor.pubkey(), false),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(incinerator::ID, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(Pubkey::new_from_array(terms.bond_remainder), false),
+        ],
+    )
+    .await
+    .expect("tag 131 settles the tag 166 fast conviction");
+    assert_eq!(f.lamports(record).await, 0);
+    assert_eq!(
+        f.lamports(f.signer.pubkey()).await,
+        challenger_before + record_balance,
+        "the settled challenge rent and bond return to the challenger"
+    );
+    assert_eq!(u32_at(&f.account(created[0]).await, 128), 0);
 }
 
 /// Tag 146 checks the binding-derived PT1O address before assigning or writing
