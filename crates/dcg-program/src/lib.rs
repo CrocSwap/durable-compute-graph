@@ -219,3 +219,46 @@ mod application_manifest_tests {
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
+
+/// Upward bump allocator over the SBF heap region, capped at the largest heap
+/// frame a transaction may request (256 KiB). The SDK default grows downward
+/// from a fixed 32 KiB top, so a larger declared length would fault every
+/// transaction that keeps the default frame. Growing upward, allocations that
+/// fit in 32 KiB behave as before under any frame; only a transaction whose
+/// allocations pass 32 KiB must request a larger frame (the generic dispute
+/// executor requests 256 KiB), and otherwise faults at the frame edge. The
+/// runtime zeroes the heap per transaction, so the cursor word starts at 0.
+/// Memory is never freed, as with the SDK allocator.
+#[cfg(all(target_os = "solana", feature = "custom-heap", not(feature = "no-entrypoint")))]
+mod upward_heap {
+    use core::alloc::{GlobalAlloc, Layout};
+
+    const START: usize = solana_program::entrypoint::HEAP_START_ADDRESS as usize;
+    const LENGTH: usize = 256 * 1024;
+
+    struct UpwardBump;
+
+    unsafe impl GlobalAlloc for UpwardBump {
+        #[inline]
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let cursor = START as *mut usize;
+            let first = START + core::mem::size_of::<usize>();
+            let at = if *cursor == 0 { first } else { *cursor };
+            let Some(aligned) = at.checked_add(layout.align() - 1).map(|v| v & !(layout.align() - 1))
+            else { return core::ptr::null_mut() };
+            match aligned.checked_add(layout.size()) {
+                Some(end) if end <= START + LENGTH => {
+                    *cursor = end;
+                    aligned as *mut u8
+                }
+                _ => core::ptr::null_mut(),
+            }
+        }
+        #[inline]
+        unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: UpwardBump = UpwardBump;
+}
+

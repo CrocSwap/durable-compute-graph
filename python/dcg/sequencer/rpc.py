@@ -474,7 +474,7 @@ class SolanaRpcEndpoint:
             raise BlockhashExpired(safe_message)
         if "too many requests" in lowered or "rate limit" in lowered:
             raise RateLimited(safe_message)
-        if "instructionerror" in lowered or "custom program error" in lowered:
+        if "instructionerror" in lowered or "custom program error" in lowered or "error processing instruction" in lowered:
             raise ProgramRefused(safe_message)
         if code in {-32005, -32004} or "node is unhealthy" in lowered or "node unhealthy" in lowered:
             raise RpcUnavailable(safe_message)

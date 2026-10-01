@@ -1228,6 +1228,7 @@ class Sequencer:
                             "step_id": step.step_id,
                             "generation": packet.generation,
                             "error_class": type(exc).__name__,
+                            "message": str(exc)[:500],
                             "retry_after": None,
                         },
                         step.step_id,
@@ -1246,6 +1247,7 @@ class Sequencer:
                             "step_id": step.step_id,
                             "generation": packet.generation,
                             "error_class": type(exc).__name__,
+                            "message": str(exc)[:500],
                             "retry_after": exc.retry_after,
                         },
                         step.step_id,
@@ -1262,6 +1264,7 @@ class Sequencer:
                             "step_id": step.step_id,
                             "generation": packet.generation,
                             "error_class": type(exc).__name__,
+                            "message": str(exc)[:500],
                             "retry_after": None,
                         },
                         step.step_id,
@@ -1278,6 +1281,7 @@ class Sequencer:
                             "step_id": step.step_id,
                             "generation": packet.generation,
                             "error_class": type(exc).__name__,
+                            "message": str(exc)[:500],
                             "retry_after": None,
                         },
                         step.step_id,
@@ -1312,6 +1316,7 @@ class Sequencer:
                                 "step_id": step.step_id,
                                 "generation": packet.generation,
                                 "error_class": type(exc).__name__,
+                            "message": str(exc)[:500],
                                 "retry_after": getattr(exc, "retry_after", None),
                             },
                             step.step_id,
@@ -2393,6 +2398,24 @@ class _PooledRpcEndpoint:
             )
         )
         return dict(zip(signatures, observations, strict=True))
+
+    async def get_account_info(self, address, commitment):
+        return await self._sequencer._rpc_call(
+            "get_account_info",
+            address,
+            commitment,
+            route_group=self._route_group,
+            route_affinity=self._route_affinity,
+        )
+
+    async def request_airdrop(self, address, lamports):
+        return await self._sequencer._rpc_call(
+            "request_airdrop",
+            address,
+            lamports,
+            route_group=self._route_group,
+            route_affinity=self._route_affinity,
+        )
 
     async def get_multiple_accounts(self, addresses, commitment):
         return await self._sequencer._rpc_call(

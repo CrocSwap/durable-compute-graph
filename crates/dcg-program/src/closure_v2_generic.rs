@@ -1995,7 +1995,29 @@ fn execute(
     for i in 0..body.read_count {
         read_operands.push(body.section(i)?.0);
     }
-    let artifacts: [&[u8]; 1] = [body.weights];
+    // C1: the synthetic tag-88 leaf has no kernel; DCG rules it itself.
+    // Tag 120 proved the posted target hashes to the canonical synthetic leaf,
+    // so the executor is honest iff that equals the committed leaf.
+    if form == SYNTHETIC_LEAF_FORM {
+        let honest = crate::hash::sha256(&[body.target]) == state[104..136];
+        let doc_revision = u16_at(&accounts[2].try_borrow_data()?, 4)?;
+        drop(raw);
+        if u16_at(&state, 6)? != challenge::VERSION || doc_revision != 7 {
+            return Err(no(PROOF));
+        }
+        return challenge::rule_v8(
+            program,
+            accounts[0].key,
+            &mut state,
+            &accounts[2],
+            if honest { 1 } else { 2 },
+            crate::unified::events::CAUSE_VERDICT,
+            0,
+        );
+    }
+    // M3: only pass weights that tag 123 or 127 verified.
+    let verified_weights: &[u8] = if state[177] == 2 || state[177] == 3 { body.weights } else { &[] };
+    let artifacts: [&[u8]; 1] = [verified_weights];
     let mut output = vec![0u8; OUTPUT_BYTES];
     let output_len = hooks
         .replay_pt1(
@@ -2290,11 +2312,21 @@ fn restage(
     if state[challenge::RECORD_BUMP_MARKER_AT] != 1 {
         return Err(no(PROOF));
     }
+    // C2: after tag 120 byte 219 holds a routes-key byte; the canonical bump
+    // lives in the marked copy. Restage must keep it for re-respond and settle.
+    let response_bump = if state[176] == 1 {
+        if state[RESPONSE_BUMP_COPY_MARKER_AT] != 1 {
+            return Err(no(PROOF));
+        }
+        state[RESPONSE_BUMP_COPY_AT]
+    } else {
+        state[challenge::RESPONSE_BUMP_AT]
+    };
     expect_derived_with_bump(
         &accounts[0],
         program,
         &response_seeds,
-        state[challenge::RESPONSE_BUMP_AT],
+        response_bump,
         response_kind,
         response_role,
     )
@@ -2318,6 +2350,7 @@ fn restage(
     **accounts[1].try_borrow_mut_lamports()? = executor_balance;
     **accounts[0].try_borrow_mut_lamports()? = 0;
     state[176..OUTPUT_AT + OUTPUT_BYTES].fill(0);
+    state[challenge::RESPONSE_BUMP_AT] = response_bump;
     challenge::respond_event(accounts[2].key, &state, TAG_RESTAGE, 1, state[4]);
     Ok(())
 }
