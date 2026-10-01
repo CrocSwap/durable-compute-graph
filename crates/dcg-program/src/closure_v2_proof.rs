@@ -333,7 +333,11 @@ pub fn verify_finalized_leaf(
             48,
         )?;
         let roots = roots_account.try_borrow_data()?;
-        if roots.len() != 48 + segments * 32
+        let roots_len = segments
+            .checked_mul(32)
+            .and_then(|n| n.checked_add(48))
+            .ok_or(no(PROOF))?;
+        if roots.len() != roots_len
             || &roots[..4] != b"DSR2"
             || &roots[8..40] != descriptor
             || u32_at(&roots, 40)? != coordinate.position
@@ -466,9 +470,11 @@ pub fn verify_producer_route<'t>(
     let producer_inst = template
         .instantiate_with(clause, route.producer_entry, route.producer_position)
         .map_err(no)?;
-    let declared_write = producer_inst
-        .route(producer.read_count + route.producer_write_ordinal as u16)
-        .map_err(no)?;
+    let producer_write_route = producer
+        .read_count
+        .checked_add(route.producer_write_ordinal as u16)
+        .ok_or(no(ROUTE))?;
+    let declared_write = producer_inst.route(producer_write_route).map_err(no)?;
     let write_at = (route.producer_write_ordinal as usize)
         .checked_mul(WRITE_ROW_BYTES)
         .ok_or(no(ROUTE))?;
