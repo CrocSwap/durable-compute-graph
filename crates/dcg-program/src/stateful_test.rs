@@ -548,16 +548,59 @@ static V3_MANIFEST: KernelManifest = KernelManifest {
     modes: &V3_MODES,
 };
 
+static V3_WORKSPACE_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-ws-v3\0\0\0\0\0\0\0"),
+    semantic_version: 1,
+    abi_version: 1,
+    input: PortLayout {
+        id: VersionedId {
+            id: 0x494e_5054,
+            version: 3,
+        },
+        max_bytes: 1,
+        alignment: 1,
+    },
+    output: PortLayout {
+        id: VersionedId {
+            id: 0x4f55_5450,
+            version: 3,
+        },
+        max_bytes: 8,
+        alignment: 1,
+    },
+    state: Some(StateSchema {
+        id: V3_STATE_SCHEMA,
+        max_bytes: V3_FIXED_STATE_LEN,
+    }),
+    resources: ResourceLimits {
+        max_input_bytes: 1,
+        max_output_bytes: 8,
+        max_state_bytes: V3_FIXED_STATE_LEN,
+        max_operations: 8,
+        max_compute_units: 100_000,
+    },
+    modes: &V3_MODES,
+};
+
 /// Small Rust engine used by the SBF test. It rejects any state pointer except
 /// the legacy account-0 data address and exposes resource-backed rendering.
 pub struct V3FixedAddressKernel {
     context: AtomicPtr<u8>,
+    workspace_first: bool,
 }
 
 impl V3FixedAddressKernel {
     pub const fn new() -> Self {
         Self {
             context: AtomicPtr::new(core::ptr::null_mut()),
+            workspace_first: false,
+        }
+    }
+
+    pub const fn workspace_first() -> Self {
+        Self {
+            context: AtomicPtr::new(core::ptr::null_mut()),
+            workspace_first: true,
         }
     }
 
@@ -604,7 +647,11 @@ impl V3FixedAddressKernel {
 
 impl Kernel for V3FixedAddressKernel {
     fn manifest(&self) -> &'static KernelManifest {
-        &V3_MANIFEST
+        if self.workspace_first {
+            &V3_WORKSPACE_MANIFEST
+        } else {
+            &V3_MANIFEST
+        }
     }
 
     fn execute(&self, _input: &[u8], _output: &mut [u8]) -> Result<usize, KernelError> {
@@ -765,7 +812,11 @@ impl StatefulKernel for V3FixedAddressKernel {
     }
 
     fn max_view_phase_bytes(&self) -> u32 {
-        32
+        if self.workspace_first {
+            16
+        } else {
+            32
+        }
     }
 
     fn view_phase_compute_units(&self) -> u32 {
@@ -774,6 +825,14 @@ impl StatefulKernel for V3FixedAddressKernel {
 
     fn max_view_workspace_bytes(&self) -> u32 {
         V3_VIEW_WORKSPACE_BYTES
+    }
+
+    fn clear_view_workspace_on_begin(&self) -> bool {
+        !self.workspace_first
+    }
+
+    fn view_workspace_at_account_base(&self) -> bool {
+        self.workspace_first
     }
 
     fn view_abis(&self) -> &'static [ViewAbi] {
@@ -814,9 +873,62 @@ impl StatefulKernel for V3FixedAddressKernel {
         output.copy_from_slice(&resource.data[..32]);
         Ok(output.len())
     }
+
+    fn render_view_phase_with_workspace_header(
+        &self,
+        phase: ViewPhase,
+        state: &[AccountSpan<'_>],
+        resources: &[AccountSpan<'_>],
+        _commitment: &[u8; 32],
+        workspace_header: &mut [u8],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        let [primary] = state else {
+            return Err(KernelError::Refused);
+        };
+        let [resource] = resources else {
+            return Err(KernelError::Refused);
+        };
+        if !self.workspace_first
+            || workspace_header.len() != 128
+            || workspace_header.as_mut_ptr() as usize != V3_FIXED_STATE_ADDRESS
+            || primary.offset != 0
+            || primary.data.len() != 1_280
+            || !primary.is_writable
+            || resource.schema != V3_RESOURCE_SCHEMA
+            || resource.owner != V3_RESOURCE_OWNER
+            || resource.is_writable
+            || workspace.len() != V3_VIEW_WORKSPACE_BYTES as usize
+            || phase.role != V3_VIEW_ROLE
+            || phase.source_offset != 0
+            || phase.output_offset > 16
+            || output.len() != 16
+            || phase.output_offset + output.len() as u32 > resource.data.len() as u32
+        {
+            return Err(KernelError::Refused);
+        }
+
+        if phase.output_offset == 0 {
+            let mut saved_header = [0u8; 128];
+            saved_header.copy_from_slice(workspace_header);
+            workspace_header[..4].copy_from_slice(b"TEMP");
+            workspace_header.copy_from_slice(&saved_header);
+        } else {
+            // Deliberate contract violation. The processor must refuse this
+            // callback and transaction rollback must restore the header.
+            workspace_header[0] ^= 1;
+        }
+        workspace[0] = workspace[0].wrapping_add(1);
+        workspace[1..5].copy_from_slice(&phase.state_cursor.to_le_bytes());
+        let start = phase.output_offset as usize;
+        output.copy_from_slice(&resource.data[start..start + output.len()]);
+        Ok(output.len())
+    }
 }
 
 pub const V3_FIXED_ENGINE: V3FixedAddressKernel = V3FixedAddressKernel::new();
+pub const V3_WORKSPACE_ENGINE: V3FixedAddressKernel = V3FixedAddressKernel::workspace_first();
 
 fn test_session_kernel_id(accounts: &[AccountInfo]) -> Option<KernelId> {
     for account in accounts {
@@ -843,6 +955,8 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         };
         if kernel_id == Some(V3_FIXED_ENGINE.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_FIXED_ENGINE)
+        } else if kernel_id == Some(V3_WORKSPACE_ENGINE.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_WORKSPACE_ENGINE)
         } else {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_COUNTER)
         }
