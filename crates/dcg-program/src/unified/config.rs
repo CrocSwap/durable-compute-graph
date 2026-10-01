@@ -20,6 +20,7 @@ use super::{
     address, d32, no, registry, u16_at, u32_at, CL_AUTHORITY, CL_MALFORMED, CL_OVERFLOW,
     PLAN_BINDING, REGISTRY_ACCOUNT,
 };
+use crate::account_provenance::{expect_keyed, AccountKind, RoleFlags};
 use crate::compatibility::{ApplicationHooks, REVISION8_COMPATIBILITY};
 use crate::hash;
 use crate::pt2p_onchain as S;
@@ -993,6 +994,17 @@ pub fn close_unpublished_template(
             {
                 return Err(no(CL_AUTHORITY));
             }
+            expect_keyed(
+                account,
+                program,
+                key.key,
+                AccountKind::exact(b"", 0),
+                RoleFlags {
+                    writable: true,
+                    signer: true,
+                },
+            )
+            .map_err(|_| no(CL_AUTHORITY))?;
             // The zero-data allocation's own key is the only provable payee.
             // Keep its lamports at that key and return ownership to System;
             // no caller-selected third account receives rent.

@@ -1,6 +1,10 @@
 //! Bounded PT1 testnet bootstrap. The three byte accounts are immutable after
 //! seal; a route-tree frontier and payload index make the large rev7 template
 //! checkable without a single unbounded SBF instruction.
+use crate::account_provenance::{
+    allocate_derived_account, create_derived_account, expect_derived, expect_keyed, AccountKind,
+    RoleFlags,
+};
 use crate::position_template as pt;
 use solana_program::{
     account_info::AccountInfo,
@@ -202,6 +206,16 @@ fn init_pt1x(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    expect_keyed(
+        state,
+        program,
+        state.key,
+        AccountKind::variable(b"", OFF_INDEX + 4, PT1X_MAX_STATE_BYTES),
+        RoleFlags {
+            writable: true,
+            signer: true,
+        },
+    )?;
     if byte_accounts.iter().any(|a| !a.is_signer) {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -344,37 +358,30 @@ pub fn prepare_pt1x_output_pda<'a>(
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        let (expected, bump) = pt1x_output_address(program, binding);
-        if output.key != &expected {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let rent = Rent::get()?.minimum_balance(allocation_bytes);
+        let (_, bump) = pt1x_output_address(program, binding);
         let space =
             u64::try_from(allocation_bytes).map_err(|_| ProgramError::AccountDataTooSmall)?;
-        let bump_seed = [bump];
-        let signer_seeds: &[&[u8]] = &[binding, &bump_seed];
         if output.lamports() == 0 {
-            invoke_signed(
-                &system_instruction::create_account(payer.key, output.key, rent, space, program),
-                &[payer.clone(), output.clone(), system.clone()],
-                &[signer_seeds],
+            create_derived_account(
+                program,
+                payer,
+                output,
+                system,
+                &[binding],
+                bump,
+                allocation_bytes,
+                allocation_bytes,
             )?;
         } else {
-            if output.lamports() < rent {
-                invoke(
-                    &system_instruction::transfer(payer.key, output.key, rent - output.lamports()),
-                    &[payer.clone(), output.clone(), system.clone()],
-                )?;
-            }
-            invoke_signed(
-                &system_instruction::allocate(output.key, space),
-                &[output.clone(), system.clone()],
-                &[signer_seeds],
-            )?;
-            invoke_signed(
-                &system_instruction::assign(output.key, program),
-                &[output.clone(), system.clone()],
-                &[signer_seeds],
+            allocate_derived_account(
+                program,
+                payer,
+                output,
+                system,
+                &[binding],
+                bump,
+                allocation_bytes,
+                allocation_bytes,
             )?;
         }
     } else {
@@ -392,6 +399,21 @@ pub fn prepare_pt1x_output_pda<'a>(
         {
             return Err(ProgramError::Custom(PT1O_RESERVATION_REQUIRED));
         }
+        let magic = if raw[..4] == *PT1X_OUTPUT_RESERVATION_MAGIC {
+            PT1X_OUTPUT_RESERVATION_MAGIC.as_slice()
+        } else {
+            OUTPUT_MAGIC.as_slice()
+        };
+        expect_derived(
+            output,
+            program,
+            &[binding],
+            AccountKind::exact(magic, required_bytes),
+            RoleFlags {
+                writable: true,
+                signer: false,
+            },
+        )?;
     }
     {
         let mut raw = output.try_borrow_mut_data()?;
@@ -469,34 +491,35 @@ pub fn reserve_pt1x_output_pda<'a>(
         }
         _ => return Err(ProgramError::IllegalOwner),
     };
+    if !system_owned {
+        let magic = {
+            let raw = output.try_borrow_data()?;
+            if raw.get(..4) == Some(PT1X_OUTPUT_RESERVATION_MAGIC.as_slice()) {
+                PT1X_OUTPUT_RESERVATION_MAGIC.as_slice()
+            } else {
+                OUTPUT_MAGIC.as_slice()
+            }
+        };
+        expect_derived(
+            output,
+            program,
+            &[binding],
+            AccountKind::variable(magic, 4, required_bytes),
+            RoleFlags {
+                writable: true,
+                signer: false,
+            },
+        )?;
+    }
     let rent = Rent::get()?.minimum_balance(next);
     let space = u64::try_from(next).map_err(|_| ProgramError::AccountDataTooSmall)?;
     let bump_seed = [bump];
     let signer_seeds: &[&[u8]] = &[binding, &bump_seed];
     if output.owner == &system_program::ID {
         if output.lamports() == 0 {
-            invoke_signed(
-                &system_instruction::create_account(payer.key, output.key, rent, space, program),
-                &[payer.clone(), output.clone(), system.clone()],
-                &[signer_seeds],
-            )?;
+            create_derived_account(program, payer, output, system, &[binding], bump, next, next)?;
         } else {
-            if output.lamports() < rent {
-                invoke(
-                    &system_instruction::transfer(payer.key, output.key, rent - output.lamports()),
-                    &[payer.clone(), output.clone(), system.clone()],
-                )?;
-            }
-            invoke_signed(
-                &system_instruction::allocate(output.key, space),
-                &[output.clone(), system.clone()],
-                &[signer_seeds],
-            )?;
-            invoke_signed(
-                &system_instruction::assign(output.key, program),
-                &[output.clone(), system.clone()],
-                &[signer_seeds],
-            )?;
+            allocate_derived_account(program, payer, output, system, &[binding], bump, next, next)?;
         }
     } else {
         if output.lamports() < rent {
@@ -547,7 +570,7 @@ pub fn close_pt1x_output_reservation<'a>(
 
 /// Retained only for the legacy tag-98 handler, which revision 8 refuses at
 /// dispatch. Revision-8 tag 146 uses `prepare_pt1x_output_pda`.
-pub fn prepare_pt1x_output<'a>(
+pub(crate) fn prepare_pt1x_output<'a>(
     program: &Pubkey,
     output: &AccountInfo<'a>,
     system: &AccountInfo<'a>,

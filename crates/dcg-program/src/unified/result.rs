@@ -37,8 +37,9 @@ use super::events::{self, Body};
 use super::terms::{Terms, Terms2, TERMS_BYTES, TERMS_BYTES_V2};
 use super::{
     d32, no, plan, u16_at, u32_at, u64_at, CL_COORDINATE, CL_MALFORMED, CL_MISSING, CL_OVERFLOW,
-    DCR1_PHASE, PLAN_BINDING,
+    DCR1_PHASE, PLAN_BINDING, SETTLEMENT_PROGRAM,
 };
+use crate::account_provenance::{expect_derived, AccountKind, RoleFlags};
 use crate::closure_v2::{self as h, Coordinate};
 use crate::hash;
 use solana_program::{
@@ -152,6 +153,17 @@ pub fn view(
     descriptor: &[u8; 32],
     writable: bool,
 ) -> Result<View, ProgramError> {
+    expect_derived(
+        account,
+        program,
+        &[address::RESULT_SEED, descriptor],
+        AccountKind::variable(b"DCR2", HEADER, MAX_ACCOUNT).with_version(4, VERSION),
+        RoleFlags {
+            writable,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(CL_MALFORMED))?;
     let raw = account.try_borrow_data()?;
     if account.owner != program
         || (writable && !account.is_writable)
@@ -295,6 +307,22 @@ fn view_v8_status_inner(
     bump: Option<u8>,
     hooks: &dyn crate::compatibility::ApplicationHooks,
 ) -> Result<View, ProgramError> {
+    let mut kind =
+        AccountKind::variable(b"DCR2", HEADER_V6, MAX_ACCOUNT).with_version(4, VERSION_V6);
+    if bump.is_some() {
+        kind = kind.with_bump(RESULT_PDA_BUMP_AT_V6);
+    }
+    expect_derived(
+        account,
+        program,
+        &[address::RESULT_SEED, descriptor],
+        kind,
+        RoleFlags {
+            writable,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(CL_MALFORMED))?;
     let raw = account.try_borrow_data()?;
     let expected = if let Some(bump) = bump {
         Pubkey::create_program_address(&[address::RESULT_SEED, descriptor, &[bump]], program)
@@ -1923,6 +1951,11 @@ fn dispose_bond<'a>(
         if aux.key != &key {
             return Err(no(super::CL_AUTHORITY));
         }
+        // Preserve C3's shape-specific refusal before the general validator
+        // maps malformed escrow accounts to the close's generic refusal.
+        if !aux.is_writable || aux.is_signer {
+            return Err(no(SETTLEMENT_PROGRAM));
+        }
         if *tail.key != system_program::id() || burn.key != &incinerator::ID || !burn.is_writable {
             return Err(no(super::CL_AUTHORITY));
         }
@@ -2045,12 +2078,17 @@ pub fn close_result<'a>(
         return Err(no(CL_MALFORMED));
     }
     let descriptor = d32(data, 1, CL_MALFORMED)?;
-    if dcr2.owner != program
-        || !dcr2.is_writable
-        || dcr2.key != &address::result(program, &descriptor).0
-    {
-        return Err(no(CL_MALFORMED));
-    }
+    expect_derived(
+        dcr2,
+        program,
+        &[address::RESULT_SEED, &descriptor],
+        AccountKind::variable(b"", TOMBSTONE_BYTES, MAX_ACCOUNT),
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(CL_MALFORMED))?;
     if dcr2.data_len() == TOMBSTONE_BYTES && dcr2.try_borrow_data()?[..4] == *b"DCRZ" {
         return Err(no(CL_CLOSE));
     }
@@ -2158,12 +2196,17 @@ pub fn close_result_v8_with_hooks<'a>(
         return Err(no(CL_MALFORMED));
     }
     let descriptor = d32(data, 1, CL_MALFORMED)?;
-    if record.owner != program
-        || !record.is_writable
-        || *record.key != address::result(program, &descriptor).0
-    {
-        return Err(no(CL_MALFORMED));
-    }
+    expect_derived(
+        record,
+        program,
+        &[address::RESULT_SEED, &descriptor],
+        AccountKind::variable(b"", TOMBSTONE_BYTES, MAX_ACCOUNT),
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(CL_MALFORMED))?;
     if record.try_borrow_data()?.starts_with(b"DCRZ") {
         return Err(no(CL_CLOSE));
     }

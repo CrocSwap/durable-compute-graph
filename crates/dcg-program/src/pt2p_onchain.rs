@@ -9,6 +9,7 @@
 //!
 //! Every handler validates owners, keys, lengths and the state machine before
 //! any mutation; a refusal leaves every byte unchanged.
+use crate::account_provenance::{expect_keyed, AccountKind, RoleFlags};
 use crate::closure_v2::{document_address, DCM2_V2_HEADER};
 use crate::position_template as pt;
 use crate::pt1_onchain;
@@ -658,6 +659,16 @@ pub fn init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
     }
     let pwr1 = &data[1..];
     let _g = pt2p::Program::decode(pwr1).map_err(err)?;
+    expect_keyed(
+        state,
+        program,
+        state.key,
+        AccountKind::exact(b"", OFF_PWR1 + pwr1.len()),
+        RoleFlags {
+            writable: true,
+            signer: true,
+        },
+    )?;
     let is_pt1x = {
         let p = pt1s.try_borrow_data()?;
         if cfg!(feature = "revision-8") && !pt1_onchain::is_pt1x(&p) {

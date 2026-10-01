@@ -37,6 +37,7 @@ use super::{
     CL_AFTER_FINAL, CL_AUTHORITY, CL_COORDINATE, CL_MALFORMED, CL_MISSING, CL_OVERFLOW, CL_ROOT,
     DCR1_BAD, EPOCH, PLAN_BINDING, REGISTRY_ROOT,
 };
+use crate::account_provenance::{expect_derived, AccountKind, RoleFlags};
 use crate::hash;
 use crate::pt2p::Pt2p;
 use crate::pt2p_onchain as S;
@@ -741,6 +742,19 @@ pub fn document(
     writable: bool,
     code: u32,
 ) -> Result<[u8; 32], ProgramError> {
+    if let Some(descriptor) = descriptor {
+        expect_derived(
+            account,
+            program,
+            &[address::DOCUMENT_SEED, descriptor],
+            AccountKind::exact(b"DCM2", DCM2_V6_BYTES).with_version(4, 6),
+            RoleFlags {
+                writable,
+                signer: false,
+            },
+        )
+        .map_err(|_| no(code))?;
+    }
     let raw = account.try_borrow_data()?;
     if account.owner != program
         || (writable && !account.is_writable)
@@ -752,6 +766,19 @@ pub fn document(
         return Err(no(code));
     }
     let d = d32(&raw, 8, code)?;
+    if descriptor.is_none() {
+        expect_derived(
+            account,
+            program,
+            &[address::DOCUMENT_SEED, &d],
+            AccountKind::exact(b"DCM2", DCM2_V6_BYTES).with_version(4, 6),
+            RoleFlags {
+                writable,
+                signer: false,
+            },
+        )
+        .map_err(|_| no(code))?;
+    }
     if descriptor.is_some_and(|want| *want != d) || *account.key != document_address(program, &d).0
     {
         return Err(no(code));
@@ -825,6 +852,24 @@ fn document_v8_inner(
     code: u32,
     bump: Option<u8>,
 ) -> Result<[u8; 32], ProgramError> {
+    let mut kind = AccountKind::variable(b"DCM2", OPTION_REGION_AT, OPTION_REGION_AT + 1_100)
+        .with_version(4, 7);
+    if bump.is_some() {
+        kind = kind.with_bump(DCM2_BUMP_AT);
+    }
+    if let Some(descriptor) = descriptor {
+        expect_derived(
+            account,
+            program,
+            &[address::DOCUMENT_SEED, descriptor],
+            kind,
+            RoleFlags {
+                writable,
+                signer: false,
+            },
+        )
+        .map_err(|_| no(code))?;
+    }
     let raw = account.try_borrow_data()?;
     let option_end = raw
         .get(BINDING_AT_V8 + 151)
@@ -850,6 +895,19 @@ fn document_v8_inner(
         return Err(no(code));
     }
     let d = d32(&raw, 8, code)?;
+    if descriptor.is_none() {
+        expect_derived(
+            account,
+            program,
+            &[address::DOCUMENT_SEED, &d],
+            kind,
+            RoleFlags {
+                writable,
+                signer: false,
+            },
+        )
+        .map_err(|_| no(code))?;
+    }
     let expected = if let Some(bump) = bump {
         Pubkey::create_program_address(&[address::DOCUMENT_SEED, &d, &[bump]], program)
             .map_err(|_| no(code))?
@@ -966,6 +1024,18 @@ fn positions_inner(
     code: u32,
     bump: Option<u8>,
 ) -> ProgramResult {
+    expect_derived(
+        account,
+        program,
+        &[address::POSITIONS_SEED, descriptor],
+        AccountKind::variable(b"DPR2", DPR2_HEADER, DPR2_HEADER + 32 * p_count as usize)
+            .with_version(4, 1),
+        RoleFlags {
+            writable,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(code))?;
     let raw = account.try_borrow_data()?;
     let expected = if let Some(bump) = bump {
         Pubkey::create_program_address(&[address::POSITIONS_SEED, descriptor, &[bump]], program)

@@ -37,6 +37,7 @@ use super::{
     CL_PATH, DCR1_AUTH, DCR1_BAD, DCR1_DEADLINE, DCR1_INCOMPLETE, DCR1_PHASE, DCR1_PROOF,
     PLAN_BINDING, REGISTRY_ROOT, REVEAL_MISMATCH, REVEAL_ORDER, SETTLEMENT_PROGRAM,
 };
+use crate::account_provenance::{expect_derived, AccountKind, RoleFlags};
 use crate::closure_v2::{self as h, Node};
 use crate::hash;
 use crate::pt2p::Pt2p;
@@ -255,9 +256,26 @@ fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> Prog
     let descriptor = d32(&raw, 72, DCR1_BAD)?;
     let challenger = Pubkey::new_from_array(d32(&raw, 8, DCR1_BAD)?);
     let nonce = u32_at(&raw, 140, DCR1_BAD)?;
-    if *account.key != address::challenge(program, &descriptor, &challenger, nonce).0 {
-        return Err(no(DCR1_AUTH));
-    }
+    // DCR1 v5/v6 carries its only challenge nonce. This check closes wrong
+    // address, owner, kind, size, and privilege substitutions; the current
+    // account list has no independent challenge identity anchor, so its seed
+    // source remains a documented next-version provenance gap.
+    expect_derived(
+        account,
+        program,
+        &[
+            address::CHALLENGE_SEED,
+            &descriptor,
+            challenger.as_ref(),
+            &nonce.to_le_bytes(),
+        ],
+        AccountKind::exact(b"DCR1", SIZE),
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(DCR1_AUTH))?;
     Ok(())
 }
 
@@ -1002,7 +1020,7 @@ fn fix_point(
 /// an executor win changes no DCM2 byte. Logs the `RULING` event, which the
 /// caller must leave as its last action.
 #[cfg(feature = "revision-7")]
-pub fn rule(
+fn rule(
     challenge: &Pubkey,
     raw: &mut [u8],
     doc: &AccountInfo,
@@ -1062,7 +1080,7 @@ pub fn rule(
 /// its document reader admits only DCM2 v7. This refusal shim satisfies the
 /// unreachable v6 arm without compiling revision 7's ruling behavior here.
 #[cfg(feature = "revision-8")]
-pub fn rule(
+fn rule(
     _challenge: &Pubkey,
     _raw: &mut [u8],
     _doc: &AccountInfo,

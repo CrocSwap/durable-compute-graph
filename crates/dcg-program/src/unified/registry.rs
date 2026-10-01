@@ -17,17 +17,12 @@ use super::{
     no, u16_at, u32_at, EPOCH, REGISTRY_ACCOUNT, REGISTRY_EPOCH, REGISTRY_ROOT, REGISTRY_STATE,
     ROW_CAPABILITY, ROW_MALFORMED,
 };
+use crate::account_provenance::allocate_derived_account;
 use crate::envelope_seal::{self as esl, RESPOND_GENERIC, WITNESS_TENSORS};
 use crate::hash;
 use solana_program::{
-    account_info::AccountInfo,
-    entrypoint::ProgramResult,
-    program::{invoke, invoke_signed},
-    program_error::ProgramError,
-    pubkey::Pubkey,
-    rent::Rent,
-    system_instruction, system_program,
-    sysvar::Sysvar,
+    account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
+    pubkey::Pubkey, system_program,
 };
 
 pub const REGISTRY_VERSION: u16 = 2;
@@ -372,23 +367,23 @@ pub(crate) fn create_pda<'a>(
     if *account.owner != system_program::id() || !account.data_is_empty() {
         return Err(no(state));
     }
-    let need = Rent::get()?.minimum_balance(rent_size);
-    if account.lamports() < need {
-        invoke(
-            &system_instruction::transfer(payer.key, account.key, need - account.lamports()),
-            &[payer.clone(), account.clone(), system.clone()],
-        )?;
+    let Some((bump_seed, base_seeds)) = seeds.split_last() else {
+        return Err(no(bad));
+    };
+    if bump_seed.len() != 1 {
+        return Err(no(bad));
     }
-    invoke_signed(
-        &system_instruction::allocate(account.key, size as u64),
-        &[account.clone(), system.clone()],
-        &[seeds],
-    )?;
-    invoke_signed(
-        &system_instruction::assign(account.key, program),
-        &[account.clone(), system.clone()],
-        &[seeds],
+    allocate_derived_account(
+        program,
+        payer,
+        account,
+        system,
+        base_seeds,
+        bump_seed[0],
+        size,
+        rent_size,
     )
+    .map_err(|_| no(state))
 }
 
 /// tag 156: registry_id:u32 | row_count:u32 | census_digest[32]

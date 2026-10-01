@@ -3,18 +3,12 @@
 //! digest before parsing proofs. Each instruction touches at most one 900-byte
 //! chunk or grows the account by at most 10,240 bytes.
 
+use crate::account_provenance::{allocate_derived_account, expect_derived, AccountKind, RoleFlags};
 use crate::hash;
 use core::cell::Ref;
 use solana_program::{
-    account_info::AccountInfo,
-    clock::Clock,
-    entrypoint::ProgramResult,
-    program::{invoke, invoke_signed},
-    program_error::ProgramError,
-    pubkey::Pubkey,
-    rent::Rent,
-    system_instruction, system_program,
-    sysvar::Sysvar,
+    account_info::AccountInfo, clock::Clock, entrypoint::ProgramResult,
+    program_error::ProgramError, pubkey::Pubkey, system_program, sysvar::Sysvar,
 };
 
 pub const TAG_BEGIN: u8 = 115;
@@ -97,9 +91,17 @@ fn account<'a>(
     executor: &AccountInfo,
     phase: u16,
 ) -> Result<Ref<'a, [u8]>, ProgramError> {
-    if response.owner != program || *response.key != address(program, challenge.key).0 {
-        return Err(no(AUTH));
-    }
+    expect_derived(
+        response,
+        program,
+        &[b"dcg-hcl-response", challenge.key.as_ref()],
+        AccountKind::variable(b"DRU1", HEADER, HEADER + MAX_BODY).with_version(4, 1),
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(AUTH))?;
     let raw = response.try_borrow_data()?;
     if raw.len() < HEADER
         || raw[..4] != *b"DRU1"
@@ -146,24 +148,17 @@ pub fn begin(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     if *response.owner != system_program::ID || !response.data_is_empty() {
         return Err(no(BAD));
     }
-    let rent = Rent::get()?.minimum_balance(HEADER + total);
-    if response.lamports() < rent {
-        invoke(
-            &system_instruction::transfer(executor.key, response.key, rent - response.lamports()),
-            &[executor.clone(), response.clone(), accounts[3].clone()],
-        )?;
-    }
-    let seeds: &[&[u8]] = &[b"dcg-hcl-response", target.key.as_ref(), &[bump]];
-    invoke_signed(
-        &system_instruction::allocate(response.key, HEADER as u64),
-        &[response.clone(), accounts[3].clone()],
-        &[seeds],
-    )?;
-    invoke_signed(
-        &system_instruction::assign(response.key, program),
-        &[response.clone(), accounts[3].clone()],
-        &[seeds],
-    )?;
+    allocate_derived_account(
+        program,
+        executor,
+        response,
+        &accounts[3],
+        &[b"dcg-hcl-response", target.key.as_ref()],
+        bump,
+        HEADER,
+        HEADER + total,
+    )
+    .map_err(|_| no(BAD))?;
     let mut raw = response.try_borrow_mut_data()?;
     raw[..4].copy_from_slice(b"DRU1");
     raw[4..6].copy_from_slice(&1u16.to_le_bytes());
@@ -294,9 +289,17 @@ pub fn sealed<'a>(
     executor: &[u8; 32],
     total: usize,
 ) -> Result<Ref<'a, [u8]>, ProgramError> {
-    if response.owner != program || *response.key != address(program, challenge.key).0 {
-        return Err(no(AUTH));
-    }
+    expect_derived(
+        response,
+        program,
+        &[b"dcg-hcl-response", challenge.key.as_ref()],
+        AccountKind::exact(b"DRU1", HEADER + total).with_version(4, 1),
+        RoleFlags {
+            writable: false,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(AUTH))?;
     let raw = response.try_borrow_data()?;
     if raw.len() < HEADER
         || raw[..4] != *b"DRU1"
@@ -329,9 +332,17 @@ pub fn sealed_view<'a>(
     executor: &[u8],
     total: usize,
 ) -> Result<Ref<'a, [u8]>, ProgramError> {
-    if response.owner != program || *response.key != address(program, challenge).0 {
-        return Err(no(AUTH));
-    }
+    expect_derived(
+        response,
+        program,
+        &[b"dcg-hcl-response", challenge.as_ref()],
+        AccountKind::exact(b"DRU1", HEADER + total).with_version(4, 1),
+        RoleFlags {
+            writable: false,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(AUTH))?;
     let raw = response.try_borrow_data()?;
     if raw.len() != HEADER + total
         || raw[..4] != *b"DRU1"

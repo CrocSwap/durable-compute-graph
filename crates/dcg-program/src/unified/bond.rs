@@ -71,6 +71,7 @@ use super::result::{
 };
 use super::terms::{self, Terms2, TERMS_BYTES_V2};
 use super::{d32, no, CL_AUTHORITY, CL_MALFORMED, CL_OVERFLOW, SETTLEMENT_PROGRAM};
+use crate::account_provenance::{expect_system_derived, RoleFlags};
 use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
@@ -107,14 +108,18 @@ pub fn validate_escrow(
     escrow: &AccountInfo,
     descriptor: &[u8; 32],
 ) -> Result<u8, ProgramError> {
-    let (key, bump) = address::bond_escrow(program, descriptor);
-    if escrow.key != &key {
-        return Err(no(CL_CLOSE));
-    }
-    if !escrow.is_writable || escrow.owner != &system_program::ID || !escrow.data_is_empty() {
-        return Err(no(SETTLEMENT_PROGRAM));
-    }
-    Ok(bump)
+    expect_system_derived(
+        escrow,
+        program,
+        &[address::BOND_ESCROW_SEED, descriptor],
+        None,
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+        true,
+    )
+    .map_err(|_| no(CL_CLOSE))
 }
 
 /// Validate a close-time escrow using the bump committed at DCM2 creation.
@@ -125,16 +130,19 @@ pub fn validate_escrow_with_bump(
     descriptor: &[u8; 32],
     bump: u8,
 ) -> ProgramResult {
-    let key =
-        Pubkey::create_program_address(&[address::BOND_ESCROW_SEED, descriptor, &[bump]], program)
-            .map_err(|_| no(CL_CLOSE))?;
-    if escrow.key != &key {
-        return Err(no(CL_CLOSE));
-    }
-    if !escrow.is_writable || escrow.owner != &system_program::ID || !escrow.data_is_empty() {
-        return Err(no(SETTLEMENT_PROGRAM));
-    }
-    Ok(())
+    expect_system_derived(
+        escrow,
+        program,
+        &[address::BOND_ESCROW_SEED, descriptor],
+        Some(bump),
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+        true,
+    )
+    .map(|_| ())
+    .map_err(|_| no(CL_CLOSE))
 }
 
 /// **Fund the escrow** (spec §1.4's CUSTOM route step 1): DCG directly debits
@@ -149,7 +157,7 @@ pub fn validate_escrow_with_bump(
 /// `amount` is the **whole** `terms.executor_bond_lamports`, not a rent-exempt
 /// top-up: check 11 already refuses `0 < bond < minimum_balance(0)` under
 /// `kind = 2`, so the pot can fund the account it is escrowed in.
-pub fn escrow_pot<'a>(
+pub(crate) fn escrow_pot<'a>(
     from: &AccountInfo<'a>,
     escrow: &AccountInfo<'a>,
     amount: u64,
@@ -178,7 +186,7 @@ pub fn escrow_pot<'a>(
 /// assignment happens **inside tag 187's transaction and is rolled back with
 /// it**, so a callee that refuses leaves the escrow system-owned and its balance
 /// intact, and the next attempt repeats the assignment.
-pub fn assign_to_program<'a>(
+pub(crate) fn assign_to_program<'a>(
     descriptor: &[u8; 32],
     settlement_program: &AccountInfo<'a>,
     escrow: &AccountInfo<'a>,
@@ -213,7 +221,7 @@ pub fn assign_to_program<'a>(
 /// remainder are the same account is handled by construction rather than by a
 /// clause. The residual after both credits is burned, and `from` is debited for
 /// the full pot.
-pub fn standard_payout(
+pub(crate) fn standard_payout(
     from: &AccountInfo,
     winner: &AccountInfo,
     remainder: &AccountInfo,
@@ -527,6 +535,9 @@ pub fn retry_with_hooks(
     //    and holding lamports. **599** if it holds none -- already settled, or
     //    never escrowed -- because "nothing to do" is a refusal and not a no-op
     //    (`outcome = 0` is unassigned and can never be emitted).
+    if !escrow.is_writable || escrow.is_signer {
+        return Err(no(SETTLEMENT_PROGRAM));
+    }
     let bump = validate_escrow(program, escrow, &s.descriptor)?;
     let pot = escrow.lamports();
     if pot == 0 {

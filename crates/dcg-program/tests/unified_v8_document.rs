@@ -461,7 +461,10 @@ async fn send_quiet_cached(
         }
         Err(error) => panic!("the banks client refused the cached transaction: {error:?}"),
     };
-    if matches!(&result, Err(TransactionError::AlreadyProcessed)) {
+    if matches!(
+        &result,
+        Err(TransactionError::AlreadyProcessed | TransactionError::BlockhashNotFound)
+    ) {
         let slot = ctx
             .banks_client
             .get_sysvar::<solana_program::clock::Clock>()
@@ -472,7 +475,7 @@ async fn send_quiet_cached(
         cache.blockhash = Some(
             ctx.get_new_latest_blockhash()
                 .await
-                .expect("a cached retry blockhash"),
+                .expect("a fresh retry blockhash"),
         );
         cache.uses = 0;
         let inner = ctx
