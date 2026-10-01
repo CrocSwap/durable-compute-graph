@@ -136,6 +136,39 @@
 //!     43, "example/empty-magic", 1, &EMPTY_MAGIC_RULES, preflight, handler)];
 //! static INVALID_EMPTY_MAGIC: ApplicationProgramManifest = ApplicationProgramManifest::new(&APP, &EMPTY_MAGIC_INSTRUCTIONS);
 //! ```
+//!
+//! ```compile_fail,E0080
+//! use dcg_program::{
+//!     account_provenance::RoleFlags,
+//!     app_api::{ApplicationAccountIdentity, ApplicationAccountRule, ApplicationCoreRecordKind,
+//!         ApplicationInstruction, ApplicationProgramManifest},
+//!     compatibility::REVISION8_COMPATIBILITY,
+//!     kernel::{ApplicationManifest, LegacyFormBinding, OptimisticReplayBinding},
+//! };
+//! static KERNELS: [&'static dyn dcg_program::kernel::Kernel; 0] = [];
+//! static REPLAYS: [OptimisticReplayBinding; 0] = [];
+//! static FORMS: [LegacyFormBinding; 0] = [];
+//! static APP: ApplicationManifest = ApplicationManifest {
+//!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
+//!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
+//!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     decision_routes: &REVISION8_COMPATIBILITY,
+//! };
+//! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! fn handler(_: dcg_program::app_api::ApplicationInstructionContext<'_>,
+//!     _: &dcg_program::app_api::CheckedApplicationAccounts<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! static RULES: [ApplicationAccountRule; 2] = [
+//!     ApplicationAccountRule::new(0, ApplicationAccountIdentity::CoreRecord {
+//!         kind: ApplicationCoreRecordKind::ChallengeV8,
+//!     }, RoleFlags { writable: false, signer: false }),
+//!     ApplicationAccountRule::new(1, ApplicationAccountIdentity::StoredBumpPda {
+//!         challenge_account_index: 0,
+//!     }, RoleFlags { writable: true, signer: false }),
+//! ];
+//! static INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+//!     42, "example/writable-stored-bump", 1, &RULES, preflight, handler)];
+//! static INVALID: ApplicationProgramManifest = ApplicationProgramManifest::new(&APP, &INSTRUCTIONS);
+//! ```
 
 use crate::{
     account_provenance::{
@@ -401,8 +434,78 @@ const CORE_ACCOUNT_MAGICS: &[&[u8]] = &[
     b"DCD1", b"BDG1", b"DEA1", b"DRP1", b"ESG4", b"PXR1", b"PT1O", b"PT1P", b"PT1R", b"PT1S",
     b"PT1X", b"PT2P", b"PT2S", b"PWR1", b"DPL1", b"DFT1", b"BDS2", b"DSB1", b"DSE2", b"DSS1",
     b"DVW1", b"DSB2", b"DSS2", b"DVW2", b"DAN3", b"DRS3", b"DSB3", b"DSE3", b"DSS3", b"DVW3",
-    b"ARI1", b"ARW1", b"RWP1", b"BSS1", b"DEV2", b"DLE1", b"DDT1", b"DDT2", b"DRB1",
+    b"ARI1", b"ARW1", b"RWP1", b"BSS1", b"DEV2", b"DLE1", b"DDT1", b"DDT2", b"DRB1", b"DTPL",
+    b"DDOC", b"DBND",
 ];
+
+const CORE_PDA_SEEDS: &[&[u8]] = &[
+    crate::unified::address::CONFIG_SEED,
+    crate::unified::address::TEMPLATE_SEAL_SEED,
+    crate::unified::address::TEMPLATE_USE_SEED,
+    crate::unified::address::CHALLENGE_SEED,
+    crate::unified::address::REGISTRY_SEED,
+    crate::unified::address::ADMISSION_SEED,
+    crate::unified::address::DOCUMENT_SEED,
+    crate::unified::address::POSITIONS_SEED,
+    crate::unified::address::FAMILY_SLOTS_SEED,
+    crate::unified::address::RESULT_SEED,
+    crate::unified::address::SETTLEMENT_ESCROW_SEED,
+    crate::unified::address::BOND_ESCROW_SEED,
+    b"dcg-hcl-checkpoint",
+    b"dcg-hcl-producer",
+    b"dcg-hcl-response",
+    b"dcg-hcl-page",
+    b"dcg-hcl-shard",
+    b"dcg-hcl-roots",
+    b"dcg-hcl-slots",
+    b"dcg-hcl-families",
+    b"dcg-desc-index",
+    b"dcg-desc",
+    b"dcg-envelope-admission",
+    b"dcg-envelope-registry-pt1",
+    b"dcg-state",
+    b"dcg-session-v1",
+    b"dcg-input-v1",
+    b"dcg-state-v1",
+    b"dcg-view-v1",
+    b"dcg-session-v2",
+    b"dcg-input-v2",
+    b"dcg-state-v2",
+    b"dcg-view-v2",
+    b"dcg-session-v3",
+    b"dcg-input-v3",
+    b"dcg-state-v3",
+    b"dcg-view-v3",
+    b"dcg-resource-v3",
+    b"dcg-anchor-v3",
+];
+
+const fn starts_with(bytes: &[u8], prefix: &[u8]) -> bool {
+    if prefix.len() > bytes.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < prefix.len() {
+        if bytes[i] != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn validate_application_id_namespace(application_id: &[u8]) {
+    if starts_with(application_id, b"dcg") {
+        panic!("application ids must not start with the DCG seed namespace");
+    }
+    let mut i = 0usize;
+    while i < CORE_PDA_SEEDS.len() {
+        if starts_with(CORE_PDA_SEEDS[i], application_id) {
+            panic!("application id must not be a prefix of a DCG core PDA seed");
+        }
+        i += 1;
+    }
+}
 
 const fn app_magic_overlaps_core(magic: &[u8]) -> bool {
     let mut i = 0usize;
@@ -443,6 +546,7 @@ const fn validate_app_seeds(application_id: &'static [u8], seeds: &[ApplicationS
     if application_id.is_empty() || application_id.len() > 32 {
         panic!("application id used as a PDA prefix must contain 1..=32 bytes");
     }
+    validate_application_id_namespace(application_id);
     if seeds.is_empty() {
         panic!("application PDA seeds must start with the application id");
     }
@@ -493,6 +597,9 @@ const fn validate_application_rules(
             ApplicationAccountIdentity::StoredBumpPda {
                 challenge_account_index,
             } => {
+                if rule.role.writable || rule.role.signer {
+                    panic!("stored-bump PDA application rules must be read-only");
+                }
                 if challenge_account_index >= i {
                     panic!("stored-bump PDA source must be an earlier account");
                 }
@@ -1031,12 +1138,13 @@ mod tests {
     const HANDLER_MARK: usize = 2;
     static ORDER: AtomicUsize = AtomicUsize::new(0);
     static PDA_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static PDA_ORDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static ROLE_ORDER: AtomicUsize = AtomicUsize::new(0);
     static EMPTY_KERNELS: [&'static dyn crate::kernel::Kernel; 0] = [];
     static EMPTY_REPLAYS: [crate::kernel::OptimisticReplayBinding; 0] = [];
     static EMPTY_FORMS: [crate::kernel::LegacyFormBinding; 0] = [];
     static TEST_APPLICATION: ApplicationManifest = ApplicationManifest {
-        application_id: b"dcg/app-api-test/1",
+        application_id: b"basanos/app-api-test/1",
         version: 1,
         kernels: &EMPTY_KERNELS,
         optimistic_replays: &EMPTY_REPLAYS,
@@ -1357,6 +1465,7 @@ mod tests {
 
     #[test]
     fn program_pda_provenance_runs_before_application_preflight() {
+        let _lock = PDA_ORDER_LOCK.lock().unwrap();
         static PDA_SEEDS: [ApplicationSeed; 2] = [
             ApplicationSeed::ApplicationId,
             ApplicationSeed::Literal(b"dispatch-test-pda"),
@@ -1469,6 +1578,7 @@ mod tests {
 
     #[test]
     fn program_key_runtime_guard_refuses_instruction_data_sources() {
+        let _lock = PDA_ORDER_LOCK.lock().unwrap();
         static PROGRAM_KEY_RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
             0,
             ApplicationAccountIdentity::ProgramKey {
@@ -1527,6 +1637,7 @@ mod tests {
 
     #[test]
     fn core_challenge_and_its_stored_bump_response_are_checked_read_only() {
+        let _lock = PDA_ORDER_LOCK.lock().unwrap();
         static DISPUTE_RULES: [ApplicationAccountRule; 2] = [
             ApplicationAccountRule::new(
                 0,
@@ -1699,5 +1810,65 @@ mod tests {
             app_program().identity_digest(),
             RULE_PROGRAM.identity_digest()
         );
+    }
+
+    #[test]
+    fn stored_bump_rules_reject_mutating_or_signer_roles() {
+        for role in [
+            RoleFlags {
+                writable: true,
+                signer: false,
+            },
+            RoleFlags {
+                writable: false,
+                signer: true,
+            },
+        ] {
+            let rules = [
+                ApplicationAccountRule::new(
+                    0,
+                    ApplicationAccountIdentity::CoreRecord {
+                        kind: ApplicationCoreRecordKind::ChallengeV8,
+                    },
+                    RoleFlags {
+                        writable: false,
+                        signer: false,
+                    },
+                ),
+                ApplicationAccountRule::new(
+                    1,
+                    ApplicationAccountIdentity::StoredBumpPda {
+                        challenge_account_index: 0,
+                    },
+                    role,
+                ),
+            ];
+            assert!(std::panic::catch_unwind(|| {
+                validate_application_rules(b"test-app", &rules)
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn app_ids_cannot_overlap_core_seed_namespaces() {
+        assert!(std::panic::catch_unwind(|| validate_application_id_namespace(b"d")).is_err());
+        assert!(std::panic::catch_unwind(|| validate_application_id_namespace(b"dc")).is_err());
+        assert!(
+            std::panic::catch_unwind(|| validate_application_id_namespace(b"dcg-app")).is_err()
+        );
+        validate_application_id_namespace(b"basanos");
+    }
+
+    #[cfg(feature = "sbf-lifecycle-test")]
+    #[test]
+    fn lifecycle_record_magics_are_reserved_for_core_app_checks() {
+        for magic in [
+            &crate::test_lifecycle::TEMPLATE_MAGIC[..],
+            &crate::test_lifecycle::DOCUMENT_MAGIC[..],
+            &crate::test_lifecycle::BOND_MAGIC[..],
+        ] {
+            assert!(CORE_ACCOUNT_MAGICS.contains(&magic));
+        }
     }
 }

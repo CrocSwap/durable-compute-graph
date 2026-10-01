@@ -39,6 +39,9 @@ const ENTRY_AT: usize = 288;
 const CLAIM_CHEATER: u8 = 1;
 const CLAIM_HONEST: u8 = 2;
 pub const TEST_STAKE_LAMPORTS: u64 = 2_000_000;
+pub(crate) const TEMPLATE_MAGIC: [u8; 4] = *b"DTPL";
+pub(crate) const DOCUMENT_MAGIC: [u8; 4] = *b"DDOC";
+pub(crate) const BOND_MAGIC: [u8; 4] = *b"DBND";
 const LEAF_DOMAIN: &[u8] = b"dcg-test-bytesum-leaf/1";
 const NODE_DOMAIN: &[u8] = b"dcg-test-bytesum-node/1";
 
@@ -121,7 +124,8 @@ struct KernelRef {
 }
 
 fn registered_kernel(raw: &[u8]) -> Result<KernelRef, ProgramError> {
-    if raw.len() != TEMPLATE_BYTES || raw[..4] != *b"DTPL" || raw[4..6] != 1u16.to_le_bytes() {
+    if raw.len() != TEMPLATE_BYTES || raw[..4] != TEMPLATE_MAGIC || raw[4..6] != 1u16.to_le_bytes()
+    {
         return Err(refusal());
     }
     let kernel = KernelRef {
@@ -237,7 +241,7 @@ fn checked_document(
     )?;
     let raw = document.try_borrow_data()?;
     if raw.len() != DOCUMENT_BYTES
-        || raw[..4] != *b"DDOC"
+        || raw[..4] != DOCUMENT_MAGIC
         || raw[4..6] != 1u16.to_le_bytes()
         || raw[7] != case_id
         || raw[8..40] != template_key
@@ -339,7 +343,7 @@ fn register_template(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         Rent::get()?.minimum_balance(TEMPLATE_BYTES),
     )?;
     let mut raw = template.try_borrow_mut_data()?;
-    raw[..4].copy_from_slice(b"DTPL");
+    raw[..4].copy_from_slice(&TEMPLATE_MAGIC);
     raw[4..6].copy_from_slice(&1u16.to_le_bytes());
     raw[6] = 1;
     raw[7] = case_id;
@@ -450,7 +454,7 @@ fn init_document(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     )?;
     {
         let mut raw = document.try_borrow_mut_data()?;
-        raw[..4].copy_from_slice(b"DDOC");
+        raw[..4].copy_from_slice(&DOCUMENT_MAGIC);
         raw[4..6].copy_from_slice(&1u16.to_le_bytes());
         raw[6] = 1;
         raw[7] = case_id;
@@ -464,7 +468,7 @@ fn init_document(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     }
     {
         let mut raw = bond.try_borrow_mut_data()?;
-        raw[..4].copy_from_slice(b"DBND");
+        raw[..4].copy_from_slice(&BOND_MAGIC);
         raw[4..6].copy_from_slice(&1u16.to_le_bytes());
         raw[7] = case_id;
         raw[8..16].copy_from_slice(&data[2..10]);
@@ -581,7 +585,7 @@ fn bisect(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRes
     }
     let (template_key, case_id) = {
         let raw = document.try_borrow_data()?;
-        if raw.len() != DOCUMENT_BYTES || raw[..4] != *b"DDOC" {
+        if raw.len() != DOCUMENT_BYTES || raw[..4] != DOCUMENT_MAGIC {
             return Err(refusal());
         }
         (
@@ -598,7 +602,7 @@ fn bisect(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRes
     )?;
     let mut raw = document.try_borrow_mut_data()?;
     if raw.len() != DOCUMENT_BYTES
-        || raw[..4] != *b"DDOC"
+        || raw[..4] != DOCUMENT_MAGIC
         || raw[6] != 5
         || raw[244..276] != challenger.key.to_bytes()
         || raw[233] == 0
@@ -727,13 +731,13 @@ fn settle(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRes
     let mut doc = document.try_borrow_mut_data()?;
     let mut escrow = bond.try_borrow_mut_data()?;
     if doc.len() != DOCUMENT_BYTES
-        || doc[..4] != *b"DDOC"
+        || doc[..4] != DOCUMENT_MAGIC
         || doc[6] != 6
         || doc[7] != case_id
         || doc[72..104] != executor.key.to_bytes()
         || doc[244..276] != challenger.key.to_bytes()
         || escrow.len() != BOND_BYTES
-        || escrow[..4] != *b"DBND"
+        || escrow[..4] != BOND_MAGIC
         || escrow[7] != case_id
         || escrow[6] != 0
     {
@@ -806,7 +810,7 @@ fn close(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResu
         let raw = bond.try_borrow_data()?;
         let closeable = (document_status == 4 && raw.get(6) == Some(&0))
             || (document_status == 7 && raw.get(6) == Some(&1));
-        if raw.len() != BOND_BYTES || raw[..4] != *b"DBND" || raw[7] != case_id || !closeable {
+        if raw.len() != BOND_BYTES || raw[..4] != BOND_MAGIC || raw[7] != case_id || !closeable {
             return Err(refusal());
         }
     }
