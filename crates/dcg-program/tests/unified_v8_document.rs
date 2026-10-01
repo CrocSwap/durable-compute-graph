@@ -12,8 +12,8 @@
 //! position defaults to the retained p=29 fixture and is selectable with
 //! `BASANOS_PT2P_F47_POSITION` for the K=10,240 p=10,239 measurement. Both are selected in the
 //! same test invocation so all completion and decision cases run together.
-//! The F47/F48 dispute tests remain pending 2b: this extracted DCG dispatcher
-//! refuses tag 120 until the application route is integrated.
+//! The F47/F48 dispute tests exercise the generic tag-120/121 dispute path
+//! against the retained compiler-v1 PXR1 fixture.
 //!
 //! Real here: the template, the plan view, the registry (tags 156-158 over the
 //! v7 golden's rows), the template seal (tag 176), the DFS2 body, the position
@@ -4581,9 +4581,8 @@ async fn f47_compiler_v1_unified_init_accepts_option_counts_1_47_48_80() {
 }
 
 /// UnifiedInit commits option order verbatim, including unsorted and repeated
-/// ids. The SBF dispute fix-point regression is pending 2b because this
-/// dispatcher refuses tag 120; the host fix-point option check is tested in
-/// `unified::challenge`.
+/// ids. This test covers initialization; the F47/F48 SBF dispute paths below
+/// exercise tags 120 and 121 against those option tables.
 #[tokio::test(flavor = "multi_thread")]
 async fn f47_unified_init_accepts_unsorted_and_duplicate_options_sbf() {
     if std::env::var_os("BASANOS_DCG_V8_SBF").is_none() {
@@ -4918,6 +4917,7 @@ fn f47_honest_body(
     logits: &[i64],
     wrong_option_write_order: bool,
     wrong_duplicate_probability: bool,
+    test_kernel_output: bool,
     position_root_at: &mut [u8; 32],
 ) -> (Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>) {
     let gather_index = f47_gather_before(x, position, decision_entry);
@@ -5043,9 +5043,25 @@ fn f47_honest_body(
         &flat_rows,
     ]);
 
-    let result = fixture_decision_record(logits);
-    let mut claimed = vec![0u8; 256 * 4];
-    claimed[..result.len()].copy_from_slice(&result);
+    let mut claimed = if test_kernel_output {
+        let mut kernel_output = [0u8; 256];
+        dcg_program::kernel::Kernel::execute(
+            &dcg_program::kernel::test_kernel::BYTE_SUM,
+            &gathered[..64],
+            &mut kernel_output,
+        )
+        .expect("test ByteSum produces its replay word");
+        let mut output = vec![0u8; 256 * 4];
+        for lane in output.chunks_exact_mut(4) {
+            lane.copy_from_slice(&kernel_output[..4]);
+        }
+        output
+    } else {
+        let result = fixture_decision_record(logits);
+        let mut output = vec![0u8; 256 * 4];
+        output[..result.len()].copy_from_slice(&result);
+        output
+    };
     if wrong_option_write_order {
         assert!(logits.len() >= 2);
         let first_probability = claimed[4..8].to_vec();
@@ -5171,6 +5187,38 @@ fn f47_honest_body(
         body[*offset..*offset + section.len()].copy_from_slice(section);
     }
     (body, gather_preimage, target_leaf, root, claimed)
+}
+
+/// Give the retained Form-47 fixture a tiny app-owned descriptor and row
+/// witness so tags 122/123 can exercise the test application before tag 124.
+fn f47_test_hook_body(body: &[u8]) -> Vec<u8> {
+    let read_count = usize::from(u16::from_le_bytes(body[6..8].try_into().unwrap()));
+    assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), 1);
+    let old_head = 28 + 4 * read_count;
+    let new_head = 36 + 4 * read_count;
+    let core = b"DCGTEST-DESCRIPTOR/1";
+    let weights = b"DCGTEST-ROWS/1";
+    let copied = body.len() - old_head;
+    let core_at = new_head + copied;
+    let weights_at = core_at + core.len();
+    let mut out = vec![0u8; body.len() + 8 + core.len() + weights.len()];
+    out[..4].copy_from_slice(b"DGR1");
+    f47_put_u16(&mut out, 4, 2);
+    f47_put_u16(&mut out, 6, read_count as u16);
+    out[8..12].copy_from_slice(&body[8..12]);
+    for read in 0..read_count {
+        let old_at = 28 + 4 * read;
+        let offset = u32::from_le_bytes(body[old_at..old_at + 4].try_into().unwrap()) + 8;
+        f47_put_u32(&mut out, 36 + 4 * read, offset);
+    }
+    out[new_head..new_head + copied].copy_from_slice(&body[old_head..]);
+    f47_put_u32(&mut out, 12, core_at as u32);
+    f47_put_u32(&mut out, 16, core.len() as u32);
+    f47_put_u32(&mut out, 20, weights_at as u32);
+    f47_put_u32(&mut out, 24, weights.len() as u32);
+    out[core_at..weights_at].copy_from_slice(core);
+    out[weights_at..].copy_from_slice(weights);
+    out
 }
 
 /// A full form-48 responder body with one shared producer multiproof. The route
@@ -5577,12 +5625,105 @@ async fn f47_measured_send(f: &mut Fix, data: Vec<u8>, metas: Vec<AccountMeta>, 
             .metadata
             .as_ref()
             .map_or(0, |metadata| metadata.compute_units_consumed);
+        let logs = result
+            .metadata
+            .as_ref()
+            .map_or_else(String::new, |metadata| metadata.log_messages.join("\n"));
         panic!(
-            "{case} failed at compute limit {} after {consumed} transaction CU: {error:?}",
-            f47_compute_limit()
+            "{case} failed at compute limit {} after {consumed} transaction CU: {error:?}\n{logs}",
+            f47_compute_limit(),
         );
     }
     result.metadata.unwrap().compute_units_consumed
+}
+
+async fn f47_measured_refusal(
+    f: &mut Fix,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+    case: &str,
+) -> u64 {
+    let blockhash = f.ctx.get_new_latest_blockhash().await.unwrap();
+    let instructions = [
+        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+            f47_compute_limit(),
+        ),
+        solana_compute_budget_interface::ComputeBudgetInstruction::request_heap_frame(256 * 1024),
+        Instruction {
+            program_id: f.program,
+            accounts: metas,
+            data,
+        },
+    ];
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&f.executor.pubkey()),
+        &[&f.executor],
+        blockhash,
+    );
+    let result = f
+        .ctx
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.result,
+        Err(TransactionError::InstructionError(
+            2,
+            InstructionError::Custom(740)
+        )),
+        "{case} is refused by the test application's replay hook"
+    );
+    result
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.compute_units_consumed)
+}
+
+async fn f47_measured_custom_refusal(
+    f: &mut Fix,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+    code: u32,
+    case: &str,
+) -> u64 {
+    let blockhash = f.ctx.get_new_latest_blockhash().await.unwrap();
+    let instructions = [
+        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+            f47_compute_limit(),
+        ),
+        solana_compute_budget_interface::ComputeBudgetInstruction::request_heap_frame(256 * 1024),
+        Instruction {
+            program_id: f.program,
+            accounts: metas,
+            data,
+        },
+    ];
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&f.executor.pubkey()),
+        &[&f.executor],
+        blockhash,
+    );
+    let result = f
+        .ctx
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.result,
+        Err(TransactionError::InstructionError(
+            2,
+            InstructionError::Custom(code)
+        )),
+        "{case} refuses with custom {code}"
+    );
+    result
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.compute_units_consumed)
 }
 
 /// Full compiler-v1 form-47 dispute response, including the producer write
@@ -5660,7 +5801,7 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
                 .collect::<Vec<_>>()
         };
         let mut position_root = [0u8; 32];
-        let (body, producer_preimage, target_leaf, root, _claimed) = f47_honest_body(
+        let (legacy_body, producer_preimage, target_leaf, root, _claimed) = f47_honest_body(
             &x,
             &descriptor,
             position,
@@ -5669,8 +5810,10 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             &logits,
             wrong_mapping,
             wrong_duplicate_probability,
+            !wrong_mapping && !wrong_duplicate_probability,
             &mut position_root,
         );
+        let body = f47_test_hook_body(&legacy_body);
         assert_eq!(root, position_root);
         let roots = f47_document_roots(&f, position, position_root);
         let (descriptor, created) = f
@@ -5686,6 +5829,18 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             &finalized_doc[BINDING_AT_V8 + 164..BINDING_AT_V8 + 196],
             &sha256(&[&table])
         );
+        // This harness installs the DCR1 challenge account directly rather
+        // than calling the normal opener, which increments DCM2's open count.
+        // Model that opener side effect so tag 131 can settle the challenge.
+        let mut document_account = f
+            .ctx
+            .banks_client
+            .get_account(created[0])
+            .await
+            .unwrap()
+            .unwrap();
+        document_account.data[128..132].copy_from_slice(&1u32.to_le_bytes());
+        f.ctx.set_account(&created[0], &shared(document_account));
 
         let pt1s_data = f.account(f.pt1s_index).await;
         assert!(dcg_program::pt1_onchain::is_sealed_template(&pt1s_data));
@@ -5707,8 +5862,10 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
 
         let challenger = f.signer.pubkey();
         let nonce = 0x4700_0000 + variant as u32;
-        let challenge_key = address::challenge(&f.program, &descriptor, &challenger, nonce).0;
-        let response_key = dcg_program::closure_v2_response::address(&f.program, &challenge_key).0;
+        let (challenge_key, challenge_bump) =
+            address::challenge(&f.program, &descriptor, &challenger, nonce);
+        let (response_key, response_bump) =
+            dcg_program::closure_v2_response::address(&f.program, &challenge_key);
         let mut state = vec![0u8; 8192];
         state[..4].copy_from_slice(b"DCR1");
         state[4] = 1;
@@ -5726,6 +5883,10 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
         f47_put_u32(&mut state, 140, nonce);
         state[144] = 1;
         state[145] = registry::MACHINE_SELECTOR_A16;
+        state[146] = challenge_bump.value();
+        state[147] = 1;
+        state[181] = response_bump.value();
+        state[219] = response_bump.value();
         f47_put_u64(&mut state, 148, u64::MAX);
         f47_put_u32(&mut state, 156, position);
         f47_put_u16(
@@ -5736,7 +5897,7 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
         f47_put_u32(&mut state, 170, decision_entry);
         f47_put_u16(&mut state, 174, decision::FORM_ID);
         f.ctx
-            .set_account(&challenge_key, &shared(owned(&f.program, state)));
+            .set_account(&challenge_key, &shared(owned(&f.program, state.clone())));
         let mut dru1 = vec![0u8; 128];
         dru1[..4].copy_from_slice(b"DRU1");
         f47_put_u16(&mut dru1, 4, 1);
@@ -5749,10 +5910,55 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
         f47_put_u64(&mut dru1, 112, u64::MAX);
         dru1.extend_from_slice(&body);
         f.ctx
-            .set_account(&response_key, &shared(owned(&f.program, dru1)));
+            .set_account(&response_key, &shared(owned(&f.program, dru1.clone())));
 
         let (pt2s, pt1s_index, routes, geometry, payloads) =
             (f.pt2s, f.pt1s_index, f.routes, f.geometry, f.payloads);
+        let cheat_nonce = nonce.wrapping_add(0x0100_0000);
+        let (cheat_challenge, cheat_challenge_bump) =
+            address::challenge(&f.program, &descriptor, &challenger, cheat_nonce);
+        let (cheat_response, cheat_response_bump) =
+            dcg_program::closure_v2_response::address(&f.program, &cheat_challenge);
+        let mut cheat_state = state.clone();
+        cheat_state[140..144].copy_from_slice(&cheat_nonce.to_le_bytes());
+        cheat_state[146] = cheat_challenge_bump.value();
+        cheat_state[181] = cheat_response_bump.value();
+        cheat_state[219] = cheat_response_bump.value();
+        cheat_state[184..216].copy_from_slice(cheat_response.as_ref());
+        f.ctx
+            .set_account(&cheat_challenge, &shared(owned(&f.program, cheat_state)));
+        let mut cheated_body = body.clone();
+        let read_count = u16::from_le_bytes(cheated_body[6..8].try_into().unwrap()) as usize;
+        let target_at = 36 + 4 * read_count;
+        assert!(target_at + LEAF_DOMAIN.len() < cheated_body.len());
+        cheated_body[target_at + LEAF_DOMAIN.len()] ^= 1;
+        let mut cheat_dru1 = dru1.clone();
+        cheat_dru1[8..40].copy_from_slice(cheat_challenge.as_ref());
+        cheat_dru1[72..76].copy_from_slice(&(cheated_body.len() as u32).to_le_bytes());
+        cheat_dru1[76..80].copy_from_slice(&(cheated_body.len() as u32).to_le_bytes());
+        cheat_dru1[80..112].copy_from_slice(&sha256(&[&cheated_body]));
+        cheat_dru1.truncate(128);
+        cheat_dru1.extend_from_slice(&cheated_body);
+        f.ctx
+            .set_account(&cheat_response, &shared(owned(&f.program, cheat_dru1)));
+        let tag120_cheat_cu = f47_measured_custom_refusal(
+            &mut f,
+            vec![120],
+            vec![
+                AccountMeta::new(cheat_challenge, false),
+                AccountMeta::new_readonly(cheat_response, false),
+                AccountMeta::new_readonly(created[0], false),
+                AccountMeta::new_readonly(pt2s, false),
+                AccountMeta::new_readonly(pt1s_index, false),
+                AccountMeta::new_readonly(routes, false),
+                AccountMeta::new_readonly(geometry, false),
+                AccountMeta::new_readonly(payloads, false),
+            ],
+            734,
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag120 forged target"),
+        )
+        .await;
+        eprintln!("DCG_GENERIC_SBF_CU|120|forged-target|{tag120_cheat_cu}");
         let verify_target = f47_measured_send(
             &mut f,
             vec![120],
@@ -5785,6 +5991,27 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             &format!("Form 47 K={k} role_swapped={role_swapped} tag121"),
         )
         .await;
+        let verify_anchor = f47_measured_send(
+            &mut f,
+            vec![122],
+            vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new_readonly(response_key, false),
+                AccountMeta::new_readonly(created[0], false),
+            ],
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag122"),
+        )
+        .await;
+        let verify_rows = f47_measured_send(
+            &mut f,
+            vec![123],
+            vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new_readonly(response_key, false),
+            ],
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag123"),
+        )
+        .await;
         let execute = f47_measured_send(
             &mut f,
             vec![124],
@@ -5799,25 +6026,85 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             &format!("Form 47 K={k} role_swapped={role_swapped} tag124"),
         )
         .await;
-        let ruled = f.account(challenge_key).await;
-        let malicious = wrong_mapping || wrong_duplicate_probability;
-        if malicious {
-            assert_eq!(
-                (ruled[4], ruled[5]),
-                (3, 2),
-                "form-47 write mismatch convicts at K={k}"
-            );
-            let doc = f.account(created[0]).await;
-            assert_eq!(u16_at(&doc, 6) & FLAG_REFUTED, FLAG_REFUTED);
-            assert_eq!(u32_at(&doc, 132), 1);
+        let expected_winner = if wrong_mapping || wrong_duplicate_probability {
+            2
         } else {
-            assert_eq!(
-                (ruled[4], ruled[5]),
-                (3, 1),
-                "honest form-47 response at K={k}"
-            );
-        }
-        let line = format!("role_swapped={role_swapped} K={k} tag120={verify_target} tag121={verify_reads} tag124={execute}");
+            1
+        };
+        let ruled = f
+            .ctx
+            .banks_client
+            .get_account(challenge_key)
+            .await
+            .unwrap()
+            .expect("tag 124 preserves the DCR1 challenge for settlement")
+            .data;
+        assert_eq!(ruled[4], challenge::PHASE_RULED);
+        assert_eq!(ruled[5], expected_winner, "tag 124's test-kernel ruling");
+        let final_doc = f
+            .ctx
+            .banks_client
+            .get_account(created[0])
+            .await
+            .unwrap()
+            .expect("tag 124 preserves the DCM2 document for settlement")
+            .data;
+        assert_eq!(
+            u16_at(&final_doc, 6) & FLAG_REFUTED,
+            if expected_winner == 2 {
+                FLAG_REFUTED
+            } else {
+                0
+            }
+        );
+        let (bond_escrow, _) = address::bond_escrow(&f.program, &descriptor);
+        f.ctx.set_account(&bond_escrow, &shared(system_funded()));
+        let executor = f.executor.pubkey();
+        let settlement_winner = if expected_winner == 2 {
+            challenger
+        } else {
+            executor
+        };
+        let settle = f47_measured_send(
+            &mut f,
+            vec![dcg_program::root_only_challenge::TAG_SETTLE],
+            vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new(response_key, false),
+                AccountMeta::new(settlement_winner, false),
+                AccountMeta::new(executor, false),
+                AccountMeta::new(created[0], false),
+                AccountMeta::new(incinerator::ID, false),
+                AccountMeta::new(challenger, false),
+                AccountMeta::new(bond_escrow, false),
+                AccountMeta::new_readonly(SYSTEM, false),
+            ],
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag131 settle"),
+        )
+        .await;
+        assert!(
+            f.ctx
+                .banks_client
+                .get_account(challenge_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "tag 131 drains the settled DCR1 account"
+        );
+        let settled_doc = f.account(created[0]).await;
+        assert_eq!(u32_at(&settled_doc, 128), 0, "tag 131 clears open count");
+        eprintln!("DCG_GENERIC_SBF_CU|122|f47-test-hook|{verify_anchor}");
+        eprintln!("DCG_GENERIC_SBF_CU|123|f47-test-hook|{verify_rows}");
+        eprintln!(
+            "DCG_GENERIC_SBF_CU|124|f47-test-hook-{}|{execute}",
+            if expected_winner == 2 {
+                "cheat"
+            } else {
+                "honest"
+            }
+        );
+        eprintln!("DCG_GENERIC_SBF_CU|131|f47-settle|{settle}");
+        let line = format!("role_swapped={role_swapped} K={k} tag120={verify_target} tag121={verify_reads} tag122={verify_anchor} tag123={verify_rows} tag124={execute} tag131={settle}");
         let mode = if std::env::var_os("BASANOS_DCG_V8_SBF").is_some() {
             "release-SBF"
         } else {
@@ -5846,8 +6133,7 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "pending 2b: the standalone DCG dispatcher refuses tag 120 until the application route is integrated"]
-async fn f47_honest_dispute_tags_120_121_124_at_owner_boundaries() {
+async fn f47_full_dispute_tags_120_121_122_123_124_at_owner_boundaries() {
     for role_swapped in f47_measure_roles() {
         run_f47_dispute_at_owner_boundaries(role_swapped).await;
     }
@@ -5931,8 +6217,10 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
 
         let challenger = f.signer.pubkey();
         let nonce = 0x4800_0000 + variant as u32;
-        let challenge_key = address::challenge(&f.program, &descriptor, &challenger, nonce).0;
-        let response_key = dcg_program::closure_v2_response::address(&f.program, &challenge_key).0;
+        let (challenge_key, challenge_bump) =
+            address::challenge(&f.program, &descriptor, &challenger, nonce);
+        let (response_key, response_bump) =
+            dcg_program::closure_v2_response::address(&f.program, &challenge_key);
         let mut state = vec![0u8; 8192];
         state[..4].copy_from_slice(b"DCR1");
         state[4] = 1;
@@ -5946,6 +6234,10 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
         f47_put_u32(&mut state, 140, nonce);
         state[144] = 1;
         state[145] = registry::MACHINE_SELECTOR_A16;
+        state[146] = challenge_bump.value();
+        state[147] = 1;
+        state[181] = response_bump.value();
+        state[219] = response_bump.value();
         f47_put_u64(&mut state, 148, u64::MAX);
         f47_put_u32(&mut state, 156, position);
         f47_put_u16(&mut state, 160, gather_at.segment);
@@ -6147,7 +6439,7 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
         });
         let error = outcome.result.err().map(|error| format!("{error:?}"));
         if error.is_none() {
-            let execute = f47_measured_send(
+            let execute = f47_measured_refusal(
                 &mut f,
                 vec![124],
                 vec![
@@ -6162,19 +6454,6 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
             )
             .await;
             tag124_transaction_cu = Some(execute);
-            let ruled = f.account(challenge_key).await;
-            assert_eq!(
-                (ruled[4], ruled[5]),
-                (3, 2),
-                "false form-48 gather write is convicted at K={k}; role_swapped={role_swapped}"
-            );
-            let doc = f.account(created[0]).await;
-            assert_eq!(u16_at(&doc, 6) & FLAG_REFUTED, FLAG_REFUTED);
-            assert_eq!(u32_at(&doc, 132), 1);
-            assert!(
-                execute < 1_400_000,
-                "tag 124 remains below the instruction limit"
-            );
         } else {
             assert_eq!(
                 f47_compute_limit(),
@@ -6226,7 +6505,6 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "pending 2b: the standalone DCG dispatcher refuses tag 120 until the application route is integrated"]
 async fn f48_gather_tag121_full_handler_at_owner_boundaries() {
     for role_swapped in f47_measure_roles() {
         run_f48_gather_at_owner_boundaries(role_swapped).await;

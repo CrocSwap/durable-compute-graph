@@ -36,6 +36,7 @@ const GATES: &[&str] = &[
     "document_v8",
     "document_v8_with_bump",
     "document_v8_stored",
+    "live",
     "positions",
     "positions_with_bump",
     "positions_from_document",

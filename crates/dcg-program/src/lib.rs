@@ -10,10 +10,13 @@ pub mod app_api;
 #[cfg(feature = "sbf-real-lifecycle-test")]
 pub mod closure_v2;
 #[cfg(not(feature = "sbf-real-lifecycle-test"))]
-pub(crate) mod closure_v2;
+pub mod closure_v2;
 pub(crate) mod closure_v2_accounts;
 #[cfg(feature = "legacy-hclosure-handlers")]
 pub(crate) mod closure_v2_bootstrap;
+/// Shared revision-8 dispute verifier used by the statically selected app
+/// manifest. Application form execution remains behind the app API hooks.
+pub mod closure_v2_generic;
 pub mod closure_v2_response;
 pub(crate) mod closure_v2_tree;
 pub mod commit;
@@ -54,7 +57,56 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    process_instruction_with_manifest(program_id, accounts, data, application_manifest())
+    let Some(tag) = data.first().copied() else {
+        return Err(ProgramError::InvalidInstructionData);
+    };
+    if matches!(tag, 120..=124 | 126..=129) {
+        return closure_v2_generic::process_generic_dispute_tag(
+            program_id,
+            accounts,
+            data,
+            application_program_manifest(),
+        );
+    }
+    process_instruction_with_manifest(
+        program_id,
+        accounts,
+        data,
+        application_program_manifest().application_manifest(),
+    )
+}
+
+#[cfg(feature = "test-kernel")]
+fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
+    static NO_INSTRUCTIONS: [app_api::ApplicationInstruction; 0] = [];
+    static TEST_APPLICATION: app_api::ApplicationProgramManifest =
+        app_api::ApplicationProgramManifest::new_with_dispute_hooks(
+            &kernel::test_kernel::MANIFEST_APP,
+            &NO_INSTRUCTIONS,
+            &kernel::test_kernel::DISPUTE_HOOKS,
+            &kernel::test_kernel::DISPUTE_HOOKS,
+        );
+    &TEST_APPLICATION
+}
+
+#[cfg(not(feature = "test-kernel"))]
+fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
+    static EMPTY_KERNELS: [&'static dyn kernel::Kernel; 0] = [];
+    static EMPTY_REPLAYS: [kernel::OptimisticReplayBinding; 0] = [];
+    static EMPTY_FORMS: [kernel::LegacyFormBinding; 0] = [];
+    static EMPTY_APPLICATION: kernel::ApplicationManifest = kernel::ApplicationManifest {
+        application_id: b"dcg/empty-application/1",
+        version: 1,
+        kernels: &EMPTY_KERNELS,
+        optimistic_replays: &EMPTY_REPLAYS,
+        legacy_forms: &EMPTY_FORMS,
+        require_legacy_form_binding: false,
+        hooks: &compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &compatibility::REVISION8_COMPATIBILITY,
+    };
+    static EMPTY_PROGRAM: app_api::ApplicationProgramManifest =
+        app_api::ApplicationProgramManifest::new(&EMPTY_APPLICATION, &[]);
+    &EMPTY_PROGRAM
 }
 
 /// Dispatch the frozen handler surface with one application-supplied static
@@ -82,10 +134,15 @@ pub fn process_instruction_with_manifest(
         117 => closure_v2_response::write(program_id, accounts, data),
         118 => closure_v2_response::seal(program_id, accounts, data),
         125 => closure_v2_response::write_at(program_id, accounts, data),
-        // These paths need the application's compiled kernel adapter. The
-        // standalone test image contains only the tiny test kernel; Basanos
-        // retains its historical dispatcher for those profile-specific rows.
-        120..=124 | 126..=129 => Err(ProgramError::InvalidInstructionData),
+        120..=124 | 126..=129 => {
+            let application = app_api::ApplicationProgramManifest::new(manifest, &[]);
+            closure_v2_generic::process_generic_dispute_tag(
+                program_id,
+                accounts,
+                data,
+                &application,
+            )
+        }
         140 => pt1_onchain::init_fresh(program_id, accounts, data),
         141 => pt1_onchain::upload(program_id, accounts, data),
         142 => pt1_onchain::seal(program_id, accounts, data),

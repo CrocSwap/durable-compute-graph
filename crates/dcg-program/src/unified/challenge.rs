@@ -39,7 +39,9 @@ use super::{
     CL_PATH, DCR1_AUTH, DCR1_BAD, DCR1_DEADLINE, DCR1_INCOMPLETE, DCR1_PHASE, DCR1_PROOF,
     PLAN_BINDING, REGISTRY_ROOT, REVEAL_MISMATCH, REVEAL_ORDER, SETTLEMENT_PROGRAM,
 };
-use crate::account_provenance::{expect_derived_with_bump, AccountKind, CanonicalBump, RoleFlags};
+use crate::account_provenance::{
+    expect_derived, expect_derived_with_bump, AccountKind, CanonicalBump, RoleFlags,
+};
 use crate::closure_v2::{self as h, Node};
 use crate::hash;
 use crate::pt2p::Pt2p;
@@ -3091,7 +3093,35 @@ fn record_document_v8(
     writable: bool,
 ) -> ProgramResult {
     let descriptor = d32(raw, 72, DCR1_BAD)?;
-    document::document_v8_stored(program, doc, Some(&descriptor), writable, DCR1_AUTH)?;
+    let version = u16_at(&doc.try_borrow_data()?, 4, DCR1_AUTH)?;
+    if version == 6 {
+        let role = RoleFlags {
+            writable,
+            signer: false,
+        };
+        expect_derived(
+            doc,
+            program,
+            &[address::DOCUMENT_SEED, &descriptor],
+            AccountKind::exact(b"DCM2", document::DCM2_V6_BYTES).with_version(4, 6),
+            role,
+        )
+        .map_err(|_| no(DCR1_AUTH))?;
+        let data = doc.try_borrow_data()?;
+        if doc.owner != program
+            || (writable && !doc.is_writable)
+            || data.len() != document::DCM2_V6_BYTES
+            || data.get(..4) != Some(&b"DCM2"[..])
+            || u16_at(&data, 4, DCR1_AUTH)? != 6
+            || u16_at(&data, 6, DCR1_AUTH)? & (document::FLAG_ROOT_ONLY | document::FLAG_SEALED)
+                != document::FLAG_ROOT_ONLY | document::FLAG_SEALED
+            || d32(&data, 8, DCR1_AUTH)? != descriptor
+        {
+            return Err(no(DCR1_AUTH));
+        }
+    } else {
+        document::document_v8_stored(program, doc, Some(&descriptor), writable, DCR1_AUTH)?;
+    }
     if doc.try_borrow_data()?[40..72] != raw[40..72] {
         return Err(no(DCR1_AUTH));
     }
@@ -3264,7 +3294,14 @@ pub fn settle_v8_with_hooks<'a>(
             return Err(no(CL_AUTHORITY));
         }
     }
-    let response_bump = record_acc.try_borrow_data()?[RESPONSE_BUMP_AT];
+    let response_bump = {
+        let record = record_acc.try_borrow_data()?;
+        if record[crate::closure_v2_generic::RESPONSE_BUMP_COPY_MARKER_AT] == 1 {
+            record[crate::closure_v2_generic::RESPONSE_BUMP_COPY_AT]
+        } else {
+            record[RESPONSE_BUMP_AT]
+        }
+    };
     let response_key =
         crate::closure_v2_response::address_with_bump(program, record_acc.key, response_bump)
             .map_err(|_| no(DCR1_AUTH))?;
