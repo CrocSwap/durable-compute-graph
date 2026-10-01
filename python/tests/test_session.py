@@ -11,12 +11,15 @@ from solders.pubkey import Pubkey
 from dcg.sequencer import JournalError, ProgramRefused
 from dcg.session import (
     ACCOUNT_LAYOUTS,
+    AccountInventory,
     COUNTER_MANIFEST,
     DEFAULT_PROGRAM_ID,
     KernelRef,
     SessionAddresses,
     SessionSigners,
     WritableAccountRefused,
+    AccountRecord,
+    Inventory,
     account_layout,
     explain_refusal,
 )
@@ -264,46 +267,114 @@ class SessionGoldenTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "accounts.json"
-            addresses = [str(self.addresses.session), str(self.addresses.stream), *(str(x) for x in self.addresses.states)]
+            inventory = Inventory(
+                path,
+                program_id=str(DEFAULT_PROGRAM_ID),
+                metadata={"session_id": 1, "authority": str(self.authority)},
+            )
+            valid = AccountRecord.derive(
+                DEFAULT_PROGRAM_ID,
+                kind="session",
+                role="session",
+                seeds=(b"dcg-session-v1", bytes(self.authority), (1).to_bytes(8, "little")),
+            )
+            forged = AccountRecord(
+                address=str(Pubkey.default()),
+                kind="stream",
+                role="input_stream",
+                seeds=(b"dcg-input-v1", bytes(self.addresses.session)),
+                parent=str(self.addresses.session),
+            )
+            with self.assertRaises(JournalError):
+                inventory.plan((valid, forged))
+
+    def test_account_inventory_persists_role_parent_and_lifecycle(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "accounts.json"
+            inventory = Inventory(
+                path,
+                program_id=str(DEFAULT_PROGRAM_ID),
+                metadata={"session_id": 1, "authority": str(self.authority)},
+            )
+            session = AccountRecord.derive(
+                DEFAULT_PROGRAM_ID,
+                kind="stateful_session_v1",
+                role="session",
+                seeds=(b"dcg-session-v1", bytes(self.authority), (1).to_bytes(8, "little")),
+            )
+            stream = AccountRecord.derive(
+                DEFAULT_PROGRAM_ID,
+                kind="stateful_stream_v1",
+                role="input_stream",
+                seeds=(b"dcg-input-v1", bytes(self.addresses.session)),
+                parent=str(self.addresses.session),
+            )
+            inventory.plan(
+                (
+                    session,
+                    stream,
+                )
+            )
+            inventory.mark_live(str(self.addresses.session), payer=str(self.payer), rent_lamports=1234)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["accounts"][0]["address"], str(self.addresses.session))
+            self.assertEqual(payload["accounts"][0]["lifecycle"], "live")
+            self.assertEqual(payload["accounts"][0]["payer"], str(self.payer))
+            self.assertEqual(payload["accounts"][0]["rent_lamports"], 1234)
+            self.assertEqual(payload["accounts"][0]["seeds"], [b"dcg-session-v1".hex(), bytes(self.authority).hex(), (1).to_bytes(8, "little").hex()])
+            self.assertEqual(payload["accounts"][1]["parent"], str(self.addresses.session))
+            self.assertEqual(payload["accounts"][1]["lifecycle"], "planned")
+
+    def test_inventory_record_derivation_matches_rust_session_vectors(self):
+        session = AccountRecord.derive(
+            DEFAULT_PROGRAM_ID,
+            kind="stateful_session_v1",
+            role="session",
+            seeds=(b"dcg-session-v1", bytes(self.authority), (1).to_bytes(8, "little")),
+        )
+        stream = AccountRecord.derive(
+            DEFAULT_PROGRAM_ID,
+            kind="stateful_stream_v1",
+            role="input_stream",
+            seeds=(b"dcg-input-v1", bytes(self.addresses.session)),
+            parent=str(self.addresses.session),
+        )
+        self.assertEqual(session.address, "AR8u9GTAuk93NLAdzm2xJV8CmM3eRduvNoFEY7NFiKh3")
+        self.assertEqual(stream.address, "HEFt7UVHfWUDWjTptWv7EsNVGjkuZBAWE8dxnSoxHcES")
+        v2_session = AccountRecord.derive(
+            DEFAULT_PROGRAM_ID,
+            kind="stateful_session_v2",
+            role="session",
+            seeds=(b"dcg-session-v2", bytes(self.authority), (1).to_bytes(8, "little")),
+        )
+        v2_stream = AccountRecord.derive(
+            DEFAULT_PROGRAM_ID,
+            kind="stateful_stream_v2",
+            role="input_stream",
+            seeds=(b"dcg-input-v2", bytes(Pubkey.from_string(v2_session.address))),
+            parent=v2_session.address,
+        )
+        self.assertEqual(v2_session.address, "r4VTYZhGs85xYmEM3BkJE6TyXeVTexmtH458U1qbobk")
+        self.assertEqual(v2_stream.address, "HEWe3L1pLLYSFRzB58aQ2ackcNd2pgWzzYPHkBwpbDop")
+
+    def test_legacy_session_inventory_upgrades_only_after_seed_match(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "accounts.json"
             payload = {
                 "schema_version": 1,
                 "session_id": 1,
                 "program_id": str(DEFAULT_PROGRAM_ID),
                 "authority": str(self.authority),
                 "accounts": [
-                    {"address": addresses[0], "role": "session", "parent": None, "lifecycle": "planned"},
-                    {"address": str(Pubkey.default()), "role": "input_stream", "parent": addresses[0], "lifecycle": "planned"},
-                    *[
-                        {"address": address, "role": f"state_span_{index}", "parent": addresses[0], "lifecycle": "planned"}
-                        for index, address in enumerate(addresses[2:])
-                    ],
+                    {"address": str(self.addresses.session), "role": "session", "parent": None, "lifecycle": "created"},
+                    {"address": str(self.addresses.stream), "role": "input_stream", "parent": str(self.addresses.session), "lifecycle": "created"},
                 ],
             }
             path.write_text(json.dumps(payload), encoding="utf-8")
-            with self.assertRaises(JournalError):
-                from dcg.session.journal import AccountInventory
-
-                inventory = AccountInventory(
-                    path,
-                    session_id=1,
-                    program_id=str(DEFAULT_PROGRAM_ID),
-                    authority=str(self.authority),
-                )
-                inventory.plan(
-                    (
-                        (addresses[0], "session", None),
-                        (addresses[1], "input_stream", addresses[0]),
-                        (addresses[2], "state_span_0", addresses[0]),
-                        (addresses[3], "state_span_1", addresses[0]),
-                    )
-                )
-
-    def test_account_inventory_persists_role_parent_and_lifecycle(self):
-        from dcg.session.journal import AccountInventory
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "accounts.json"
             inventory = AccountInventory(
                 path,
                 session_id=1,
@@ -312,29 +383,26 @@ class SessionGoldenTests(unittest.TestCase):
             )
             inventory.plan(
                 (
-                    (str(self.addresses.session), "session", None),
-                    (str(self.addresses.stream), "input_stream", str(self.addresses.session)),
+                    AccountRecord.derive(
+                        DEFAULT_PROGRAM_ID,
+                        kind="stateful_session_v1",
+                        role="session",
+                        seeds=(b"dcg-session-v1", bytes(self.authority), (1).to_bytes(8, "little")),
+                    ),
+                    AccountRecord.derive(
+                        DEFAULT_PROGRAM_ID,
+                        kind="stateful_stream_v1",
+                        role="input_stream",
+                        seeds=(b"dcg-input-v1", bytes(self.addresses.session)),
+                        parent=str(self.addresses.session),
+                    ),
                 )
             )
-            inventory.mark_created(str(self.addresses.session))
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                payload["accounts"],
-                [
-                    {
-                        "address": str(self.addresses.session),
-                        "lifecycle": "created",
-                        "parent": None,
-                        "role": "session",
-                    },
-                    {
-                        "address": str(self.addresses.stream),
-                        "lifecycle": "planned",
-                        "parent": str(self.addresses.session),
-                        "role": "input_stream",
-                    },
-                ],
-            )
+            upgraded = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual([item["lifecycle"] for item in upgraded["accounts"]], ["live", "live"])
+        self.assertTrue(all(item["seeds"] for item in upgraded["accounts"]))
 
 
 if __name__ == "__main__":

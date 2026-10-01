@@ -53,12 +53,14 @@ PYTHONPATH=python /private/tmp/dcg-python-session-venv/bin/python \
 ```
 
 The client defaults to `http://127.0.0.1:8899` and the fixed example program
-ID above. The account inventory records each PDA's role, parent and lifecycle
-state. `close()` only sends close instructions for the derived accounts listed
-there and returns the refunded lamports. Its default inventory path is unique
-per session; if `DCG_SESSION_JOURNAL` is set, choose a fresh path for each new
-session. The original [`run.py`](run.py) remains the in-process ProgramTest
-path for comparison.
+ID above. The account inventory records each PDA's seed derivation, kind, role,
+parent, lifecycle, payer and observed rent. Before cleanup, `Session.close()`
+reconciles the inventory with batched RPC reads, discovers parent-bearing
+children, then retires and closes the session accounts. Its default inventory
+path is unique per session; if `DCG_SESSION_JOURNAL` is set, choose a fresh path
+for each new session. See [the Python session guide](../../docs/python-session.md)
+for drift reports and recovery. The original [`run.py`](run.py) remains the
+in-process ProgramTest path for comparison.
 
 This runs one counter transition against DCG's stateful instruction handler in
 an in-process Solana `ProgramTest` bank. It creates a session, deposits one

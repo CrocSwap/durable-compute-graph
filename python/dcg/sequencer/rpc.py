@@ -232,6 +232,75 @@ class SolanaRpcEndpoint:
             raise RpcUnavailable("RPC returned an invalid getAccountInfo result") from exc
         if value is None:
             return None
+        return self._parse_account_info(value, context_slot)
+
+    async def get_multiple_accounts(
+        self, addresses: Sequence[str], commitment: Commitment
+    ) -> tuple[AccountInfo | None, ...]:
+        """Read up to 100 accounts in one Solana ``getMultipleAccounts`` call."""
+
+        if commitment not in {Commitment.CONFIRMED, Commitment.FINALIZED}:
+            raise ValueError("getMultipleAccounts commitment must be confirmed or finalized")
+        if len(addresses) > 100 or any(not isinstance(address, str) or not address for address in addresses):
+            raise ValueError("getMultipleAccounts needs at most 100 non-empty addresses")
+        result = await self._call(
+            "getMultipleAccounts",
+            [list(addresses), {"encoding": "base64", "commitment": commitment.value}],
+        )
+        try:
+            context_slot = result["context"].get("slot")
+            values = result["value"]
+        except (KeyError, TypeError) as exc:
+            raise RpcUnavailable("RPC returned an invalid getMultipleAccounts result") from exc
+        if not isinstance(values, list) or len(values) != len(addresses):
+            raise RpcUnavailable("RPC returned the wrong number of getMultipleAccounts values")
+        slot = context_slot if isinstance(context_slot, int) else None
+        return tuple(None if value is None else self._parse_account_info(value, slot) for value in values)
+
+    async def get_program_accounts(
+        self,
+        program_id: str,
+        *,
+        filters: Sequence[dict[str, object]],
+        commitment: Commitment,
+    ) -> tuple[tuple[str, AccountInfo], ...]:
+        """Read program-owned accounts matching the supplied Solana filters."""
+
+        if commitment not in {Commitment.CONFIRMED, Commitment.FINALIZED}:
+            raise ValueError("getProgramAccounts commitment must be confirmed or finalized")
+        result = await self._call(
+            "getProgramAccounts",
+            [
+                program_id,
+                {
+                    "encoding": "base64",
+                    "commitment": commitment.value,
+                    "withContext": True,
+                    "filters": list(filters),
+                },
+            ],
+        )
+        try:
+            context_slot = result["context"].get("slot")
+            values = result["value"]
+        except (KeyError, TypeError) as exc:
+            raise RpcUnavailable("RPC returned an invalid getProgramAccounts result") from exc
+        if not isinstance(values, list):
+            raise RpcUnavailable("RPC returned malformed getProgramAccounts values")
+        slot = context_slot if isinstance(context_slot, int) else None
+        parsed: list[tuple[str, AccountInfo]] = []
+        try:
+            for item in values:
+                address = item["pubkey"]
+                if not isinstance(address, str) or not address:
+                    raise ValueError
+                parsed.append((address, self._parse_account_info(item["account"], slot)))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RpcUnavailable("RPC returned malformed getProgramAccounts entries") from exc
+        return tuple(parsed)
+
+    @staticmethod
+    def _parse_account_info(value: object, context_slot: int | None) -> AccountInfo:
         try:
             data_value = value["data"]
             if not isinstance(data_value, list) or len(data_value) != 2 or data_value[1] != "base64":
@@ -246,6 +315,8 @@ class SolanaRpcEndpoint:
         if (
             not isinstance(owner, str)
             or not isinstance(lamports, int)
+            or isinstance(lamports, bool)
+            or lamports < 0
             or not isinstance(executable, bool)
             or (rent_epoch is not None and not isinstance(rent_epoch, int))
         ):
@@ -256,7 +327,7 @@ class SolanaRpcEndpoint:
             executable=executable,
             rent_epoch=rent_epoch,
             data=data,
-            context_slot=context_slot if isinstance(context_slot, int) else None,
+            context_slot=context_slot,
         )
 
     async def get_health(self) -> str:

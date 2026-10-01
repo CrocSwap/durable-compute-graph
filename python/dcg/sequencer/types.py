@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Protocol, Sequence
 
 
 class FailureClass(str, Enum):
@@ -176,6 +176,18 @@ class RpcEndpoint(Protocol):
     async def send_raw_transaction(self, raw_bytes: bytes) -> SendReceipt: ...
 
     async def signature_status(self, signature: str) -> SignatureObservation | None: ...
+
+    async def get_multiple_accounts(
+        self, addresses: Sequence[str], commitment: Commitment
+    ) -> tuple[AccountInfo | None, ...]: ...
+
+    async def get_program_accounts(
+        self,
+        program_id: str,
+        *,
+        filters: Sequence[dict[str, object]],
+        commitment: Commitment,
+    ) -> tuple[tuple[str, AccountInfo], ...]: ...
 
 
 Postcondition = Callable[[RpcEndpoint], Awaitable[PostconditionResult]]

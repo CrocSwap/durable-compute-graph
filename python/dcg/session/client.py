@@ -32,9 +32,11 @@ from dcg.sequencer import (
 from .errors import explain_refusal
 from .instructions import (
     BuiltInstruction,
-    KIND_SESSION,
     KIND_STATE,
     KIND_STREAM,
+    KIND_VIEW_COUNTER,
+    KIND_VIEW_TOTAL,
+    KIND_SCRATCH,
     advance as encode_advance,
     close_child,
     close_session as encode_close_session,
@@ -46,7 +48,7 @@ from .instructions import (
     open_session,
     write_input as encode_write_input,
 )
-from .journal import AccountInventory, AccountRecord
+from .journal import AccountRecord, Inventory, stateful_account_codecs
 from .layout import SessionAddresses, account_layout
 from .manifest import KernelRef
 from .signers import SessionSigners
@@ -239,19 +241,42 @@ class Session:
             session_id=self.session_id,
             state_span_count=len(kernel.state_span_lengths),
         )
-        self.inventory = AccountInventory(
+        self.inventory = Inventory(
             journal_path,
-            session_id=self.session_id,
             program_id=str(program_id),
-            authority=signers.authority_public_key,
+            metadata={"session_id": self.session_id, "authority": signers.authority_public_key},
+            codecs=stateful_account_codecs(self.wire_version),
         )
         self.inventory.plan(
             (
-                (str(self.addresses.session), "session", None),
-                (str(self.addresses.stream), "input_stream", str(self.addresses.session)),
+                AccountRecord.derive(
+                    program_id,
+                    kind=f"stateful_session_v{self.wire_version}",
+                    role="session",
+                    seeds=(self.layout.session_seed, bytes(signers.authority.pubkey()), self.session_id.to_bytes(8, "little")),
+                    expected_size=672 if self.wire_version == 1 else 1280,
+                    payer=signers.public_key,
+                ),
+                AccountRecord.derive(
+                    program_id,
+                    kind=f"stateful_stream_v{self.wire_version}",
+                    role="input_stream",
+                    seeds=(self.layout.stream_seed, bytes(self.addresses.session)),
+                    parent=str(self.addresses.session),
+                    expected_size=CHILD_HEADER_BYTES + self.input_capacity * 16,
+                    payer=signers.public_key,
+                ),
                 *(
-                    (str(address), f"state_span_{index}", str(self.addresses.session))
-                    for index, address in enumerate(self.addresses.states)
+                    AccountRecord.derive(
+                        program_id,
+                        kind=f"stateful_state_v{self.wire_version}",
+                        role=f"state_span_{index}",
+                        seeds=(self.layout.state_seed, bytes(self.addresses.session), bytes([index])),
+                        parent=str(self.addresses.session),
+                        expected_size=CHILD_HEADER_BYTES + length,
+                        payer=signers.public_key,
+                    )
+                    for index, (address, length) in enumerate(zip(self.addresses.states, kernel.state_span_lengths, strict=True))
                 ),
             )
         )
@@ -333,7 +358,7 @@ class Session:
             ),
             expected=((self.addresses.session, True),),
         )
-        self.inventory.mark_created(str(self.addresses.session))
+        await self._mark_inventory_live(str(self.addresses.session))
         await self._send(
             create_stream(
                 program_id=self.program_id,
@@ -343,7 +368,7 @@ class Session:
             ),
             expected=((self.addresses.stream, True),),
         )
-        self.inventory.mark_created(str(self.addresses.stream))
+        await self._mark_inventory_live(str(self.addresses.stream))
         await self._send(
             create_state(
                 program_id=self.program_id,
@@ -355,7 +380,7 @@ class Session:
             expected=tuple((address, True) for address in self.addresses.states),
         )
         for address in self.addresses.states:
-            self.inventory.mark_created(str(address))
+            await self._mark_inventory_live(str(address))
         if self.wire_version == 2:
             for index, length in enumerate(self.kernel.state_span_lengths):
                 for _offset in range(min(length, 8192), length, 8192):
@@ -453,60 +478,104 @@ class Session:
     async def close(self) -> CloseReceipt:
         if self._closed:
             return CloseReceipt(0, ())
-        self._validate_inventory()
-        created = self.inventory.created()
-        session_record = next((item for item in created if item.role == "session"), None)
-        if session_record is None:
-            raise RuntimeError("session account is not recorded as created; refusing to close anything")
+        report = await self.inventory.reconcile(self.transport.endpoint, rebuild=True)
+        session_address = str(self.addresses.session)
+        session_record = self.inventory.record(session_address)
+        if not report.discovery_complete:
+            raise RuntimeError(report.discovery_issue or "could not verify on-chain account dependencies")
+        if report.unexpected:
+            accounts = ", ".join(item.address for item in report.unexpected)
+            raise RuntimeError(f"unexpected on-chain accounts depend on this session: {accounts}")
+        if report.wrong_state:
+            issue = report.wrong_state[0]
+            raise RuntimeError(f"account inventory failed chain reconciliation for {issue.address}: {issue.message}")
+        if session_record.lifecycle == "planned" and any(item.address == session_address for item in report.missing):
+            raise RuntimeError("session account was never created; nothing can be retired or closed")
+        child_records = [item for item in self.inventory.accounts if item.role != "session" and item.lifecycle != "closed"]
+        supported_roles = {"input_stream", "view_counter", "view_total", "view_scratch"}
+        unsupported = [item for item in child_records if not item.role.startswith("state_span_") and item.role not in supported_roles]
+        if unsupported:
+            accounts = ", ".join(item.address for item in unsupported)
+            raise RuntimeError(f"session cleanup has unsupported account kinds: {accounts}")
+        unretired_missing = [item for item in report.missing if item.lifecycle == "live"]
+        if unretired_missing:
+            accounts = ", ".join(item.address for item in unretired_missing)
+            raise RuntimeError(f"live accounts are missing on chain: {accounts}")
+        for missing in report.missing:
+            if missing.lifecycle == "planned":
+                await self.inventory.forget_missing_plan(missing.address, self.transport.endpoint)
+        session_info = (await self.transport.endpoint.get_multiple_accounts((session_address,), Commitment.CONFIRMED))[0]
+        if session_info is None:
+            if report.children_of(session_address):
+                raise RuntimeError("session account is missing on chain while dependent accounts remain")
+            if session_record.lifecycle == "closed":
+                self._closed = True
+                return CloseReceipt(0, ())
+            if session_record.lifecycle != "retired":
+                raise RuntimeError("session account is missing on chain and was not retired")
 
-        session_info = await self.transport.endpoint.get_account_info(
-            str(self.addresses.session), Commitment.CONFIRMED
-        )
+            async def already_absent(_record, _info):
+                return None
+
+            for item in reversed(child_records):
+                current = self.inventory.record(item.address)
+                if current.lifecycle == "retired":
+                    await self.inventory.close(item.address, self.transport.endpoint, already_absent)
+                elif current.lifecycle != "closed":
+                    raise RuntimeError(f"session is absent while child {item.address} remains {current.lifecycle}")
+            await self.inventory.close(session_address, self.transport.endpoint, already_absent)
+            self._closed = True
+            return CloseReceipt(0, ())
         closed: list[str] = []
         refunded = 0
-        if session_info is not None:
-            status = session_info.data[6] if len(session_info.data) > 6 else None
-            if status == 1:
-                await self._send(
-                    halt_session(
-                        program_id=self.program_id,
-                        addresses=self.addresses,
-                        authority=self.signers.authority.pubkey(),
-                        cursor=self.cursor,
-                        wire_version=self.wire_version,
-                    ),
-                    expected=((self.addresses.session, True),),
-                )
-
-        child_records = [item for item in created if item.role != "session"]
-        for item in reversed(child_records):
-            address = Pubkey.from_string(item.address)
-            info = await self.transport.endpoint.get_account_info(item.address, Commitment.CONFIRMED)
-            if info is None:
-                self.inventory.mark_closed(item.address)
-                continue
-            refunded += info.lamports
-            kind = KIND_STREAM if item.role == "input_stream" else KIND_STATE
+        status = session_info.data[6] if len(session_info.data) > 6 else None
+        if status == 1:
             await self._send(
-                close_child(
+                halt_session(
                     program_id=self.program_id,
                     addresses=self.addresses,
                     authority=self.signers.authority.pubkey(),
-                    target=address,
-                    kind=kind,
-                    role=item.role,
+                    cursor=self.cursor,
                     wire_version=self.wire_version,
                 ),
-                expected=((address, False),),
+                expected=((self.addresses.session, True),),
             )
-            self.inventory.mark_closed(item.address)
+        elif status != 2:
+            raise RuntimeError(f"session has an unrecognized on-chain status {status!r}; refusing cleanup")
+        if session_record.lifecycle == "live":
+            self.inventory.retire(session_address)
+
+        for item in reversed(child_records):
+            current = self.inventory.record(item.address)
+            if current.lifecycle == "planned":
+                raise RuntimeError(f"account {item.address} is still only planned; reconcile it before cleanup")
+            if current.lifecycle == "live":
+                self.inventory.retire(item.address)
+
+            async def close_child_action(record, _info):
+                child_kind = {
+                    "input_stream": KIND_STREAM,
+                    "view_counter": KIND_VIEW_COUNTER,
+                    "view_total": KIND_VIEW_TOTAL,
+                    "view_scratch": KIND_SCRATCH,
+                }.get(record.role, KIND_STATE)
+                await self._send(
+                    close_child(
+                        program_id=self.program_id,
+                        addresses=self.addresses,
+                        authority=self.signers.authority.pubkey(),
+                        target=Pubkey.from_string(record.address),
+                        kind=child_kind,
+                        role=record.role,
+                        wire_version=self.wire_version,
+                    ),
+                    expected=((Pubkey.from_string(record.address), False),),
+                )
+
+            refunded += await self.inventory.close(item.address, self.transport.endpoint, close_child_action)
             closed.append(item.address)
 
-        current_session = await self.transport.endpoint.get_account_info(
-            str(self.addresses.session), Commitment.CONFIRMED
-        )
-        if current_session is not None:
-            refunded += current_session.lamports
+        async def close_session_action(_record, _info):
             await self._send(
                 encode_close_session(
                     program_id=self.program_id,
@@ -516,13 +585,24 @@ class Session:
                 ),
                 expected=((self.addresses.session, False),),
             )
-            self.inventory.mark_closed(session_record.address)
-            closed.append(session_record.address)
+
+        refunded += await self.inventory.close(session_address, self.transport.endpoint, close_session_action)
+        closed.append(session_address)
         self._closed = True
         return CloseReceipt(refunded, tuple(closed))
 
     async def aclose(self) -> None:
         await self.transport.endpoint.aclose()
+
+    async def _mark_inventory_live(self, address: str) -> None:
+        info = (await self.transport.endpoint.get_multiple_accounts((address,), Commitment.CONFIRMED))[0]
+        if info is None:
+            raise RuntimeError(f"account {address} was not present after its create transaction")
+        self.inventory.mark_live(
+            address,
+            payer=self.signers.public_key,
+            rent_lamports=info.lamports,
+        )
 
     async def _send(self, built: BuiltInstruction, *, expected: Iterable[tuple[Pubkey, bool]]) -> None:
         try:
@@ -536,21 +616,6 @@ class Session:
             if translated is error:
                 raise
             raise translated from error
-
-    def _validate_inventory(self) -> None:
-        expected = {
-            str(self.addresses.session): ("session", None),
-            str(self.addresses.stream): ("input_stream", str(self.addresses.session)),
-            **{
-                str(address): (f"state_span_{index}", str(self.addresses.session))
-                for index, address in enumerate(self.addresses.states)
-            },
-        }
-        for record in self.inventory.accounts:
-            if expected.get(record.address) != (record.role, record.parent):
-                raise RuntimeError("account journal lists an address or parent outside this derived session")
-        if set(item.address for item in self.inventory.accounts) != set(expected):
-            raise RuntimeError("account journal is missing one or more derived session accounts")
 
     def _require_open(self) -> None:
         if not self._opened or self._closed:
