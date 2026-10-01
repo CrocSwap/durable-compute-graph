@@ -3,6 +3,8 @@
 The stream WAL is append-only between checkpoints. Its manifest is a compact
 recovery pointer; event history and terminal detail are sealed in checkpoint
 files. Fixed-plan journal v1 remains implemented by journal.py and is unchanged.
+A complete final WAL row without a trailing newline is accepted and repaired
+with a newline when the stream resumes.
 """
 
 from __future__ import annotations
