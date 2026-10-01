@@ -1,9 +1,10 @@
 """Durable, dependency-aware transaction sequencing for DCG applications."""
 
-from .core import RunResult, Sequencer, StepOutcome
+from .core import RunResult, Sequencer, SequencerStream, StepOutcome
 from .journal import JournalEvent, JournalStore, SCHEMA_VERSION
 from .rpc import RpcConfig, SolanaRpcEndpoint
-from .signer import KeypairFileSigner
+from .signer import KeypairFileSigner, MultiSigner
+from .stream_journal import StreamIdentity, StreamIntent, StreamLimits, StreamTerminal
 from .types import (
     AmbiguousFate,
     AccountInfo,
@@ -14,11 +15,14 @@ from .types import (
     EndpointLimits,
     FailureClass,
     JournalError,
+    LatencyMode,
+    MessageSigner,
     PacketTooLarge,
     PlanError,
     PostconditionResult,
     ProgramRefused,
     RateLimited,
+    ReconciliationRequired,
     RpcConfigurationError,
     RecoveryEvidence,
     RetryPolicy,
@@ -47,12 +51,16 @@ __all__ = [
     "JournalError",
     "JournalEvent",
     "JournalStore",
+    "LatencyMode",
+    "MessageSigner",
+    "MultiSigner",
     "PacketTooLarge",
     "PlanError",
     "PostconditionResult",
     "ProgramRefused",
     "RpcConfig",
     "RateLimited",
+    "ReconciliationRequired",
     "RpcConfigurationError",
     "RecoveryEvidence",
     "RetryPolicy",
@@ -61,6 +69,7 @@ __all__ = [
     "RunResult",
     "SCHEMA_VERSION",
     "Sequencer",
+    "SequencerStream",
     "SequencerConfig",
     "SendReceipt",
     "SolanaRpcEndpoint",
@@ -70,6 +79,10 @@ __all__ = [
     "Signer",
     "StepOutcome",
     "StepTimeCapExceeded",
+    "StreamIdentity",
+    "StreamIntent",
+    "StreamLimits",
+    "StreamTerminal",
     "KeypairFileSigner",
     "TransactionPlan",
     "TransactionStep",
