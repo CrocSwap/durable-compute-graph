@@ -17,6 +17,11 @@ evidence. ``checkpoint`` waits for an app-selected terminal boundary, and
 leave work resumable. Pending plus in-flight steps count against the bound
 until Package C records a terminal summary.
 
+After resume, the adapter must reconcile unresolved packets before signing new
+work. route_policy_digest must be the canonical digest of the configured
+endpoint pool and provider configuration. observations exposes observations
+restored from both active segments and sealed checkpoints.
+
 This module is intentionally not exported from ``dcg.sequencer.__init__`` in
 this package: Package C owns that integration surface.
 """
@@ -38,7 +43,9 @@ from .stream_journal import (
     StreamIntent,
     StreamJournal,
     StreamJournalProtocol,
+    StreamLifecycleEvent,
     StreamLimits,
+    StreamObservation,
     StreamQuotaExceeded,
     StreamTerminal,
 )
@@ -47,7 +54,12 @@ _T = TypeVar("_T")
 
 
 class StreamingPlanProtocol(Protocol):
-    """Typed surface Package C's scheduler consumes from the stream layer."""
+    """Typed stream surface with Package C recovery duties.
+
+    After resume, Package C must reconcile unresolved packets before signing
+    new work. route_policy_digest is a canonical digest of the endpoint-pool
+    and provider configuration.
+    """
 
     @property
     def identity(self) -> StreamIdentity: ...
@@ -64,6 +76,9 @@ class StreamingPlanProtocol(Protocol):
     @property
     def terminal_summaries(self) -> dict[str, StreamTerminal]: ...
 
+    @property
+    def observations(self) -> tuple[StreamObservation, ...]: ...
+
     async def append(self, intent: StreamIntent) -> StreamAppendReceipt: ...
 
     async def checkpoint(self, through_sequence: int | None = None) -> StreamCheckpoint: ...
@@ -74,12 +89,20 @@ class StreamingPlanProtocol(Protocol):
         self, step_id: str, signature: str, raw_bytes: bytes, signer_public_key: str
     ) -> SignedPacketRecord: ...
 
-    async def record_send_attempt(self, step_id: str, generation: int) -> PacketAttempt: ...
+    async def record_send_attempt(
+        self, step_id: str, generation: int, *, provider_id: str, endpoint_id: str | None = None,
+        route_group: str | None = None, route: Any | None = None,
+        route_affinity: str | None = None, disposition: str | None = None
+    ) -> PacketAttempt: ...
 
     async def unresolved_packets(self) -> tuple[SignedPacketRecord, ...]: ...
 
     async def record_send_result(
-        self, step_id: str, generation: int, attempt: int, *, acknowledged: bool, detail: str | None = None
+        self, step_id: str, generation: int, attempt: int, *, acknowledged: bool,
+        provider_id: str | None = None, endpoint_id: str | None = None,
+        route_group: str | None = None, route: Any | None = None, receipt: Any | None = None,
+        route_affinity: str | None = None,
+        disposition: str | None = None, detail: str | None = None
     ) -> PacketAttempt: ...
 
     async def record_observation(
@@ -94,11 +117,33 @@ class StreamingPlanProtocol(Protocol):
         postcondition_digest: str | None,
     ) -> None: ...
 
+    async def record_late_provider_failure(
+        self, step_id: str, generation: int, attempt: int, *, provider_id: str | None = None,
+        endpoint_id: str | None = None, route_group: str | None = None, route: Any | None = None,
+        receipt: Any | None = None, disposition: str | None = None, detail: str,
+        route_affinity: str | None = None
+    ) -> None: ...
+
+    async def record_step_dropped(self, step_id: str, generation: int, *, detail: str) -> None: ...
+
+    async def record_optimistic_branch_invalidated(
+        self, step_id: str, generation: int, *, detail: str
+    ) -> None: ...
+
+    async def record_reconciliation_required(
+        self, step_id: str, generation: int, *, detail: str
+    ) -> None: ...
+
     async def record_terminal(self, terminal: StreamTerminal) -> None: ...
 
 
 class StreamingPlan:
-    """Async stream admission and journal facade used by a live scheduler."""
+    """Async stream facade with package-level reconciliation duties.
+
+    After resume, the application adapter must reconcile unresolved packets
+    before signing new work. StreamIdentity.route_policy_digest must be the
+    canonical digest of the configured endpoint pool and send providers.
+    """
 
     def __init__(self, journal: StreamJournalProtocol, limits: StreamLimits):
         self._journal = journal
@@ -124,15 +169,11 @@ class StreamingPlan:
 
     @property
     def pending_count(self) -> int:
-        return len(self._journal.intents) - len(self._journal.terminals)
+        return self._journal.pending_count
 
     @property
     def pending_intents(self) -> tuple[tuple[int, StreamIntent], ...]:
-        return tuple(
-            (sequence, intent)
-            for step_id, (sequence, intent, _) in sorted(self._journal.intents.items(), key=lambda row: row[1][0])
-            if step_id not in self._journal.terminals
-        )
+        return self._journal.pending_intents
 
     @property
     def sequence_digest(self) -> str:
@@ -140,7 +181,19 @@ class StreamingPlan:
 
     @property
     def terminal_summaries(self) -> dict[str, StreamTerminal]:
-        return dict(self._journal.terminals)
+        return dict(self._journal.terminal_summaries)
+
+    @property
+    def observations(self) -> tuple[StreamObservation, ...]:
+        return self._journal.observations
+
+    @property
+    def lifecycle_events(self) -> tuple[StreamLifecycleEvent, ...]:
+        return self._journal.lifecycle_events
+
+    @property
+    def provider_failures(self) -> tuple[StreamLifecycleEvent, ...]:
+        return self._journal.provider_failures
 
     @property
     def input_closed(self) -> bool:
@@ -181,8 +234,17 @@ class StreamingPlan:
     async def authorize_rebuild(self, step_id: str, generation: int, evidence_digest: str) -> None:
         await _run_thread(self._journal.authorize_rebuild, step_id, generation, evidence_digest)
 
-    async def record_send_attempt(self, step_id: str, generation: int) -> PacketAttempt:
-        return await _run_thread(self._journal.record_send_attempt, step_id, generation)
+    async def record_send_attempt(
+        self, step_id: str, generation: int, *, provider_id: str,
+        endpoint_id: str | None = None, route_group: str | None = None,
+        route: Any | None = None, route_affinity: str | None = None,
+        disposition: str | None = None
+    ) -> PacketAttempt:
+        return await _run_thread(
+            self._journal.record_send_attempt, step_id, generation,
+            provider_id=provider_id, endpoint_id=endpoint_id, route_group=route_group, route=route,
+            route_affinity=route_affinity, disposition=disposition,
+        )
 
     async def unresolved_packets(self) -> tuple[SignedPacketRecord, ...]:
         return await asyncio.to_thread(self._journal.unresolved_packets)
@@ -194,6 +256,13 @@ class StreamingPlan:
         attempt: int,
         *,
         acknowledged: bool,
+        provider_id: str | None = None,
+        endpoint_id: str | None = None,
+        route_group: str | None = None,
+        route: Any | None = None,
+        receipt: Any | None = None,
+        route_affinity: str | None = None,
+        disposition: str | None = None,
         detail: str | None = None,
     ) -> PacketAttempt:
         return await _run_thread(
@@ -202,6 +271,13 @@ class StreamingPlan:
             generation,
             attempt,
             acknowledged=acknowledged,
+            provider_id=provider_id,
+            endpoint_id=endpoint_id,
+            route_group=route_group,
+            route=route,
+            receipt=receipt,
+            route_affinity=route_affinity,
+            disposition=disposition,
             detail=detail,
         )
 
@@ -225,6 +301,36 @@ class StreamingPlan:
             slot=slot,
             postcondition_satisfied=postcondition_satisfied,
             postcondition_digest=postcondition_digest,
+        )
+
+    async def record_late_provider_failure(
+        self, step_id: str, generation: int, attempt: int, *, provider_id: str | None = None,
+        endpoint_id: str | None = None, route_group: str | None = None, route: Any | None = None,
+        receipt: Any | None = None, disposition: str | None = None, detail: str,
+        route_affinity: str | None = None
+    ) -> None:
+        await _run_thread(
+            self._journal.record_late_provider_failure, step_id, generation, attempt,
+            provider_id=provider_id, endpoint_id=endpoint_id, route_group=route_group,
+            route=route, receipt=receipt, route_affinity=route_affinity,
+            disposition=disposition, detail=detail,
+        )
+
+    async def record_step_dropped(self, step_id: str, generation: int, *, detail: str) -> None:
+        await _run_thread(self._journal.record_step_dropped, step_id, generation, detail=detail)
+
+    async def record_optimistic_branch_invalidated(
+        self, step_id: str, generation: int, *, detail: str
+    ) -> None:
+        await _run_thread(
+            self._journal.record_optimistic_branch_invalidated, step_id, generation, detail=detail
+        )
+
+    async def record_reconciliation_required(
+        self, step_id: str, generation: int, *, detail: str
+    ) -> None:
+        await _run_thread(
+            self._journal.record_reconciliation_required, step_id, generation, detail=detail
         )
 
     async def record_terminal(self, terminal: StreamTerminal) -> None:
@@ -264,6 +370,11 @@ class StreamingPlan:
             while self.pending_count >= self.limits.max_pending_steps and not self._journal.input_closed:
                 await self._condition.wait()
 
+    async def close(self) -> None:
+        """Release the process-wide single-writer lock."""
+
+        await asyncio.to_thread(self._journal.close)
+
 
 async def _run_thread(function: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
     """Keep the async admission lock until an fsync operation really finishes."""
@@ -291,7 +402,9 @@ __all__ = [
     "StreamIdentity",
     "StreamIntent",
     "StreamJournalProtocol",
+    "StreamLifecycleEvent",
     "StreamLimits",
+    "StreamObservation",
     "StreamQuotaExceeded",
     "StreamTerminal",
     "StreamingPlan",
