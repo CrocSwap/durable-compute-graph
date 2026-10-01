@@ -19,7 +19,13 @@ pub mod decision {
     pub const FORM_ID: u16 = 47;
     pub const GATHER_FORM_ID: u16 = 48;
     pub const MAX_OPTIONS_SINGLE: usize = 80;
+    /// DRB1 v2 encodes the option count as `u8`; the arithmetic accepts every
+    /// nonzero count representable by that field, independently of a form's
+    /// tighter admission limit.
+    pub const MAX_OPTIONS: usize = u8::MAX as usize;
     pub const ERR_OPTION_RANGE: u32 = 813;
+    pub const ERR_OPTION_COUNT_ZERO: u32 = 814;
+    pub const ERR_OPTION_COUNT_CAP: u32 = 815;
     /// Compiler-v1 Form-47 geometry version used by the revision-8 program.
     const FORM_GEOMETRY_VERSION: u16 = 2;
 
@@ -27,12 +33,16 @@ pub mod decision {
     pub struct Refusal(pub u32);
 
     pub fn check_options(options: &[u32], logits: usize) -> Result<(), Refusal> {
-        let mut previous = None;
+        if options.is_empty() {
+            return Err(Refusal(ERR_OPTION_COUNT_ZERO));
+        }
+        if options.len() > MAX_OPTIONS {
+            return Err(Refusal(ERR_OPTION_COUNT_CAP));
+        }
         for &option in options {
-            if option as usize >= logits || previous.is_some_and(|p| p >= option) {
+            if option as usize >= logits {
                 return Err(Refusal(ERR_OPTION_RANGE));
             }
-            previous = Some(option);
         }
         Ok(())
     }
@@ -53,7 +63,7 @@ pub mod decision {
             || u16::from_le_bytes([raw[0], raw[1]]) != FORM_GEOMETRY_VERSION
             || raw[3] != 0
         {
-            return Err(Refusal(ERR_OPTION_RANGE));
+            return Err(Refusal(crate::descriptor::err::EXEC_KERNEL_GEOMETRY));
         }
         let option_capacity = raw[2] as usize;
         let option_region_id = u16::from_le_bytes([raw[4], raw[5]]);
@@ -61,7 +71,7 @@ pub mod decision {
         let logits_base_offset = u64::from_le_bytes(
             raw[8..16]
                 .try_into()
-                .map_err(|_| Refusal(ERR_OPTION_RANGE))?,
+                .map_err(|_| Refusal(crate::descriptor::err::EXEC_KERNEL_GEOMETRY))?,
         );
         if option_capacity != 128
             || option_region_id != u16::MAX
@@ -69,7 +79,7 @@ pub mod decision {
                 .checked_add((LOGITS_ROW_LENGTH * 8) as u64)
                 .is_none()
         {
-            return Err(Refusal(ERR_OPTION_RANGE));
+            return Err(Refusal(crate::descriptor::err::EXEC_KERNEL_GEOMETRY));
         }
         Ok(FormGeometry {
             option_capacity,
@@ -103,7 +113,10 @@ pub mod decision {
             );
 
             let refuse = |raw: &[u8]| {
-                assert_eq!(decode_form_geometry(raw), Err(Refusal(ERR_OPTION_RANGE)));
+                assert_eq!(
+                    decode_form_geometry(raw),
+                    Err(Refusal(crate::descriptor::err::EXEC_KERNEL_GEOMETRY))
+                );
             };
 
             let mut wrong_version = COMPILER_V1_FORM47_GEOMETRY_V2;
@@ -119,6 +132,23 @@ pub mod decision {
             refuse(&wrong_option_region);
 
             refuse(&COMPILER_V1_FORM47_GEOMETRY_V2[..15]);
+        }
+
+        #[test]
+        fn option_table_order_and_duplicates_are_preserved() {
+            assert_eq!(check_options(&[5, 3], 8), Ok(()));
+            assert_eq!(check_options(&[17, 17], 18), Ok(()));
+            assert_eq!(check_options(&[17, 17], 17), Err(Refusal(ERR_OPTION_RANGE)));
+        }
+
+        #[test]
+        fn option_table_refuses_only_empty_oversized_and_out_of_row_inputs() {
+            assert_eq!(check_options(&[], 18), Err(Refusal(ERR_OPTION_COUNT_ZERO)));
+            assert_eq!(
+                check_options(&vec![0; MAX_OPTIONS + 1], usize::MAX),
+                Err(Refusal(ERR_OPTION_COUNT_CAP))
+            );
+            assert_eq!(check_options(&[5, 3], 5), Err(Refusal(ERR_OPTION_RANGE)));
         }
     }
 }
