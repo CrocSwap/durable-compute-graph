@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.signature import Signature
 
 from .types import BlockhashLease, SignedTransaction
 
@@ -74,6 +77,93 @@ class KeypairFileSigner:
         signature_bytes = bytes(signature)
         raw_transaction = _shortvec(1) + signature_bytes + message
         return SignedTransaction(signature=str(signature), raw_bytes=raw_transaction)
+
+    async def sign_message(self, message: bytes) -> bytes:
+        """Return this injected keypair's signature for a multi-signer message."""
+
+        required, signers = _message_signers(message)
+        if required <= 1 or self._public_key_bytes not in signers:
+            raise ValueError("keypair is not a required signer in the supplied message")
+        return bytes(self._keypair.sign_message(message))
+
+
+class MultiSigner:
+    """Combine signatures from explicitly injected message signers.
+
+    The signer order must match the required-signer prefix in the transaction
+    message. This object retains only the signer objects supplied by its
+    caller and never reads or discovers key material.
+    """
+
+    def __init__(self, signers):
+        self._signers = tuple(signers)
+        if len(self._signers) < 2:
+            raise ValueError("MultiSigner requires at least two injected signers")
+        keys = tuple(signer.public_key for signer in self._signers)
+        if any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
+            raise ValueError("injected signer public keys must be non-empty and unique")
+        self._public_keys = keys
+
+    @property
+    def public_key(self) -> str:
+        return self._public_keys[0]
+
+    @property
+    def public_keys(self) -> tuple[str, ...]:
+        return self._public_keys
+
+    @property
+    def signature_count(self) -> int:
+        return len(self._signers)
+
+    @property
+    def signature_size_bytes(self) -> int:
+        return 64
+
+    async def sign(self, message: bytes, lease: BlockhashLease) -> SignedTransaction:
+        del lease
+        required, message_signers = _message_signers(message)
+        expected = tuple(_pubkey_bytes(key) for key in self._public_keys)
+        if required != len(expected) or message_signers != expected:
+            raise ValueError("transaction required signers do not match the injected signer order")
+        signatures = await asyncio.gather(*(signer.sign_message(message) for signer in self._signers))
+        if any(not isinstance(signature, bytes) or len(signature) != 64 for signature in signatures):
+            raise ValueError("message signers must return exactly 64 signature bytes")
+        if any(
+            not Signature.from_bytes(signature).verify(Pubkey.from_bytes(public_key), message)
+            for public_key, signature in zip(expected, signatures, strict=True)
+        ):
+            raise ValueError("an injected signer returned a signature that does not verify")
+        signature = str(Signature.from_bytes(signatures[0]))
+        return SignedTransaction(signature=signature, raw_bytes=_shortvec(len(signatures)) + b"".join(signatures) + message)
+
+
+def _pubkey_bytes(value: str) -> bytes:
+    from solders.pubkey import Pubkey
+
+    return bytes(Pubkey.from_string(value))
+
+
+def _message_signers(message: bytes) -> tuple[int, tuple[bytes, ...]]:
+    if not message:
+        raise ValueError("transaction message is empty")
+    versioned = bool(message[0] & 0x80)
+    header_at = 1 if versioned else 0
+    if versioned and (message[0] & 0x7F) != 0:
+        raise ValueError("unsupported versioned transaction message")
+    if len(message) < header_at + 3:
+        raise ValueError("transaction message header is truncated")
+    required = message[header_at]
+    account_count, account_keys_at = _read_shortvec(message, header_at + 3)
+    if account_count == 0 or required == 0 or required > account_count:
+        raise ValueError("transaction message has an invalid signer header")
+    key_end = account_keys_at + 32 * account_count
+    if key_end > len(message):
+        raise ValueError("transaction message account keys are truncated")
+    return required, tuple(
+        message[account_keys_at + index * 32 : account_keys_at + (index + 1) * 32]
+        for index in range(required)
+    )
 
 
 def _message_signer(message: bytes) -> tuple[int, bytes]:

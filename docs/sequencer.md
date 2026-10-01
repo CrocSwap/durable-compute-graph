@@ -33,10 +33,13 @@ blockhash lease and rejects a mismatch with the plan. Account reads accept
 `confirmed` or `finalized`; simulations accept the requested commitment.
 Metadata not returned by `getSignatureStatuses` remains `None`.
 
-Concurrent single-signature polls are coalesced for a short configurable
-window and sent as `getSignatureStatuses([signatures])`, in groups capped at
-256 by default. One endpoint-wide limiter spaces all RPC calls and bounds
-in-flight requests. HTTP 429 and JSON-RPC rate-limit errors become
+`Sequencer` puts every blockhash, status, account and send request through an
+`EndpointPool`. Each node has independent send and total-request rates, an
+in-flight cap, a weight and a route group. A single confirmation pump coalesces
+signature watches across fixed-plan steps, stream lanes and send providers;
+status batches are capped at 256 by default. The pool is the authoritative
+limiter, so configure `SolanaRpcEndpoint`'s own limiter high enough that it
+does not impose a lower competing cap. HTTP 429 and JSON-RPC rate-limit errors become
 `RateLimited` and honor `Retry-After`; timeouts, transport failures, and 5xx
 responses become `RpcUnavailable`; explicit blockhash errors become
 `BlockhashExpired`; and explicit instruction/program errors become
@@ -48,10 +51,15 @@ not authorize a fresh signature.
 keypair into memory and supports one required transaction signer. It validates
 that the message fee payer matches the keypair before signing. A regression
 test checks that private key bytes do not appear in captured output or the
-journal. Hardware or remote signers can implement the same `Signer` protocol,
-keeping signing custody outside the sequencer. This round does not provide a
-multisigner aggregator; callers that build transactions with additional
-required signers need to supply that adapter before submitting those messages.
+journal. Hardware or remote signers can implement the `Signer` protocol,
+keeping signing custody outside the sequencer. `MultiSigner` combines multiple
+injected `MessageSigner` implementations in the required-signer order encoded
+by the Solana message. It checks that this order matches the supplied signer
+set and that each signer returns a 64-byte signature. The first signer remains
+the plan's primary signer; fixed-plan identity and digest also bind the full
+ordered signer list when a plan uses multiple signers. Every returned
+signature is verified against its required message key before the transaction
+is assembled. The sequencer never opens or discovers additional key material.
 
 ```python
 from dcg.sequencer import KeypairFileSigner, RpcConfig, SolanaRpcEndpoint
@@ -164,13 +172,152 @@ validation rejects unknown/cyclic
 dependencies, missing endpoint limits, invalid budgets, duplicate step IDs,
 and signer or plan identity mismatches before signing.
 
-The sequencer fires up to `max_batch_size` ready independent steps together.
-Declared dependencies gate the next wave. Steps sharing a declared write lock
-are placed in separate waves. A batch means concurrent RPC sends; it is not an
-atomic transaction and send order does not imply landing order. Endpoint
-`sends_per_second` spaces sends, and `max_in_flight` bounds active transactions
-from preparation through confirmation. These limits are local configured
-caps, not measured network capacity.
+For fixed plans, the sequencer fires up to `max_batch_size` ready independent
+steps together. Declared dependencies gate the next wave. Steps sharing a
+declared write lock are placed in separate waves. A batch means concurrent
+sends; it is not an atomic transaction and send order does not imply landing
+order. Each signed send attempt is journaled and fsynced first; the sequencer
+then acquires a `RequestKind.SEND` pool lease immediately before handing the
+exact packet bytes to its provider. RPC and TPU/QUIC use the same lease rule.
+The lease selects the observer endpoint recorded for the attempt, including
+when a shared TPU helper carries the packet.
+
+The default health policy cools a node after three consecutive transport
+failures or immediately after any rate limit/429. Its base cooldown is one
+second, doubling up to 60 seconds, followed by a probe before normal traffic
+resumes. These values, each node's rates and in-flight cap, pool acquisition
+deadline, and health thresholds are configurable through `SequencerConfig`
+and `EndpointLimits`. They are operator caps, not measured network capacity.
+
+```python
+from dcg.sequencer import EndpointLimits, SequencerConfig
+
+config = SequencerConfig(
+    endpoint_limits={
+        "rpc-a": EndpointLimits(
+            sends_per_second=8,
+            requests_per_second=40,
+            max_in_flight=4,
+            weight=2,
+            route_group="cluster-a",
+        ),
+        "rpc-b": EndpointLimits(
+            sends_per_second=4,
+            requests_per_second=20,
+            max_in_flight=2,
+            route_group="cluster-a",
+        ),
+    },
+)
+```
+
+RPC is the default send provider. A configured provider can instead submit
+signed bytes through TPU/QUIC; status and application state observations
+still use the checked RPC endpoints. Provider handoff acknowledgments do not
+prove landing. A helper failure leaves the signature ambiguous and the
+journaled bytes authoritative.
+
+In streaming mode, asynchronous TPU `ERR` records are matched to their
+acknowledged signature and recorded as `late_provider_failure`; a provider's
+existing failure callback is preserved and chained. Errors without a matching
+active stream attempt are kept in a bounded 256-entry
+`sequencer.unmatched_provider_failures` queue for application handling.
+Fixed-plan v1 has no late-provider event, so its journal shape is unchanged;
+its asynchronous failures remain available in that queue and the provider's
+own bounded `drain_failures()` queue.
+
+## Streaming plans
+
+`Sequencer.open_stream()` adds open-ended scheduling while retaining
+`TransactionPlan` and `submit`/`resume` for finite work. The stream identity
+binds the run, genesis, program, destination accounts, signer set, route-policy
+digest and commitment policy. Each append is a durable `StreamIntent` with a
+monotonic sequence, stable digest, dependencies, route group, compute and
+packet limits, and write locks. A callback builds the transaction step from
+that intent; it cannot change the durable intent fields.
+
+```python
+from dcg.sequencer import (
+    StreamIdentity,
+    StreamIntent,
+    StreamLimits,
+)
+
+identity = StreamIdentity(
+    run_id="render-session-17",
+    genesis_hash=genesis_hash,
+    program_id=program_id,
+    destination_accounts=(session_account, workspace_account),
+    signer_public_keys=(signer.public_key,),
+    route_policy_digest=sequencer.route_policy_digest,
+    commitment_policy="confirmed",
+)
+stream = await sequencer.open_stream(
+    identity,
+    "out/sequencer/render-session-17",
+    build_step_from_intent,
+    limits=StreamLimits(
+        max_pending_steps=128,
+        max_journal_bytes=1_000_000_000,
+    ),
+)
+await stream.append(StreamIntent(
+    step_id="advance-0",
+    dependencies=(),
+    route_group="cluster-a",
+    route_affinity="session-lane",
+    compute_class="advance",
+    compute_unit_limit=180_000,
+    intent_digest="sha256-of-stable-advance-intent",
+    recovery_policy_digest="sha256-of-postcondition-and-recovery-policy",
+    intent_data={"cursor": 1},
+    write_locks=(session_account,),
+))
+await stream.checkpoint()
+await stream.close_input(wait_for_pending=True)
+result = await stream.wait()
+```
+
+The stream queue is bounded and `append` applies backpressure at its configured
+pending-step limit. The configured journal quota defaults to 1 GB; exact signed
+packets and every attempt stay in the journal until safe terminal handling.
+Call `checkpoint()` at an application-selected terminal prefix. Package B
+compacts the stream into the latest checkpoint and deletes the older checkpoint
+and covered segments after the new manifest pointer commits. The effective
+checkpoint retention is therefore one, including with the default
+`SequencerConfig.stream_checkpoint_retention=2`; that setting is currently
+validated but does not change Package B's compaction policy. Keeping only the
+latest checkpoint is safe because it contains the state needed to resume, and
+the prior files are removed only after the new pointer commits. Quota exhaustion
+stops new appends rather than evicting unresolved signed work.
+
+The default `LatencyMode.CONFIRMED` releases dependents only after the
+configured stable commitment. `LatencyMode.PROCESSED` can release bounded
+optimistic descendants after a parent reaches `processed`: the default limit
+is two dependency steps or two seconds per unresolved branch. Optimistic
+outcomes carry `optimistic=True` and appear in `RunResult.optimistic_steps`;
+they are not confirmed outcomes. The journal labels each observation as
+`optimistic`, `stable`, or `unresolved`; `SequencerStream.optimistic_steps`
+lists pending steps whose latest observation remains optimistic. Processed mode
+requires an app-supplied `reconcile_dropped` callback. If a processed signature
+disappears, the journal records the drop and branch invalidation. The callback
+reads app-owned state, and the scheduler checks every already-signed descendant's signature and
+postcondition through its callback, and then raises `ReconciliationRequired`.
+It does not automatically replay or replace signed bytes. Package B's
+`reconciliation_required` method also accepts unsigned descendants, so each
+invalidated pending intent is journaled even when it never received a packet.
+After application reconciliation, the adapter can journal a `continue`,
+`rebuild`, or `abandon` decision with its evidence digest. An abandoned
+descendant is released from the pending bound only after a terminal
+`abandoned` summary references that decision; this outcome has no stable
+commitment. For signed work, abandonment remains the application's decision
+and requires evidence that the packet can no longer land.
+
+The stream shares one batched confirmation pump across lanes and configured
+send providers. Steps with overlapping write locks serialize; independent
+lanes can run concurrently subject to pool admission. Checkpoint and stream
+journal formats are versioned separately from fixed-plan v1. The fixed-plan
+v1 manifest, digest and event shape remain unchanged for single-signer plans.
 
 The caller sets a compute class and a transaction-level CU limit for every
 step. The core records these values and checks packet size, but it does not
@@ -276,9 +423,15 @@ for resume. This bounds one step, not the overall plan.
   lifetime. Other networks should configure their own bound.
 - **Designed:** every step requires caller-provided compute class and CU limit;
   no generic CU values are asserted.
-- **Open:** external-cluster behavior, multisigner transaction support, live
-  network limits and storage-device power-loss behavior have not been
-  exercised in this package round.
+- **Designed:** endpoint cooldown starts at one second, doubles to a 60-second
+  cap, and requires three consecutive transport failures or any rate limit;
+  after cooldown the next bounded request is a probe.
+- **Designed:** stream quota defaults to 1 GB, and processed optimism is
+  bounded to two steps or two seconds. Package B currently retains only the
+  latest compacted checkpoint; see Streaming plans.
+- **Open:** external-cluster behavior, live network limits, TPU helper runtime
+  packaging, and storage-device power-loss behavior have not been exercised
+  in this package round.
 
 ## Run against a local validator
 

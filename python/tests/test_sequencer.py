@@ -9,6 +9,10 @@ import time
 import unittest
 from pathlib import Path
 
+from solders.keypair import Keypair
+from solders.signature import Signature
+
+from dcg.sequencer.pool import EndpointNodeConfig, EndpointPool
 from dcg.sequencer import (
     AmbiguousFate,
     Backoff,
@@ -43,7 +47,8 @@ class SimulatedCrash(Exception):
 class FakeSigner:
     def __init__(self, secret: bytes = b"SECRET_KEY_MUST_NOT_ENTER_THE_JOURNAL"):
         self.secret = secret
-        self._public_key = "SignerPublicKey111111111111111111111111111111"
+        self._keypair = Keypair.from_seed(hashlib.sha256(secret).digest())
+        self._public_key = str(self._keypair.pubkey())
         self.sign_calls = 0
 
     @property
@@ -60,15 +65,16 @@ class FakeSigner:
 
     async def sign(self, message: bytes, lease: BlockhashLease) -> SignedTransaction:
         self.sign_calls += 1
-        signature = hashlib.sha256(self.secret + message + lease.blockhash.encode()).hexdigest()[:48]
-        raw = b"\x01" + signature.encode().ljust(64, b"\0") + message
-        return SignedTransaction(signature, raw)
+        del lease
+        signature = self._keypair.sign_message(message)
+        raw = b"\x01" + bytes(signature) + message
+        return SignedTransaction(str(signature), raw)
 
 
 class FakeRpc:
     endpoint_id = "rpc-a"
 
-    def __init__(self):
+    def __init__(self, clock=time.monotonic):
         self.behaviors: list[str] = []
         self.status_behaviors: list[str] = []
         self.statuses: dict[str, SignatureObservation] = {}
@@ -87,6 +93,7 @@ class FakeRpc:
         self.max_active_sends = 0
         self.blockhash_count = 0
         self.status_calls = 0
+        self.clock = clock
 
     async def latest_blockhash(self, genesis_hash: str, lifetime_seconds: float) -> BlockhashLease:
         if self.hang_on_blockhash:
@@ -104,7 +111,7 @@ class FakeRpc:
     async def send_raw_transaction(self, raw_bytes: bytes):
         self.active_sends += 1
         self.max_active_sends = max(self.max_active_sends, self.active_sends)
-        self.send_started_times.append(time.monotonic())
+        self.send_started_times.append(self.clock())
         try:
             if self.send_delay:
                 await asyncio.sleep(self.send_delay)
@@ -117,7 +124,7 @@ class FakeRpc:
             if behavior == "blockhash-expired":
                 raise BlockhashExpired("injected expired blockhash")
 
-            signature = raw_bytes[1:65].rstrip(b"\0").decode()
+            signature = str(Signature.from_bytes(raw_bytes[1:65]))
             already_seen = signature in self.packets_by_signature
             if already_seen:
                 self.duplicate_count += 1
@@ -212,11 +219,20 @@ def config(
     time_cap: float = 1.0,
 ) -> SequencerConfig:
     return SequencerConfig(
-        endpoint_limits={"rpc-a": EndpointLimits(sends_per_second=100_000, max_in_flight=max_in_flight)},
+        endpoint_limits={
+            "rpc-a": EndpointLimits(
+                sends_per_second=100_000,
+                max_in_flight=max_in_flight,
+                requests_per_second=100_000,
+            )
+        },
         max_batch_size=batch_size,
         per_step_time_cap_seconds=time_cap,
         confirmation_poll_seconds=0,
         backoff=Backoff(initial_seconds=0, maximum_seconds=0, multiplier=2),
+        health_cooldown_seconds=0.001,
+        health_max_cooldown_seconds=0.01,
+        pool_acquire_timeout_seconds=1.0,
     )
 
 
@@ -276,18 +292,65 @@ class SequencerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rpc.max_active_sends, 2)
 
     async def test_endpoint_send_rate_spaces_packets(self):
-        rpc = FakeRpc()
+        class InjectedClock:
+            def __init__(self):
+                self.now = 100.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        clock = InjectedClock()
+        rpc = FakeRpc(clock)
         limited = SequencerConfig(
             endpoint_limits={"rpc-a": EndpointLimits(sends_per_second=10, max_in_flight=8)},
             max_batch_size=4,
             per_step_time_cap_seconds=2,
             confirmation_poll_seconds=0,
             backoff=Backoff(initial_seconds=0, maximum_seconds=0, multiplier=2),
+            monotonic_clock=clock,
+            status_batch_window_seconds=0,
+            health_cooldown_seconds=0.001,
+            health_max_cooldown_seconds=0.01,
         )
-        await self.sequencer(rpc, cfg=limited).submit(plan(step("a"), step("b"), step("c")), self.journal())
+        pool = EndpointPool(
+            [
+                EndpointNodeConfig(
+                    endpoint=rpc,
+                    sends_per_second=10,
+                    requests_per_second=1e300,
+                    max_in_flight=8,
+                    route_group="rpc-a",
+                )
+            ],
+            clock=clock,
+            default_acquire_timeout_seconds=1,
+        )
+        task = asyncio.create_task(
+            Sequencer(
+                endpoints={"rpc-a": rpc},
+                signer=FakeSigner(),
+                config=limited,
+                pool=pool,
+            ).submit(plan(step("a"), step("b"), step("c")), self.journal())
+        )
+        advanced_for_send_count = 0
+        for _ in range(1000):
+            if task.done():
+                break
+            if len(rpc.send_started_times) > advanced_for_send_count:
+                clock.advance(0.1)
+                advanced_for_send_count = len(rpc.send_started_times)
+                async with pool._condition:  # test-only wake after advancing the injected clock
+                    pool._condition.notify_all()
+            await asyncio.sleep(0)
+        await task
         deltas = [right - left for left, right in zip(rpc.send_started_times, rpc.send_started_times[1:])]
         self.assertEqual(len(deltas), 2)
-        self.assertTrue(all(delta >= 0.08 for delta in deltas), deltas)
+        for delta in deltas:
+            self.assertAlmostEqual(delta, 0.1)
 
     async def test_signed_packet_is_fsynced_before_provider_handoff(self):
         class JournalAwareRpc(FakeRpc):
