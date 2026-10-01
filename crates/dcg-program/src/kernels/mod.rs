@@ -26,8 +26,9 @@ pub mod decision {
     pub const ERR_OPTION_RANGE: u32 = 813;
     pub const ERR_OPTION_COUNT_ZERO: u32 = 814;
     pub const ERR_OPTION_COUNT_CAP: u32 = 815;
-    /// Compiler-v1 Form-47 geometry version used by the revision-8 program.
-    const FORM_GEOMETRY_VERSION: u16 = 2;
+    /// Revision-selected Form-47 geometry version. Revision 7 retains the
+    /// original version-1 bytes; revision 8 consumes compiler-v1 version 2.
+    const FORM_GEOMETRY_VERSION: u16 = if cfg!(feature = "revision-8") { 2 } else { 1 };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Refusal(pub u32);
@@ -98,6 +99,7 @@ pub mod decision {
             0x00, 0x00,
         ];
 
+        #[cfg(feature = "revision-8")]
         #[test]
         fn form47_geometry_v2_compiler_golden_guard() {
             let decoded = decode_form_geometry(&COMPILER_V1_FORM47_GEOMETRY_V2)
@@ -132,6 +134,19 @@ pub mod decision {
             refuse(&wrong_option_region);
 
             refuse(&COMPILER_V1_FORM47_GEOMETRY_V2[..15]);
+        }
+
+        #[cfg(not(feature = "revision-8"))]
+        #[test]
+        fn revision7_form47_geometry_uses_version_one() {
+            let mut version_one = COMPILER_V1_FORM47_GEOMETRY_V2;
+            version_one[..2].copy_from_slice(&1u16.to_le_bytes());
+            assert!(decode_form_geometry(&version_one).is_ok());
+
+            assert_eq!(
+                decode_form_geometry(&COMPILER_V1_FORM47_GEOMETRY_V2),
+                Err(Refusal(crate::descriptor::err::EXEC_KERNEL_GEOMETRY))
+            );
         }
 
         #[test]

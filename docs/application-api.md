@@ -144,3 +144,15 @@ Tests regenerate its deterministic account bodies and account-content folds,
 then compare the 84-account, reordered, repartitioned, and single-account
 roots. DRS1 state, address derivation, tags 14–15, and supplied-window
 handling are outside this module.
+
+## Revision-8 template-term hook
+
+`ApplicationHooks::check_terms2_template` is an additive app policy hook. On
+`UnifiedInit`, DCG first applies the revision-8 core checks 17–20: the abandon
+window stays between the template's minimum and maximum, the challenge and
+response windows stay within their maxima, and the abandon window stays within
+the document lifetime. A core refusal is `791`. The application hook runs only
+after those checks pass and may return another refusal; returning `Ok(())`
+cannot permit terms outside the template owner's limits. The default
+compatibility hook repeats the same comparisons, preserving its existing
+admission results.
