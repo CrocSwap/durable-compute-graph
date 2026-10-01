@@ -69,6 +69,17 @@ class SessionSigners:
         return str(self.payer.pubkey())
 
     @property
+    def public_keys(self) -> tuple[str, ...]:
+        """Every distinct required signer, fee payer first (stream identity binding)."""
+
+        keys = [str(self.payer.pubkey())]
+        for keypair in self._by_pubkey.values():
+            key = str(keypair.pubkey())
+            if key not in keys:
+                keys.append(key)
+        return tuple(keys)
+
+    @property
     def signature_count(self) -> int:
         return len(self._by_pubkey)
 
