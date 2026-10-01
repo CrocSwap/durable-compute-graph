@@ -1571,6 +1571,10 @@ def _validate_manifest(manifest: KernelManifestV1) -> None:
                 raise GraphError("MUTABILITY", "input is read-only and output is kernel-written")
             if port.alias_rule not in (0, 1, 2):
                 raise GraphError("ALIAS_RULE", "unknown alias rule")
+            if port.alias_rule == 1 and port.direction != 0:
+                raise GraphError("ALIAS_RULE", "read-only sharing is valid only on input ports")
+            if port.alias_rule == 2:
+                raise GraphError("ALIAS_RULE_OPEN", "exact in-place alias pairing is not defined by DCKC v1")
             shape_bytes = 1
             for dim in port.dimensions:
                 shape_bytes *= dim
@@ -1614,6 +1618,8 @@ def _validate_manifest(manifest: KernelManifestV1) -> None:
             if replay is not None:
                 if not replay.abi_id or not replay.abi_version:
                     raise GraphError("REPLAY_ABI", "replay ABI ID/version must be nonzero")
+                if replay.max_opening_bytes == 0:
+                    raise GraphError("OPENING_LIMIT", "replay opening maximum must be nonzero")
                 if replay.max_opening_bytes > MAX_OPENING_BYTES:
                     raise GraphError("OPENING_LIMIT", f"replay opening exceeds {MAX_OPENING_BYTES}")
         _strictly_sorted(kernel.error_mappings, lambda e: e.condition_id, "ORDER", GraphError)
