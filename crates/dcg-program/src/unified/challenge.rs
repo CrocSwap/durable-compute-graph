@@ -3520,7 +3520,7 @@ mod tests {
         let descriptor = [0x42; 32];
         let executor = Pubkey::new_unique();
         let first_challenger = Pubkey::new_unique();
-        let (doc_key, _) = address::document(&program, &descriptor);
+        let (doc_key, doc_bump) = address::document(&program, &descriptor);
         let mut doc_lamports = 10_000_000;
         let mut doc_data = vec![0; document::OPTION_REGION_AT];
         doc_data[..4].copy_from_slice(b"DCM2");
@@ -3529,6 +3529,7 @@ mod tests {
             .copy_from_slice(&(document::FLAG_ROOT_ONLY | document::FLAG_SEALED).to_le_bytes());
         doc_data[8..40].copy_from_slice(&descriptor);
         doc_data[40..72].copy_from_slice(executor.as_ref());
+        doc_data[document::DCM2_BUMP_AT] = doc_bump.value();
         // Keep a CUSTOM policy and a nonzero old window encoded. Revision 8 RULE
         // does not read that window and leaves DCR1[170..178] zero.
         doc_data[TERMS_AT_V8 + 48] = 1;
@@ -3553,7 +3554,9 @@ mod tests {
             raw[72..104].copy_from_slice(&descriptor);
             raw[140..144].copy_from_slice(&nonce.to_le_bytes());
             raw[170..178].fill(0xA5);
-            let key = address::challenge(&program, &descriptor, challenger, nonce).0;
+            let (key, bump) = address::challenge(&program, &descriptor, challenger, nonce);
+            raw[RECORD_BUMP_AT] = bump.value();
+            raw[RECORD_BUMP_MARKER_AT] = 1;
             (key, raw)
         };
 

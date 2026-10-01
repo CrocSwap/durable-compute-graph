@@ -1677,7 +1677,7 @@ pub fn init_v8_with_application(
         // the question is the same one the terms decode above just answered.
         // Check 20 is the load-bearing one: it is what makes the finalize
         // budget's subtraction non-negative at tag 165.
-        terms.check_template(&limits).map_err(no)?;
+        terms.check_template_with(&limits, hooks).map_err(no)?;
         // 3. Registry and admission record.
         let reg = registry::frozen(program, drp2, None)?;
         let adm = admission::view_with_bump(program, dea2, true, admission_bump)?;
@@ -2426,7 +2426,14 @@ pub fn finalize_v8_with_hooks(
         let doc = accounts[1].try_borrow_data()?;
         Binding2::decode(&doc[BINDING_AT_V8..BINDING_AT_V8 + BINDING_BYTES_V8]).map_err(no)?
     };
-    super::result::view_v8(program, &accounts[2], &descriptor, true)?;
+    super::result::view_v8_status_with_hooks(
+        program,
+        &accounts[2],
+        &descriptor,
+        true,
+        super::result::STATUS_SETTLED,
+        hooks,
+    )?;
     let doc = accounts[1].try_borrow_data()?;
     if !accounts[0].is_signer || accounts[0].key.as_ref() != &doc[40..72] {
         return Err(no(CL_AUTHORITY));
@@ -2559,6 +2566,78 @@ pub fn finalize_v8_with_hooks(
 mod tests {
     use super::*;
     use crate::unified::classes::tests::{golden, hex, rung_d, unhex, view, FAMILY_BODY};
+
+    const TEST_HOOK_REFUSAL: u32 = 0x7ff0;
+
+    struct RefuseTemplateHook;
+
+    impl crate::compatibility::ApplicationHooks for RefuseTemplateHook {
+        fn check_terms_v1(
+            &self,
+            terms: &crate::unified::terms::Terms,
+            round_floor_slots: u64,
+        ) -> Result<(), u32> {
+            crate::compatibility::REVISION8_COMPATIBILITY.check_terms_v1(terms, round_floor_slots)
+        }
+
+        fn check_terms_v2(&self, terms: &Terms2, round_floor_slots: u64) -> Result<(), u32> {
+            crate::compatibility::REVISION8_COMPATIBILITY.check_terms_v2(terms, round_floor_slots)
+        }
+
+        fn check_terms2_template(
+            &self,
+            _terms: &Terms2,
+            _limits: &super::super::config::TemplateLimits,
+        ) -> Result<(), u32> {
+            Err(TEST_HOOK_REFUSAL)
+        }
+
+        fn check_template_limits(
+            &self,
+            limits: &super::super::config::TemplateLimits,
+            seal_slot: u64,
+        ) -> Result<(), u32> {
+            crate::compatibility::REVISION8_COMPATIBILITY.check_template_limits(limits, seal_slot)
+        }
+
+        fn check_registry_class(
+            &self,
+            row: Option<&crate::unified::registry::RowV2>,
+            shape: &crate::unified::registry::Shape,
+        ) -> u32 {
+            crate::compatibility::REVISION8_COMPATIBILITY.check_registry_class(row, shape)
+        }
+    }
+
+    #[test]
+    fn supplied_non_default_template_hook_can_refuse_init_terms() {
+        let terms = Terms2 {
+            challenge_window_slots: 90_000,
+            response_window_slots: 45_000,
+            challenger_bond_lamports: 1,
+            executor_bond_lamports: 0,
+            executor_reward_bps: 0,
+            bond_policy_kind: crate::unified::terms::BOND_POLICY_STANDARD,
+            bond_slasher_bps: 0,
+            settlement_program: [0; 32],
+            custom_settle_window_slots: 0,
+            result_retention_slots: 100_000,
+            bond_remainder: [1; 32],
+            abandon_after_slots: 10,
+        };
+        let limits = crate::unified::config::TemplateLimits {
+            max_challenge_window_slots: 100_000,
+            max_response_window_slots: 50_000,
+            max_document_lifetime_slots: 100_000,
+            max_abandon_after_slots: 100,
+            min_abandon_after_slots: 1,
+        };
+
+        assert_eq!(
+            terms.check_template_with(&limits, &RefuseTemplateHook),
+            Err(TEST_HOOK_REFUSAL)
+        );
+    }
 
     fn d(v: &serde_json::Value) -> [u8; 32] {
         unhex(v.as_str().unwrap()).try_into().unwrap()

@@ -247,6 +247,17 @@ pub fn compiled_capability(form: u16) -> (u8, u8) {
     (respond, generic::witness_kind(form))
 }
 
+#[cfg(all(test, feature = "revision-8"))]
+mod capability_tests {
+    use super::compiled_capability;
+
+    #[test]
+    fn revision8_typed_decision_forms_are_respondable_without_witnesses() {
+        assert_eq!(compiled_capability(47), (1, 0));
+        assert_eq!(compiled_capability(48), (1, 0));
+    }
+}
+
 /// Registry table root over the frozen header identity and every row, in
 /// stored (strictly ascending form) order.
 pub fn table_root(
