@@ -1,16 +1,31 @@
 """Versioned durable journal primitives for open-ended transaction streams.
 
-The stream WAL is append-only between checkpoints. Its manifest is a compact
-recovery pointer; event history and terminal detail are sealed in checkpoint
-files. Fixed-plan journal v1 remains implemented by journal.py and is unchanged.
-A complete final WAL row without a trailing newline is accepted and repaired
-with a newline when the stream resumes.
+The stream WAL is append-only between checkpoints. A checkpoint stores only
+pending work, a deterministic terminal window, and observations/lifecycle rows
+for those live steps. It never copies segment history. Once its manifest pointer
+commits, older checkpoints and covered segments are deleted. Fixed-plan journal
+v1 remains implemented by journal.py and is unchanged. A complete final WAL row
+without a trailing newline is accepted and repaired when the stream resumes.
+
+An append may depend only on pending steps or one of the last
+``max_pending_steps`` terminal steps by stream sequence. Older dependencies are
+refused before writing, independent of segment rotation timing. Checkpoint
+layout changes are stream schema 4; schema 3 journals are refused rather than
+silently migrated. Applications
+must also use globally unique step IDs for the stream lifetime and map late
+provider failures to their original step, generation, and attempt. Compacted
+late failures are stored as orphan events because their packet records are gone.
+
+For packets that invoke this stream program, every instruction account meta
+must appear in ``destination_accounts``. That includes the payer, authority,
+and system program when they are instruction accounts. The stream program ID is
+checked separately against ``program_id``. Instructions to other programs are
+not checked by this destination rule.
 """
 
 from __future__ import annotations
 
 import base64
-import copy
 import errno
 import fcntl
 import hashlib
@@ -18,7 +33,8 @@ import json
 import os
 import sys
 import threading
-from dataclasses import dataclass, field
+from enum import Enum
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Mapping, Protocol
@@ -26,7 +42,7 @@ from typing import Any, Literal, Mapping, Protocol
 from .types import JournalError
 
 
-STREAM_SCHEMA_VERSION = 3
+STREAM_SCHEMA_VERSION = 4
 _ZERO_DIGEST = "0" * 64
 _SEQUENCE_DOMAIN = b"dcg-stream-sequence-v1\0"
 _INTENT_DOMAIN = b"dcg-stream-intent-v1\0"
@@ -39,6 +55,8 @@ _HISTORY_EVENTS = frozenset(
         "step_dropped",
         "optimistic_branch_invalidated",
         "reconciliation_required",
+        "reconciliation_decision",
+        "step_abandoned_after_reconciliation",
     }
 )
 
@@ -247,27 +265,34 @@ class StreamAppendReceipt:
 
 @dataclass(frozen=True)
 class StreamTerminal:
-    """Durable summary after stable signature and application state checks."""
+    """Durable stable result or adapter-authorized abandonment summary."""
 
     step_id: str
-    outcome: Literal["confirmed", "failed"]
-    signature: str
-    commitment: str
+    outcome: Literal["confirmed", "failed", "abandoned"]
+    signature: str | None
+    commitment: str | None
     postcondition_satisfied: bool
     postcondition_digest: str
     slot: int | None = None
     error: str | None = None
+    reconciliation_decision_event_sequence: int | None = None
 
     def __post_init__(self) -> None:
-        if not self.step_id or not self.signature or not self.commitment:
-            raise ValueError("terminal step identity, signature, and commitment are required")
-        if self.outcome not in {"confirmed", "failed"}:
-            raise ValueError("terminal outcome must be confirmed or failed")
+        if not isinstance(self.step_id, str) or not self.step_id:
+            raise ValueError("terminal step identity must be non-empty text")
+        if not isinstance(self.outcome, str) or self.outcome not in {"confirmed", "failed", "abandoned"}:
+            raise ValueError("terminal outcome must be confirmed, failed, or abandoned")
+        if self.signature is not None and (not isinstance(self.signature, str) or not self.signature):
+            raise ValueError("terminal signature must be non-empty text or null")
+        if self.commitment is not None and not isinstance(self.commitment, str):
+            raise ValueError("terminal commitment must be text or null")
         if not isinstance(self.postcondition_satisfied, bool):
             raise ValueError("terminal postcondition result must be boolean")
         if not isinstance(self.postcondition_digest, str) or not self.postcondition_digest:
             raise ValueError("terminal summary must bind a postcondition digest")
-        if len(self.postcondition_digest) > 256 or len(self.commitment) > 64:
+        if len(self.postcondition_digest) > 256 or (
+            self.commitment is not None and len(self.commitment) > 64
+        ):
             raise ValueError("terminal commitment and postcondition digest exceed their bounds")
         if self.error is not None and (not isinstance(self.error, str) or len(self.error) > 512):
             raise ValueError("terminal error must be at most 512 characters or null")
@@ -275,10 +300,24 @@ class StreamTerminal:
             raise ValueError("a confirmed terminal step requires a satisfied postcondition")
         if self.outcome == "failed" and self.postcondition_satisfied:
             raise ValueError("a failed terminal step cannot have a satisfied postcondition")
+        if self.outcome in {"confirmed", "failed"} and (not self.signature or not self.commitment):
+            raise ValueError("signed terminal outcomes require a signature and commitment")
         if self.outcome == "confirmed" and self.commitment not in {"confirmed", "finalized"}:
             raise ValueError("a confirmed terminal step requires stable commitment")
         if self.outcome == "failed" and self.commitment != "finalized":
             raise ValueError("a terminal failure requires finalized commitment")
+        if self.outcome == "abandoned" and (
+            self.commitment is not None
+            or self.postcondition_satisfied
+            or self.reconciliation_decision_event_sequence is None
+        ):
+            raise ValueError("abandonment requires a journaled reconciliation decision, no commitment, and a false postcondition")
+        if self.reconciliation_decision_event_sequence is not None and (
+            not isinstance(self.reconciliation_decision_event_sequence, int)
+            or isinstance(self.reconciliation_decision_event_sequence, bool)
+            or self.reconciliation_decision_event_sequence < 0
+        ):
+            raise ValueError("reconciliation decision event sequence must be non-negative")
         if self.slot is not None and (
             not isinstance(self.slot, int) or isinstance(self.slot, bool) or self.slot < 0
         ):
@@ -294,6 +333,7 @@ class StreamTerminal:
             "postcondition_digest": self.postcondition_digest,
             "slot": self.slot,
             "error": self.error,
+            "reconciliation_decision_event_sequence": self.reconciliation_decision_event_sequence,
         }
 
     @classmethod
@@ -343,6 +383,16 @@ class StreamObservation:
     postcondition_digest: str | None
     event_sequence: int
 
+    @property
+    def label(self) -> Literal["optimistic", "stable", "unresolved"]:
+        """Classify progress released at processed without calling it confirmed."""
+
+        if self.status_commitment == "processed":
+            return "optimistic"
+        if self.status_commitment in {"confirmed", "finalized"}:
+            return "stable"
+        return "unresolved"
+
 
 @dataclass(frozen=True)
 class StreamLifecycleEvent:
@@ -387,6 +437,9 @@ class StreamJournalProtocol(Protocol):
     def observations(self) -> tuple[StreamObservation, ...]: ...
 
     @property
+    def optimistic_steps(self) -> tuple[str, ...]: ...
+
+    @property
     def lifecycle_events(self) -> tuple[StreamLifecycleEvent, ...]: ...
 
     @property
@@ -404,6 +457,8 @@ class StreamJournalProtocol(Protocol):
     def record_send_result(self, step_id: str, generation: int, attempt: int, *, acknowledged: bool, **route: Any) -> PacketAttempt: ...
     def record_observation(self, step_id: str, generation: int, **observation: Any) -> None: ...
     def record_late_provider_failure(self, step_id: str, generation: int, attempt: int, **failure: Any) -> None: ...
+    def record_reconciliation_required(self, step_id: str, generation: int, *, detail: str) -> None: ...
+    def record_reconciliation_decision(self, step_id: str, generation: int, **decision: Any) -> int: ...
     def record_terminal(self, terminal: StreamTerminal) -> None: ...
     def close_input(self) -> None: ...
     def checkpoint(self, through_sequence: int | None = None) -> StreamCheckpoint: ...
@@ -521,10 +576,9 @@ class StreamJournal:
         self._packet_index: dict[tuple[str, int], SignedPacketRecord] = {}
         self._attempt_index: dict[tuple[str, int], list[PacketAttempt]] = {}
         self._rebuild_authorizations: list[dict[str, Any]] = []
-        self._observations: list[StreamObservation] = []
-        self._lifecycle_events: list[StreamLifecycleEvent] = []
-        self._provider_failures: list[StreamLifecycleEvent] = []
-        self._active_history: list[dict[str, Any]] = []
+        self._observations_by_step: dict[str, list[StreamObservation]] = {}
+        self._lifecycle_events_by_step: dict[str, list[StreamLifecycleEvent]] = {}
+        self._reconciliation_decisions: dict[tuple[str, int], tuple[int, str, str]] = {}
         self._next_event_sequence = 0
         self._next_stream_sequence = 1
         self._sequence_digest = _initial_sequence_digest(identity.digest)
@@ -588,17 +642,61 @@ class StreamJournal:
     @property
     def observations(self) -> tuple[StreamObservation, ...]:
         with self._lock:
-            return tuple(self._observations)
+            return tuple(
+                sorted(
+                    (row for rows in self._observations_by_step.values() for row in rows),
+                    key=lambda row: row.event_sequence,
+                )
+            )
+
+    @property
+    def optimistic_steps(self) -> tuple[str, ...]:
+        """Pending steps whose latest recorded status is only ``processed``."""
+
+        with self._lock:
+            optimistic = []
+            for step_id, (sequence, _intent, _digest) in sorted(
+                self._pending.items(), key=lambda item: item[1][0]
+            ):
+                rows = self._observations_by_step.get(step_id, ())
+                processed = [
+                    row for row in rows if row.status_commitment == "processed"
+                ]
+                stable_sequences = {
+                    row.event_sequence
+                    for row in rows
+                    if row.status_commitment in {"confirmed", "finalized"}
+                }
+                if processed:
+                    latest_processed = max(row.event_sequence for row in processed)
+                    if not any(event_sequence > latest_processed for event_sequence in stable_sequences):
+                        optimistic.append((sequence, step_id))
+            return tuple(step_id for _sequence, step_id in optimistic)
 
     @property
     def lifecycle_events(self) -> tuple[StreamLifecycleEvent, ...]:
         with self._lock:
-            return tuple(self._lifecycle_events)
+            return tuple(
+                sorted(
+                    (row for rows in self._lifecycle_events_by_step.values() for row in rows),
+                    key=lambda row: row.event_sequence,
+                )
+            )
 
     @property
     def provider_failures(self) -> tuple[StreamLifecycleEvent, ...]:
         with self._lock:
-            return tuple(self._provider_failures)
+            return tuple(
+                sorted(
+                    (
+                        row
+                        for rows in self._lifecycle_events_by_step.values()
+                        for row in rows
+                        if row.event == "late_provider_failure"
+                    ),
+                    key=lambda row: row.event_sequence,
+                )
+            )
 
     @property
     def disk_bytes(self) -> int:
@@ -668,9 +766,14 @@ class StreamJournal:
                 raise StreamClosed("stream input is closed")
             if len(self._pending) >= self.limits.max_pending_steps:
                 raise StreamQuotaExceeded("pending stream-step limit reached")
-            known = set(self._intents)
-            if any(dependency not in known for dependency in intent.dependencies):
-                raise StreamError("stream dependencies must name retained earlier steps")
+            retained_terminals = self._terminal_keep_ids()
+            if any(
+                dependency not in self._pending and dependency not in retained_terminals
+                for dependency in intent.dependencies
+            ):
+                raise StreamError(
+                    "stream dependencies must name pending steps or the deterministic retained terminal window"
+                )
             sequence = self._next_stream_sequence
             if any(self._intents[dependency][0] >= sequence for dependency in intent.dependencies):
                 raise StreamError("stream dependency does not precede the appended step")
@@ -747,6 +850,8 @@ class StreamJournal:
     def authorize_rebuild(self, step_id: str, generation: int, evidence_digest: str) -> None:
         with self._lock:
             self._ensure_usable()
+            if not isinstance(step_id, str) or not step_id:
+                raise StreamError("step identity must be non-empty text")
             packet = self._packet_index.get((step_id, generation))
             latest_generation = max(
                 (candidate for candidate_step, candidate in self._packet_index if candidate_step == step_id),
@@ -906,22 +1011,39 @@ class StreamJournal:
         detail: str,
         route_affinity: str | None = None,
     ) -> None:
-        """Record a delayed provider ERR for a handoff already acknowledged."""
+        """Record a delayed provider error, orphaning it after packet compaction.
+
+        The adapter must map provider output to the original step, generation,
+        and attempt. A compacted or terminal step has no packet lookup; the
+        supplied receipt/route data is the provider's attestation.
+        """
 
         with self._lock:
             self._ensure_usable()
-            packet = self._packet_index.get((step_id, generation))
-            if packet is None:
-                raise StreamError("late failure references an unretained signed packet")
+            if not isinstance(step_id, str) or not step_id:
+                raise StreamError("late provider failure step identity must be non-empty text")
             if not isinstance(detail, str) or not detail or len(detail) > 512:
                 raise StreamError("late provider failure detail must be 1 to 512 characters")
-            attempts = self._attempt_index[(step_id, generation)]
-            if not 0 < attempt <= len(attempts):
-                raise StreamError("late failure references an unknown attempt")
-            current = attempts[attempt - 1]
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 0
+                or not isinstance(attempt, int)
+                or isinstance(attempt, bool)
+                or attempt <= 0
+            ):
+                raise StreamError("late failure generation and attempt must be non-negative/positive integers")
+            packet = self._packet_index.get((step_id, generation))
+            orphan = step_id not in self._pending
+            if packet is None and not orphan:
+                raise StreamError("late failure references an unsigned pending step")
+            expected_signature = None if orphan else packet.signature
             provider_id, endpoint_id, disposition = self._receipt_values(
-                receipt, provider_id, endpoint_id, disposition, packet.signature
+                receipt, provider_id, endpoint_id, disposition, expected_signature
             )
+            receipt_signature = self._route_attribute(receipt, "signature")
+            if receipt_signature is not None and not isinstance(receipt_signature, str):
+                raise StreamError("late provider failure receipt signature must be text or null")
             route_record = self._resolve_route(
                 provider_id,
                 endpoint_id,
@@ -930,18 +1052,24 @@ class StreamJournal:
                 disposition,
                 route=route,
             )
-            if current.outcome != "acknowledged":
-                raise StreamError("late provider failure requires an acknowledged send attempt")
-            if any(
-                route_record[field] != getattr(current, field)
-                for field in ("provider_id", "endpoint_id", "route_group", "route_affinity", "disposition")
-            ):
-                raise StreamError("late provider failure differs from the acknowledged provider receipt")
+            if not orphan:
+                attempts = self._attempt_index[(step_id, generation)]
+                if not 0 < attempt <= len(attempts):
+                    raise StreamError("late failure references an unknown attempt")
+                current = attempts[attempt - 1]
+                if current.outcome != "acknowledged":
+                    raise StreamError("late provider failure requires an acknowledged send attempt")
+                if any(
+                    route_record[field] != getattr(current, field)
+                    for field in ("provider_id", "endpoint_id", "route_group", "route_affinity", "disposition")
+                ):
+                    raise StreamError("late provider failure differs from the acknowledged provider receipt")
             if any(
                 event.step_id == step_id
                 and event.generation == generation
                 and event.data.get("attempt") == attempt
-                for event in self._provider_failures
+                for event in self._lifecycle_events_by_step.get(step_id, ())
+                if event.event == "late_provider_failure"
             ):
                 raise StreamError("late provider failure was already recorded for this attempt")
             self._append_event(
@@ -950,7 +1078,8 @@ class StreamJournal:
                     "step_id": step_id,
                     "generation": generation,
                     "attempt": attempt,
-                    "signature": packet.signature,
+                    "signature": packet.signature if packet is not None else receipt_signature,
+                    "orphan": orphan,
                     "detail": detail,
                     **route_record,
                 },
@@ -978,8 +1107,8 @@ class StreamJournal:
                 postcondition_digest,
             )
             count = sum(
-                observation.step_id == step_id and observation.generation == generation
-                for observation in self._observations
+                observation.generation == generation
+                for observation in self._observations_by_step.get(step_id, ())
             )
             if count >= self.limits.max_observations_per_generation:
                 raise StreamError("observation limit reached for signed generation")
@@ -1000,7 +1129,7 @@ class StreamJournal:
 
     def observations_for(self, step_id: str) -> tuple[StreamObservation, ...]:
         with self._lock:
-            return tuple(row for row in self._observations if row.step_id == step_id)
+            return tuple(self._observations_by_step.get(step_id, ()))
 
     def record_step_dropped(self, step_id: str, generation: int, *, detail: str) -> None:
         self._record_lifecycle("step_dropped", step_id, generation, detail=detail)
@@ -1013,18 +1142,87 @@ class StreamJournal:
     def record_reconciliation_required(
         self, step_id: str, generation: int, *, detail: str
     ) -> None:
-        self._record_lifecycle("reconciliation_required", step_id, generation, detail=detail)
+        self._record_lifecycle(
+            "reconciliation_required", step_id, generation, detail=detail, allow_unsigned=True
+        )
 
-    def _record_lifecycle(self, name: str, step_id: str, generation: int, *, detail: str) -> None:
+    def record_reconciliation_decision(
+        self,
+        step_id: str,
+        generation: int,
+        *,
+        decision: Literal["abandon", "continue", "rebuild"],
+        evidence_digest: str,
+    ) -> int:
+        """Journal the adapter's choice before it changes a dropped branch."""
+
         with self._lock:
-            packet = self._require_packet(step_id, generation)
+            self._ensure_usable()
+            if not isinstance(step_id, str) or not step_id:
+                raise StreamError("reconciliation step identity must be non-empty text")
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 0
+            ):
+                raise StreamError("reconciliation generation must be a non-negative integer")
+            if step_id not in self._pending:
+                raise StreamError("reconciliation decision requires a pending stream step")
+            if not any(
+                event.event == "reconciliation_required" and event.generation == generation
+                for event in self._lifecycle_events_by_step.get(step_id, ())
+            ):
+                raise StreamError("reconciliation decision requires a prior reconciliation_required event")
+            if not isinstance(decision, str) or decision not in {"abandon", "continue", "rebuild"}:
+                raise StreamError("reconciliation decision must be abandon, continue, or rebuild")
+            if not isinstance(evidence_digest, str) or not evidence_digest or len(evidence_digest) > 256:
+                raise StreamError("reconciliation evidence digest must be 1 to 256 characters")
+            key = (step_id, generation)
+            if key in self._reconciliation_decisions:
+                raise StreamError("reconciliation decision was already recorded")
+            row = self._append_event(
+                "reconciliation_decision",
+                {
+                    "step_id": step_id,
+                    "generation": generation,
+                    "decision": decision,
+                    "evidence_digest": evidence_digest,
+                },
+                reservation_step=step_id,
+            )
+            return row["event_sequence"]
+
+    def _record_lifecycle(
+        self,
+        name: str,
+        step_id: str,
+        generation: int,
+        *,
+        detail: str,
+        allow_unsigned: bool = False,
+    ) -> None:
+        with self._lock:
+            self._ensure_usable()
+            if not isinstance(step_id, str) or not step_id:
+                raise StreamError(f"{name} step identity must be non-empty text")
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 0
+            ):
+                raise StreamError(f"{name} generation must be a non-negative integer")
+            packet = self._packet_index.get((step_id, generation))
+            if packet is None:
+                if not allow_unsigned or generation != 0 or step_id not in self._pending:
+                    raise StreamError("stream event references an unknown signed packet")
+            elif step_id not in self._pending:
+                raise StreamError("cannot add lifecycle events after step terminal state")
             if not isinstance(detail, str) or not detail or len(detail) > 512:
                 raise StreamError(f"{name} detail must be 1 to 512 characters")
             if any(
                 event.event == name
-                and event.step_id == step_id
                 and event.generation == generation
-                for event in self._lifecycle_events
+                for event in self._lifecycle_events_by_step.get(step_id, ())
             ):
                 raise StreamError(f"{name} was already recorded for this packet generation")
             self._append_event(
@@ -1032,7 +1230,8 @@ class StreamJournal:
                 {
                     "step_id": step_id,
                     "generation": generation,
-                    "signature": packet.signature,
+                    "signature": None if packet is None else packet.signature,
+                    "unsigned": packet is None,
                     "detail": detail,
                 },
                 reservation_step=step_id,
@@ -1043,14 +1242,33 @@ class StreamJournal:
             self._ensure_usable()
             if terminal.step_id not in self._pending:
                 raise StreamError(f"cannot finish unknown or already terminal stream step {terminal.step_id!r}")
-            if not any(
-                key[0] == terminal.step_id and packet.signature == terminal.signature
-                for key, packet in self._packet_index.items()
-            ):
-                raise StreamError("terminal summary signature does not match a retained signed packet")
-            self._validate_terminal_policy(terminal)
+            if terminal.outcome == "abandoned":
+                decision = next(
+                    (
+                        value
+                        for (candidate, _generation), value in self._reconciliation_decisions.items()
+                        if candidate == terminal.step_id
+                        and value[0] == terminal.reconciliation_decision_event_sequence
+                    ),
+                    None,
+                )
+                if decision is None or decision[1] != "abandon":
+                    raise StreamError("abandonment requires a journaled adapter decision to abandon")
+                if terminal.reconciliation_decision_event_sequence != decision[0]:
+                    raise StreamError("abandonment does not reference the journaled reconciliation decision")
+            else:
+                if not any(
+                    key[0] == terminal.step_id and packet.signature == terminal.signature
+                    for key, packet in self._packet_index.items()
+                ):
+                    raise StreamError("terminal summary signature does not match a retained signed packet")
+                self._validate_terminal_policy(terminal)
             self._append_event(
-                "step_confirmed" if terminal.outcome == "confirmed" else "step_terminal_failure",
+                {
+                    "confirmed": "step_confirmed",
+                    "failed": "step_terminal_failure",
+                    "abandoned": "step_abandoned_after_reconciliation",
+                }[terminal.outcome],
                 terminal.to_record(),
                 reservation_step=terminal.step_id,
             )
@@ -1186,10 +1404,11 @@ class StreamJournal:
                 raise StreamError("stream manifest event high-water mark is invalid")
             if not isinstance(self._manifest["next_stream_sequence"], int) or self._manifest["next_stream_sequence"] <= 0:
                 raise StreamError("stream manifest stream sequence is invalid")
-            if not isinstance(self._manifest["pending_intents"], dict):
-                raise StreamError("stream manifest pending intents are invalid")
-            if not isinstance(self._manifest["terminal_records"], dict):
-                raise StreamError("stream manifest terminal records are invalid")
+            if self._manifest.get("checkpoint") is None:
+                if not isinstance(self._manifest.get("pending_intents", {}), dict):
+                    raise StreamError("stream manifest pending intents are invalid")
+                if not isinstance(self._manifest.get("terminal_records", {}), dict):
+                    raise StreamError("stream manifest terminal records are invalid")
             if not isinstance(self._manifest["sequence_digest"], str) or len(self._manifest["sequence_digest"]) != 64:
                 raise StreamError("stream manifest sequence digest is invalid")
             bytes.fromhex(self._manifest["sequence_digest"])
@@ -1209,65 +1428,62 @@ class StreamJournal:
             raise StreamError("stream manifest has invalid fields") from exc
 
     def _load_checkpoint_chain(self, pointer: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        """Load and validate only the checkpoint named by the manifest pointer."""
+
         if pointer is None:
             if self._manifest["active_segment"] != 0:
                 raise StreamError("stream manifest has no checkpoint for a rotated segment")
             return None
         try:
-            latest_path = self.path / pointer["file"]
+            relative_path = Path(pointer["file"])
+            if relative_path.parent != Path("checkpoints") or len(relative_path.parts) != 2:
+                raise StreamError("stream checkpoint pointer path is invalid")
+            latest_path = self.path / relative_path
             expected_digest = pointer["digest"]
             marker_sequence = pointer["marker_event_sequence"]
             raw = latest_path.read_bytes()
             if hashlib.sha256(raw).hexdigest() != expected_digest:
                 raise StreamError("active stream checkpoint digest mismatch")
             latest = json.loads(raw)
+        except StreamError:
+            raise
         except (KeyError, OSError, json.JSONDecodeError, TypeError) as exc:
             raise StreamError("active stream checkpoint is unreadable") from exc
+        if not isinstance(latest, dict):
+            raise StreamError("active stream checkpoint is invalid")
+        sealed_index = latest.get("sealed_segment_index")
         if (
-            not isinstance(latest, dict)
-            or latest.get("schema_version") != STREAM_SCHEMA_VERSION
+            not isinstance(sealed_index, int)
+            or isinstance(sealed_index, bool)
+            or sealed_index < 0
+        ):
+            raise StreamError("checkpoint sealed_segment_index is missing or invalid")
+        previous_checkpoint_digest = latest.get("previous_checkpoint_digest")
+        previous_segment_digest = latest.get("previous_segment_digest")
+        sealed_digest = latest.get("sealed_segment_digest")
+        try:
+            for digest in (previous_checkpoint_digest, previous_segment_digest, sealed_digest):
+                if not isinstance(digest, str) or len(digest) != 64:
+                    raise ValueError
+                bytes.fromhex(digest)
+        except ValueError as exc:
+            raise StreamError("checkpoint digest-chain fields are invalid") from exc
+        if (
+            latest.get("schema_version") != STREAM_SCHEMA_VERSION
             or latest.get("checkpoint_id") != latest_path.stem
+            or latest_path.stem != f"checkpoint-{sealed_index + 1:08d}"
             or latest.get("identity_digest") != self.identity.digest
+            or latest.get("next_active_segment") != sealed_index + 1
             or latest.get("event_high_water_mark") != marker_sequence
             or marker_sequence != self._manifest["event_high_water_mark"]
             or latest.get("next_active_segment") != self._manifest["active_segment"]
-            or latest.get("sealed_segment_digest") != self._manifest["previous_segment_digest"]
+            or sealed_digest != self._manifest["previous_segment_digest"]
             or expected_digest != self._manifest["previous_checkpoint_digest"]
+            or latest.get("next_stream_sequence") != self._manifest["next_stream_sequence"]
+            or latest.get("sequence_digest") != self._manifest["sequence_digest"]
+            or latest.get("input_closed") != self._manifest["input_closed"]
         ):
             raise StreamError("checkpoint pointer does not match the stream manifest")
-        # Check the immutable checkpoint digest chain. Checkpoint files retain
-        # per-segment history, while runtime state is restored only from latest.
-        chain_paths = sorted((self.path / "checkpoints").glob("checkpoint-*.json"))
-        prior_digest = _ZERO_DIGEST
-        prior_segment_digest = _ZERO_DIGEST
-        found_latest = False
-        for path in chain_paths:
-            try:
-                index = int(path.stem.removeprefix("checkpoint-"))
-                row_bytes = path.read_bytes()
-                row = json.loads(row_bytes)
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                raise StreamError("sealed stream checkpoint is unreadable") from exc
-            if index > latest["next_active_segment"]:
-                continue
-            digest = hashlib.sha256(row_bytes).hexdigest()
-            if (
-                row.get("schema_version") != STREAM_SCHEMA_VERSION
-                or row.get("identity_digest") != self.identity.digest
-                or row.get("previous_checkpoint_digest") != prior_digest
-                or row.get("previous_segment_digest") != prior_segment_digest
-                or row.get("sealed_segment_index") + 1 != index
-            ):
-                raise StreamError("sealed checkpoint chain is inconsistent")
-            self._collect_checkpoint_history(row)
-            prior_digest = digest
-            prior_segment_digest = row.get("sealed_segment_digest")
-            if path == latest_path:
-                found_latest = True
-                if digest != expected_digest:
-                    raise StreamError("latest checkpoint digest changed during validation")
-        if not found_latest:
-            raise StreamError("latest checkpoint is absent from its sealed chain")
         return latest
 
     def _restore_manifest_state(self, manifest: Mapping[str, Any]) -> None:
@@ -1276,9 +1492,9 @@ class StreamJournal:
         self._terminals.clear()
         self._reserve_left.clear()
         self._intent_chain_digests.clear()
-        for step_id, row in manifest["pending_intents"].items():
+        for step_id, row in manifest.get("pending_intents", {}).items():
             self._restore_intent_row(step_id, row, pending=True)
-        for step_id, row in manifest["terminal_records"].items():
+        for step_id, row in manifest.get("terminal_records", {}).items():
             self._restore_intent_row(step_id, row["intent_row"], pending=False)
             self._terminals[step_id] = StreamTerminal.from_record(row["terminal"])
         self._next_stream_sequence = manifest["next_stream_sequence"]
@@ -1291,6 +1507,8 @@ class StreamJournal:
             not isinstance(checkpoint.get("pending_intents"), dict)
             or not isinstance(checkpoint.get("terminal_records"), dict)
             or not isinstance(checkpoint.get("unresolved_packets"), list)
+            or not isinstance(checkpoint.get("observations"), list)
+            or not isinstance(checkpoint.get("lifecycle_events"), list)
         ):
             raise StreamError("checkpoint state is invalid")
         state = {
@@ -1306,6 +1524,7 @@ class StreamJournal:
             self._next_stream_sequence != self._manifest["next_stream_sequence"]
             or self._sequence_digest != self._manifest["sequence_digest"]
             or self._input_closed != self._manifest["input_closed"]
+            or checkpoint["event_high_water_mark"] != self._manifest["event_high_water_mark"]
         ):
             raise StreamError("checkpoint state does not match manifest state")
         self._next_event_sequence = checkpoint["event_high_water_mark"] + 1
@@ -1315,6 +1534,7 @@ class StreamJournal:
         for row in checkpoint["unresolved_packets"]:
             self._restore_packet_row(row)
         self._validate_checkpoint_packet_refs(checkpoint)
+        self._restore_checkpoint_event_state(checkpoint)
         self._validate_restored_intents()
 
     def _restore_intent_row(self, step_id: str, row: Mapping[str, Any], *, pending: bool) -> None:
@@ -1372,8 +1592,9 @@ class StreamJournal:
             signed_sequence = value["signed_event_sequence"]
             segment_index = value["segment_index"]
             if (
-                step_id not in self._intents
+                step_id not in self._pending
                 or not isinstance(generation, int)
+                or isinstance(generation, bool)
                 or generation < 0
                 or hashlib.sha256(raw_bytes).hexdigest() != packet_digest
                 or len(raw_bytes) > self._intents[step_id][1].max_packet_bytes
@@ -1412,10 +1633,21 @@ class StreamJournal:
             (packet.step_id, packet.generation): packet
             for packet in self.unresolved_packets()
         }
+        reference_keys = []
         for reference in references:
             if not isinstance(reference, dict):
                 raise StreamError("checkpoint unresolved packet reference is invalid")
             key = (reference.get("step_id"), reference.get("generation"))
+            if (
+                not isinstance(key[0], str)
+                or not key[0]
+                or not isinstance(key[1], int)
+                or isinstance(key[1], bool)
+                or key[1] < 0
+                or key in reference_keys
+            ):
+                raise StreamError("checkpoint unresolved packet reference identity is invalid")
+            reference_keys.append(key)
             packet = actual.get(key)
             if (
                 packet is None
@@ -1431,29 +1663,89 @@ class StreamJournal:
                     event_sequences.append(attempt.finished_event_sequence)
             if event_sequences != reference.get("attempt_event_sequences"):
                 raise StreamError("checkpoint attempt references do not match packet history")
+        if set(reference_keys) != set(actual):
+            raise StreamError("checkpoint unresolved packet references do not cover pending packets")
 
-    def _collect_checkpoint_history(self, checkpoint: Mapping[str, Any]) -> None:
-        rows = checkpoint.get("journal_events")
-        if not isinstance(rows, list):
-            raise StreamError("checkpoint sealed event history is invalid")
-        for row in rows:
-            self._validate_event_row(row)
-            event = row["event"]
-            data = row["data"]
-            sequence = row["event_sequence"]
-            if event == "step_observed":
-                self._observations.append(self._observation_from_event(data, sequence))
-            elif event in _HISTORY_EVENTS:
-                lifecycle = StreamLifecycleEvent(
-                    event,
-                    data["step_id"],
-                    data.get("generation", 0),
-                    sequence,
-                    dict(data),
+    def _restore_checkpoint_event_state(self, checkpoint: Mapping[str, Any]) -> None:
+        live_ids = set(self._pending) | set(self._terminals)
+        high_water = checkpoint["event_high_water_mark"]
+        seen_event_sequences: set[int] = set()
+        for row in checkpoint["observations"]:
+            try:
+                if not isinstance(row, dict):
+                    raise ValueError
+                observation = StreamObservation(**row)
+                if (
+                    observation.step_id not in live_ids
+                    or not isinstance(observation.generation, int)
+                    or isinstance(observation.generation, bool)
+                    or observation.generation < 0
+                    or not 0 <= observation.event_sequence <= high_water
+                    or observation.event_sequence in seen_event_sequences
+                ):
+                    raise ValueError
+                terminal = self._terminals.get(observation.step_id)
+                packet = self._packet_index.get((observation.step_id, observation.generation))
+                expected_signature = terminal.signature if terminal is not None else (
+                    None if packet is None else packet.signature
                 )
-                self._lifecycle_events.append(lifecycle)
-                if event == "late_provider_failure":
-                    self._provider_failures.append(lifecycle)
+                if (
+                    (terminal is not None and terminal.signature is None)
+                    or (expected_signature is not None and observation.signature != expected_signature)
+                ):
+                    raise ValueError
+                if terminal is None and packet is None:
+                    raise ValueError
+                seen_event_sequences.add(observation.event_sequence)
+            except (TypeError, ValueError) as exc:
+                raise StreamError("checkpoint contains an invalid live observation") from exc
+            self._observations_by_step.setdefault(observation.step_id, []).append(observation)
+
+        for row in checkpoint["lifecycle_events"]:
+            try:
+                event = row["event"]
+                step_id = row["step_id"]
+                generation = row["generation"]
+                event_sequence = row["event_sequence"]
+                data = row["data"]
+                if (
+                    event not in _HISTORY_EVENTS
+                    or step_id not in live_ids
+                    or not isinstance(generation, int)
+                    or isinstance(generation, bool)
+                    or generation < 0
+                    or not isinstance(event_sequence, int)
+                    or isinstance(event_sequence, bool)
+                    or not 0 <= event_sequence <= high_water
+                    or event_sequence in seen_event_sequences
+                    or not isinstance(data, dict)
+                    or data.get("step_id") != step_id
+                ):
+                    raise ValueError
+                lifecycle = StreamLifecycleEvent(
+                    event, step_id, generation, event_sequence, dict(data)
+                )
+                if event == "reconciliation_decision":
+                    decision = data.get("decision")
+                    evidence_digest = data.get("evidence_digest")
+                    if (
+                        decision not in {"abandon", "continue", "rebuild"}
+                        or not isinstance(evidence_digest, str)
+                        or not evidence_digest
+                    ):
+                        raise ValueError
+                    key = (step_id, generation)
+                    if key in self._reconciliation_decisions:
+                        raise ValueError
+                    self._reconciliation_decisions[key] = (
+                        event_sequence,
+                        decision,
+                        evidence_digest,
+                    )
+                self._lifecycle_events_by_step.setdefault(step_id, []).append(lifecycle)
+                seen_event_sequences.add(event_sequence)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StreamError("checkpoint contains an invalid live lifecycle event") from exc
 
     def _scan_active_segment(self, checkpoint: Mapping[str, Any] | None) -> None:
         active_index = self._manifest["active_segment"]
@@ -1527,7 +1819,11 @@ class StreamJournal:
                 or data.get("sequence_digest")
                 != _advance_sequence_digest(self._sequence_digest, stream_sequence, record_digest)
                 or intent.step_id in self._intents
-                or any(dependency not in self._intents for dependency in intent.dependencies)
+                or any(
+                    dependency not in self._pending
+                    and dependency not in self._terminal_keep_ids()
+                    for dependency in intent.dependencies
+                )
             ):
                 raise StreamError("appended intent digest, sequence, or dependency is invalid")
             if len(_canonical_json(intent.to_record())) > self.limits.max_intent_bytes:
@@ -1561,38 +1857,92 @@ class StreamJournal:
             pass
         elif name == "late_provider_failure":
             lifecycle = StreamLifecycleEvent(name, data["step_id"], data["generation"], sequence, dict(data))
-            self._provider_failures.append(lifecycle)
-            self._lifecycle_events.append(lifecycle)
+            self._lifecycle_events_by_step.setdefault(lifecycle.step_id, []).append(lifecycle)
         elif name == "step_observed":
-            self._observations.append(self._observation_from_event(data, sequence))
+            observation = self._observation_from_event(data, sequence)
+            self._observations_by_step.setdefault(observation.step_id, []).append(observation)
         elif name in {"step_dropped", "optimistic_branch_invalidated", "reconciliation_required"}:
             if any(
                 event.event == name
-                and event.step_id == data["step_id"]
                 and event.generation == data["generation"]
-                for event in self._lifecycle_events
+                for event in self._lifecycle_events_by_step.get(data["step_id"], ())
             ):
                 raise StreamError(f"{name} was recorded more than once for one packet generation")
-            self._lifecycle_events.append(
-                StreamLifecycleEvent(name, data["step_id"], data["generation"], sequence, dict(data))
+            lifecycle = StreamLifecycleEvent(
+                name, data["step_id"], data["generation"], sequence, dict(data)
             )
-        elif name in {"step_confirmed", "step_terminal_failure"}:
+            self._lifecycle_events_by_step.setdefault(lifecycle.step_id, []).append(lifecycle)
+        elif name == "reconciliation_decision":
+            step_id = data.get("step_id")
+            generation = data.get("generation")
+            decision = data.get("decision")
+            evidence_digest = data.get("evidence_digest")
+            if (
+                step_id not in self._pending
+                or not any(
+                    event.event == "reconciliation_required" and event.generation == generation
+                    for event in self._lifecycle_events_by_step.get(step_id, ())
+                )
+                or decision not in {"abandon", "continue", "rebuild"}
+                or not isinstance(evidence_digest, str)
+                or not evidence_digest
+                or (step_id, generation) in self._reconciliation_decisions
+            ):
+                raise StreamError("invalid or duplicate reconciliation decision row")
+            self._reconciliation_decisions[(step_id, generation)] = (
+                sequence,
+                decision,
+                evidence_digest,
+            )
+            lifecycle = StreamLifecycleEvent(
+                name, step_id, generation, sequence, dict(data)
+            )
+            self._lifecycle_events_by_step.setdefault(step_id, []).append(lifecycle)
+        elif name in {
+            "step_confirmed",
+            "step_terminal_failure",
+            "step_abandoned_after_reconciliation",
+        }:
             terminal = StreamTerminal.from_record(data)
-            self._validate_terminal_policy(terminal)
             if terminal.step_id not in self._pending:
                 raise StreamError("terminal event references unknown or already terminal step")
-            if not any(
-                key[0] == terminal.step_id and packet.signature == terminal.signature
-                for key, packet in self._packet_index.items()
-            ):
-                raise StreamError("terminal event signature has no retained packet")
+            if terminal.outcome == "abandoned":
+                decision = next(
+                    (
+                        value
+                        for (candidate, _generation), value in self._reconciliation_decisions.items()
+                        if candidate == terminal.step_id
+                        and value[0] == terminal.reconciliation_decision_event_sequence
+                    ),
+                    None,
+                )
+                if decision is None or decision[1] != "abandon":
+                    raise StreamError("abandonment has no preceding adapter decision")
+            else:
+                self._validate_terminal_policy(terminal)
+                if not any(
+                    key[0] == terminal.step_id and packet.signature == terminal.signature
+                    for key, packet in self._packet_index.items()
+                ):
+                    raise StreamError("terminal event signature has no retained packet")
             if name == "step_confirmed" and terminal.outcome != "confirmed":
                 raise StreamError("step_confirmed row has non-confirmed outcome")
             if name == "step_terminal_failure" and terminal.outcome != "failed":
                 raise StreamError("step_terminal_failure row has non-failed outcome")
+            if name == "step_abandoned_after_reconciliation" and terminal.outcome != "abandoned":
+                raise StreamError("step_abandoned row has non-abandoned outcome")
             self._terminals[terminal.step_id] = terminal
             self._pending.pop(terminal.step_id)
             self._reserve_left.pop(terminal.step_id, None)
+            lifecycle = StreamLifecycleEvent(
+                name,
+                terminal.step_id,
+                0,
+                sequence,
+                dict(data),
+            )
+            self._lifecycle_events_by_step.setdefault(terminal.step_id, []).append(lifecycle)
+            self._prune_memory_state(self._terminal_keep_ids())
         elif name == "input_closed":
             if data.get("stream_sequence_high_water_mark") != self._next_stream_sequence - 1:
                 raise StreamError("input_closed row has a mismatched stream high-water mark")
@@ -1603,8 +1953,6 @@ class StreamJournal:
             raise StreamError(f"unknown stream journal event {name!r}")
         self._next_event_sequence = sequence + 1
         self._manifest["event_high_water_mark"] = sequence
-        if name != "checkpoint":
-            self._active_history.append(dict(row))
 
     def _consume_replayed_reservation(self, row: Mapping[str, Any]) -> None:
         if row["event"] not in {
@@ -1619,6 +1967,8 @@ class StreamJournal:
             "reconciliation_required",
             "step_confirmed",
             "step_terminal_failure",
+            "reconciliation_decision",
+            "step_abandoned_after_reconciliation",
         }:
             return
         step_id = row["data"].get("step_id")
@@ -1755,9 +2105,45 @@ class StreamJournal:
             packet = self._packet_index.get((data.get("step_id"), data.get("generation")))
             if packet is None or data.get("signature") != packet.signature:
                 raise StreamError("observation references an unknown signed packet")
+        elif name == "late_provider_failure" and data.get("orphan") is True:
+            step_id = data.get("step_id")
+            generation = data.get("generation")
+            number = data.get("attempt")
+            detail = data.get("detail")
+            signature = data.get("signature")
+            if (
+                not isinstance(step_id, str)
+                or not step_id
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 0
+                or not isinstance(number, int)
+                or isinstance(number, bool)
+                or number <= 0
+                or not isinstance(detail, str)
+                or not detail
+                or (signature is not None and not isinstance(signature, str))
+            ):
+                raise StreamError("orphan late provider failure has invalid identity fields")
+            self._validate_route(
+                data.get("provider_id"),
+                data.get("endpoint_id"),
+                data.get("route_group"),
+                data.get("route_affinity"),
+                data.get("disposition"),
+            )
+        elif name == "reconciliation_required" and data.get("unsigned") is True:
+            if (
+                data.get("generation") != 0
+                or data.get("signature") is not None
+                or data.get("step_id") not in self._pending
+                or not isinstance(data.get("detail"), str)
+                or not data.get("detail")
+            ):
+                raise StreamError("unsigned reconciliation event does not reference a pending descendant")
         elif name in {"late_provider_failure", "step_dropped", "optimistic_branch_invalidated", "reconciliation_required"}:
             packet = self._packet_index.get((data.get("step_id"), data.get("generation")))
-            if packet is None or data.get("signature") != packet.signature:
+            if packet is None or data.get("signature") != packet.signature or data.get("step_id") not in self._pending:
                 raise StreamError(f"{name} references an unknown signed packet")
             if name == "late_provider_failure":
                 attempts = self._attempt_index[(packet.step_id, packet.generation)]
@@ -1821,7 +2207,11 @@ class StreamJournal:
             if available is None or len(encoded) > available:
                 raise StreamQuotaExceeded("event exceeds the reserved finish bytes for its admitted step")
             after_reserve -= len(encoded)
-            if name in {"step_confirmed", "step_terminal_failure"}:
+            if name in {
+                "step_confirmed",
+                "step_terminal_failure",
+                "step_abandoned_after_reconciliation",
+            }:
                 after_reserve -= available - len(encoded)
             extra_preserve = 0
         else:
@@ -1922,25 +2312,24 @@ class StreamJournal:
                 raise
             raise StreamError("cannot durably rotate stream journal") from exc
 
-        previous_checkpoint_digest = self._manifest.get("previous_checkpoint_digest", _ZERO_DIGEST)
         self._manifest = candidate
         self._active_bytes = len(marker_bytes)
         self._next_event_sequence = marker_sequence + 1
-        self._active_history.clear()
         self._prune_memory_state(terminal_keep)
         try:
-            self._unlink_if_present(old_path)
+            latest_checkpoint = self.path / "checkpoints" / f"{checkpoint_id}.json"
+            for path in (self.path / "segments").glob("segment-*.jsonl"):
+                if path != new_segment_path:
+                    self._unlink_if_present(path)
             self._fsync_directory(self.path / "segments")
+            for path in (self.path / "checkpoints").glob("checkpoint-*.json"):
+                if path != latest_checkpoint:
+                    self._unlink_if_present(path)
+            self._fsync_directory(self.path / "checkpoints")
         except Exception:
             self._poisoned = True
             raise
-        terminal_rows = {
-            step_id: terminal.to_record()
-            for step_id, terminal in self._terminals.items()
-        }
-        for row in checkpoint_record["journal_events"]:
-            if row["event"] in {"step_confirmed", "step_terminal_failure"}:
-                terminal_rows[row["data"]["step_id"]] = dict(row["data"])
+        terminal_rows = {step_id: terminal.to_record() for step_id, terminal in self._terminals.items()}
         confirmed = {
             step_id: row for step_id, row in terminal_rows.items() if row.get("outcome") == "confirmed"
         }
@@ -1975,13 +2364,14 @@ class StreamJournal:
             for step_id, terminal in sorted(self._terminals.items())
             if step_id in terminal_keep
         }
+        pending_ids = set(self._pending)
         packet_rows = [
             self._packet_record(packet)
             for packet in sorted(
                 self._packet_index.values(),
                 key=lambda item: (item.signed_event_sequence, item.generation),
             )
-            if packet.step_id in (set(self._pending) | terminal_keep)
+            if packet.step_id in pending_ids
         ]
         refs = []
         for packet in self.unresolved_packets():
@@ -2023,10 +2413,19 @@ class StreamJournal:
             "terminal_records": retained,
             "unresolved_packets": packet_rows,
             "unresolved_packet_references": refs,
+            "observations": [
+                self._observation_to_record(observation)
+                for observation in self.observations
+                if observation.step_id in (pending_ids | terminal_keep)
+            ],
+            "lifecycle_events": [
+                self._lifecycle_to_record(event)
+                for event in self.lifecycle_events
+                if event.step_id in (pending_ids | terminal_keep)
+            ],
             "rebuild_authorizations": [
                 row for row in self._rebuild_authorizations if row["step_id"] in self._pending
             ],
-            "journal_events": copy.deepcopy(self._active_history),
         }
 
     def _manifest_value_for_checkpoint(
@@ -2039,15 +2438,6 @@ class StreamJournal:
         terminal_keep: set[str],
         previous_checkpoint_digest: str,
     ) -> dict[str, Any]:
-        pending_rows = self._serialize_intent_rows(self._pending, pending=True)
-        retained = {
-            step_id: {
-                "intent_row": self._serialize_one_intent(step_id),
-                "terminal": terminal.to_record(),
-            }
-            for step_id, terminal in sorted(self._terminals.items())
-            if step_id in terminal_keep
-        }
         return {
             "schema_version": STREAM_SCHEMA_VERSION,
             "identity": self.identity.to_record(),
@@ -2058,8 +2448,6 @@ class StreamJournal:
             "event_high_water_mark": marker_sequence,
             "next_stream_sequence": self._next_stream_sequence,
             "sequence_digest": self._sequence_digest,
-            "pending_intents": pending_rows,
-            "terminal_records": retained,
             "input_closed": self._input_closed,
             "checkpoint": {
                 "file": f"checkpoints/{checkpoint_id}.json",
@@ -2108,6 +2496,20 @@ class StreamJournal:
         }
 
     @staticmethod
+    def _observation_to_record(observation: StreamObservation) -> dict[str, Any]:
+        return asdict(observation)
+
+    @staticmethod
+    def _lifecycle_to_record(event: StreamLifecycleEvent) -> dict[str, Any]:
+        return {
+            "event": event.event,
+            "step_id": event.step_id,
+            "generation": event.generation,
+            "event_sequence": event.event_sequence,
+            "data": dict(event.data),
+        }
+
+    @staticmethod
     def _attempt_to_record(attempt: PacketAttempt) -> dict[str, Any]:
         return {
             "number": attempt.number,
@@ -2130,19 +2532,12 @@ class StreamJournal:
             raise StreamError("checkpoint attempt record is invalid") from exc
 
     def _terminal_keep_ids(self) -> set[str]:
-        needed = {
-            dependency
-            for _, intent, _ in self._pending.values()
-            for dependency in intent.dependencies
-            if dependency in self._terminals
-        }
         ordered = sorted(
             self._terminals,
             key=lambda step_id: self._intents.get(step_id, (0, None, ""))[0],
             reverse=True,
         )
-        needed.update(ordered[: self.limits.max_pending_steps])
-        return needed
+        return set(ordered[: self.limits.max_pending_steps])
 
     def _prune_memory_state(self, terminal_keep: set[str]) -> None:
         for step_id in tuple(self._terminals):
@@ -2150,10 +2545,26 @@ class StreamJournal:
                 self._terminals.pop(step_id, None)
                 self._intents.pop(step_id, None)
                 self._intent_chain_digests.pop(step_id, None)
-                for key in tuple(self._packet_index):
-                    if key[0] == step_id:
-                        self._packet_index.pop(key, None)
-                        self._attempt_index.pop(key, None)
+        for key in tuple(self._packet_index):
+            if key[0] not in self._pending:
+                self._packet_index.pop(key, None)
+                self._attempt_index.pop(key, None)
+        live_ids = set(self._pending) | terminal_keep
+        self._observations_by_step = {
+            step_id: rows
+            for step_id, rows in self._observations_by_step.items()
+            if step_id in live_ids
+        }
+        self._lifecycle_events_by_step = {
+            step_id: rows
+            for step_id, rows in self._lifecycle_events_by_step.items()
+            if step_id in live_ids
+        }
+        self._reconciliation_decisions = {
+            key: value
+            for key, value in self._reconciliation_decisions.items()
+            if key[0] in live_ids
+        }
         self._rebuild_authorizations = [
             row for row in self._rebuild_authorizations if row["step_id"] in self._pending
         ]
@@ -2217,6 +2628,9 @@ class StreamJournal:
             or len(route_affinity.encode("utf-8")) > 128
         ):
             raise StreamError("route_affinity must be null or 1 to 128 UTF-8 bytes")
+        if isinstance(disposition, Enum):
+            disposition = disposition.value
+            values["disposition"] = disposition
         if disposition is None and allow_no_disposition:
             pass
         elif not isinstance(disposition, str) or not disposition or len(disposition) > 64:
@@ -2273,12 +2687,12 @@ class StreamJournal:
         provider_id: str | None,
         endpoint_id: str | None,
         disposition: str | None,
-        expected_signature: str,
+        expected_signature: str | None,
     ) -> tuple[str | None, str | None, str | None]:
         if receipt is None:
             return provider_id, endpoint_id, disposition
         receipt_signature = self._route_attribute(receipt, "signature")
-        if receipt_signature != expected_signature:
+        if expected_signature is not None and receipt_signature != expected_signature:
             raise StreamError("provider receipt signature differs from the signed packet")
         received = (
             self._route_attribute(receipt, "provider_id"),
@@ -2335,7 +2749,11 @@ class StreamJournal:
         )
 
     def _validate_terminal_policy(self, terminal: StreamTerminal) -> None:
-        if self.identity.commitment_policy == "finalized" and terminal.commitment != "finalized":
+        if (
+            terminal.outcome != "abandoned"
+            and self.identity.commitment_policy == "finalized"
+            and terminal.commitment != "finalized"
+        ):
             raise StreamError("terminal summary is weaker than the stream commitment policy")
 
     def _ensure_usable(self) -> None:
@@ -2479,7 +2897,7 @@ class StreamJournal:
                 self._unlink_if_present(path)
                 changed_segments = True
         latest = (
-            0
+            None
             if checkpoint is None
             else int(Path(checkpoint["file"]).stem.removeprefix("checkpoint-"))
         )
@@ -2490,7 +2908,7 @@ class StreamJournal:
                 self._unlink_if_present(path)
                 changed_checkpoints = True
                 continue
-            if index > latest:
+            if index != latest:
                 self._unlink_if_present(path)
                 changed_checkpoints = True
         if changed_segments:

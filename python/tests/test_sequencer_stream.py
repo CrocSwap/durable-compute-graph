@@ -3,20 +3,26 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import multiprocessing
 import os
+import queue
+import resource
 import statistics
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from solders.hash import Hash
 from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
 from solders.message import Message
+from solders.system_program import ID as SYSTEM_PROGRAM_ID
 from solders.transaction import VersionedTransaction
 
 from dcg.sequencer.stream import (
@@ -41,15 +47,17 @@ def identity(
     *,
     genesis_hash: str = "genesis-test-1",
     signer_public_keys: tuple[str, ...] | None = None,
+    destination_accounts: tuple[str, ...] | None = None,
+    commitment_policy: str = "confirmed",
 ) -> StreamIdentity:
     return StreamIdentity(
         run_id="app-session-17",
         genesis_hash=genesis_hash,
         program_id=str(_PROGRAM),
-        destination_accounts=(str(_DESTINATION),),
+        destination_accounts=destination_accounts or (str(_DESTINATION),),
         signer_public_keys=signer_public_keys or (str(_KEYPAIR.pubkey()),),
         route_policy_digest="route-policy-sha256",
-        commitment_policy="confirmed",
+        commitment_policy=commitment_policy,
     )
 
 
@@ -105,6 +113,146 @@ async def confirm(stream: StreamingPlan, step_id: str, signature: str | None = N
             slot=20,
         )
     )
+
+
+def _long_run_worker(root_text: str, progress: Any) -> None:
+    """Run the isolated 100k-step persistence probe and return checkpoint samples."""
+
+    root = Path(root_text)
+    limits = StreamLimits(
+        max_pending_steps=128,
+        max_segment_bytes=4 * 1024 * 1024,
+        max_journal_bytes=64 * 1024 * 1024,
+        append_reserve_bytes=1024,
+        max_intent_bytes=512,
+        max_attempts_per_generation=1,
+        max_observations_per_generation=1,
+        max_generations_per_step=1,
+    )
+    journal = StreamJournal(root, identity(), limits)
+    signature, raw_packet = signed_packet("shared-long-run-packet")
+    samples = []
+    max_disk_bytes = journal.disk_bytes
+    started = time.perf_counter()
+    try:
+        for index in range(100_000):
+            step_id = f"step-{index:06d}"
+            journal.append_intent(intent(step_id, route_affinity=None))
+            journal.record_signed_packet(step_id, signature, raw_packet, str(_KEYPAIR.pubkey()))
+            journal.record_send_attempt(
+                step_id,
+                0,
+                provider_id="tpu",
+                endpoint_id="rpc-a",
+                route_group="render",
+            )
+            journal.record_send_result(
+                step_id,
+                0,
+                1,
+                acknowledged=True,
+                disposition="helper-pipe-written",
+            )
+            journal.record_observation(
+                step_id,
+                0,
+                status_commitment="confirmed",
+                status_error=None,
+                slot=1,
+                postcondition_satisfied=True,
+                postcondition_digest="stable-state",
+            )
+            journal.record_terminal(
+                StreamTerminal(
+                    step_id=step_id,
+                    outcome="confirmed",
+                    signature=signature,
+                    commitment="confirmed",
+                    postcondition_satisfied=True,
+                    postcondition_digest="stable-state",
+                )
+            )
+            max_disk_bytes = max(max_disk_bytes, journal.disk_bytes)
+            if (index + 1) % 5_000 == 0:
+                journal.checkpoint(index + 1)
+                journal.close()
+                open_started = time.perf_counter()
+                journal = StreamJournal(root, identity(), limits)
+                open_seconds = time.perf_counter() - open_started
+                checkpoint_paths = list((root / "checkpoints").glob("checkpoint-*.json"))
+                sample = {
+                    "steps": index + 1,
+                    "disk_bytes": journal.disk_bytes,
+                    "max_disk_bytes": max_disk_bytes,
+                    "file_count": sum(path.is_file() for path in root.rglob("*")),
+                    "manifest_bytes": journal.manifest_bytes,
+                    "checkpoint_bytes": checkpoint_paths[0].stat().st_size if checkpoint_paths else 0,
+                    "open_seconds": open_seconds,
+                }
+                samples.append(sample)
+                progress.put({"progress": sample})
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_bytes = int(peak if sys.platform == "darwin" else peak * 1024)
+        progress.put(
+            {
+                "done": {
+                    "elapsed_seconds": time.perf_counter() - started,
+                    "peak_rss_bytes": peak_bytes,
+                    "samples": samples,
+                }
+            }
+        )
+    finally:
+        journal.close()
+
+
+def _complete_journal_step(
+    journal: StreamJournal,
+    step_id: str,
+    *,
+    dependencies: tuple[str, ...] = (),
+    observe: bool = False,
+    acknowledge: bool = False,
+) -> tuple[str, bytes]:
+    journal.append_intent(intent(step_id, dependencies=dependencies, route_affinity=None))
+    signature, raw_packet = signed_packet(step_id)
+    journal.record_signed_packet(step_id, signature, raw_packet, str(_KEYPAIR.pubkey()))
+    if acknowledge:
+        journal.record_send_attempt(
+            step_id,
+            0,
+            provider_id="tpu",
+            endpoint_id="rpc-a",
+            route_group="render",
+        )
+        journal.record_send_result(
+            step_id,
+            0,
+            1,
+            acknowledged=True,
+            disposition="helper-pipe-written",
+        )
+    if observe:
+        journal.record_observation(
+            step_id,
+            0,
+            status_commitment="confirmed",
+            status_error=None,
+            slot=1,
+            postcondition_satisfied=True,
+            postcondition_digest="stable-state",
+        )
+    journal.record_terminal(
+        StreamTerminal(
+            step_id=step_id,
+            outcome="confirmed",
+            signature=signature,
+            commitment="confirmed",
+            postcondition_satisfied=True,
+            postcondition_digest="stable-state",
+        )
+    )
+    return signature, raw_packet
 
 
 class StreamingJournalTests(unittest.IsolatedAsyncioTestCase):
@@ -270,6 +418,70 @@ class StreamingJournalTests(unittest.IsolatedAsyncioTestCase):
                 "verified", str(other_tx.signatures[0]), bytes(other_tx), str(_KEYPAIR.pubkey())
             )
 
+    async def test_stream_instruction_requires_every_account_meta_to_be_bound(self):
+        unbound_authority = Keypair().pubkey()
+        unbound = (
+            AccountMeta(_KEYPAIR.pubkey(), True, True),
+            AccountMeta(unbound_authority, False, True),
+            AccountMeta(SYSTEM_PROGRAM_ID, False, False),
+        )
+        for index, account in enumerate(unbound):
+            step_id = f"unbound-{index}"
+            stream = await self.open_stream(step_id)
+            await stream.append(intent(step_id))
+            instruction = Instruction(
+                _PROGRAM,
+                b"\x01",
+                [AccountMeta(_DESTINATION, False, True), account],
+            )
+            transaction = VersionedTransaction(
+                Message.new_with_blockhash(
+                    [instruction],
+                    _KEYPAIR.pubkey(),
+                    Hash.from_bytes(hashlib.sha256(step_id.encode()).digest()),
+                ),
+                [_KEYPAIR],
+            )
+            with self.assertRaisesRegex(StreamError, "outside the identity"):
+                await stream.record_signed_packet(
+                    step_id,
+                    str(transaction.signatures[0]),
+                    bytes(transaction),
+                    str(_KEYPAIR.pubkey()),
+                )
+
+        other_program = Keypair().pubkey()
+        other_account = Keypair().pubkey()
+        step_id = "other-program-account"
+        stream = await self.open_stream(step_id)
+        await stream.append(intent(step_id))
+        transaction = VersionedTransaction(
+            Message.new_with_blockhash(
+                [
+                    Instruction(
+                        _PROGRAM,
+                        b"\x01",
+                        [AccountMeta(_DESTINATION, False, True)],
+                    ),
+                    Instruction(
+                        other_program,
+                        b"\x02",
+                        [AccountMeta(other_account, False, True)],
+                    ),
+                ],
+                _KEYPAIR.pubkey(),
+                Hash.from_bytes(hashlib.sha256(step_id.encode()).digest()),
+            ),
+            [_KEYPAIR],
+        )
+        packet = await stream.record_signed_packet(
+            step_id,
+            str(transaction.signatures[0]),
+            bytes(transaction),
+            str(_KEYPAIR.pubkey()),
+        )
+        self.assertEqual(packet.raw_bytes, bytes(transaction))
+
     async def test_record_signed_packet_is_idempotent_for_latest_generation(self):
         stream = await self.open_stream()
         await stream.append(intent("same-packet"))
@@ -359,20 +571,15 @@ class StreamingJournalTests(unittest.IsolatedAsyncioTestCase):
             json.loads(path.read_bytes())
             for path in (self.root / "run" / "checkpoints").glob("checkpoint-*.json")
         ]
+        self.assertEqual(len(checkpoints), 1)
         self.assertTrue(checkpoints[-1]["unresolved_packet_references"])
         self.assertEqual(
             checkpoints[-1]["unresolved_packet_references"][0]["packet_digest"],
             first.packet_digest,
         )
-        sealed_events = {row["event"] for checkpoint in checkpoints for row in checkpoint["journal_events"]}
-        self.assertTrue(
-            {
-                "step_appended",
-                "step_signed",
-                "send_attempt_started",
-                "send_attempt_finished",
-                "step_observed",
-            }.issubset(sealed_events)
+        self.assertNotIn("journal_events", checkpoints[-1])
+        self.assertEqual(
+            [row["step_id"] for row in checkpoints[-1]["observations"]], ["pending"]
         )
 
     async def test_late_provider_failure_and_latency_events_read_back_after_resume(self):
@@ -481,6 +688,427 @@ class StreamingJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed.pending_count, 0)
         self.assertEqual(resumed.sequence_digest, checkpoint.sequence_digest)
         self.assertIn("done", resumed.terminal_summaries)
+
+    async def test_checkpoint_keeps_only_latest_checkpoint_and_live_state(self):
+        stream = await self.open_stream(limits=StreamLimits(max_pending_steps=2))
+        await stream.append(intent("one"))
+        await confirm(stream, "one")
+        first = await stream.checkpoint()
+        await stream.append(intent("two"))
+        await confirm(stream, "two")
+        second = await stream.checkpoint()
+
+        checkpoint_paths = list((self.root / "run" / "checkpoints").glob("checkpoint-*.json"))
+        segment_paths = list((self.root / "run" / "segments").glob("segment-*.jsonl"))
+        self.assertEqual([path.stem for path in checkpoint_paths], [second.checkpoint_id])
+        self.assertEqual([path.stem for path in segment_paths], ["segment-00000002"])
+        record = json.loads(checkpoint_paths[0].read_bytes())
+        self.assertNotIn("journal_events", record)
+        self.assertEqual(set(record["terminal_records"]), {"one", "two"})
+        self.assertEqual(record["pending_intents"], {})
+        self.assertLess(second.event_high_water_mark, 2**63)
+        self.assertNotEqual(first.checkpoint_id, second.checkpoint_id)
+
+    async def test_missing_sealed_segment_index_is_a_stream_error(self):
+        stream = await self.open_stream()
+        await stream.append(intent("checkpoint-corruption"))
+        await confirm(stream, "checkpoint-corruption")
+        checkpoint = await stream.checkpoint()
+        await self.close_stream(stream)
+
+        checkpoint_path = self.root / "run" / "checkpoints" / f"{checkpoint.checkpoint_id}.json"
+        checkpoint_record = json.loads(checkpoint_path.read_bytes())
+        del checkpoint_record["sealed_segment_index"]
+        checkpoint_bytes = json.dumps(
+            checkpoint_record, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+        checkpoint_digest = hashlib.sha256(checkpoint_bytes).hexdigest()
+        checkpoint_path.write_bytes(checkpoint_bytes)
+        manifest_path = self.root / "run" / "manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["checkpoint"]["digest"] = checkpoint_digest
+        manifest["previous_checkpoint_digest"] = checkpoint_digest
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        )
+        segment_path = next((self.root / "run" / "segments").glob("segment-*.jsonl"))
+        marker = json.loads(segment_path.read_text().splitlines()[0])
+        marker["data"]["checkpoint_digest"] = checkpoint_digest
+        segment_path.write_text(
+            json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+        )
+
+        with self.assertRaisesRegex(StreamError, "sealed_segment_index is missing"):
+            await StreamingPlan.open(identity(), self.root / "run", limits=StreamLimits())
+
+    async def test_dependencies_are_refused_after_deterministic_terminal_window(self):
+        limits = StreamLimits(max_pending_steps=1)
+        stream = await self.open_stream(limits=limits)
+        await stream.append(intent("old"))
+        await confirm(stream, "old")
+        await stream.append(intent("new", dependencies=("old",)))
+        await confirm(stream, "new")
+        journal = stream._journal
+        self.assertNotIn("old", journal.intents)
+
+        before = (
+            journal.event_high_water_mark,
+            journal.sequence_digest,
+            journal.disk_bytes,
+            journal._active_bytes,
+        )
+        with self.assertRaisesRegex(StreamError, "dependencies"):
+            await stream.append(intent("too-old", dependencies=("old",)))
+        self.assertEqual(
+            before,
+            (
+                journal.event_high_water_mark,
+                journal.sequence_digest,
+                journal.disk_bytes,
+                journal._active_bytes,
+            ),
+        )
+        self.assertFalse(journal._poisoned)
+        await self.close_stream(stream)
+        resumed = await self.open_stream(limits=limits)
+        self.assertEqual(resumed.pending_count, 0)
+        self.assertEqual(resumed.terminal_summaries["new"].outcome, "confirmed")
+
+    async def test_compacted_terminal_late_failure_is_an_orphan_and_reopens(self):
+        limits = StreamLimits(max_pending_steps=1)
+        stream = await self.open_stream(limits=limits)
+        await stream.append(intent("provider-old"))
+        signature, raw_packet = signed_packet("provider-old")
+        await stream.record_signed_packet(
+            "provider-old", signature, raw_packet, str(_KEYPAIR.pubkey())
+        )
+        route = SimpleNamespace(
+            endpoint_id="rpc-a", route_group="render", affinity_key=None, is_probe=False
+        )
+        receipt = SimpleNamespace(
+            signature=signature,
+            provider_id="tpu",
+            endpoint_id="rpc-a",
+            disposition="helper-pipe-written",
+        )
+        await stream.record_send_attempt("provider-old", 0, provider_id="tpu", route=route)
+        await stream.record_send_result(
+            "provider-old", 0, 1, acknowledged=True, route=route, receipt=receipt
+        )
+        await stream.record_terminal(
+            StreamTerminal(
+                step_id="provider-old",
+                outcome="confirmed",
+                signature=signature,
+                commitment="confirmed",
+                postcondition_satisfied=True,
+                postcondition_digest="stable",
+            )
+        )
+        await stream.append(intent("newer", dependencies=("provider-old",)))
+        await confirm(stream, "newer")
+        self.assertNotIn("provider-old", stream._journal.intents)
+
+        await stream.record_late_provider_failure(
+            "provider-old",
+            0,
+            1,
+            route=route,
+            receipt=receipt,
+            detail="provider reported delayed error",
+        )
+        self.assertTrue(stream.provider_failures[-1].data["orphan"])
+        await self.close_stream(stream)
+        resumed = await self.open_stream(limits=limits)
+        self.assertEqual(len(resumed.provider_failures), 1)
+        self.assertTrue(resumed.provider_failures[0].data["orphan"])
+        self.assertEqual(resumed.pending_count, 0)
+
+    async def test_processed_observation_is_labeled_optimistic_until_stable(self):
+        stream = await self.open_stream()
+        await stream.append(intent("optimistic"))
+        signature, raw_packet = signed_packet("optimistic")
+        await stream.record_signed_packet(
+            "optimistic", signature, raw_packet, str(_KEYPAIR.pubkey())
+        )
+        await stream.record_observation(
+            "optimistic",
+            0,
+            status_commitment="processed",
+            status_error=None,
+            slot=10,
+            postcondition_satisfied=None,
+            postcondition_digest=None,
+        )
+        self.assertEqual(stream.observations[-1].label, "optimistic")
+        self.assertEqual(stream.optimistic_steps, ("optimistic",))
+        await stream.record_observation(
+            "optimistic",
+            0,
+            status_commitment="confirmed",
+            status_error=None,
+            slot=11,
+            postcondition_satisfied=True,
+            postcondition_digest="stable",
+        )
+        self.assertEqual(stream.observations[-1].label, "stable")
+        self.assertEqual(stream.optimistic_steps, ())
+        await stream.record_terminal(
+            StreamTerminal(
+                step_id="optimistic",
+                outcome="confirmed",
+                signature=signature,
+                commitment="confirmed",
+                postcondition_satisfied=True,
+                postcondition_digest="stable",
+                slot=11,
+            )
+        )
+
+    async def test_unsigned_descendant_can_be_abandoned_after_journaled_reconciliation(self):
+        limits = StreamLimits(max_pending_steps=1)
+        final_identity = identity(commitment_policy="finalized")
+        stream = await self.open_stream(
+            limits=limits, stream_identity=final_identity
+        )
+        await stream.append(intent("parent"))
+        parent_signature, parent_packet = signed_packet("parent")
+        await stream.record_signed_packet(
+            "parent", parent_signature, parent_packet, str(_KEYPAIR.pubkey())
+        )
+        await stream.record_terminal(
+            StreamTerminal(
+                step_id="parent",
+                outcome="confirmed",
+                signature=parent_signature,
+                commitment="finalized",
+                postcondition_satisfied=True,
+                postcondition_digest="stable-parent",
+            )
+        )
+        await stream.append(intent("unsigned-child", dependencies=("parent",)))
+        await stream.record_reconciliation_required(
+            "unsigned-child", 0, detail="parent branch was dropped before child signing"
+        )
+        with self.assertRaisesRegex(StreamError, "journaled adapter decision"):
+            await stream.record_terminal(
+                StreamTerminal(
+                    step_id="unsigned-child",
+                    outcome="abandoned",
+                    signature=None,
+                    commitment=None,
+                    postcondition_satisfied=False,
+                    postcondition_digest="adapter-decision",
+                    reconciliation_decision_event_sequence=0,
+                )
+            )
+        self.assertEqual(stream.pending_count, 1)
+        self.assertTrue(stream.lifecycle_events[-1].data["unsigned"])
+        decision_sequence = await stream.record_reconciliation_decision(
+            "unsigned-child",
+            0,
+            decision="abandon",
+            evidence_digest="adapter-decision",
+        )
+        await stream.record_terminal(
+            StreamTerminal(
+                step_id="unsigned-child",
+                outcome="abandoned",
+                signature=None,
+                commitment=None,
+                postcondition_satisfied=False,
+                postcondition_digest="adapter-decision",
+                reconciliation_decision_event_sequence=decision_sequence,
+            )
+        )
+        self.assertEqual(stream.pending_count, 0)
+        self.assertIsNone(stream.terminal_summaries["unsigned-child"].commitment)
+        await stream.checkpoint(2)
+        await self.close_stream(stream)
+        resumed = await self.open_stream(limits=limits, stream_identity=final_identity)
+        self.assertEqual(resumed.terminal_summaries["unsigned-child"].outcome, "abandoned")
+
+    async def test_provider_disposition_type_matches_before_and_after_reopen(self):
+        from dcg.sequencer.pool import EndpointRoute
+        from dcg.sequencer.providers import ProviderReceipt, SendDisposition
+
+        stream = await self.open_stream()
+        await stream.append(intent("typed-disposition"))
+        signature, raw_packet = signed_packet("typed-disposition")
+        await stream.record_signed_packet(
+            "typed-disposition", signature, raw_packet, str(_KEYPAIR.pubkey())
+        )
+        route = EndpointRoute("rpc-a", "render", "lane-a")
+        await stream.record_send_attempt("typed-disposition", 0, provider_id="tpu", route=route)
+        receipt = ProviderReceipt(
+            signature,
+            "tpu",
+            "rpc-a",
+            SendDisposition.HELPER_PIPE_WRITTEN,
+            0.0,
+        )
+        result = await stream.record_send_result(
+            "typed-disposition", 0, 1, acknowledged=True, receipt=receipt, route=route
+        )
+        self.assertIs(type(result.disposition), str)
+        await self.close_stream(stream)
+        resumed = await self.open_stream()
+        restored = (await resumed.unresolved_packets())[0].attempts[-1]
+        self.assertIs(type(restored.disposition), str)
+        self.assertEqual(restored.disposition, result.disposition)
+
+    async def test_p2_natural_segment_size_sweep_reopens_with_late_failures_and_dependencies(self):
+        rotations = 0
+        no_rotations = 0
+        for max_segment_bytes in range(4_000, 16_000, 37):
+            root = self.root / f"natural-{max_segment_bytes}"
+            limits = StreamLimits(
+                max_pending_steps=1,
+                max_segment_bytes=max_segment_bytes,
+                max_journal_bytes=4 * 1024 * 1024,
+                append_reserve_bytes=1024,
+                max_intent_bytes=512,
+                max_attempts_per_generation=1,
+                max_observations_per_generation=1,
+                max_generations_per_step=1,
+            )
+            journal = StreamJournal(root, identity(), limits)
+            try:
+                signature, _ = _complete_journal_step(
+                    journal, "A", acknowledge=True
+                )
+                _complete_journal_step(journal, "B", dependencies=("A",))
+                if journal._manifest["active_segment"] > 0:
+                    rotations += 1
+                else:
+                    no_rotations += 1
+
+                before = (
+                    journal.event_high_water_mark,
+                    journal.sequence_digest,
+                    journal.disk_bytes,
+                    journal._active_bytes,
+                )
+                with self.assertRaisesRegex(StreamError, "dependencies"):
+                    journal.append_intent(intent("C", dependencies=("A",)))
+                self.assertEqual(
+                    before,
+                    (
+                        journal.event_high_water_mark,
+                        journal.sequence_digest,
+                        journal.disk_bytes,
+                        journal._active_bytes,
+                    ),
+                )
+                self.assertFalse(journal._poisoned)
+
+                journal.record_late_provider_failure(
+                    "A",
+                    0,
+                    1,
+                    provider_id="tpu",
+                    endpoint_id="rpc-a",
+                    route_group="render",
+                    disposition="helper-pipe-written",
+                    detail="late provider error after terminal compaction",
+                )
+                self.assertTrue(journal.provider_failures[-1].data["orphan"])
+                expected_digest = journal.sequence_digest
+                journal.close()
+
+                reopened = StreamJournal(root, identity(), limits)
+                self.assertEqual(reopened.sequence_digest, expected_digest)
+                self.assertEqual(reopened.pending_count, 0)
+                self.assertEqual(len(reopened.provider_failures), 1)
+                self.assertTrue(reopened.provider_failures[0].data["orphan"])
+                self.assertLessEqual(
+                    len(list((root / "checkpoints").glob("checkpoint-*.json"))), 1
+                )
+                self.assertLessEqual(
+                    len(list((root / "segments").glob("segment-*.jsonl"))), 1
+                )
+                reopened.close()
+            finally:
+                journal.close()
+        self.assertGreater(rotations, 0)
+        self.assertGreater(no_rotations, 0)
+
+    async def test_p2_brick_dependency_refusal_is_clean_when_rotation_is_due(self):
+        limits = StreamLimits(max_pending_steps=1)
+        journal = StreamJournal(self.root / "brick", identity(), limits)
+        _complete_journal_step(journal, "A")
+        journal.append_intent(intent("B", dependencies=("A",)))
+        journal.checkpoint(1)
+        signature, raw_packet = signed_packet("B")
+        journal.record_signed_packet("B", signature, raw_packet, str(_KEYPAIR.pubkey()))
+        journal.record_terminal(
+            StreamTerminal(
+                step_id="B",
+                outcome="confirmed",
+                signature=signature,
+                commitment="confirmed",
+                postcondition_satisfied=True,
+                postcondition_digest="stable",
+            )
+        )
+        self.assertNotIn("A", journal.intents)
+        journal._active_bytes = limits.max_segment_bytes
+        before = (journal.event_high_water_mark, journal.disk_bytes, journal.sequence_digest)
+        with self.assertRaisesRegex(StreamError, "dependencies"):
+            journal.append_intent(intent("C", dependencies=("A",)))
+        self.assertEqual(
+            before,
+            (journal.event_high_water_mark, journal.disk_bytes, journal.sequence_digest),
+        )
+        self.assertFalse(journal._poisoned)
+        journal.close()
+        reopened = StreamJournal(self.root / "brick", identity(), limits)
+        self.assertEqual(reopened.pending_count, 0)
+        self.assertEqual(reopened.terminal_summaries["B"].outcome, "confirmed")
+        reopened.close()
+
+    async def test_checkpoint_crash_injections_recover_only_committed_live_state(self):
+        limits = StreamLimits(max_pending_steps=4)
+        phases = (
+            ("before-manifest", "_write_manifest_value", None),
+            ("before-unlink", "_unlink_if_present", "segment-00000001.jsonl"),
+            ("before-new-segment", "_write_new_file", "segment-00000002.jsonl"),
+            ("before-checkpoint-directory-sync", "_fsync_directory", "checkpoints"),
+        )
+        for phase, target, condition in phases:
+            root = self.root / phase
+            journal = StreamJournal(root, identity(), limits)
+            _complete_journal_step(journal, "A", observe=True)
+            journal.checkpoint(1)
+            _complete_journal_step(journal, "B", observe=True)
+            journal.append_intent(intent("P"))
+            signature, raw_packet = signed_packet("P")
+            journal.record_signed_packet("P", signature, raw_packet, str(_KEYPAIR.pubkey()))
+            journal.record_send_attempt(
+                "P", 0, provider_id="tpu", endpoint_id="rpc-a", route_group="render"
+            )
+
+            original = getattr(journal, target)
+
+            def inject(*args, _original=original, _condition=condition, **kwargs):
+                if _condition is None or _condition in str(args[0]):
+                    raise StreamError("injected checkpoint crash")
+                return _original(*args, **kwargs)
+
+            with patch.object(journal, target, side_effect=inject):
+                with self.assertRaises(StreamError):
+                    journal.checkpoint(2)
+            journal.close()
+
+            resumed = StreamJournal(root, identity(), limits)
+            unresolved = resumed.unresolved_packets()
+            self.assertEqual([(packet.step_id, packet.raw_bytes) for packet in unresolved], [("P", raw_packet)])
+            self.assertEqual(len(unresolved[0].attempts), 1)
+            self.assertEqual({row.step_id for row in resumed.observations}, {"A", "B"})
+            self.assertTrue({"A", "B"}.issubset(resumed.terminal_summaries))
+            resumed.append_intent(intent("Z"))
+            resumed.checkpoint(2)
+            resumed.close()
 
     async def test_failed_partial_append_poisons_process_and_recovers_prior_packet(self):
         stream = await self.open_stream()
@@ -693,74 +1321,71 @@ class StreamingJournalTests(unittest.IsolatedAsyncioTestCase):
             await stream.append(intent("incremental-quota"))
         self.assertGreater(journal.disk_bytes, 0)
 
-    async def test_long_run_20k_steps_keeps_manifest_event_and_disk_cost_bounded(self):
-        limits = StreamLimits(
-            max_pending_steps=1,
-            max_segment_bytes=131_072,
-            max_journal_bytes=64 * 1024 * 1024,
-            append_reserve_bytes=1024,
-            max_intent_bytes=512,
-            max_attempts_per_generation=1,
-            max_observations_per_generation=1,
-            max_generations_per_step=1,
+    async def test_long_run_100k_steps_keeps_journal_and_reopen_cost_bounded(self):
+        context = multiprocessing.get_context("spawn")
+        progress = context.Queue()
+        process = context.Process(
+            target=_long_run_worker,
+            args=(str(self.root / "long-run"), progress),
         )
-        journal = StreamJournal(self.root / "long-run", identity(), limits)
-        self.addCleanup(journal.close)
-        signature, raw_packet = signed_packet("shared-long-run-packet")
-        append_durations: list[int] = []
-        max_manifest = journal.manifest_bytes
-        max_disk = journal.disk_bytes
-        started = time.perf_counter()
-        checkpoints = 0
-
-        for index in range(20_000):
-            step_id = f"step-{index:05d}"
-            start = time.perf_counter_ns()
-            journal.append_intent(intent(step_id, route_affinity=None))
-            append_durations.append(time.perf_counter_ns() - start)
-            journal.record_signed_packet(step_id, signature, raw_packet, str(_KEYPAIR.pubkey()))
-            journal.record_terminal(
-                StreamTerminal(
-                    step_id=step_id,
-                    outcome="confirmed",
-                    signature=signature,
-                    commitment="confirmed",
-                    postcondition_satisfied=True,
-                    postcondition_digest="stable-state",
-                )
-            )
-            max_manifest = max(max_manifest, journal.manifest_bytes)
-            max_disk = max(max_disk, journal.disk_bytes)
-            if (index + 1) % 1000 == 0:
-                journal.checkpoint(index + 1)
-                checkpoints += 1
-                max_manifest = max(max_manifest, journal.manifest_bytes)
-                max_disk = max(max_disk, journal.disk_bytes)
-            if (index + 1) % 5000 == 0:
+        process.start()
+        samples = []
+        result = None
+        while result is None:
+            try:
+                message = progress.get(timeout=5)
+            except queue.Empty:
+                if not process.is_alive():
+                    break
+                continue
+            if "progress" in message:
+                sample = message["progress"]
+                samples.append(sample)
                 print(
-                    f"20k stream persistence progress: {index + 1} steps, "
-                    f"manifest {journal.manifest_bytes} bytes, disk {journal.disk_bytes} bytes",
+                    f"100k stream progress: {sample['steps']} steps; "
+                    f"disk {sample['disk_bytes']} bytes; "
+                    f"manifest {sample['manifest_bytes']} bytes; "
+                    f"open {sample['open_seconds']:.4f}s",
                     flush=True,
                 )
+            else:
+                result = message["done"]
+        process.join()
+        exit_code = process.exitcode
+        progress.close()
+        process.close()
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(samples), 20)
 
-        elapsed = time.perf_counter() - started
-        average_append_ms = statistics.mean(append_durations) / 1_000_000
-        disk_bytes_per_step = max_disk / 20_000
-        early_median_ms = statistics.median(append_durations[:1000]) / 1_000_000
-        late_median_ms = statistics.median(append_durations[-1000:]) / 1_000_000
-        self.assertEqual(checkpoints, 20)
-        self.assertEqual(journal.pending_count, 0)
-        self.assertLess(max_manifest, 64 * 1024)
-        self.assertLess(max_disk, limits.max_journal_bytes)
-        self.assertLess(disk_bytes_per_step, 4096)
-        self.assertLessEqual(late_median_ms, max(early_median_ms * 10, 250.0))
-        self.assertLess(average_append_ms, 250.0)
+        max_disk = max(sample["max_disk_bytes"] for sample in samples)
+        disk_samples = [sample["disk_bytes"] for sample in samples]
+        manifest_samples = [sample["manifest_bytes"] for sample in samples]
+        checkpoint_samples = [sample["checkpoint_bytes"] for sample in samples]
+        file_samples = [sample["file_count"] for sample in samples]
+        open_samples = [sample["open_seconds"] for sample in samples]
+        early_open = statistics.median(open_samples[:5])
+        late_open = statistics.median(open_samples[-5:])
+
+        self.assertLess(max_disk, 16 * 1024 * 1024)
+        self.assertLess(max_disk, 64 * 1024 * 1024)
+        self.assertLess(max(disk_samples) - min(disk_samples), 1024 * 1024)
+        self.assertEqual(set(file_samples), {4})
+        self.assertLess(max(manifest_samples), 16 * 1024)
+        self.assertLess(max(manifest_samples) - min(manifest_samples), 1024)
+        self.assertLess(max(checkpoint_samples), 2 * 1024 * 1024)
+        self.assertLess(max(checkpoint_samples) - min(checkpoint_samples), 64 * 1024)
+        self.assertLess(max(open_samples), 2.0)
+        self.assertLessEqual(late_open, early_open * 5 + 0.05)
+        self.assertLess(result["peak_rss_bytes"], 256 * 1024 * 1024)
         print(
-            "20k stream persistence: "
-            f"{elapsed:.2f}s total; append mean {average_append_ms:.3f}ms, "
-            f"early/late median {early_median_ms:.3f}/{late_median_ms:.3f}ms; "
-            f"manifest max {max_manifest} bytes; disk max {max_disk} bytes "
-            f"({disk_bytes_per_step:.1f} bytes/step); checkpoints {checkpoints}"
+            "100k stream persistence: "
+            f"{result['elapsed_seconds']:.1f}s total; disk samples {min(disk_samples)}.."
+            f"{max(disk_samples)} bytes (peak accounted {max_disk}); files {set(file_samples)}; "
+            f"manifest {min(manifest_samples)}..{max(manifest_samples)} bytes; "
+            f"checkpoint {min(checkpoint_samples)}..{max(checkpoint_samples)} bytes; "
+            f"reopen median early/late {early_open:.4f}/{late_open:.4f}s, max {max(open_samples):.4f}s; "
+            f"peak RSS {result['peak_rss_bytes'] / (1024 * 1024):.1f} MiB"
         )
 
 

@@ -17,6 +17,13 @@ evidence. ``checkpoint`` waits for an app-selected terminal boundary, and
 leave work resumable. Pending plus in-flight steps count against the bound
 until Package C records a terminal summary.
 
+An observation at ``processed`` is labeled ``optimistic`` until a stable
+observation or terminal result is recorded. After a dropped branch, the adapter
+may mark even never-signed descendants ``reconciliation_required``. It releases
+their pending slots only by journaling a reconciliation decision of ``abandon``
+and then a terminal ``abandoned`` summary; this outcome does not claim finalized
+commitment.
+
 After resume, the adapter must reconcile unresolved packets before signing new
 work. route_policy_digest must be the canonical digest of the configured
 endpoint pool and provider configuration. observations exposes observations
@@ -30,7 +37,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, Callable, Protocol, TypeVar
+from typing import Any, Callable, Literal, Protocol, TypeVar
 
 from .stream_journal import (
     PacketAttempt,
@@ -78,6 +85,9 @@ class StreamingPlanProtocol(Protocol):
 
     @property
     def observations(self) -> tuple[StreamObservation, ...]: ...
+
+    @property
+    def optimistic_steps(self) -> tuple[str, ...]: ...
 
     async def append(self, intent: StreamIntent) -> StreamAppendReceipt: ...
 
@@ -134,6 +144,15 @@ class StreamingPlanProtocol(Protocol):
         self, step_id: str, generation: int, *, detail: str
     ) -> None: ...
 
+    async def record_reconciliation_decision(
+        self,
+        step_id: str,
+        generation: int,
+        *,
+        decision: Literal["abandon", "continue", "rebuild"],
+        evidence_digest: str,
+    ) -> int: ...
+
     async def record_terminal(self, terminal: StreamTerminal) -> None: ...
 
 
@@ -188,6 +207,12 @@ class StreamingPlan:
         return self._journal.observations
 
     @property
+    def optimistic_steps(self) -> tuple[str, ...]:
+        """Steps released at ``processed`` that have not reached stable status."""
+
+        return self._journal.optimistic_steps
+
+    @property
     def lifecycle_events(self) -> tuple[StreamLifecycleEvent, ...]:
         return self._journal.lifecycle_events
 
@@ -209,7 +234,9 @@ class StreamingPlan:
                     raise StreamClosed("stream input is closed")
                 known = set(self._journal.intents)
                 if any(dependency not in known for dependency in intent.dependencies):
-                    raise StreamError("stream dependencies must name already appended steps")
+                    raise StreamError(
+                        "stream dependencies must name pending steps or the deterministic retained terminal window"
+                    )
                 while self.pending_count >= self.limits.max_pending_steps:
                     if self._journal.input_closed:
                         raise StreamClosed("stream input closed while append waited for capacity")
@@ -331,6 +358,22 @@ class StreamingPlan:
     ) -> None:
         await _run_thread(
             self._journal.record_reconciliation_required, step_id, generation, detail=detail
+        )
+
+    async def record_reconciliation_decision(
+        self,
+        step_id: str,
+        generation: int,
+        *,
+        decision: Literal["abandon", "continue", "rebuild"],
+        evidence_digest: str,
+    ) -> int:
+        return await _run_thread(
+            self._journal.record_reconciliation_decision,
+            step_id,
+            generation,
+            decision=decision,
+            evidence_digest=evidence_digest,
         )
 
     async def record_terminal(self, terminal: StreamTerminal) -> None:
