@@ -66,11 +66,14 @@ use super::document::{BOND_ESCROWED, BOND_HELD, BOND_NONE, BOND_PAID, WINNER_AT_
 use super::events::{self, Body};
 use super::result::{
     self, BOND_CAUSE_AT_V6, BOND_STATE_AT_V6, CL_CLOSE, RESULT_TERMS_AT_V6, STATUS_WITHHELD,
-    TOMBSTONE_V2_CAUSE_AT, TOMBSTONE_V2_PROGRAM_AT, TOMBSTONE_V2_REMAINDER_AT,
+    TOMBSTONE_V2_BYTES, TOMBSTONE_V2_CAUSE_AT, TOMBSTONE_V2_PROGRAM_AT, TOMBSTONE_V2_REMAINDER_AT,
     TOMBSTONE_V2_WINNER_AT, WINNER_AT_V6,
 };
 use super::terms::{self, Terms2, TERMS_BYTES_V2};
 use super::{d32, no, CL_AUTHORITY, CL_MALFORMED, CL_OVERFLOW, SETTLEMENT_PROGRAM};
+use crate::account_provenance::{
+    expect_derived, expect_system_account_shape, AccountKind, RoleFlags,
+};
 use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
@@ -107,13 +110,19 @@ pub fn validate_escrow(
     escrow: &AccountInfo,
     descriptor: &[u8; 32],
 ) -> Result<u8, ProgramError> {
-    let (key, bump) = address::bond_escrow(program, descriptor);
-    if escrow.key != &key {
+    let (expected, bump) = address::bond_escrow(program, descriptor);
+    if escrow.key != &expected {
         return Err(no(CL_CLOSE));
     }
-    if !escrow.is_writable || escrow.owner != &system_program::ID || !escrow.data_is_empty() {
-        return Err(no(SETTLEMENT_PROGRAM));
-    }
+    expect_system_account_shape(
+        escrow,
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+        true,
+    )
+    .map_err(|_| no(SETTLEMENT_PROGRAM))?;
     Ok(bump)
 }
 
@@ -125,16 +134,21 @@ pub fn validate_escrow_with_bump(
     descriptor: &[u8; 32],
     bump: u8,
 ) -> ProgramResult {
-    let key =
+    let expected =
         Pubkey::create_program_address(&[address::BOND_ESCROW_SEED, descriptor, &[bump]], program)
             .map_err(|_| no(CL_CLOSE))?;
-    if escrow.key != &key {
+    if escrow.key != &expected {
         return Err(no(CL_CLOSE));
     }
-    if !escrow.is_writable || escrow.owner != &system_program::ID || !escrow.data_is_empty() {
-        return Err(no(SETTLEMENT_PROGRAM));
-    }
-    Ok(())
+    expect_system_account_shape(
+        escrow,
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+        true,
+    )
+    .map_err(|_| no(SETTLEMENT_PROGRAM))
 }
 
 /// **Fund the escrow** (spec §1.4's CUSTOM route step 1): DCG directly debits
@@ -352,9 +366,17 @@ pub fn read_settlement_with_hooks(
             return Err(no(CL_CLOSE));
         }
         let descriptor = d32(&raw, 8, CL_MALFORMED)?;
-        if record.key != &address::result(program, &descriptor).0 {
-            return Err(no(CL_MALFORMED));
-        }
+        expect_derived(
+            record,
+            program,
+            &[address::RESULT_SEED, &descriptor],
+            AccountKind::exact(b"DCRZ", TOMBSTONE_V2_BYTES).with_version(4, 2),
+            RoleFlags {
+                writable: true,
+                signer: false,
+            },
+        )
+        .map_err(|_| no(CL_MALFORMED))?;
         let cause = raw[TOMBSTONE_V2_CAUSE_AT];
         let settlement_program = d32(&raw, TOMBSTONE_V2_PROGRAM_AT, CL_MALFORMED)?;
         let bond_remainder = d32(&raw, TOMBSTONE_V2_REMAINDER_AT, CL_MALFORMED)?;
@@ -527,6 +549,11 @@ pub fn retry_with_hooks(
     //    and holding lamports. **599** if it holds none -- already settled, or
     //    never escrowed -- because "nothing to do" is a refusal and not a no-op
     //    (`outcome = 0` is unassigned and can never be emitted).
+    // Preserve the public refusal order: meta privilege errors are reported
+    // before the escrow address is checked.
+    if !escrow.is_writable || escrow.is_signer {
+        return Err(no(SETTLEMENT_PROGRAM));
+    }
     let bump = validate_escrow(program, escrow, &s.descriptor)?;
     let pot = escrow.lamports();
     if pot == 0 {

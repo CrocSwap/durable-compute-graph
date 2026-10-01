@@ -5,6 +5,10 @@
 //! the statically linked kernel, and stages multi-account views in resumable
 //! phases before one atomic publication transaction.
 
+use crate::account_provenance::{
+    create_derived_account, expect_derived, expect_derived_with_bump, expect_keyed, AccountKind,
+    RoleFlags,
+};
 use crate::kernel::{
     AccountSpan, InitializationPhase, KernelId, ModeId, StateSchema, StateSpanMut, StatefulKernel,
     TransitionDisposition, VersionedId, ViewAbi, ViewPhase, MAX_DECLARED_KERNEL_COMPUTE_UNITS,
@@ -329,11 +333,23 @@ fn checked_resource(
     writable: bool,
 ) -> Result<ResourceMeta, ProgramError> {
     check_program_owned(account, program, writable)?;
-    let (expected, _) = resource_pda(program, session_account.key);
+    if session.resource_key == Pubkey::default() {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
+    expect_keyed(
+        account,
+        program,
+        &session.resource_key,
+        AccountKind::variable(RESOURCE_MAGIC, RESOURCE_HEADER_BYTES, ACCOUNT_MAX_BYTES)
+            .with_version(4, WIRE_VERSION as u16),
+        RoleFlags {
+            writable,
+            signer: false,
+        },
+    )
+    .map_err(|_| refusal(REFUSAL_RESOURCE))?;
     let raw = account.try_borrow_data()?;
     if session.resource_key == Pubkey::default()
-        || account.key != &expected
-        || account.key != &session.resource_key
         || raw.len() < RESOURCE_HEADER_BYTES
         || &raw[..4] != RESOURCE_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
@@ -814,12 +830,21 @@ fn checked_session_from(
         return Err(refusal(REFUSAL_AUTHORITY));
     }
     let id = session.id.to_le_bytes();
-    let bump = [session.bump];
-    let expected =
-        Pubkey::create_program_address(&[SESSION_SEED, authority.as_ref(), &id, &bump], program)
-            .map_err(|_| refusal(REFUSAL_SESSION))?;
-    if account.key != &expected
-        || account.key != &session.self_key
+    expect_derived_with_bump(
+        account,
+        program,
+        &[SESSION_SEED, authority.as_ref(), &id],
+        session.bump,
+        AccountKind::exact(SESSION_MAGIC, SESSION_BYTES)
+            .with_version(4, WIRE_VERSION as u16)
+            .with_bump(1262),
+        RoleFlags {
+            writable,
+            signer: false,
+        },
+    )
+    .map_err(|_| refusal(REFUSAL_SESSION))?;
+    if account.key != &session.self_key
         || session.kernel_id != kernel.manifest().id
         || session.semantic_version != kernel.manifest().semantic_version
         || session.abi_version != kernel.manifest().abi_version
@@ -847,32 +872,13 @@ fn create_pda<'a>(
     bump: u8,
     data_len: usize,
 ) -> ProgramResult {
-    if !payer.is_signer
-        || !payer.is_writable
-        || !target.is_writable
-        || *system.key != system_program::id()
-        || target.owner != &system_program::id()
-        || target.lamports() != 0
-        || !target.data_is_empty()
-        || data_len > ACCOUNT_MAX_BYTES
-    {
+    if data_len > ACCOUNT_MAX_BYTES {
         return Err(refusal(REFUSAL_SESSION));
     }
-    let bump_seed = [bump];
-    let mut signer_seeds = seeds.to_vec();
-    signer_seeds.push(&bump_seed);
-    invoke_signed(
-        &system_instruction::create_account(
-            payer.key,
-            target.key,
-            Rent::get()?.minimum_balance(data_len),
-            data_len as u64,
-            program,
-        ),
-        &[payer.clone(), target.clone(), system.clone()],
-        &[&signer_seeds],
-    )?;
-    Ok(())
+    create_derived_account(
+        program, payer, target, system, seeds, bump, data_len, data_len,
+    )
+    .map_err(|_| refusal(REFUSAL_SESSION))
 }
 
 fn open_session(
@@ -1080,12 +1086,27 @@ fn stream_pda_check(
     writable: bool,
 ) -> ProgramResult {
     check_program_owned(account, program, writable)?;
+    if session.stream_key == Pubkey::default() {
+        return Err(refusal(REFUSAL_SESSION));
+    }
+    expect_keyed(
+        account,
+        program,
+        &session.stream_key,
+        AccountKind::exact(
+            STREAM_MAGIC,
+            CHILD_HEADER_BYTES + session.capacity as usize * SLOT_BYTES,
+        )
+        .with_version(4, WIRE_VERSION as u16),
+        RoleFlags {
+            writable,
+            signer: false,
+        },
+    )
+    .map_err(|_| refusal(REFUSAL_SESSION))?;
     let raw = account.try_borrow_data()?;
-    let (derived_key, _) = stream_pda(program, session_account.key);
     let expected_len = CHILD_HEADER_BYTES + session.capacity as usize * SLOT_BYTES;
-    if account.key != &derived_key
-        || account.key != &session.stream_key
-        || raw.len() != expected_len
+    if raw.len() != expected_len
         || &raw[..4] != STREAM_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
         || raw[6] != KIND_STREAM
@@ -1382,10 +1403,30 @@ fn grow_state(
     }
     check_program_owned(state, program, true)?;
     let schema = validate_kernel(kernel)?;
-    let (expected, _) = state_pda(program, session_account.key, index as u8);
+    let state_kind = if session.primary_state && index == 0 {
+        let len = session.state_lengths[index] as usize;
+        AccountKind::variable(b"", len.min(HALT_BEFORE_RUNTIME_CHECK_BYTES), len)
+    } else {
+        AccountKind::variable(STATE_MAGIC, CHILD_HEADER_BYTES + 1, ACCOUNT_MAX_BYTES)
+            .with_version(4, WIRE_VERSION as u16)
+    };
+    if session.state_keys[index] == Pubkey::default() {
+        return Err(refusal(REFUSAL_STATE));
+    }
+    expect_keyed(
+        state,
+        program,
+        &session.state_keys[index],
+        state_kind,
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+    )
+    .map_err(|_| refusal(REFUSAL_STATE))?;
     let raw = state.try_borrow_data()?;
     let headerless = session.primary_state && index == 0;
-    if state.key != &expected || schema.id != session.state_schema {
+    if schema.id != session.state_schema {
         return Err(refusal(REFUSAL_STATE));
     }
     let (desired, allocated) = if headerless {
@@ -1878,10 +1919,22 @@ fn grow_view(
     } else {
         return Err(refusal(REFUSAL_VIEW));
     };
-    if expected_key == Pubkey::default() || view.key != &expected_key {
+    if expected_key == Pubkey::default() {
         return Err(refusal(REFUSAL_VIEW));
     }
     check_program_owned(view, program, true)?;
+    expect_keyed(
+        view,
+        program,
+        &expected_key,
+        AccountKind::variable(VIEW_MAGIC, CHILD_HEADER_BYTES + 1, ACCOUNT_MAX_BYTES)
+            .with_version(4, WIRE_VERSION as u16),
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+    )
+    .map_err(|_| refusal(REFUSAL_VIEW))?;
     let raw = view.try_borrow_data()?;
     if raw.len() < CHILD_HEADER_BYTES
         || &raw[..4] != VIEW_MAGIC
@@ -1939,14 +1992,30 @@ fn state_meta(
     writable: bool,
 ) -> Result<StateSpanMeta, ProgramError> {
     check_program_owned(account, program, writable)?;
-    let raw = account.try_borrow_data()?;
     if index >= MAX_STATE_SPANS {
         return Err(refusal(REFUSAL_STATE));
     }
-    let (derived_key, _) = state_pda(program, session_account.key, index as u8);
-    if account.key != &derived_key || account.key != &session.state_keys[index] {
+    if session.state_keys[index] == Pubkey::default() {
         return Err(refusal(REFUSAL_STATE));
     }
+    let kind = if session.primary_state && index == 0 {
+        AccountKind::exact(b"", session.state_lengths[0] as usize)
+    } else {
+        AccountKind::variable(STATE_MAGIC, CHILD_HEADER_BYTES + 1, ACCOUNT_MAX_BYTES)
+            .with_version(4, WIRE_VERSION as u16)
+    };
+    expect_keyed(
+        account,
+        program,
+        &session.state_keys[index],
+        kind,
+        RoleFlags {
+            writable,
+            signer: false,
+        },
+    )
+    .map_err(|_| refusal(REFUSAL_STATE))?;
+    let raw = account.try_borrow_data()?;
     if session.primary_state && index == 0 {
         let len = session.state_lengths[0];
         if schema.id != session.state_schema || len == 0 || raw.len() != len as usize {
@@ -2289,7 +2358,6 @@ fn view_meta(
     kernel: &dyn StatefulKernel,
 ) -> Result<ViewMeta, ProgramError> {
     check_program_owned(account, program, writable)?;
-    let raw = account.try_borrow_data()?;
     let (kind, expected_key) = if role == SCRATCH_ROLE {
         (KIND_SCRATCH, session.scratch_key)
     } else if role == WORKSPACE_ROLE {
@@ -2299,11 +2367,23 @@ fn view_meta(
     } else {
         return Err(refusal(REFUSAL_VIEW));
     };
-    let (derived_key, _) = view_pda(program, session_account.key, role);
-    if expected_key == Pubkey::default()
-        || account.key != &derived_key
-        || account.key != &expected_key
-        || raw.len() < CHILD_HEADER_BYTES
+    if expected_key == Pubkey::default() {
+        return Err(refusal(REFUSAL_VIEW));
+    }
+    expect_keyed(
+        account,
+        program,
+        &expected_key,
+        AccountKind::variable(VIEW_MAGIC, CHILD_HEADER_BYTES + 1, ACCOUNT_MAX_BYTES)
+            .with_version(4, WIRE_VERSION as u16),
+        RoleFlags {
+            writable,
+            signer: false,
+        },
+    )
+    .map_err(|_| refusal(REFUSAL_VIEW))?;
+    let raw = account.try_borrow_data()?;
+    if raw.len() < CHILD_HEADER_BYTES
         || &raw[..4] != VIEW_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
         || raw[6] != kind
@@ -3479,10 +3559,19 @@ fn checked_anchor(
     writable: bool,
 ) -> Result<AnchorMeta, ProgramError> {
     check_program_owned(account, program, writable)?;
-    let (expected, _) = anchor_pda(program, session_account.key);
+    expect_derived(
+        account,
+        program,
+        &[ANCHOR_SEED, session_account.key.as_ref()],
+        AccountKind::exact(ANCHOR_MAGIC, ANCHOR_ACCOUNT_BYTES).with_version(4, WIRE_VERSION as u16),
+        RoleFlags {
+            writable,
+            signer: false,
+        },
+    )
+    .map_err(|_| refusal(REFUSAL_SESSION))?;
     let raw = account.try_borrow_data()?;
-    if account.key != &expected
-        || raw.len() != ANCHOR_ACCOUNT_BYTES
+    if raw.len() != ANCHOR_ACCOUNT_BYTES
         || &raw[..4] != ANCHOR_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
         || !matches!(raw[6], 0 | 1)

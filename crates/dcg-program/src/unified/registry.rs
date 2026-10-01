@@ -17,17 +17,12 @@ use super::{
     no, u16_at, u32_at, EPOCH, REGISTRY_ACCOUNT, REGISTRY_EPOCH, REGISTRY_ROOT, REGISTRY_STATE,
     ROW_CAPABILITY, ROW_MALFORMED,
 };
+use crate::account_provenance::{allocate_derived_account, expect_derived, AccountKind, RoleFlags};
 use crate::envelope_seal::{self as esl, RESPOND_GENERIC, WITNESS_TENSORS};
 use crate::hash;
 use solana_program::{
-    account_info::AccountInfo,
-    entrypoint::ProgramResult,
-    program::{invoke, invoke_signed},
-    program_error::ProgramError,
-    pubkey::Pubkey,
-    rent::Rent,
-    system_instruction, system_program,
-    sysvar::Sysvar,
+    account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
+    pubkey::Pubkey, system_program,
 };
 
 pub const REGISTRY_VERSION: u16 = 2;
@@ -314,8 +309,21 @@ pub fn view(program: &Pubkey, account: &AccountInfo) -> Result<View, ProgramErro
     }
     let registry_id = u32_at(&raw, 12, REGISTRY_ACCOUNT)?;
     let row_count = u32_at(&raw, 16, REGISTRY_ACCOUNT)?;
-    if *account.key != super::address::registry(program, registry_id).0
-        || raw.len() != HEADER + row_count as usize * ROW_BYTES
+    let epoch = EPOCH.to_le_bytes();
+    let id = registry_id.to_le_bytes();
+    expect_derived(
+        account,
+        program,
+        &[super::address::REGISTRY_SEED, &epoch, &id],
+        AccountKind::variable(b"DRP2", HEADER, HEADER + MAX_ROWS as usize * ROW_BYTES)
+            .with_version(4, REGISTRY_VERSION),
+        RoleFlags {
+            writable: false,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(REGISTRY_ACCOUNT))?;
+    if raw.len() != HEADER + row_count as usize * ROW_BYTES
         || raw[184..192] != [0; 8]
         || u16_at(&raw, 6, REGISTRY_ACCOUNT)? & !1 != 0
     {
@@ -372,23 +380,23 @@ pub(crate) fn create_pda<'a>(
     if *account.owner != system_program::id() || !account.data_is_empty() {
         return Err(no(state));
     }
-    let need = Rent::get()?.minimum_balance(rent_size);
-    if account.lamports() < need {
-        invoke(
-            &system_instruction::transfer(payer.key, account.key, need - account.lamports()),
-            &[payer.clone(), account.clone(), system.clone()],
-        )?;
+    let Some((bump_seed, base_seeds)) = seeds.split_last() else {
+        return Err(no(bad));
+    };
+    if bump_seed.len() != 1 {
+        return Err(no(bad));
     }
-    invoke_signed(
-        &system_instruction::allocate(account.key, size as u64),
-        &[account.clone(), system.clone()],
-        &[seeds],
-    )?;
-    invoke_signed(
-        &system_instruction::assign(account.key, program),
-        &[account.clone(), system.clone()],
-        &[seeds],
+    allocate_derived_account(
+        program,
+        payer,
+        account,
+        system,
+        base_seeds,
+        bump_seed[0],
+        size,
+        rent_size,
     )
+    .map_err(|_| no(state))
 }
 
 /// tag 156: registry_id:u32 | row_count:u32 | census_digest[32]

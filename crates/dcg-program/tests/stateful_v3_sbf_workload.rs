@@ -1410,6 +1410,92 @@ async fn stateful_v3_default_layout_remains_headered() {
         true,
     )
     .await;
+    let first_state = account(&mut context, states[0]).await;
+    let mut wrong_kind_state = account(&mut context, stream).await;
+    wrong_kind_state.data.resize(first_state.data.len(), 0);
+    context.set_account(&states[0], &AccountSharedData::from(wrong_kind_state));
+    send(
+        &mut context,
+        advance_with_spans(authority.pubkey(), session, 0, 2, &states),
+        &[&authority],
+        "ADVANCE-v3-wrong-kind-headered-state-refused",
+        Err(v3::REFUSAL_STATE),
+        true,
+    )
+    .await;
+    context.set_account(&states[0], &AccountSharedData::from(first_state.clone()));
+
+    let second_authority = keypair(68);
+    let second_session = session_pda(&second_authority.pubkey(), 6);
+    let second_states = [state_pda(&second_session, 0), state_pda(&second_session, 1)];
+    send(
+        &mut context,
+        open_default(payer, second_authority.pubkey(), 6),
+        &[&second_authority],
+        "OPEN_SESSION-v3-second-headered-state-instance",
+        Ok(()),
+        true,
+    )
+    .await;
+    send(
+        &mut context,
+        create_stream(payer, second_session),
+        &[],
+        "CREATE_STREAM-v3-second-headered-state-instance",
+        Ok(()),
+        true,
+    )
+    .await;
+    let mut second_create_payload = vec![v3::WIRE_VERSION, 2];
+    second_create_payload.extend_from_slice(&8u32.to_le_bytes());
+    second_create_payload.extend_from_slice(&8u32.to_le_bytes());
+    send(
+        &mut context,
+        instruction(
+            sw::TAG_CREATE_STATE,
+            second_create_payload,
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(second_session, false),
+                AccountMeta::new(second_states[0], false),
+                AccountMeta::new(second_states[1], false),
+                AccountMeta::new_readonly(SYSTEM, false),
+            ],
+        ),
+        &[],
+        "CREATE_STATE-v3-second-headered-state-instance",
+        Ok(()),
+        true,
+    )
+    .await;
+    send(
+        &mut context,
+        advance_with_spans(
+            authority.pubkey(),
+            session,
+            0,
+            2,
+            &[states[0], second_states[1]],
+        ),
+        &[&authority],
+        "ADVANCE-v3-second-instance-headered-state-refused",
+        Err(v3::REFUSAL_STATE),
+        true,
+    )
+    .await;
+    let mut stale_parent_state = first_state.clone();
+    stale_parent_state.data[8..40].copy_from_slice(second_session.as_ref());
+    context.set_account(&states[0], &AccountSharedData::from(stale_parent_state));
+    send(
+        &mut context,
+        advance_with_spans(authority.pubkey(), session, 0, 2, &states),
+        &[&authority],
+        "ADVANCE-v3-stale-parent-headered-state-refused",
+        Err(v3::REFUSAL_STATE),
+        true,
+    )
+    .await;
+    context.set_account(&states[0], &AccountSharedData::from(first_state));
     send(
         &mut context,
         instruction(
@@ -2052,6 +2138,172 @@ async fn stateful_v3_forged_session_and_other_primary_are_refused() {
             send(&mut context, ix, &[], label, Ok(()), false).await;
         }
     }
+    // Session and stream substitutions reach their actual writers. A second
+    // valid session/stream is the wrong parent, while same-address images with
+    // a wrong kind or old parent identity must be refused atomically.
+    let session_image = account(&mut context, session).await;
+    let mut wrong_session_kind = session_image.clone();
+    wrong_session_kind.data[..4].copy_from_slice(b"XXXX");
+    context.set_account(&session, &AccountSharedData::from(wrong_session_kind));
+    send(
+        &mut context,
+        write_input(authority.pubkey(), session, 0, 1),
+        &[&authority],
+        "WRITE_INPUT-v3-wrong-kind-session-refused",
+        Err(v3::REFUSAL_SESSION),
+        true,
+    )
+    .await;
+    context.set_account(&session, &AccountSharedData::from(session_image.clone()));
+    send(
+        &mut context,
+        write_input(authority.pubkey(), victim_session, 0, 1),
+        &[&authority],
+        "WRITE_INPUT-v3-second-session-authority-refused",
+        Err(v3::REFUSAL_AUTHORITY),
+        true,
+    )
+    .await;
+    let mut stale_session = session_image.clone();
+    stale_session.data[1262] = stale_session.data[1262].wrapping_add(1);
+    context.set_account(&session, &AccountSharedData::from(stale_session));
+    send(
+        &mut context,
+        write_input(authority.pubkey(), session, 0, 1),
+        &[&authority],
+        "WRITE_INPUT-v3-stale-session-bump-refused",
+        Err(v3::REFUSAL_SESSION),
+        true,
+    )
+    .await;
+    context.set_account(&session, &AccountSharedData::from(session_image));
+
+    let stream = stream_pda(&session);
+    let stream_image = account(&mut context, stream).await;
+    let mut wrong_stream_kind = stream_image.clone();
+    wrong_stream_kind.data[..4].copy_from_slice(b"XXXX");
+    context.set_account(&stream, &AccountSharedData::from(wrong_stream_kind));
+    send(
+        &mut context,
+        write_input(authority.pubkey(), session, 0, 1),
+        &[&authority],
+        "WRITE_INPUT-v3-wrong-kind-stream-refused",
+        Err(v3::REFUSAL_SESSION),
+        true,
+    )
+    .await;
+    context.set_account(&stream, &AccountSharedData::from(stream_image.clone()));
+    let mut second_stream = write_input(authority.pubkey(), session, 0, 1);
+    second_stream.accounts[2].pubkey = stream_pda(&victim_session);
+    send(
+        &mut context,
+        second_stream,
+        &[&authority],
+        "WRITE_INPUT-v3-second-stream-refused",
+        Err(v3::REFUSAL_SESSION),
+        true,
+    )
+    .await;
+    let mut stale_stream = stream_image.clone();
+    stale_stream.data[8..40].copy_from_slice(victim_session.as_ref());
+    context.set_account(&stream, &AccountSharedData::from(stale_stream));
+    send(
+        &mut context,
+        write_input(authority.pubkey(), session, 0, 1),
+        &[&authority],
+        "WRITE_INPUT-v3-stale-stream-parent-refused",
+        Err(v3::REFUSAL_SESSION),
+        true,
+    )
+    .await;
+    context.set_account(&stream, &AccountSharedData::from(stream_image));
+
+    let resource_key = resource_pda(&session);
+    let resource_image = account(&mut context, resource_key).await;
+    let resource_proof = resource_proof(&resource, 0);
+    let mut wrong_resource_kind = resource_image.clone();
+    wrong_resource_kind.data[..4].copy_from_slice(b"XXXX");
+    context.set_account(&resource_key, &AccountSharedData::from(wrong_resource_kind));
+    send(
+        &mut context,
+        upload_resource_chunk(authority.pubkey(), session, RESOURCE, 0, &resource_proof),
+        &[&authority],
+        "RESOURCE_CHUNK-v3-wrong-kind-resource-refused",
+        Err(v3::REFUSAL_RESOURCE),
+        true,
+    )
+    .await;
+    context.set_account(
+        &resource_key,
+        &AccountSharedData::from(resource_image.clone()),
+    );
+    let mut second_resource =
+        upload_resource_chunk(authority.pubkey(), session, RESOURCE, 0, &resource_proof);
+    second_resource.accounts[2].pubkey = resource_pda(&victim_session);
+    send(
+        &mut context,
+        second_resource,
+        &[&authority],
+        "RESOURCE_CHUNK-v3-second-resource-refused",
+        Err(v3::REFUSAL_RESOURCE),
+        true,
+    )
+    .await;
+    let mut stale_resource = resource_image.clone();
+    stale_resource.data[8..40].copy_from_slice(victim_session.as_ref());
+    context.set_account(&resource_key, &AccountSharedData::from(stale_resource));
+    send(
+        &mut context,
+        upload_resource_chunk(authority.pubkey(), session, RESOURCE, 0, &resource_proof),
+        &[&authority],
+        "RESOURCE_CHUNK-v3-stale-resource-parent-refused",
+        Err(v3::REFUSAL_RESOURCE),
+        true,
+    )
+    .await;
+    context.set_account(&resource_key, &AccountSharedData::from(resource_image));
+
+    let view = view_pda(&session, 0);
+    let view_image = account(&mut context, view).await;
+    let mut wrong_view_kind = view_image.clone();
+    wrong_view_kind.data[..4].copy_from_slice(b"XXXX");
+    context.set_account(&view, &AccountSharedData::from(wrong_view_kind));
+    send(
+        &mut context,
+        begin_view(authority.pubkey(), session),
+        &[&authority],
+        "BEGIN_PHASE-v3-wrong-kind-view-refused",
+        Err(v3::REFUSAL_VIEW),
+        true,
+    )
+    .await;
+    context.set_account(&view, &AccountSharedData::from(view_image.clone()));
+    let mut second_view = publication_accounts(authority.pubkey(), session, false);
+    second_view[4].pubkey = view_pda(&victim_session, 0);
+    send(
+        &mut context,
+        begin_view_with_accounts(authority.pubkey(), second_view),
+        &[&authority],
+        "BEGIN_PHASE-v3-second-view-refused",
+        Err(v3::REFUSAL_VIEW),
+        true,
+    )
+    .await;
+    let mut stale_view = view_image;
+    stale_view.data[8..40].copy_from_slice(victim_session.as_ref());
+    context.set_account(&view, &AccountSharedData::from(stale_view));
+    send(
+        &mut context,
+        begin_view(authority.pubkey(), session),
+        &[&authority],
+        "BEGIN_PHASE-v3-stale-view-parent-refused",
+        Err(v3::REFUSAL_VIEW),
+        true,
+    )
+    .await;
+    let valid_view = account(&mut context, view).await;
+    context.set_account(&view, &AccountSharedData::from(valid_view));
+
     let mut foreign_workspace = publication_accounts(authority.pubkey(), session, false);
     foreign_workspace[5] = AccountMeta::new(view_pda(&victim_session, v3::WORKSPACE_ROLE), false);
     let mut foreign_scratch = publication_accounts(authority.pubkey(), session, false);
@@ -2145,7 +2397,6 @@ async fn stateful_v3_forged_session_and_other_primary_are_refused() {
     )
     .await;
     let victim_before = account(&mut context, victim_primary).await;
-    let state_before = account(&mut context, forged_primary).await;
     let session_before = account(&mut context, session).await;
     send(
         &mut context,
@@ -2157,8 +2408,33 @@ async fn stateful_v3_forged_session_and_other_primary_are_refused() {
     )
     .await;
     assert_eq!(account(&mut context, victim_primary).await, victim_before);
-    assert_eq!(account(&mut context, forged_primary).await, state_before);
     assert_eq!(account(&mut context, session).await, session_before);
+
+    // Begin anchors after the view and primary-state checks: an open anchor
+    // holds the session phase and changes the earlier handlers' refusal order.
+    for (child_session, child_authority, label) in [
+        (session, authority.pubkey(), "ANCHOR-v3-provenance-primary"),
+        (
+            victim_session,
+            victim_authority.pubkey(),
+            "ANCHOR-v3-provenance-second-instance",
+        ),
+    ] {
+        let signers: &[&Keypair] = if child_authority == authority.pubkey() {
+            &[&authority]
+        } else {
+            &[&victim_authority]
+        };
+        send(
+            &mut context,
+            begin_anchor(payer, child_authority, child_session, 0),
+            signers,
+            label,
+            Ok(()),
+            false,
+        )
+        .await;
+    }
     send(
         &mut context,
         halt_session(authority.pubkey(), session, 0),
@@ -2175,6 +2451,66 @@ async fn stateful_v3_forged_session_and_other_primary_are_refused() {
         "HALT_SESSION-v3-before-cross-primary-close",
         Ok(()),
         false,
+    )
+    .await;
+    let anchor = anchor_pda(&session);
+    let anchor_image = account(&mut context, anchor).await;
+    let mut wrong_anchor_kind = anchor_image.clone();
+    wrong_anchor_kind.data[..4].copy_from_slice(b"XXXX");
+    context.set_account(&anchor, &AccountSharedData::from(wrong_anchor_kind));
+    send(
+        &mut context,
+        close_child(session, anchor, authority.pubkey(), v3::KIND_ANCHOR),
+        &[],
+        "CLOSE_ACCOUNT-v3-wrong-kind-anchor-refused",
+        Err(v3::REFUSAL_SESSION),
+        true,
+    )
+    .await;
+    context.set_account(&anchor, &AccountSharedData::from(anchor_image.clone()));
+    send(
+        &mut context,
+        close_child(
+            session,
+            anchor_pda(&victim_session),
+            authority.pubkey(),
+            v3::KIND_ANCHOR,
+        ),
+        &[],
+        "CLOSE_ACCOUNT-v3-second-anchor-refused",
+        Err(v3::REFUSAL_SESSION),
+        true,
+    )
+    .await;
+    let mut stale_anchor = anchor_image.clone();
+    stale_anchor.data[8..40].copy_from_slice(victim_session.as_ref());
+    context.set_account(&anchor, &AccountSharedData::from(stale_anchor));
+    send(
+        &mut context,
+        close_child(session, anchor, authority.pubkey(), v3::KIND_ANCHOR),
+        &[],
+        "CLOSE_ACCOUNT-v3-stale-anchor-parent-refused",
+        Err(v3::REFUSAL_SESSION),
+        true,
+    )
+    .await;
+    context.set_account(&anchor, &AccountSharedData::from(anchor_image));
+    send(
+        &mut context,
+        close_child(session, anchor, authority.pubkey(), v3::KIND_ANCHOR),
+        &[],
+        "CLOSE_ACCOUNT-v3-honest-anchor-close",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        close_child(session, anchor, authority.pubkey(), v3::KIND_ANCHOR),
+        &[],
+        "CLOSE_ACCOUNT-v3-stale-closed-anchor-refused",
+        Err(v3::REFUSAL_SESSION),
+        true,
     )
     .await;
     let mut halted_forgery = account(&mut context, forged_primary).await;

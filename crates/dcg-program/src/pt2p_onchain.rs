@@ -1233,7 +1233,7 @@ fn instantiate_with_mode(
     let output_binding = if let Some(keys) = &output_keys {
         let key_refs = keys.iter().copied().collect::<Vec<_>>();
         let binding = pt1_onchain::pt1x_output_binding(program, &key_refs, position, start, count);
-        let fresh = pt1_onchain::validate_pt1x_output_binding(
+        let (fresh, bump) = pt1_onchain::validate_pt1x_output_binding(
             program,
             output,
             system.unwrap(),
@@ -1241,7 +1241,7 @@ fn instantiate_with_mode(
             position,
             start,
         )?;
-        Some((binding, fresh))
+        Some((binding, fresh, bump))
     } else {
         None
     };
@@ -1276,7 +1276,7 @@ fn instantiate_with_mode(
             .checked_add(14 + plen + 40 * route_count)
             .ok_or(ProgramError::AccountDataTooSmall)?;
     }
-    if let Some((binding, fresh)) = output_binding {
+    if let Some((binding, fresh, bump)) = output_binding {
         if stream_bytes > u32::MAX as usize {
             return Err(ProgramError::AccountDataTooSmall);
         }
@@ -1295,6 +1295,7 @@ fn instantiate_with_mode(
                     system.unwrap(),
                     rent_payer.unwrap(),
                     &binding,
+                    bump,
                     required_bytes,
                 )?;
                 return Ok(());
@@ -1305,6 +1306,7 @@ fn instantiate_with_mode(
                     output,
                     rent_payer.unwrap(),
                     &binding,
+                    bump,
                     required_bytes,
                 )?;
                 return Ok(());
@@ -1318,6 +1320,7 @@ fn instantiate_with_mode(
                 system.unwrap(),
                 rent_payer.unwrap(),
                 &binding,
+                bump,
                 count,
                 stream_bytes,
                 required_bytes,
@@ -1392,7 +1395,7 @@ fn instantiate_with_mode(
     put_u32(&mut out, 4, position);
     put_u32(&mut out, 8, start);
     put_u32(&mut out, 12, (at - payload_at) as u32);
-    if let Some((binding, _)) = output_binding {
+    if let Some((binding, _, _)) = output_binding {
         out[16..48].copy_from_slice(&binding);
     }
     Ok(())

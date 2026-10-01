@@ -4,6 +4,7 @@
 //! bounded SVM adapter modules live here. Applications provide kernels through
 //! a compile-time manifest; this repository includes a tiny test kernel only.
 
+pub mod account_provenance;
 #[cfg(feature = "sbf-real-lifecycle-test")]
 pub mod closure_v2;
 #[cfg(not(feature = "sbf-real-lifecycle-test"))]
