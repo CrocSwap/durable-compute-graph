@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dcg-program"]
+members = ["crates/dcg-program", "crates/dcg-program/vendor"]
 default-members = ["crates/dcg-program"]
 
 [patch.crates-io]

@@ -1960,7 +1960,7 @@ fn grow_view(
         || allocated > len
         || (kind == KIND_SCRATCH && len > MAX_SCRATCH_BYTES)
         || (kind == KIND_WORKSPACE
-            && (len > kernel.max_view_workspace_bytes() || len > MAX_SCRATCH_BYTES))
+            && (len > kernel.max_view_workspace_bytes() || len > MAX_VIEW_BYTES))
         || (kind == KIND_VIEW && len > MAX_VIEW_BYTES)
     {
         return Err(refusal(REFUSAL_VIEW));
@@ -2311,12 +2311,14 @@ fn create_workspace(
     let mut session = checked_session(program, session_account, true, kernel)?;
     let len = u32_at(data, 3);
     let limit = kernel.max_view_workspace_bytes();
+    // A workspace is a view payload; publication scratch has its own smaller
+    // cap and should not constrain workspace-backed engine state.
     if session.status != STATUS_ACTIVE
         || !session.state_initialized
         || session.workspace_key != Pubkey::default()
         || len == 0
         || len > limit
-        || len > MAX_SCRATCH_BYTES
+        || len > MAX_VIEW_BYTES
         || *system.key != system_program::id()
     {
         return Err(refusal(REFUSAL_VIEW));
@@ -2415,7 +2417,7 @@ fn view_meta(
     } else if kind == KIND_WORKSPACE {
         if abi_id != [0; 32]
             || len > kernel.max_view_workspace_bytes()
-            || len > MAX_SCRATCH_BYTES
+            || len > MAX_VIEW_BYTES
             || source_offset != 0
         {
             return Err(refusal(REFUSAL_VIEW));
@@ -2893,6 +2895,53 @@ fn parse_publication_accounts<'a>(
     })
 }
 
+/// Convert the additive workspace-first RUN_PHASE account order into the
+/// canonical order used by the existing v3 validators. The runtime's first
+/// account data address is fixed for some engines; the workspace occupies it
+/// while all committed state remains read-only later in the message.
+fn normalize_workspace_first_accounts<'a>(
+    session: &Session,
+    accounts: &[AccountInfo<'a>],
+) -> Result<Vec<AccountInfo<'a>>, ProgramError> {
+    if !session.primary_state || accounts.len() < 4 || accounts[0].key != &session.workspace_key {
+        return Err(refusal(REFUSAL_VIEW));
+    }
+    let resource_count = usize::from(session.resource_key != Pubkey::default());
+    let state_start = 3usize
+        .checked_add(resource_count)
+        .ok_or_else(|| refusal(REFUSAL_VIEW))?;
+    let state_count = session.state_span_count as usize;
+    let view_count = session.view_count as usize;
+    let state_end = state_start
+        .checked_add(state_count)
+        .ok_or_else(|| refusal(REFUSAL_VIEW))?;
+    let view_end = state_end
+        .checked_add(view_count)
+        .ok_or_else(|| refusal(REFUSAL_VIEW))?;
+    let expected_accounts = view_end
+        .checked_add(1)
+        .ok_or_else(|| refusal(REFUSAL_VIEW))?;
+    if accounts.len() != expected_accounts
+        || accounts[1].key != &session.authority
+        || accounts[2].key != &session.self_key
+    {
+        return Err(refusal(REFUSAL_VIEW));
+    }
+
+    let mut normalized = Vec::with_capacity(accounts.len());
+    normalized.push(accounts[state_start].clone());
+    normalized.push(accounts[1].clone());
+    normalized.push(accounts[2].clone());
+    if resource_count == 1 {
+        normalized.push(accounts[3].clone());
+    }
+    normalized.extend(accounts[state_start + 1..state_end].iter().cloned());
+    normalized.extend(accounts[state_end..view_end].iter().cloned());
+    normalized.push(accounts[0].clone());
+    normalized.push(accounts[view_end].clone());
+    Ok(normalized)
+}
+
 fn phase_declaration(kernel: &dyn StatefulKernel, declared: u32) -> ProgramResult {
     let limit = kernel.view_phase_compute_units();
     let bytes = kernel.max_view_phase_bytes();
@@ -2993,7 +3042,9 @@ fn begin_view_phase(
     }
     {
         let mut workspace = accounts[parsed.workspace_index].try_borrow_mut_data()?;
-        workspace[CHILD_HEADER_BYTES..].fill(0);
+        if kernel.clear_view_workspace_on_begin() {
+            workspace[CHILD_HEADER_BYTES..].fill(0);
+        }
         put_u32(&mut workspace, 112, expected_cursor);
     }
     session.phase = PHASE_VIEW_PUBLICATION;
@@ -3011,6 +3062,7 @@ fn render_phase_chunk(
     view_metas: &[ViewMeta],
     resources: &[AccountSpan<'_>],
     commitment: &[u8; 32],
+    mut workspace_header: Option<&mut [u8]>,
     workspace: &mut [u8],
     chunk_start: u32,
     chunk: &mut [u8],
@@ -3062,16 +3114,23 @@ fn render_phase_chunk(
                 output_offset: local,
                 compute_units,
             };
-            let written = kernel
-                .render_view_phase_with_resources(
-                    request,
-                    &state,
-                    resources,
-                    commitment,
-                    workspace,
-                    &mut chunk[target..target + len],
+            let output = &mut chunk[target..target + len];
+            let rendered = if let Some(header) = workspace_header.as_deref_mut() {
+                let header_before: [u8; CHILD_HEADER_BYTES] =
+                    header.try_into().map_err(|_| refusal(REFUSAL_KERNEL))?;
+                let rendered = kernel.render_view_phase_with_workspace_header(
+                    request, &state, resources, commitment, header, workspace, output,
+                );
+                if header != header_before.as_slice() {
+                    return Err(refusal(REFUSAL_KERNEL));
+                }
+                rendered
+            } else {
+                kernel.render_view_phase_with_resources(
+                    request, &state, resources, commitment, workspace, output,
                 )
-                .map_err(|_| refusal(REFUSAL_KERNEL))?;
+            };
+            let written = rendered.map_err(|_| refusal(REFUSAL_KERNEL))?;
             if written != len {
                 return Err(refusal(REFUSAL_KERNEL));
             }
@@ -3124,6 +3183,16 @@ fn run_view_phase(
     if declared != session.phase_compute_units {
         return Err(refusal(REFUSAL_RESOURCE));
     }
+    let workspace_first = accounts[0].key == &session.workspace_key;
+    if workspace_first && !kernel.view_workspace_at_account_base() {
+        return Err(refusal(REFUSAL_VIEW));
+    }
+    let normalized_accounts = if workspace_first {
+        normalize_workspace_first_accounts(&session, accounts)?
+    } else {
+        accounts.to_vec()
+    };
+    let accounts = normalized_accounts.as_slice();
     let parsed =
         parse_publication_accounts(program, &session, accounts, false, true, true, kernel)?;
     if parsed
@@ -3170,6 +3239,14 @@ fn run_view_phase(
         let mut scratch_raw = scratch.try_borrow_mut_data()?;
         let stage_start = CHILD_HEADER_BYTES + session.phase_cursor as usize;
         let stage_end = stage_start + count;
+        let mut workspace_header = None;
+        let workspace_payload = if workspace_first {
+            let (header, payload) = workspace_raw.split_at_mut(CHILD_HEADER_BYTES);
+            workspace_header = Some(header);
+            &mut payload[..workspace_len]
+        } else {
+            &mut workspace_raw[CHILD_HEADER_BYTES..CHILD_HEADER_BYTES + workspace_len]
+        };
         render_phase_chunk(
             &parsed.state_metas,
             &parsed.state_accounts,
@@ -3177,7 +3254,8 @@ fn run_view_phase(
             &parsed.view_metas,
             &resources,
             &session.resource_commitment,
-            &mut workspace_raw[CHILD_HEADER_BYTES..CHILD_HEADER_BYTES + workspace_len],
+            workspace_header,
+            workspace_payload,
             session.phase_cursor,
             &mut scratch_raw[stage_start..stage_end],
             session.phase_state_cursor,

@@ -44,8 +44,9 @@ existing bounds: at most eight state spans, 10,000,000 aggregate engine-state
 bytes, at most eight transitions per `ADVANCE`, at most 64 input slots in the
 active write window, and state growth in 8,192-byte increments. Views support
 up to 16 outputs; publication scratch is capped at 4,000,000 bytes. A renderer
-workspace has a kernel-declared maximum. Kernel phase declarations are checked
-against the shared `MAX_DECLARED_KERNEL_COMPUTE_UNITS` constant. The test
+workspace has a kernel-declared maximum, bounded by the 10 MiB SVM account-data
+limit separately from publication scratch. Kernel phase declarations are
+checked against the shared `MAX_DECLARED_KERNEL_COMPUTE_UNITS` constant. The test
 kernel declares initialization at 90% of that constant, below the
 1,289,567-CU compatibility target for the seam-fix work. These are designed
 limits, not measured cost promises.
@@ -117,6 +118,27 @@ separate writable workspace account. The workspace is session-bound and
 versioned alongside the state cursor. The view output remains staged in the
 existing publication scratch until `COMMIT_PHASE`; workspace changes alone do
 not publish output.
+
+The ordinary `RUN_PHASE` account order keeps a headerless primary state span
+first. A fixed-address engine may opt into the additive workspace-first order
+for `RUN_PHASE` only: `[workspace, authority, session, resource?, state spans,
+view outputs, publication scratch]`. This makes the workspace account the
+invocation's first data region. It validates the same session, state, view,
+resource, workspace, and scratch PDAs as the ordinary order, then normalizes
+the spans for the kernel callback. A view may receive writable transaction
+privileges on state accounts; each application kernel must enforce its own
+state-write contract. For example, Doom refuses writable state spans in its
+renderer.
+`BEGIN_PHASE`, `COMMIT_PHASE`, and `ABORT_PHASE` keep
+the ordinary account order. A kernel that opts into this path may temporarily
+use the authenticated 128-byte workspace child header as fixed-address engine
+bytes during its callback; the processor snapshots the header before each
+callback and refuses if any of its 128 bytes differ when the callback returns.
+
+By default, `BEGIN_PHASE` clears the workspace payload. A kernel may opt out
+when it overwrites every byte it relies on before reading the workspace in a
+new publication. The view cursor still starts at zero, outputs remain staged,
+and transaction rollback still covers callback changes.
 
 At `OPEN_SESSION`, the caller names a read-only source account and commits a
 Merkle root over its 65,536-byte chunks. The program creates a `DRS3`

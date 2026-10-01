@@ -507,6 +507,22 @@ pub trait StatefulKernel: Kernel {
         0
     }
 
+    /// Whether a view publication may keep its session-bound workspace bytes
+    /// between BEGIN_PHASE and later publications. The default clears the
+    /// payload at each begin. Kernels that preserve it must overwrite every
+    /// byte they rely on before reading it in a new publication.
+    fn clear_view_workspace_on_begin(&self) -> bool {
+        true
+    }
+
+    /// Opt in to the additive RUN_PHASE account layout that places the
+    /// writable workspace account first. This lets a fixed-address engine
+    /// use the workspace as its invocation-local context while all committed
+    /// state accounts remain read-only later in the account list.
+    fn view_workspace_at_account_base(&self) -> bool {
+        false
+    }
+
     /// Render with the session's read-only authenticated resources and its
     /// declared writable workspace. The default retains resource-free v2
     /// rendering behavior.
@@ -523,6 +539,29 @@ pub trait StatefulKernel: Kernel {
             return Err(KernelError::Refused);
         }
         self.render_view_phase(phase, state, output)
+    }
+
+    /// Render when RUN_PHASE places the whole writable workspace account at
+    /// the invocation's first-account address. `workspace_header` is the
+    /// authenticated 128-byte DCG child header; `workspace` is its declared
+    /// payload. The default preserves the ordinary resource/workspace API.
+    /// An opted-in kernel may borrow the header temporarily, but must restore
+    /// all DCG header bytes before returning. The processor checks the entire
+    /// 128-byte header around every callback and refuses if any byte changed.
+    fn render_view_phase_with_workspace_header(
+        &self,
+        phase: ViewPhase,
+        state: &[AccountSpan<'_>],
+        resources: &[AccountSpan<'_>],
+        commitment: &[u8; 32],
+        workspace_header: &mut [u8],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        let _ = workspace_header;
+        self.render_view_phase_with_resources(
+            phase, state, resources, commitment, workspace, output,
+        )
     }
 
     /// The output ABIs this application image permits for state views.
