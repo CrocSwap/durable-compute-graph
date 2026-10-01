@@ -120,12 +120,13 @@ async fn referee_authority_rent_and_terminal_close_laws() {
     let base_keys = [&bases[0], &bases[1], &bases[2]].map(|key| key.pubkey());
     let protected = Pubkey::new_from_array([0xC1; 32]);
 
-    let mut test = ProgramTest::new(
+    let mut test = ProgramTest::default();
+    test.prefer_bpf(false);
+    test.add_program(
         "dcg_program",
         PROGRAM,
         processor!(dcg_program::process_instruction),
     );
-    test.prefer_bpf(false);
     test.add_account(
         authority.pubkey(),
         funded(system_program::ID, 10_000_000_000, vec![]),

@@ -629,12 +629,13 @@ impl Fx {
 }
 
 async fn start(ids: Ids) -> Fx {
-    let mut test = ProgramTest::new(
+    let mut test = ProgramTest::default();
+    test.prefer_bpf(false);
+    test.add_program(
         "dcg_program",
         ids.program,
         processor!(dcg_program::process_instruction),
     );
-    test.prefer_bpf(false);
     test.add_program("settler_honest", ids.honest, processor!(settler));
     test.add_program("settler_thief", ids.thief, processor!(settler_thief));
     test.add_program("settler_refuses", ids.refuser, processor!(settler_refuses));

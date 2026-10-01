@@ -75,7 +75,7 @@ mod kernel_lifecycle {
     fn test_kernel_runs_through_static_registry_commitment_and_lifecycle() {
         let app = &MANIFEST_APP;
         let kernel_id = KernelId(*b"dcg-test-sum-v1\0");
-        let mut output = [0u8; 8];
+        let mut output = [0u8; 256];
         let written = app
             .execute(
                 kernel_id,
@@ -87,19 +87,23 @@ mod kernel_lifecycle {
             )
             .unwrap();
         assert_eq!(written, 8);
-        assert_eq!(u64::from_le_bytes(output), 256);
+        let transition = output[..written].to_vec();
+        assert_eq!(
+            u64::from_le_bytes(transition.as_slice().try_into().unwrap()),
+            256
+        );
 
         let backend = ObserveBackend;
-        let mut honest = backend.start(Commitment::sha256(&output)).unwrap();
+        let mut honest = backend.start(Commitment::sha256(&transition)).unwrap();
         assert_eq!(backend.mode(), MODE_OPTIMISTIC_V1);
         assert_eq!(
-            backend.advance(&mut honest, output.to_vec()).unwrap(),
+            backend.advance(&mut honest, transition.clone()).unwrap(),
             ResolutionStatus::Final
         );
 
         let mut malformed = backend.start(Commitment::sha256(&[0u8; 8])).unwrap();
         assert_eq!(
-            backend.advance(&mut malformed, output.to_vec()).unwrap(),
+            backend.advance(&mut malformed, transition).unwrap(),
             ResolutionStatus::Refuted
         );
         assert_eq!(BYTE_SUM.manifest().id, kernel_id);

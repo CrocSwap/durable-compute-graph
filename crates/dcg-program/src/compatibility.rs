@@ -540,7 +540,7 @@ pub mod profile_v1 {
                 | 47
                 | 256
                 | 40..=46
-        ) || (form == 48 && !cfg!(feature = "revision-8"))
+        ) || (form == 48 && cfg!(feature = "revision-8"))
     }
 
     pub fn witness_kind(form: u16) -> u8 {

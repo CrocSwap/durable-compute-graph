@@ -132,17 +132,21 @@ mod tests {
     fn document_seeds_are_the_closure_v2_ones() {
         let program = Pubkey::new_from_array([7; 32]);
         let d = [9u8; 32];
-        assert_eq!(
+        let assert_matches_legacy = |actual: (Pubkey, CanonicalBump), legacy: (Pubkey, u8)| {
+            assert_eq!(actual.0, legacy.0);
+            assert_eq!(actual.1.value(), legacy.1);
+        };
+        assert_matches_legacy(
             document(&program, &d),
-            crate::closure_v2::document_address(&program, &d)
+            crate::closure_v2::document_address(&program, &d),
         );
-        assert_eq!(
+        assert_matches_legacy(
             positions(&program, &d),
-            crate::closure_v2::position_page_address(&program, &d)
+            crate::closure_v2::position_page_address(&program, &d),
         );
-        assert_eq!(
+        assert_matches_legacy(
             result(&program, &d),
-            crate::closure_v2::result_address(&program, &d)
+            crate::closure_v2::result_address(&program, &d),
         );
         assert_eq!(REGISTRY_SEED.len(), 25);
         assert_ne!(REGISTRY_SEED, crate::envelope_seal::REGISTRY_SEED);
