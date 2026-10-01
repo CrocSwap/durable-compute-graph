@@ -1568,6 +1568,11 @@ class SequencerStream:
         self._invalidated: set[str] = set()
         self._failures: dict[str, BaseException] = {}
         self._reconciliation_recorded: set[str] = set()
+        # C1: lane predecessors are fixed at registration; completed steps stay
+        # satisfied after the journal prunes their terminal summaries.
+        self._latest_by_lock: dict[str, tuple[int, str]] = {}
+        self._lane_prev: dict[str, frozenset[str]] = {}
+        self._completed: set[str] = set()
         self._last_observations: dict[tuple[str, int], tuple[Any, ...]] = {}
         self._leases: dict[tuple[str, int], BlockhashLease] = {}
         self._conditions = asyncio.Condition()
@@ -1596,6 +1601,7 @@ class SequencerStream:
     async def _start(self) -> None:
         for sequence, intent in self.plan.pending_intents:
             self._intents[intent.step_id] = (sequence, intent)
+            self._register(sequence, intent)
         for packet in await self.plan.unresolved_packets():
             for prior_attempt in packet.attempts:
                 if (
@@ -1647,6 +1653,7 @@ class SequencerStream:
             raise JournalError("stream scheduler is closed")
         receipt = await self.plan.append(intent)
         self._intents[intent.step_id] = (receipt.sequence, intent)
+        self._register(receipt.sequence, intent)
         if not receipt.already_present or intent.step_id not in self._tasks:
             if intent.step_id not in self.plan.terminal_summaries:
                 self._schedule(receipt.sequence, intent)
@@ -1779,16 +1786,34 @@ class SequencerStream:
                 return self._lanes[dependency]
         return (f"step:{step.step_id}",)
 
+    def _register(self, sequence: int, intent: StreamIntent) -> None:
+        if intent.step_id in self._lane_prev:
+            return
+        prev = set()
+        for lock in intent.write_locks:
+            latest = self._latest_by_lock.get(lock)
+            if latest is not None and latest[0] < sequence:
+                prev.add(latest[1])
+            if latest is None or latest[0] < sequence:
+                self._latest_by_lock[lock] = (sequence, intent.step_id)
+        self._lane_prev[intent.step_id] = frozenset(prev)
+
     def _dependencies_for(self, sequence: int, intent: StreamIntent) -> tuple[str, ...]:
         dependencies = set(intent.dependencies)
-        locks = set(intent.write_locks)
-        if locks:
-            dependencies.update(
-                step_id
-                for step_id, (prior_sequence, prior_intent) in self._intents.items()
-                if prior_sequence < sequence and locks.intersection(prior_intent.write_locks)
-            )
+        dependencies.update(self._lane_prev.get(intent.step_id, ()))
         return tuple(sorted(dependencies))
+
+    def _forget(self, step_id: str) -> None:
+        # M4: bounded memory; keep only what a later step can still reference.
+        self._completed.add(step_id)
+        if len(self._completed) > 4 * max(1, getattr(self.plan, "max_pending_steps", 128)):
+            keep = {sid for _, sid in self._latest_by_lock.values()}
+            for old in list(self._completed):
+                if old in keep:
+                    continue
+                if not any(old in prev for prev in self._lane_prev.values()):
+                    for table in (self._intents, self._steps, self._lanes, self._lane_prev, self._causal):
+                        table.pop(old, None)
 
     async def _wait_dependencies(self, sequence: int, intent: StreamIntent, step: TransactionStep):
         dependencies = self._dependencies_for(sequence, intent)
@@ -1801,7 +1826,7 @@ class SequencerStream:
                 return False, dependencies
             if any(dep in terminals and terminals[dep].outcome == "failed" for dep in dependencies):
                 return False, dependencies
-            unresolved = [dep for dep in dependencies if dep not in terminals]
+            unresolved = [dep for dep in dependencies if dep not in terminals and dep not in self._completed]
             causes: list[tuple[float, int, str, int, frozenset[str]]] = []
             waiting_for_parent = False
             for dependency in dependencies:
@@ -1820,7 +1845,7 @@ class SequencerStream:
                                 active_roots,
                             )
                         )
-                if dependency in terminals:
+                if dependency in terminals or dependency in self._completed:
                     continue
                 optimistic = self._optimistic.get(dependency)
                 if optimistic is None:
@@ -1878,6 +1903,7 @@ class SequencerStream:
                 raise ReconciliationRequired(f"step {step.step_id} requires application reconciliation")
             async with asyncio.timeout(self.sequencer.config.per_step_time_cap_seconds):
                 await self._drive_stream_step(sequence, intent, step, dependencies)
+            self._forget(intent.step_id)
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
@@ -1907,6 +1933,7 @@ class SequencerStream:
             for row in self.plan.observations
         )
         missing_processed = 0
+        missing_since: float | None = None
         while True:
             if step.step_id in self._invalidated:
                 await self._record_reconciliation_required(step, intent, "an optimistic ancestor was dropped")
@@ -1998,13 +2025,27 @@ class SequencerStream:
                             )
                         async with self._conditions:
                             self._conditions.notify_all()
-            elif status is None and processed_observed and status_query_succeeded:
+            elif (
+                status is None
+                and processed_observed
+                and status_query_succeeded
+                and self.sequencer.config.latency_mode is LatencyMode.PROCESSED
+            ):
+                # H1: only latency mode may infer a drop, only after a bounded
+                # window, and never against a satisfied postcondition.
                 missing_processed += 1
-                if missing_processed >= self.sequencer.config.optimistic_drop_status_misses:
+                if missing_since is None:
+                    missing_since = self.sequencer.config.monotonic_clock()
+                if (
+                    missing_processed >= self.sequencer.config.optimistic_drop_status_misses
+                    and self.sequencer.config.monotonic_clock() - missing_since
+                    >= self.sequencer.config.optimistic_drop_window_seconds
+                ):
                     await self._drop_branch(step, intent, packet_record, postcondition)
                     return
             elif status is not None:
                 missing_processed = 0
+                missing_since = None
 
             permission = self._permissions.get(step.step_id)
             if (

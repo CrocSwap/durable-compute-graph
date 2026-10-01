@@ -284,6 +284,7 @@ class SequencerConfig:
     optimistic_max_depth: int = 2
     optimistic_max_seconds: float = 2.0
     optimistic_drop_status_misses: int = 2
+    optimistic_drop_window_seconds: float = 0.0
     stream_journal_quota_bytes: int = 1_000_000_000
     stream_checkpoint_retention: int = 2
     monotonic_clock: Callable[[], float] = time.monotonic
