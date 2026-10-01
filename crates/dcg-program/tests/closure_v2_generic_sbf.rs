@@ -181,6 +181,8 @@ fn challenge_fixture(
     state[dcg_program::unified::challenge::RESPONSE_BUMP_AT] = response_bump.value();
     if staged_response {
         state[176] = 1;
+        state[480] = 1;
+        state[481] = response_bump.value();
         state[184..216].copy_from_slice(response.as_ref());
     }
     set_owned(context, challenge, state);
@@ -371,20 +373,19 @@ async fn verify_outputs_accepts_claim_and_rejects_mismatch_and_fixture_envelope_
                 .value();
         state[147] = 1;
         state[148..156].copy_from_slice(&u64::MAX.to_le_bytes());
-        state[dcg_program::unified::challenge::RESPONSE_BUMP_STAGED_AT] =
-            dcg_program::closure_v2_response::address(&PROGRAM, &challenge)
-                .1
-                .value();
-        state[dcg_program::unified::challenge::RESPONSE_BUMP_AT] =
-            dcg_program::closure_v2_response::address(&PROGRAM, &challenge)
-                .1
-                .value();
+        let response_bump = dcg_program::closure_v2_response::address(&PROGRAM, &challenge)
+            .1
+            .value();
+        state[dcg_program::unified::challenge::RESPONSE_BUMP_STAGED_AT] = response_bump;
+        state[dcg_program::unified::challenge::RESPONSE_BUMP_AT] = response_bump;
         state[136..140].copy_from_slice(&entry.to_le_bytes());
         state[156..160].copy_from_slice(&position.to_le_bytes());
         state[160..162].copy_from_slice(&segment.to_le_bytes());
         state[170..174].copy_from_slice(&entry.to_le_bytes());
         state[174..176].copy_from_slice(&1u16.to_le_bytes());
         state[176] = 1;
+        state[480] = 1;
+        state[481] = response_bump;
         state[184..216].copy_from_slice(response.as_ref());
         set_owned(&mut context, challenge, state);
         let body = retained_fixture.map_or_else(

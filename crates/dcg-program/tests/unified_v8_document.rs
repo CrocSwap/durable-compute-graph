@@ -12,8 +12,8 @@
 //! position defaults to the retained p=29 fixture and is selectable with
 //! `BASANOS_PT2P_F47_POSITION` for the K=10,240 p=10,239 measurement. Both are selected in the
 //! same test invocation so all completion and decision cases run together.
-//! The F47/F48 dispute tests remain pending 2b: this extracted DCG dispatcher
-//! refuses tag 120 until the application route is integrated.
+//! The F47/F48 dispute tests exercise the generic tag-120/121 dispute path
+//! against the retained compiler-v1 PXR1 fixture.
 //!
 //! Real here: the template, the plan view, the registry (tags 156-158 over the
 //! v7 golden's rows), the template seal (tag 176), the DFS2 body, the position
@@ -4390,9 +4390,8 @@ async fn f47_compiler_v1_unified_init_accepts_option_counts_1_47_48_80() {
 }
 
 /// UnifiedInit commits option order verbatim, including unsorted and repeated
-/// ids. The SBF dispute fix-point regression is pending 2b because this
-/// dispatcher refuses tag 120; the host fix-point option check is tested in
-/// `unified::challenge`.
+/// ids. This test covers initialization; the F47/F48 SBF dispute paths below
+/// exercise tags 120 and 121 against those option tables.
 #[tokio::test(flavor = "multi_thread")]
 async fn f47_unified_init_accepts_unsorted_and_duplicate_options_sbf() {
     if std::env::var_os("BASANOS_DCG_V8_SBF").is_none() {
@@ -5427,7 +5426,7 @@ async fn f47_measured_refusal(
     assert_eq!(
         result.result,
         Err(TransactionError::InstructionError(
-            0,
+            2,
             InstructionError::InvalidInstructionData
         )),
         "{case} remains deferred"
@@ -5472,7 +5471,7 @@ async fn f47_measured_custom_refusal(
     assert_eq!(
         result.result,
         Err(TransactionError::InstructionError(
-            0,
+            2,
             InstructionError::Custom(code)
         )),
         "{case} refuses with custom {code}"
@@ -6149,7 +6148,6 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "pending 2b: the standalone DCG dispatcher refuses tag 120 until the application route is integrated"]
 async fn f48_gather_tag121_full_handler_at_owner_boundaries() {
     for role_swapped in f47_measure_roles() {
         run_f48_gather_at_owner_boundaries(role_swapped).await;

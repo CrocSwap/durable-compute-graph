@@ -41,6 +41,12 @@ const SYNTHETIC_LEAF_FORM: u16 = 0x0100;
 const INCOMPLETE: u32 = 741;
 const PT2S_AT: usize = 448;
 const PT2S_END: usize = 480;
+// `commit_target` retains Basanos's route/geometry addresses at 216..280.
+// That range includes DCR1's stable DRU1 bump at byte 219, so preserve the
+// authenticated bump before writing it and use this marked copy for later
+// dispute steps.
+const RESPONSE_BUMP_COPY_MARKER_AT: usize = 480;
+const RESPONSE_BUMP_COPY_AT: usize = 481;
 pub const TAG_VERIFY_TARGET: u8 = 120;
 pub const TAG_VERIFY_READS: u8 = 121;
 pub const TAG_WEIGHTS_ANCHOR: u8 = 122;
@@ -154,11 +160,19 @@ fn response<'a>(
     record: &Pubkey,
     state: &[u8],
 ) -> Result<core::cell::Ref<'a, [u8]>, ProgramError> {
+    let response_bump = if state[176] == 1 {
+        if state[RESPONSE_BUMP_COPY_MARKER_AT] != 1 {
+            return Err(no(PROOF));
+        }
+        state[RESPONSE_BUMP_COPY_AT]
+    } else {
+        state[challenge::RESPONSE_BUMP_AT]
+    };
     expect_derived_with_bump(
         account,
         program,
         &[b"dcg-hcl-response", record.as_ref()],
-        state[challenge::RESPONSE_BUMP_AT],
+        response_bump,
         AccountKind::variable(b"DRU1", 128, RESPONSE_BYTES).with_version(4, 1),
         RoleFlags {
             writable: false,
@@ -604,6 +618,8 @@ fn commit_target(
     u16_put(state, 180, writes);
     u16_put(state, 182, operation);
     state[184..216].copy_from_slice(response.as_ref());
+    state[RESPONSE_BUMP_COPY_MARKER_AT] = 1;
+    state[RESPONSE_BUMP_COPY_AT] = state[challenge::RESPONSE_BUMP_AT];
     state[216..248].copy_from_slice(routes.as_ref());
     state[248..280].copy_from_slice(geometry.as_ref());
     u16_put(state, 280, payload.len() as u16);

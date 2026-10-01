@@ -37,55 +37,76 @@ DCG record uses stored canonical bumps and maps its gate failures to 734.
 The missing 740 behavior and older source-format acceptance are not provenance
 seams, so the code and acceptance behavior do not yet match the source.
 
-## SBF build and CU measurements
+## Final SBF build and CU measurements
 
-Measured on the local SBF ProgramTest image built with
+Measured on the final local SBF ProgramTest image built with
 `crates/dcg-program/scripts/build-sbf-reproducible.sh`, release profile,
 `sbf-real-lifecycle-test`, `cargo-build-sbf 3.0.15`, platform-tools v1.51, and
-`rustc 1.84.1-dev`. The image is
-`out/runs/dcg-2b-engine-a-2026-10-01/sbf-image/dcg_program.so`, 1,389,376
-bytes, SHA-256
-`00de5eaabb5edd22766c429195c3c55b1af3ffad47fc4fefd883ca637d099727`.
-Build log: `out/runs/dcg-2b-engine-a-2026-10-01/sbf-build.log`.
+`rustc 1.84.1-dev`. The final image is
+`out/runs/dcg-2b-engine-a-2026-10-01/sbf-image-final/dcg_program.so`,
+1,389,048 bytes, SHA-256
+`bcc2671e62eba0e68f41a94069e47209864ade3e014b39de119085d5147947a2`.
+Build log: `out/runs/dcg-2b-engine-a-2026-10-01/sbf-build-final.log`.
 
-The table reports measured `compute_units_consumed` from that exact image.
-For tags 120 and 121 only the malformed account-list path ran; it does not
-measure their honest or disputed handler path.
+All figures below are measured from this image in local ProgramTest. The
+malformed-account and part-B refusal figures are transaction CU. F47 tag
+figures are transaction CU, including the ComputeBudget instructions. F48
+reports both instruction and transaction CU for its 128-read tag-121 case.
 
 | Tag | Measured SBF path and CU |
 |---:|---|
-| 120 | Malformed account list: 209 CU |
-| 121 | Malformed account list: 210 CU |
-| 126 | Malformed account list: 216 CU; honest restage: 5,879 CU; executor substitution refusal: 2,979 CU |
-| 128 | Malformed account list: 217 CU; honest output verification: 11,066 CU; write mismatch refusal: 10,296 CU; retained fixture mismatch: 9,903 CU in the standalone fixture test and 11,403 CU in the combined output test |
+| 120 | Malformed accounts: 209; honest F47 K=80: 293,972 default roles / 290,972 swapped roles; forged-target refusal (734): 268,328 / 263,828 |
+| 121 | Malformed accounts: 210; honest F47 K=80: 282,235 / 279,235; honest F48 128-read K=80: 818,476 / 816,976 instruction CU, 818,832 / 817,332 transaction CU |
+| 126 | Malformed accounts: 216; honest restage: 5,879; executor substitution refusal (733): 2,979 |
+| 128 | Malformed accounts: 217; honest output verification: 11,075; committed-write mismatch refusal (734): 10,305; retained fixture descriptor mismatch (734): 9,912 standalone and 11,412 combined |
 
-Measured reserved-tag refusals on the same image: tag 122, 123, and 124 used
+The F47 run exercised tags 120 and 121 in both honest role orders, rejected a
+forged tag-120 target with 734, and confirmed deferred tag 124 still returns
+`InvalidInstructionData` (1,507 transaction CU). The F48 run also exercised
+tag 120 followed by a complete 128-read tag 121 in both role orders, rejected
+out-of-range mappings and segment ordinals atomically, and confirmed tag 124
+remains refused (1,507 CU). The generic SBF suite passed 5/5, including the
+malformed inputs, tag-126 substitution, tag-128 mismatch, and retained
+`tests/fixtures/closure_v2_generic/entry-119.dgr1` descriptor-mismatch paths.
+
+Measured reserved-tag refusals on the final image: tag 122, 123, and 124 used
 211 CU each; tags 127 and 129 used 214 CU each. Each returned
-`InvalidInstructionData`.
+`InvalidInstructionData`. Tag 129 is source `VERIFY_RANGE_SLOTS`, the bounded
+range-read proof continuation, and remains intentionally refused in this
+part.
 
-The retained `tests/fixtures/closure_v2_generic/entry-119.dgr1` envelope
-rejected the wrong descriptor with 734. The valid synthetic DGR1 used by the
-tag-128 test passed; an altered committed write was refused with 734.
+The focused `app_api::tests` unit suite passed 15/15. The focused host F47
+test also passed both role orders. Formatting and `git diff --check` passed.
+No evidence-register row was requested or added; no live chain transaction
+was submitted. Retained artifacts are compiler-v1 fixtures; this dispatch did
+not invoke a compiler.
 
-## Tag 120/121 setup blocker
+## Earlier attempts and retained receipts
 
-Both attempted SBF integration tests stopped before reaching tag 120 or 121.
-Their retained Form-47 setup failed at the prior tag-145 template seal with
-custom 813 (`ERR_OPTION_RANGE`), consuming 492,732 CU including the
-ComputeBudget instruction. The same Form-47 tag-145 refusal is recorded as
-reproduced on the baseline lifecycle image in
-`docs/experiments/dcg-seam-fix-2026-09-30.md`. The seal implementation is
-outside this dispatch's permitted edit set, so the tag-120 forged-target and
-tag-121 honest Form-47/F48 SBF cases remain unverified.
+The pre-merge image at
+`out/runs/dcg-2b-engine-a-2026-10-01/sbf-image/dcg_program.so` (1,389,376
+bytes, SHA-256
+`00de5eaabb5edd22766c429195c3c55b1af3ffad47fc4fefd883ca637d099727`)
+recorded the initial generic-tag measurements. Its F47/F48 setup reached the
+prior tag-145 template seal, then failed with 813 (`ERR_OPTION_RANGE`). Merging
+current `main` supplied the Form-47 geometry fix; the post-merge rerun reached
+the generic tags. During that rerun, tag 121 exposed the overlap between the
+routes key at bytes 216..248 and the stored response bump at byte 219. The
+final implementation preserves the response bump at byte 481 with marker 1
+at byte 480 before staging the route key, then the final SBF runs above passed.
 
-Retained artifacts are compiler-v1 fixtures; this dispatch did not invoke a
-compiler. The full captured test output is in:
+The failed and intermediate outputs remain preserved alongside the final
+receipts:
 
 - `out/runs/dcg-2b-engine-a-2026-10-01/generic-sbf-test-receipt.log`
 - `out/runs/dcg-2b-engine-a-2026-10-01/f47-sbf-test-receipt.log`
 - `out/runs/dcg-2b-engine-a-2026-10-01/f48-sbf-test-receipt.log`
+- `out/runs/dcg-2b-engine-a-2026-10-01/f47-sbf-post-merge.log`
+- `out/runs/dcg-2b-engine-a-2026-10-01/f47-sbf-post-merge-rerun.log`
+- `out/runs/dcg-2b-engine-a-2026-10-01/f47-sbf-final.log`
+- `out/runs/dcg-2b-engine-a-2026-10-01/f48-sbf-final.log`
+- `out/runs/dcg-2b-engine-a-2026-10-01/generic-sbf-final.log`
+- `out/runs/dcg-2b-engine-a-2026-10-01/app-api-final.log`
 
-The generic SBF suite passed 5/5, and the focused `app_api::tests` unit suite
-passed 15/15. The focused F47 and F48 setup tests each failed before the
-ported handler ran. The host check, retained DGR1 parser fixture, and
-formatting checks also passed. No evidence-register row was added.
+The source-format and unsupported-form parity gaps listed above remain open.
+This is not a source-parity result and is not ready for a qualified image.

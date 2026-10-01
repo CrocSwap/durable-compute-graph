@@ -78,8 +78,12 @@ adapters:
 - **Generic dispute tags 120/121/126/128.** The generic revision-8 engine
   requires a fresh DCR1 record with marker `1` at byte 147, checks its
   challenge PDA using the stored canonical bump at byte 146, and checks DRU1
-  using the response bump at byte 219. Tag 126 also requires the staged DRU1
-  to have the expected sealed revision and challenge key before clearing it.
+  using the response bump at byte 219 before tag 120 stages its target. Tag
+  120 retains the source's route and geometry addresses at bytes 216..280,
+  which overlaps byte 219, so DCG copies the already checked response bump to
+  byte 481 and marks byte 480 before writing those addresses. Later generic
+  steps check that marked copy. Tag 126 also requires the staged DRU1 to have
+  the expected sealed revision and challenge key before clearing it.
   The pre-extraction Basanos handler used its legacy owner/address helpers on
   these paths; DCG's stored-bump checks are the intentional provenance seam.
   The byte offsets and account order are unchanged for the unified DCR1 v5
