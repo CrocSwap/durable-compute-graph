@@ -234,6 +234,32 @@ fn k10240_registry_rows() -> (Vec<u8>, [u8; 32]) {
     (rows, digest)
 }
 
+/// The measured compiler-v1 registry input retained with the typed-decision
+/// fixture. Unlike the older frozen census golden, it includes the measured
+/// Form-47 and Form-48 rows needed to drive the real tag-157/tag-160 path.
+fn f47_registry_rows() -> (Vec<u8>, [u8; 32]) {
+    let path = std::env::var_os("BASANOS_DCG_F47_REGISTRY_INPUT")
+        .map(PathBuf::from)
+        .expect("set BASANOS_DCG_F47_REGISTRY_INPUT to the retained registry-input.json");
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("read retained registry input"))
+            .expect("parse retained registry input");
+    assert_eq!(value["schema"], "basanos/rev8-g3-registry-input/1");
+    let rows = unhex(value["rows"].as_str().expect("registry rows"));
+    let census = unhex(value["census_digest"].as_str().expect("census digest"))
+        .try_into()
+        .expect("32-byte census digest");
+    assert_eq!(
+        rows.len(),
+        value["row_count"].as_u64().unwrap() as usize * registry::ROW_BYTES
+    );
+    let gather = registry::find_row(&rows, decision::GATHER_FORM_ID)
+        .unwrap()
+        .expect("measured Form-48 registry row");
+    assert_eq!((gather.respond_path, gather.witness_kind), (1, 0));
+    (rows, census)
+}
+
 /// The executor's own rung-D run: position roots, attest packets and the
 /// revision-7 descriptor they commit.
 fn executor() -> serde_json::Value {
@@ -466,8 +492,55 @@ async fn send_quiet_cached(
             }
             inner.result
         }
+        Err(error) if matches!(error.unwrap(), TransactionError::BlockhashNotFound) => {
+            // Long SBF upload/hash walks can age a 32-transaction cache out of
+            // the bank's recent-blockhash window. Refresh and retry once rather
+            // than making a valid fixture depend on test-runner timing.
+            cache.blockhash = Some(ctx.banks_client.get_latest_blockhash().await.unwrap());
+            cache.uses = 0;
+            let inner = ctx
+                .banks_client
+                .process_transaction_with_metadata(make_transaction(cache.blockhash.unwrap()))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("the banks client refused the refreshed transaction: {error:?}")
+                });
+            if matches!(data.first().copied(), Some(140..=147 | 156..=160 | 176)) {
+                if let Some(metadata) = inner.metadata.as_ref() {
+                    eprintln!(
+                        "CU tag {} data {} cu {}",
+                        data[0],
+                        data.len(),
+                        metadata.compute_units_consumed
+                    );
+                }
+            }
+            inner.result
+        }
         Err(error) => panic!("the banks client refused the cached transaction: {error:?}"),
     };
+    if matches!(&result, Err(TransactionError::BlockhashNotFound)) {
+        cache.blockhash = Some(ctx.banks_client.get_latest_blockhash().await.unwrap());
+        cache.uses = 0;
+        let inner = ctx
+            .banks_client
+            .process_transaction_with_metadata(make_transaction(cache.blockhash.unwrap()))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the banks client refused the refreshed transaction: {error:?}")
+            });
+        if matches!(data.first().copied(), Some(140..=147 | 156..=160 | 176)) {
+            if let Some(metadata) = inner.metadata.as_ref() {
+                eprintln!(
+                    "CU tag {} data {} cu {}",
+                    data[0],
+                    data.len(),
+                    metadata.compute_units_consumed
+                );
+            }
+        }
+        result = inner.result;
+    }
     if matches!(&result, Err(TransactionError::AlreadyProcessed)) {
         let slot = ctx
             .banks_client
@@ -1606,29 +1679,32 @@ async fn seal_pt2s(
 }
 
 async fn build() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, false, false, false, false).await
+    build_with_pre_fix_seal_processor(false, false, false, false, false, false).await
 }
 async fn build_f47() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, false, false, true, false).await
+    build_with_pre_fix_seal_processor(false, false, false, true, false, false).await
 }
 async fn build_honest_pt1x() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, true, false, false, true).await
+    build_with_pre_fix_seal_processor(false, true, false, false, true, false).await
 }
 async fn build_k10240_pre_admitted() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, false, false, false, true).await
+    build_with_pre_fix_seal_processor(false, false, false, false, true, false).await
+}
+async fn build_form48_admission_only() -> Option<Fix> {
+    build_with_pre_fix_seal_processor(false, true, false, true, false, true).await
 }
 
 async fn build_with_swapped_roles() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, false, true, false, false).await
+    build_with_pre_fix_seal_processor(false, false, true, false, false, false).await
 }
 async fn build_f47_with_swapped_roles() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(false, false, true, true, false).await
+    build_with_pre_fix_seal_processor(false, false, true, true, false, false).await
 }
 
 #[cfg(feature = "test-rev8-before-payer-alias-fix")]
 
 async fn build_before_payer_alias_fix() -> Option<Fix> {
-    build_with_pre_fix_seal_processor(true, false, false, false, false).await
+    build_with_pre_fix_seal_processor(true, false, false, false, false, false).await
 }
 
 async fn build_with_pre_fix_seal_processor(
@@ -1637,7 +1713,9 @@ async fn build_with_pre_fix_seal_processor(
     swap_executor_and_challenger: bool,
     f47_fixture: bool,
     k10240_fixture: bool,
+    admit_form48_only: bool,
 ) -> Option<Fix> {
+    assert!(!admit_form48_only || (full_honest_setup && f47_fixture));
     let fixture = if k10240_fixture {
         k10240_artifacts()
     } else if f47_fixture {
@@ -1701,6 +1779,30 @@ async fn build_with_pre_fix_seal_processor(
             class_count(&view).unwrap(),
         )
     };
+    let form48_class = if admit_form48_only {
+        let view = Pt2p::new(
+            &routes,
+            &geometry,
+            &payloads,
+            Some(&payload_index),
+            g_prog.clone(),
+        )
+        .unwrap();
+        (0..class_total).find(|index| {
+            let key = dcg_program::unified::classes::key_of(&view, *index).unwrap();
+            dcg_program::unified::classes::class_shape(&view, key)
+                .unwrap()
+                .is_some_and(|shape| shape.form == decision::GATHER_FORM_ID)
+        })
+    } else {
+        None
+    };
+    if admit_form48_only {
+        assert!(
+            form48_class.is_some(),
+            "the retained compiler-v1 fixture has a Form-48 class"
+        );
+    }
     if k10240_fixture {
         assert_eq!(k, 10_240, "K=10,240 path uses the retained large template");
     }
@@ -2098,7 +2200,9 @@ async fn build_with_pre_fix_seal_processor(
     );
     let pt2s_sha = sha256(&[&pt2s_image]);
     // The registry, by real instructions over the v7 golden's rows.
-    let (mut rows, census) = if k10240_fixture {
+    let (mut rows, census) = if admit_form48_only {
+        f47_registry_rows()
+    } else if k10240_fixture {
         k10240_registry_rows()
     } else {
         (
@@ -2344,11 +2448,20 @@ async fn build_with_pre_fix_seal_processor(
         )
         .await
         .expect("permissionless admission begins from the sealed PT1X/PT2S");
-        let mut first = 0u32;
-        while first < class_total {
-            // Keep the historical 16-class transaction shape. App-bound
-            // K=10,240 admission needs a position cursor and is follow-up work.
-            let count = (class_total - first).min(16) as u16;
+        let mut first = if admit_form48_only {
+            form48_class.unwrap()
+        } else {
+            0
+        };
+        let admission_end = if admit_form48_only {
+            first + 1
+        } else {
+            class_total
+        };
+        while first < admission_end {
+            // Keep the historical 16-class transaction shape. The targeted
+            // Form-48 regression admits exactly its measured class.
+            let count = (admission_end - first).min(16) as u16;
             let mut step = vec![160];
             step.extend_from_slice(&first.to_le_bytes());
             step.extend_from_slice(&count.to_le_bytes());
@@ -15180,6 +15293,63 @@ async fn rev8_pt1x_registry_and_admission_sbf() {
     assert_eq!(u32_at(&admission, 136), f.k);
 }
 
+/// The retained compiler-v1 typed-decision capture supplies a measured
+/// Form-48 row. Exercise its actual tag-157 write and matching tag-160 class
+/// admission in ProgramTest.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_form48_registry_write_and_class_admission_program_test() {
+    let Some(mut f) = build_form48_admission_only().await else {
+        panic!("retained compiler-v1 typed-decision artifacts absent")
+    };
+
+    let registry_account = f.account(f.drp2).await;
+    let row = registry::find_row(
+        &registry_account[registry::HEADER..],
+        decision::GATHER_FORM_ID,
+    )
+    .unwrap()
+    .expect("tag 157 committed the Form-48 row");
+    assert_eq!((row.respond_path, row.witness_kind), (1, 0));
+
+    let (routes, geometry, payloads, program, _) =
+        f47_artifacts().expect("retained compiler-v1 typed-decision artifacts");
+    let payload_index = retained_payload_index(&payloads);
+    let decoded_program = pt2p::Program::decode(&program).unwrap();
+    let view = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        Some(&payload_index),
+        decoded_program,
+    )
+    .unwrap();
+    let form48_class = (0..class_count(&view).unwrap())
+        .find(|index| {
+            let key = dcg_program::unified::classes::key_of(&view, *index).unwrap();
+            dcg_program::unified::classes::class_shape(&view, key)
+                .unwrap()
+                .is_some_and(|shape| shape.form == decision::GATHER_FORM_ID)
+        })
+        .expect("the retained compiler-v1 capture has a Form-48 admission class");
+    let admission_account = f.account(f.dea2).await;
+    let form48_bit = 1u8 << (form48_class % 8);
+    assert_eq!(
+        u32_at(&admission_account, 148),
+        1,
+        "tag 160 admitted one class"
+    );
+    assert_eq!(
+        admission_account[admission::HEADER + form48_class as usize / 8] & form48_bit,
+        form48_bit,
+        "tag 160 set the Form-48 class bit"
+    );
+    assert_eq!(
+        u16_at(&admission_account, 6) & 1,
+        0,
+        "this targeted run leaves other admission classes untouched"
+    );
+}
+
 /// A timeout in SELECT can settle before tag 164 transfers the staged DRU1
 /// bump, so tag 132 must make byte 219 usable by tag 131.
 #[tokio::test(flavor = "multi_thread")]
@@ -15378,7 +15548,8 @@ async fn rev8_pt1x_output_pda_provenance_sbf() {
     // Tag 146 consumes the sealed template and PT1X index, not DEA2's class
     // bitmap. Use the retained fixture setup here so the provenance matrix
     // does not repeat the unrelated 10,240-position admission walk.
-    let Some(mut f) = build_with_pre_fix_seal_processor(false, false, false, false, true).await
+    let Some(mut f) =
+        build_with_pre_fix_seal_processor(false, false, false, false, true, false).await
     else {
         panic!("retained K=10,240 artifacts absent")
     };
