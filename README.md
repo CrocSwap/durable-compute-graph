@@ -50,6 +50,32 @@ and the extracted revision-8 handler tests, see
 `bytesum_sbf_lifecycle` target is an isolated canary, not the revision-8
 lifecycle.
 
+## Application instruction seam
+
+Application crates can add statically linked instruction handlers through
+[`dcg_program::app_api`](crates/dcg-program/src/app_api.rs). A const-validated
+`ApplicationProgramManifest` pairs the existing kernel/form manifest with a
+tag-sorted table of handler ids, semantic versions, preflight callbacks, and
+handlers. `process_instruction_with_application` sends the revision-8 core tag
+set through DCG first, then checks the application table, and rejects
+everything else. Tag 125 stays DCG-owned; the application dispute/replay tags
+are the non-core members of 120–129.
+
+The preflight callback receives the full instruction bytes and raw ordered
+accounts. Its checked-account view is the seam for the shared address-rule
+helper being landed separately; do not treat the current placeholder as
+independent address-provenance evidence. The program-manifest digest commits
+the app identity, its form-to-kernel admission identity, and the canonical
+`(tag, handler id, handler version)` rows.
+
+Pure region-content folds are available from
+[`dcg_program::region_commitment`](crates/dcg-program/src/region_commitment.rs).
+They preserve Basanos's v1 domain and little-endian encoding; the shared
+`region_content_v1.tsv` vectors live under `tests/golden/dcg/lifecycle/`.
+The DRS1 record and tags 14–15 remain outside this small commitment module.
+See [`docs/application-api.md`](docs/application-api.md) for the exact public
+surface and callback contract.
+
 ## Kernel contract: what a developer implements
 
 Each application defines a static `ApplicationManifest` whose kernel entries

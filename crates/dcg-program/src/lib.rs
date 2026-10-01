@@ -4,6 +4,8 @@
 //! bounded SVM adapter modules live here. Applications provide kernels through
 //! a compile-time manifest; this repository includes a tiny test kernel only.
 
+/// Static application instruction registration and dispatch seam.
+pub mod app_api;
 #[cfg(feature = "sbf-real-lifecycle-test")]
 pub mod closure_v2;
 #[cfg(not(feature = "sbf-real-lifecycle-test"))]
@@ -26,6 +28,7 @@ pub mod position_template;
 pub mod pt1_onchain;
 pub mod pt2p;
 pub mod pt2p_onchain;
+pub mod region_commitment;
 pub mod root_only;
 pub mod root_only_challenge;
 pub mod root_only_sealed;
