@@ -5625,9 +5625,13 @@ async fn f47_measured_send(f: &mut Fix, data: Vec<u8>, metas: Vec<AccountMeta>, 
             .metadata
             .as_ref()
             .map_or(0, |metadata| metadata.compute_units_consumed);
+        let logs = result
+            .metadata
+            .as_ref()
+            .map_or_else(String::new, |metadata| metadata.log_messages.join("\n"));
         panic!(
-            "{case} failed at compute limit {} after {consumed} transaction CU: {error:?}",
-            f47_compute_limit()
+            "{case} failed at compute limit {} after {consumed} transaction CU: {error:?}\n{logs}",
+            f47_compute_limit(),
         );
     }
     result.metadata.unwrap().compute_units_consumed
@@ -5825,6 +5829,18 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             &finalized_doc[BINDING_AT_V8 + 164..BINDING_AT_V8 + 196],
             &sha256(&[&table])
         );
+        // This harness installs the DCR1 challenge account directly rather
+        // than calling the normal opener, which increments DCM2's open count.
+        // Model that opener side effect so tag 131 can settle the challenge.
+        let mut document_account = f
+            .ctx
+            .banks_client
+            .get_account(created[0])
+            .await
+            .unwrap()
+            .unwrap();
+        document_account.data[128..132].copy_from_slice(&1u32.to_le_bytes());
+        f.ctx.set_account(&created[0], &shared(document_account));
 
         let pt1s_data = f.account(f.pt1s_index).await;
         assert!(dcg_program::pt1_onchain::is_sealed_template(&pt1s_data));
@@ -6015,10 +6031,24 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
         } else {
             1
         };
-        let ruled = f.account(challenge_key).await;
+        let ruled = f
+            .ctx
+            .banks_client
+            .get_account(challenge_key)
+            .await
+            .unwrap()
+            .expect("tag 124 preserves the DCR1 challenge for settlement")
+            .data;
         assert_eq!(ruled[4], challenge::PHASE_RULED);
         assert_eq!(ruled[5], expected_winner, "tag 124's test-kernel ruling");
-        let final_doc = f.account(created[0]).await;
+        let final_doc = f
+            .ctx
+            .banks_client
+            .get_account(created[0])
+            .await
+            .unwrap()
+            .expect("tag 124 preserves the DCM2 document for settlement")
+            .data;
         assert_eq!(
             u16_at(&final_doc, 6) & FLAG_REFUTED,
             if expected_winner == 2 {
@@ -6052,7 +6082,17 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             &format!("Form 47 K={k} role_swapped={role_swapped} tag131 settle"),
         )
         .await;
-        assert_eq!(f.account(challenge_key).await[4], challenge::PHASE_SETTLED);
+        assert!(
+            f.ctx
+                .banks_client
+                .get_account(challenge_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "tag 131 drains the settled DCR1 account"
+        );
+        let settled_doc = f.account(created[0]).await;
+        assert_eq!(u32_at(&settled_doc, 128), 0, "tag 131 clears open count");
         eprintln!("DCG_GENERIC_SBF_CU|122|f47-test-hook|{verify_anchor}");
         eprintln!("DCG_GENERIC_SBF_CU|123|f47-test-hook|{verify_rows}");
         eprintln!(

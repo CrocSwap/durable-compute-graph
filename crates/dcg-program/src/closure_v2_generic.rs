@@ -47,8 +47,8 @@ const PT2S_END: usize = 480;
 // That range includes DCR1's stable DRU1 bump at byte 219, so preserve the
 // authenticated bump before writing it and use this marked copy for later
 // dispute steps.
-const RESPONSE_BUMP_COPY_MARKER_AT: usize = 480;
-const RESPONSE_BUMP_COPY_AT: usize = 481;
+pub(crate) const RESPONSE_BUMP_COPY_MARKER_AT: usize = 480;
+pub(crate) const RESPONSE_BUMP_COPY_AT: usize = 481;
 pub const TAG_VERIFY_TARGET: u8 = 120;
 pub const TAG_VERIFY_READS: u8 = 121;
 pub const TAG_WEIGHTS_ANCHOR: u8 = 122;

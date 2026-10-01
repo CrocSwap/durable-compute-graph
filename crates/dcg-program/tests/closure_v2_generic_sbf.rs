@@ -133,6 +133,68 @@ async fn new_generic_tags_refuse_unsupported_forms_with_740_on_sbf() {
 }
 
 #[tokio::test]
+async fn artifact_hook_accepts_the_test_app_block_on_sbf() {
+    let mut context = start().await;
+    let executor = context.payer.pubkey();
+    let (challenge, response) = challenge_fixture(&mut context, 0x1270_0001, executor, true);
+    let (document, _) = dcg_program::unified::address::document(&PROGRAM, &DESCRIPTOR);
+    let mut doc = vec![0u8; dcg_program::unified::document::DCM2_V6_BYTES];
+    doc[..4].copy_from_slice(b"DCM2");
+    doc[4..6].copy_from_slice(&6u16.to_le_bytes());
+    doc[6..8].copy_from_slice(
+        &(dcg_program::unified::document::FLAG_ROOT_ONLY
+            | dcg_program::unified::document::FLAG_SEALED)
+            .to_le_bytes(),
+    );
+    doc[8..40].copy_from_slice(&DESCRIPTOR);
+    doc[40..72].copy_from_slice(executor.as_ref());
+    doc[264..296].fill(0x44);
+    set_owned(&mut context, document, doc);
+
+    let mut body = replay_body(&5u64.to_le_bytes(), &[2, 3]);
+    let weights_at = u32::from_le_bytes(body[20..24].try_into().unwrap()) as usize;
+    body.truncate(weights_at);
+    body.extend_from_slice(b"DCGTEST-ARTIFACT/1");
+    body[24..28].copy_from_slice(&(b"DCGTEST-ARTIFACT/1".len() as u32).to_le_bytes());
+    set_owned(
+        &mut context,
+        response,
+        response_fixture(challenge, executor, &body),
+    );
+    let mut record = context
+        .banks_client
+        .get_account(challenge)
+        .await
+        .unwrap()
+        .unwrap();
+    record.data[174..176].copy_from_slice(&10u16.to_le_bytes());
+    context.set_account(&challenge, &AccountSharedData::from(record));
+
+    let ix = instruction_with_accounts(
+        127,
+        vec![
+            AccountMeta::new(challenge, false),
+            AccountMeta::new_readonly(response, false),
+            AccountMeta::new_readonly(document, false),
+        ],
+    );
+    let (result, units) = send(&mut context, ix).await;
+    assert_eq!(result, Ok(()), "tag 127 delegates the test artifact marker");
+    assert_eq!(
+        context
+            .banks_client
+            .get_account(challenge)
+            .await
+            .unwrap()
+            .unwrap()
+            .data[177],
+        3,
+        "tag 127 records artifact verification before replay"
+    );
+    eprintln!("DCG_GENERIC_SBF_CU|127|test-app-artifact|{units}");
+}
+
+#[tokio::test]
 async fn output_verifier_rejects_retained_v1_fixture_with_descriptor_mismatch() {
     let mut context = start().await;
     let executor = context.payer.pubkey();

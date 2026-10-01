@@ -3294,7 +3294,14 @@ pub fn settle_v8_with_hooks<'a>(
             return Err(no(CL_AUTHORITY));
         }
     }
-    let response_bump = record_acc.try_borrow_data()?[RESPONSE_BUMP_AT];
+    let response_bump = {
+        let record = record_acc.try_borrow_data()?;
+        if record[crate::closure_v2_generic::RESPONSE_BUMP_COPY_MARKER_AT] == 1 {
+            record[crate::closure_v2_generic::RESPONSE_BUMP_COPY_AT]
+        } else {
+            record[RESPONSE_BUMP_AT]
+        }
+    };
     let response_key =
         crate::closure_v2_response::address_with_bump(program, record_acc.key, response_bump)
             .map_err(|_| no(DCR1_AUTH))?;
