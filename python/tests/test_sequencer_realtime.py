@@ -37,6 +37,7 @@ from dcg.sequencer import (
     StreamIdentity,
     StreamIntent,
     StreamLimits,
+    StreamTerminal,
     StepTimeCapExceeded,
     TransactionPlan,
     TransactionStep,
@@ -381,8 +382,10 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
         tags = [tag.decode() for tag in (b"root", b"child-1", b"child-2", b"child-3") if any(f"dcg-step:{tag.decode()}".encode() in p for p in self.rpc.send_packets)]
         self.assertEqual(tags, ["root", "child-1", "child-2"])
         self.assertTrue(stream.result().outcomes["root"].optimistic)
+        self.assertEqual(stream.optimistic_steps, ("root",))
         parent_observations = [row for row in stream.observations if row.step_id == "root"]
         self.assertIn("processed", [row.status_commitment for row in parent_observations])
+        self.assertTrue(any(row.label == "optimistic" for row in parent_observations))
         parent_stable = True
         await asyncio.wait_for(stream.wait(), timeout=2)
         self.assertIn(b"dcg-step:child-3", b"".join(self.rpc.send_packets))
@@ -411,6 +414,54 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reconciliation_required", [event.event for event in events])
         self.assertEqual(len(self.rpc.reconciliations), 2, "both signed packets are checked by the app adapter")
         self.assertEqual(len(self.rpc.send_packets), 2, "the invalidated child is never silently replayed")
+
+    async def test_invalidated_unsigned_descendant_is_journaled_and_can_be_abandoned(self):
+        def status(signature, packet, count):
+            if b"dcg-step:parent" in packet:
+                return _status(signature, Commitment.PROCESSED) if count == 2 else None
+            if b"dcg-step:child" in packet:
+                return _status(signature, Commitment.PROCESSED)
+            return None
+
+        self.rpc.status_resolver = status
+        stream = await self.open_stream(
+            latency_mode=LatencyMode.PROCESSED,
+            config=_config(latency_mode=LatencyMode.PROCESSED, optimistic_max_depth=1),
+            name="unsigned-descendant",
+        )
+        await stream.append(_intent("parent", write_locks=("lane",)))
+        await stream.append(_intent("child", dependencies=("parent",), write_locks=("lane",)))
+        await stream.append(_intent("grandchild", dependencies=("child",), write_locks=("lane",)))
+
+        with self.assertRaises(ReconciliationRequired):
+            await asyncio.wait_for(stream.wait(), timeout=2)
+
+        self.assertEqual(len(self.rpc.send_packets), 2, "the depth-limited grandchild stays unsigned")
+        required = next(
+            event
+            for event in stream.plan.lifecycle_events
+            if event.event == "reconciliation_required" and event.step_id == "grandchild"
+        )
+        self.assertTrue(required.data["unsigned"])
+        self.assertEqual(required.generation, 0)
+        decision_sequence = await stream.plan.record_reconciliation_decision(
+            "grandchild",
+            0,
+            decision="abandon",
+            evidence_digest="test-application-reconciliation",
+        )
+        await stream.plan.record_terminal(
+            StreamTerminal(
+                step_id="grandchild",
+                outcome="abandoned",
+                signature=None,
+                commitment=None,
+                postcondition_satisfied=False,
+                postcondition_digest="test-application-reconciliation",
+                reconciliation_decision_event_sequence=decision_sequence,
+            )
+        )
+        self.assertEqual(stream.plan.terminal_summaries["grandchild"].outcome, "abandoned")
 
     async def test_status_transport_outage_does_not_count_as_processed_drop(self):
         def status(signature, packet, count):
@@ -581,12 +632,28 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dead.sent[0][0], unresolved[0].raw_bytes)
 
     async def test_tpu_async_error_is_recorded_against_acknowledged_stream_attempt(self):
-        helper = MemoryHelper()
+        class ObservableMemoryHelper(MemoryHelper):
+            async def send_raw(inner_self, raw_bytes, expected_signature):
+                await super(ObservableMemoryHelper, inner_self).send_raw(raw_bytes, expected_signature)
+                self.rpc.send_packets.append(raw_bytes)
+                self.rpc.packets_by_signature[expected_signature] = raw_bytes
+
+        helper = ObservableMemoryHelper()
         provider = TpuQuicSendProvider(
             TpuQuicConfig(helper_binary="unused-test-helper", rpc_url="http://127.0.0.1:8899"),
             helper_factory=lambda: helper,
         )
         self.addAsyncCleanup(provider.close)
+        self.rpc.status_resolver = lambda signature, packet, count: None
+        original_statuses = self.rpc.signature_statuses
+        acknowledged_status_read = asyncio.Event()
+
+        async def signal_after_handoff_ack(signatures):
+            if all(signature in self.rpc.packets_by_signature for signature in signatures):
+                acknowledged_status_read.set()
+            return await original_statuses(signatures)
+
+        self.rpc.signature_statuses = signal_after_handoff_ack
         sequencer = Sequencer(
             endpoints={"rpc-a": self.rpc},
             signer=self.signer,
@@ -607,38 +674,88 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
             identity,
             journal_path,
             _step_factory(self.rpc, self.signer),
+            limits=StreamLimits(max_attempts_per_generation=1),
         )
         self.streams.append(stream)
         await stream.append(_intent("late-error"))
-        packet = None
-        for _ in range(200):
-            packets = await stream.plan.unresolved_packets()
-            packet = next((item for item in packets if item.attempts and item.attempts[0].outcome == "acknowledged"), None)
-            if packet is not None:
-                break
-            await asyncio.sleep(0.005)
+        await asyncio.wait_for(acknowledged_status_read.wait(), timeout=2)
+        packets = await stream.plan.unresolved_packets()
+        packet = next((item for item in packets if item.attempts and item.attempts[0].outcome == "acknowledged"), None)
         self.assertIsNotNone(packet, "the helper attempt should be durably acknowledged before its async ERR")
         await stream.close()
         stream = await sequencer.open_stream(
             identity,
             journal_path,
             _step_factory(self.rpc, self.signer),
+            limits=StreamLimits(max_attempts_per_generation=1),
         )
         self.streams.append(stream)
         await provider._on_helper_failure(packet.signature, "leader returned ERR")
-        failure = None
-        for _ in range(100):
-            failure = next(
-                (event for event in stream.plan.provider_failures if event.event == "late_provider_failure"),
-                None,
-            )
-            if failure is not None:
-                break
-            await asyncio.sleep(0.005)
+        failure = next(
+            (event for event in stream.plan.provider_failures if event.event == "late_provider_failure"),
+            None,
+        )
         self.assertIsNotNone(failure, "the async provider ERR should reach the stream journal")
         self.assertEqual(failure.step_id, "late-error")
         self.assertEqual(failure.data["attempt"], packet.attempts[0].number)
         self.assertIn("leader returned ERR", failure.data["detail"])
+
+    async def test_tpu_callback_before_handoff_ack_is_journaled_after_ack(self):
+        provider_box = {}
+        test_case = self
+        previous_failures = []
+
+        class CallbackBeforeAckHelper(MemoryHelper):
+            async def send_raw(self, raw_bytes, expected_signature):
+                self.sent.append((raw_bytes, expected_signature))
+                test_case.rpc.send_packets.append(raw_bytes)
+                test_case.rpc.packets_by_signature[expected_signature] = raw_bytes
+                await provider_box["provider"]._on_helper_failure(
+                    expected_signature,
+                    "leader returned ERR before the send acknowledgement",
+                )
+
+        helper = CallbackBeforeAckHelper()
+        provider = TpuQuicSendProvider(
+            TpuQuicConfig(helper_binary="unused-test-helper", rpc_url="http://127.0.0.1:8899"),
+            helper_factory=lambda: helper,
+            failure_handler=previous_failures.append,
+        )
+        provider_box["provider"] = provider
+        self.addAsyncCleanup(provider.close)
+        sequencer = Sequencer(
+            endpoints={"rpc-a": self.rpc},
+            signer=self.signer,
+            config=_config(),
+            providers={provider.provider_id: provider},
+        )
+        identity = StreamIdentity(
+            run_id="tpu-early-error",
+            genesis_hash=GENESIS,
+            program_id=str(PROGRAM),
+            destination_accounts=(str(DESTINATION),),
+            signer_public_keys=(self.signer.public_key,),
+            route_policy_digest=sequencer.route_policy_digest,
+            commitment_policy="confirmed",
+        )
+        stream = await sequencer.open_stream(
+            identity,
+            str(self.root / "tpu-early-error"),
+            _step_factory(self.rpc, self.signer),
+        )
+        self.streams.append(stream)
+        await stream.append(_intent("early-error"))
+        await asyncio.wait_for(stream.wait(), timeout=2)
+
+        failures = [
+            event
+            for event in stream.plan.provider_failures
+            if event.event == "late_provider_failure" and event.step_id == "early-error"
+        ]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].data["attempt"], 1)
+        self.assertIn("before the send acknowledgement", failures[0].data["detail"])
+        self.assertEqual(len(previous_failures), 1, "the provider's existing callback remains chained")
 
     def _fixed_plan(self):
         async def postcondition(endpoint):

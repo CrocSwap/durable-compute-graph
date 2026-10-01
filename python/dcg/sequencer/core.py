@@ -1582,6 +1582,12 @@ class SequencerStream:
     def observations(self):
         return self.plan.observations
 
+    @property
+    def optimistic_steps(self) -> tuple[str, ...]:
+        """Pending steps whose latest journaled observation is only processed."""
+
+        return self.plan.optimistic_steps
+
     async def _start(self) -> None:
         for sequence, intent in self.plan.pending_intents:
             self._intents[intent.step_id] = (sequence, intent)
@@ -1617,6 +1623,8 @@ class SequencerStream:
         for event in self.plan.lifecycle_events:
             if event.event == "step_dropped":
                 self._dropped.add(event.step_id)
+            elif event.event == "reconciliation_required":
+                self._reconciliation_recorded.add(event.step_id)
         for row in self.plan.observations:
             self._last_observations[(row.step_id, row.generation)] = (
                 row.status_commitment,
@@ -1671,18 +1679,30 @@ class SequencerStream:
                     optimistic=False,
                     commitment=Commitment(terminal.commitment),
                 )
-        for step_id, state in self._optimistic.items():
-            if step_id not in outcomes:
-                outcomes[step_id] = StepOutcome(
-                    step_id,
-                    state.signature,
-                    "signature",
-                    None,
-                    None,
-                    None,
-                    optimistic=True,
-                    commitment=Commitment.PROCESSED,
-                )
+        observations = self.plan.observations
+        for step_id in self.optimistic_steps:
+            if step_id in outcomes:
+                continue
+            observation = next(
+                (
+                    row
+                    for row in reversed(observations)
+                    if row.step_id == step_id and row.label == "optimistic"
+                ),
+                None,
+            )
+            if observation is None:
+                continue
+            outcomes[step_id] = StepOutcome(
+                step_id,
+                observation.signature,
+                "signature",
+                observation.slot,
+                None,
+                None,
+                optimistic=True,
+                commitment=Commitment.PROCESSED,
+            )
         optimistic_steps = tuple(sorted(step_id for step_id, outcome in outcomes.items() if outcome.optimistic))
         return RunResult(self.identity.run_id, self.plan.sequence_digest, outcomes, optimistic_steps)
 
@@ -1878,7 +1898,7 @@ class SequencerStream:
         processed_observed = any(
             row.step_id == step.step_id
             and row.generation == packet_record.generation
-            and row.status_commitment == Commitment.PROCESSED.value
+            and row.label == "optimistic"
             for row in self.plan.observations
         )
         missing_processed = 0
@@ -2216,8 +2236,13 @@ class SequencerStream:
         packets = [packet for packet in await self.plan.unresolved_packets() if packet.step_id == step.step_id]
         if packets:
             packet = max(packets, key=lambda item: item.generation)
-            await self.plan.record_reconciliation_required(step.step_id, packet.generation, detail=detail)
-            self._reconciliation_recorded.add(step.step_id)
+            generation = packet.generation
+        else:
+            # Package B supports reconciliation records for descendants that
+            # were invalidated before they received a signed packet.
+            generation = 0
+        await self.plan.record_reconciliation_required(step.step_id, generation, detail=detail)
+        self._reconciliation_recorded.add(step.step_id)
 
     async def _reconcile_existing_packet(self, step: TransactionStep, packet) -> PostconditionResult:
         intent = self._intents[step.step_id][1]

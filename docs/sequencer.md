@@ -281,37 +281,37 @@ result = await stream.wait()
 The stream queue is bounded and `append` applies backpressure at its configured
 pending-step limit. The configured journal quota defaults to 1 GB; exact signed
 packets and every attempt stay in the journal until safe terminal handling.
-Call `checkpoint()` at an application-selected terminal prefix. The current
-Package B public API does not expose checkpoint-retention control: its journal
-keeps the sealed digest chain for recovery, so
-`SequencerConfig.stream_checkpoint_retention` is reserved for the Package B
-integration and does not prune that chain in this build. The default target is
-two retained checkpoints; callers needing a strict on-disk retention bound
-must wait for the corresponding Package B API support. Quota exhaustion stops
-new appends rather than evicting unresolved signed work.
+Call `checkpoint()` at an application-selected terminal prefix. Package B
+compacts the stream into the latest checkpoint and deletes the older checkpoint
+and covered segments after the new manifest pointer commits. The effective
+checkpoint retention is therefore one, including with the default
+`SequencerConfig.stream_checkpoint_retention=2`; that setting is currently
+validated but does not change Package B's compaction policy. Keeping only the
+latest checkpoint is safe because it contains the state needed to resume, and
+the prior files are removed only after the new pointer commits. Quota exhaustion
+stops new appends rather than evicting unresolved signed work.
 
 The default `LatencyMode.CONFIRMED` releases dependents only after the
 configured stable commitment. `LatencyMode.PROCESSED` can release bounded
 optimistic descendants after a parent reaches `processed`: the default limit
 is two dependency steps or two seconds per unresolved branch. Optimistic
 outcomes carry `optimistic=True` and appear in `RunResult.optimistic_steps`;
-they are not confirmed outcomes. Processed mode requires an app-supplied
-`reconcile_dropped` callback. If a processed signature disappears, the journal
-records the drop and branch invalidation, the callback reads app-owned state,
-the scheduler checks every already-signed descendant's signature and
+they are not confirmed outcomes. The journal labels each observation as
+`optimistic`, `stable`, or `unresolved`; `SequencerStream.optimistic_steps`
+lists pending steps whose latest observation remains optimistic. Processed mode
+requires an app-supplied `reconcile_dropped` callback. If a processed signature
+disappears, the journal records the drop and branch invalidation. The callback
+reads app-owned state, and the scheduler checks every already-signed descendant's signature and
 postcondition through its callback, and then raises `ReconciliationRequired`.
 It does not automatically replay or replace signed bytes. Package B's
-`reconciliation_required` method currently requires a signed packet, so an
-invalidated intent that has not yet been signed cannot receive its own
-reconciliation event; the scheduler still suppresses it and surfaces the
-reconciliation exception.
-
-For processed steps, the current Package B journal stores the actual
-`status_commitment="processed"` in each `step_observed` row. Its stable public
-API does not yet expose a separate per-step `optimistic` flag or transition
-event, so the WAL records the evidence for optimism while `RunResult` carries
-the explicit Boolean label. A distinct journal label remains pending Package B
-API support.
+`reconciliation_required` method also accepts unsigned descendants, so each
+invalidated pending intent is journaled even when it never received a packet.
+After application reconciliation, the adapter can journal a `continue`,
+`rebuild`, or `abandon` decision with its evidence digest. An abandoned
+descendant is released from the pending bound only after a terminal
+`abandoned` summary references that decision; this outcome has no stable
+commitment. For signed work, abandonment remains the application's decision
+and requires evidence that the packet can no longer land.
 
 The stream shares one batched confirmation pump across lanes and configured
 send providers. Steps with overlapping write locks serialize; independent
@@ -427,8 +427,8 @@ for resume. This bounds one step, not the overall plan.
   cap, and requires three consecutive transport failures or any rate limit;
   after cooldown the next bounded request is a probe.
 - **Designed:** stream quota defaults to 1 GB, and processed optimism is
-  bounded to two steps or two seconds. Package B currently lacks configurable
-  checkpoint retention; see Streaming plans.
+  bounded to two steps or two seconds. Package B currently retains only the
+  latest compacted checkpoint; see Streaming plans.
 - **Open:** external-cluster behavior, live network limits, TPU helper runtime
   packaging, and storage-device power-loss behavior have not been exercised
   in this package round.
