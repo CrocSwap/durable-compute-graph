@@ -7,7 +7,7 @@
 //! hooks to check artifact witnesses and replay the selected operation.
 
 use crate::{
-    account_provenance::{expect_derived_with_bump, AccountKind, RoleFlags},
+    account_provenance::{expect_derived, expect_derived_with_bump, AccountKind, RoleFlags},
     closure_v2_response, position_template as pt,
     pt2p::{self, Pt2p},
     unified::{address, challenge, document},
@@ -18,12 +18,14 @@ use solana_program::{
 };
 
 const MALFORMED: u32 = 730;
+const AUTH: u32 = 731;
 const STATE: u32 = 733;
 const PROOF: u32 = 734;
 const DEADLINE: u32 = 736;
 const ROUTE: u32 = 738;
 const ROW_BYTES: usize = 120;
 const MAX_READS: usize = 128;
+const MAX_RANGE_SLOTS: usize = 64;
 const OUTPUT_AT: usize = 1024;
 const OUTPUT_BYTES: usize = 2048;
 const RESPONSE_BYTES: usize = 128 + closure_v2_response::MAX_BODY;
@@ -104,26 +106,43 @@ fn u64_at(raw: &[u8], at: usize) -> Result<u64, ProgramError> {
     ))
 }
 
-/// Validate the revision-8 live DCR1 record and its exact challenge PDA.
-/// The fresh revision-8 image requires both the challenge and DRU1 bumps that
-/// tag 166 committed at open; caller-controlled descriptors do not trigger a
-/// second canonical search here.
-fn live(program: &Pubkey, record: &AccountInfo) -> ProgramResult {
+/// Validate a live DCR1 record and the application form catalog. Fresh v5
+/// records use their committed PDA bump; the retained v2/v4 formats predate
+/// that field and keep their canonical address check.
+fn live(
+    program: &Pubkey,
+    record: &AccountInfo,
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
     if !record.is_writable {
         return Err(no(MALFORMED));
     }
     let raw = record.try_borrow_data()?;
-    if raw.len() != challenge::SIZE
-        || raw.get(..4) != Some(&b"DCR1"[..])
-        || u16_at(&raw, 6)? != challenge::VERSION
+    if raw.len() != challenge::SIZE || raw.get(..4) != Some(&b"DCR1"[..]) {
+        return Err(no(STATE));
+    }
+    let version = u16_at(&raw, 6)?;
+    if !matches!(version, 2 | 4 | challenge::VERSION)
         || raw[4] != challenge::PHASE_RESPOND
-        || raw[challenge::PT2P_MODE_AT] != 1
+        || (version == challenge::VERSION && raw[challenge::PT2P_MODE_AT] != 1)
     {
         return Err(no(STATE));
+    }
+    if version != challenge::VERSION && record.owner != program {
+        return Err(no(AUTH));
+    }
+    if !manifest
+        .dispute_hooks()
+        .supports_form(raw[145], u16_at(&raw, 174)?)
+    {
+        return Err(no(740));
     }
     let deadline = u64_at(&raw, 148)?;
     if Clock::get()?.slot > deadline {
         return Err(no(DEADLINE));
+    }
+    if version != challenge::VERSION {
+        return Ok(());
     }
     let descriptor: &[u8; 32] = raw[72..104].try_into().map_err(|_| no(STATE))?;
     let challenger = Pubkey::new_from_array(raw[8..40].try_into().map_err(|_| no(STATE))?);
@@ -160,31 +179,49 @@ fn response<'a>(
     record: &Pubkey,
     state: &[u8],
 ) -> Result<core::cell::Ref<'a, [u8]>, ProgramError> {
-    let response_bump = if state[176] == 1 {
-        if state[RESPONSE_BUMP_COPY_MARKER_AT] != 1 {
-            return Err(no(PROOF));
-        }
-        state[RESPONSE_BUMP_COPY_AT]
-    } else {
-        state[challenge::RESPONSE_BUMP_AT]
+    let kind = AccountKind::variable(b"DRU1", 128, RESPONSE_BYTES).with_version(4, 1);
+    let role = RoleFlags {
+        writable: false,
+        signer: false,
     };
-    expect_derived_with_bump(
-        account,
-        program,
-        &[b"dcg-hcl-response", record.as_ref()],
-        response_bump,
-        AccountKind::variable(b"DRU1", 128, RESPONSE_BYTES).with_version(4, 1),
-        RoleFlags {
-            writable: false,
-            signer: false,
-        },
-    )
-    .map_err(|_| no(PROOF))?;
-    let total = usize::try_from(u32_at(
-        &account.try_borrow_data()?,
-        closure_v2_response::DECLARED_LEN_AT,
-    )?)
-    .map_err(|_| no(MALFORMED))?;
+    let version = u16_at(state, 6)?;
+    if version == challenge::VERSION {
+        let response_bump = if state[176] == 1 {
+            if state[RESPONSE_BUMP_COPY_MARKER_AT] != 1 {
+                return Err(no(PROOF));
+            }
+            state[RESPONSE_BUMP_COPY_AT]
+        } else {
+            state[challenge::RESPONSE_BUMP_AT]
+        };
+        expect_derived_with_bump(
+            account,
+            program,
+            &[b"dcg-hcl-response", record.as_ref()],
+            response_bump,
+            kind,
+            role,
+        )
+        .map_err(|_| no(PROOF))?;
+    } else {
+        expect_derived(
+            account,
+            program,
+            &[b"dcg-hcl-response", record.as_ref()],
+            kind,
+            role,
+        )
+        .map_err(|_| no(PROOF))?;
+    }
+    let total = if version == challenge::VERSION {
+        usize::try_from(u32_at(
+            &account.try_borrow_data()?,
+            closure_v2_response::DECLARED_LEN_AT,
+        )?)
+        .map_err(|_| no(MALFORMED))?
+    } else {
+        usize::try_from(u32_at(state, 140)?).map_err(|_| no(MALFORMED))?
+    };
     if total > closure_v2_response::MAX_BODY || account.data_len() > RESPONSE_BYTES {
         return Err(no(MALFORMED));
     }
@@ -193,7 +230,58 @@ fn response<'a>(
 
 fn document(program: &Pubkey, account: &AccountInfo, state: &[u8]) -> ProgramResult {
     let descriptor: &[u8; 32] = state[72..104].try_into().map_err(|_| no(PROOF))?;
-    document::document_v8_stored(program, account, Some(descriptor), false, PROOF)?;
+    let record_version = u16_at(state, 6)?;
+    if record_version == challenge::VERSION {
+        let raw = account.try_borrow_data()?;
+        if raw.len() < 6 || raw.get(..4) != Some(&b"DCM2"[..]) {
+            return Err(no(PROOF));
+        }
+        match u16_at(&raw, 4)? {
+            6 => {
+                let kind = AccountKind::exact(b"DCM2", document::DCM2_V6_BYTES).with_version(4, 6);
+                expect_derived(
+                    account,
+                    program,
+                    &[address::DOCUMENT_SEED, descriptor],
+                    kind,
+                    RoleFlags {
+                        writable: false,
+                        signer: false,
+                    },
+                )
+                .map_err(|_| no(PROOF))?;
+                if raw.len() != document::DCM2_V6_BYTES
+                    || u16_at(&raw, 6)? & (document::FLAG_ROOT_ONLY | document::FLAG_SEALED)
+                        != document::FLAG_ROOT_ONLY | document::FLAG_SEALED
+                    || raw[8..40] != descriptor[..]
+                {
+                    return Err(no(PROOF));
+                }
+            }
+            7 => {
+                drop(raw);
+                document::document_v8_stored(program, account, Some(descriptor), false, PROOF)?;
+            }
+            _ => return Err(no(PROOF)),
+        }
+    } else {
+        if account.owner != program {
+            return Err(no(AUTH));
+        }
+        if account.key != &crate::closure_v2::document_address(program, descriptor).0 {
+            return Err(no(PROOF));
+        }
+        let raw = account.try_borrow_data()?;
+        let version = u16_at(&raw, 4)?;
+        if raw.len() < 360
+            || &raw[..4] != b"DCM2"
+            || (record_version == 2 && version != 2)
+            || (record_version == 4 && !crate::closure_v2::pt1_bound(version))
+            || raw[8..40] != descriptor[..]
+        {
+            return Err(no(PROOF));
+        }
+    }
     let raw = account.try_borrow_data()?;
     if raw[40..72] != state[40..72] {
         return Err(no(PROOF));
@@ -673,7 +761,7 @@ fn verify_target_unified(
     if accounts.len() != 8 {
         return Err(no(MALFORMED));
     }
-    live(program, &accounts[0])?;
+    live(program, &accounts[0], manifest)?;
     let mut state = accounts[0].try_borrow_mut_data()?;
     if state[176] != 0 {
         return Err(no(STATE));
@@ -1422,7 +1510,7 @@ fn verify_reads(
     if data.len() < 5 || accounts.len() != 8 {
         return Err(no(MALFORMED));
     }
-    live(program, &accounts[0])?;
+    live(program, &accounts[0], manifest)?;
     let mut state = accounts[0].try_borrow_mut_data()?;
     if state[176] != 1 || accounts[1].key.as_ref() != &state[184..216] {
         return Err(no(STATE));
@@ -1705,24 +1793,479 @@ pub fn process_generic_dispute_tag(
     match data.first().copied() {
         Some(TAG_VERIFY_TARGET) => verify_target(program, accounts, data, manifest),
         Some(TAG_VERIFY_READS) => verify_reads(program, accounts, data, manifest),
-        Some(TAG_RESTAGE) => restage(program, accounts, data),
-        Some(TAG_VERIFY_OUTPUTS) => verify_outputs(program, accounts, data),
-        // 122/123/124/127 perform application model-artifact or kernel work;
-        // 129 is the separately chunked range-proof continuation.
-        Some(
-            TAG_WEIGHTS_ANCHOR
-            | TAG_WEIGHTS_ROWS
-            | TAG_EXECUTE
-            | TAG_VERIFY_ARTIFACTS
-            | TAG_VERIFY_RANGE_SLOTS,
-        ) => Err(ProgramError::InvalidInstructionData),
+        Some(TAG_WEIGHTS_ANCHOR) => weights_anchor(program, accounts, data, manifest),
+        Some(TAG_WEIGHTS_ROWS) => weights_rows(program, accounts, data, manifest),
+        Some(TAG_EXECUTE) => execute(program, accounts, data, manifest),
+        Some(TAG_RESTAGE) => restage(program, accounts, data, manifest),
+        Some(TAG_VERIFY_ARTIFACTS) => verify_artifacts(program, accounts, data, manifest),
+        Some(TAG_VERIFY_OUTPUTS) => verify_outputs(program, accounts, data, manifest),
+        Some(TAG_VERIFY_RANGE_SLOTS) => verify_range_slots(program, accounts, data, manifest),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
 
+/// Tag 122: delegate descriptor/model-row interpretation to the application,
+/// then persist only the generic authenticated row anchor.
+fn weights_anchor(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
+    if data.len() != 1 || data[0] != TAG_WEIGHTS_ANCHOR || accounts.len() != 3 {
+        return Err(no(MALFORMED));
+    }
+    live(program, &accounts[0], manifest)?;
+    let mut state = accounts[0].try_borrow_mut_data()?;
+    let form = u16_at(&state, 174)?;
+    let operation = u16_at(&state, 182)?;
+    if state[176] != 1
+        || state[177] != 0
+        || accounts[1].key.as_ref() != &state[184..216]
+        || !manifest
+            .dispute_hooks()
+            .requires_weight_rows(form, operation)
+    {
+        return Err(no(STATE));
+    }
+    document(program, &accounts[2], &state)?;
+    let doc = accounts[2].try_borrow_data()?;
+    let model_root: [u8; 32] = doc[264..296].try_into().map_err(|_| no(PROOF))?;
+    let raw = response(program, &accounts[1], accounts[0].key, &state)?;
+    let body = Body::parse(&raw)?;
+    let anchor = manifest
+        .artifact_witness_verifier()
+        .verify_descriptor_row_anchor(body.core, &model_root)
+        .map_err(no)?;
+    drop(raw);
+    drop(doc);
+    state[356..388].copy_from_slice(&anchor.root);
+    u32_put(&mut state, 388, anchor.leaf_count);
+    state[177] = 1;
+    challenge::respond_event(accounts[0].key, &state, TAG_WEIGHTS_ANCHOR, 1, state[4]);
+    Ok(())
+}
+
+/// Tag 123: authenticate the selected application rows without decoding a
+/// model-specific tensor name or witness format in the DCG engine.
+fn weights_rows(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
+    if data.len() != 1 || data[0] != TAG_WEIGHTS_ROWS || accounts.len() != 2 {
+        return Err(no(MALFORMED));
+    }
+    live(program, &accounts[0], manifest)?;
+    let mut state = accounts[0].try_borrow_mut_data()?;
+    let form = u16_at(&state, 174)?;
+    let operation = u16_at(&state, 182)?;
+    if state[176] != 1
+        || state[177] != 1
+        || accounts[1].key.as_ref() != &state[184..216]
+        || !manifest
+            .dispute_hooks()
+            .requires_weight_rows(form, operation)
+    {
+        return Err(no(STATE));
+    }
+    let payload_len = usize::from(u16_at(&state, 280)?);
+    let payload = state.get(282..282 + payload_len).ok_or(no(PROOF))?;
+    let raw = response(program, &accounts[1], accounts[0].key, &state)?;
+    let body = Body::parse(&raw)?;
+    let mut reads = Vec::with_capacity(body.read_count);
+    for i in 0..body.read_count {
+        reads.push(body.section(i)?.0);
+    }
+    let anchor = crate::app_api::ArtifactRowAnchor {
+        root: state[356..388].try_into().map_err(|_| no(PROOF))?,
+        leaf_count: u32_at(&state, 388)?,
+    };
+    manifest
+        .artifact_witness_verifier()
+        .verify_weight_rows_for_entry(
+            body.weights,
+            anchor,
+            state[145],
+            form,
+            operation,
+            payload,
+            &reads,
+        )
+        .map_err(no)?;
+    drop(raw);
+    state[177] = 2;
+    challenge::respond_event(accounts[0].key, &state, TAG_WEIGHTS_ROWS, 1, state[4]);
+    Ok(())
+}
+
+/// Tag 127: authenticate application-owned artifact bytes and store the
+/// generic progress marker consumed by tag 124.
+fn verify_artifacts(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
+    if data.len() != 1 || data[0] != TAG_VERIFY_ARTIFACTS || accounts.len() != 3 {
+        return Err(no(MALFORMED));
+    }
+    live(program, &accounts[0], manifest)?;
+    let mut state = accounts[0].try_borrow_mut_data()?;
+    let form = u16_at(&state, 174)?;
+    let operation = u16_at(&state, 182)?;
+    if state[176] != 1
+        || state[177] != 0
+        || accounts[1].key.as_ref() != &state[184..216]
+        || !manifest
+            .dispute_hooks()
+            .requires_artifact_block(form, operation)
+    {
+        return Err(no(STATE));
+    }
+    document(program, &accounts[2], &state)?;
+    let doc = accounts[2].try_borrow_data()?;
+    let model_root: [u8; 32] = doc[264..296].try_into().map_err(|_| no(PROOF))?;
+    let raw = response(program, &accounts[1], accounts[0].key, &state)?;
+    let body = Body::parse(&raw)?;
+    manifest
+        .artifact_witness_verifier()
+        .verify_artifact_block(
+            form,
+            operation,
+            u32_at(&state, 156)?,
+            body.weights,
+            body.core,
+            &model_root,
+        )
+        .map_err(no)?;
+    drop(raw);
+    drop(doc);
+    state[177] = 3;
+    challenge::respond_event(accounts[0].key, &state, TAG_VERIFY_ARTIFACTS, 1, state[4]);
+    Ok(())
+}
+
+/// Tag 124: ask the application to replay the committed form, then compare
+/// its output with every DCL2 write commitment and rule the challenge.
+fn execute(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
+    if data.len() < 1 || data[0] != TAG_EXECUTE || accounts.len() != 6 || !accounts[2].is_writable {
+        return Err(no(MALFORMED));
+    }
+    live(program, &accounts[0], manifest)?;
+    let mut state = accounts[0].try_borrow_mut_data()?;
+    let form = u16_at(&state, 174)?;
+    let operation = u16_at(&state, 182)?;
+    let reads_expected = usize::from(u16_at(&state, 178)?);
+    let all_reads = if reads_expected == MAX_READS {
+        u128::MAX
+    } else {
+        (1u128 << reads_expected) - 1
+    };
+    let hooks = manifest.dispute_hooks();
+    let needs_weights = hooks.requires_weight_rows(form, operation);
+    let needs_artifacts = hooks.requires_artifact_block(form, operation);
+    if state[176] != 1
+        || accounts[1].key.as_ref() != &state[184..216]
+        || read_bits(&state)? != all_reads
+        || (needs_weights && state[177] != 2)
+        || (needs_artifacts && state[177] != 3)
+    {
+        return Err(no(INCOMPLETE));
+    }
+    document(program, &accounts[2], &state)?;
+    pinned_tables(program, &state, &accounts[3], &accounts[4])?;
+    if accounts[5].key.as_ref() != &state[PT2S_AT..PT2S_END] {
+        return Err(no(PROOF));
+    }
+    let raw = response(program, &accounts[1], accounts[0].key, &state)?;
+    let body = Body::parse(&raw)?;
+    let descriptor: [u8; 32] = state[72..104].try_into().map_err(|_| no(PROOF))?;
+    let (_, _, _, _, _, writes) =
+        crate::closure_v2::proof::preimage_fields(body.target, &descriptor)?;
+    let payload_len = usize::from(u16_at(&state, 280)?);
+    let payload = state.get(282..282 + payload_len).ok_or(no(PROOF))?;
+    let mut read_operands = Vec::with_capacity(body.read_count);
+    for i in 0..body.read_count {
+        read_operands.push(body.section(i)?.0);
+    }
+    let artifacts: [&[u8]; 1] = [body.weights];
+    let mut output = vec![0u8; OUTPUT_BYTES];
+    let output_len = hooks
+        .replay_pt1(
+            crate::app_api::ApplicationReplayRequest {
+                machine: state[145],
+                form,
+                operation,
+                payload,
+                reads: &read_operands,
+                artifact_operands: &artifacts,
+                instruction_data: data,
+                output_range: None,
+            },
+            &mut output,
+        )
+        .map_err(no)?;
+    if output_len > output.len() {
+        return Err(no(ROUTE));
+    }
+    output.truncate(output_len);
+    let target = crate::closure_v2::Coordinate {
+        position: u32_at(&state, 156)?,
+        segment: u16_at(&state, 160)?,
+        entry: u32_at(&state, 136)?,
+    };
+    let mut offset = 0usize;
+    let mut honest = true;
+    for write in writes.chunks_exact(WRITE_ROW) {
+        let len = usize::try_from(u32_at(write, 4)?).map_err(|_| no(MALFORMED))?;
+        let bytes = slice(&output, offset, len).map_err(|_| no(ROUTE))?;
+        let digest = crate::closure_v2::write_digest(
+            &descriptor,
+            target,
+            u16_at(write, 0)?,
+            u64_at(write, 8)?,
+            bytes,
+        )
+        .map_err(|_| no(PROOF))?;
+        honest &= digest == write[16..48];
+        offset = offset.checked_add(len).ok_or(no(MALFORMED))?;
+    }
+    if offset != output.len() {
+        return Err(no(ROUTE));
+    }
+    let doc_revision = u16_at(&accounts[2].try_borrow_data()?, 4)?;
+    drop(raw);
+    if u16_at(&state, 6)? == challenge::VERSION {
+        if doc_revision == 7 {
+            challenge::rule_v8(
+                program,
+                accounts[0].key,
+                &mut state,
+                &accounts[2],
+                if honest { 1 } else { 2 },
+                crate::unified::events::CAUSE_VERDICT,
+                0,
+            )?;
+        } else if doc_revision == 6 {
+            rule_v6(
+                accounts[0].key,
+                &mut state,
+                &accounts[2],
+                if honest { 1 } else { 2 },
+            )?;
+        } else {
+            return Err(no(PROOF));
+        }
+    } else {
+        rule_legacy(&mut state, &accounts[2], honest)?;
+    }
+    Ok(())
+}
+
+fn rule_legacy(state: &mut [u8], document: &AccountInfo, honest: bool) -> ProgramResult {
+    if !honest {
+        let mut doc = document.try_borrow_mut_data()?;
+        let wins = u32_at(&doc, 132)?.checked_add(1).ok_or(no(STATE))?;
+        doc[132..136].copy_from_slice(&wins.to_le_bytes());
+        let flags = u16_at(&doc, 6)? | 4;
+        doc[6..8].copy_from_slice(&flags.to_le_bytes());
+    }
+    state[4] = 3;
+    state[5] = if honest { 1 } else { 2 };
+    Ok(())
+}
+
+fn rule_v6(
+    challenge_key: &Pubkey,
+    state: &mut [u8],
+    document: &AccountInfo,
+    winner: u8,
+) -> ProgramResult {
+    let descriptor: [u8; 32] = state[72..104].try_into().map_err(|_| no(PROOF))?;
+    let deadline = if winner == 2 {
+        let terms = {
+            let doc = document.try_borrow_data()?;
+            let end = crate::unified::document::TERMS_AT
+                .checked_add(crate::unified::terms::TERMS_BYTES)
+                .ok_or(no(STATE))?;
+            crate::unified::terms::Terms::decode(
+                doc.get(crate::unified::document::TERMS_AT..end)
+                    .ok_or(no(PROOF))?,
+            )
+            .map_err(no)?
+        };
+        let mut doc = document.try_borrow_mut_data()?;
+        let wins = u32_at(&doc, 132)?.checked_add(1).ok_or(no(STATE))?;
+        doc[132..136].copy_from_slice(&wins.to_le_bytes());
+        let flags = u16_at(&doc, 6)? | document::FLAG_REFUTED;
+        doc[6..8].copy_from_slice(&flags.to_le_bytes());
+        if terms.settlement_program == [0; 32] {
+            0
+        } else {
+            Clock::get()?
+                .slot
+                .checked_add(terms.custom_settle_window_slots)
+                .ok_or(no(598))?
+        }
+    } else {
+        u32_at(&document.try_borrow_data()?, 132)?;
+        0
+    };
+    state[4] = challenge::PHASE_RULED;
+    state[5] = winner;
+    state[170..178].copy_from_slice(&deadline.to_le_bytes());
+    state[178] = crate::unified::events::CAUSE_VERDICT;
+    crate::unified::events::emit(
+        crate::unified::events::RULING,
+        &descriptor,
+        crate::unified::events::Body::new()
+            .key(challenge_key.as_ref())
+            .u8(winner)
+            .u8(crate::unified::events::CAUSE_VERDICT)
+            .pad(2)
+            .u32(0)
+            .u32(u32_at(&document.try_borrow_data()?, 132)?)
+            .pad(4),
+    );
+    Ok(())
+}
+
+fn verify_range_slots(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
+    if data.len() != 7 || accounts.len() != 8 {
+        return Err(no(MALFORMED));
+    }
+    live(program, &accounts[0], manifest)?;
+    let mut state = accounts[0].try_borrow_mut_data()?;
+    if u16_at(&state, 6)? != challenge::VERSION {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if state[176] != 1 || accounts[1].key.as_ref() != &state[184..216] {
+        return Err(no(STATE));
+    }
+    document(program, &accounts[2], &state)?;
+    pinned_tables(program, &state, &accounts[4], &accounts[5])?;
+    if accounts[6].key.as_ref() != &state[PT2S_AT..PT2S_END] {
+        return Err(no(PROOF));
+    }
+    crate::unified::plan::bind_pt2s(program, &accounts[6], &accounts[4], &accounts[5], None)
+        .map_err(|_| no(PROOF))?;
+    let doc = accounts[2].try_borrow_data()?;
+    let descriptor: [u8; 32] = state[72..104].try_into().map_err(|_| no(PROOF))?;
+    if accounts[7].owner != program || accounts[7].key.as_ref() != &doc[456..488] {
+        return Err(no(PROOF));
+    }
+    document::positions(
+        program,
+        &accounts[3],
+        &descriptor,
+        u32_at(&doc, 72)?,
+        false,
+        PROOF,
+    )?;
+    let s = accounts[6].try_borrow_data()?;
+    let routes = accounts[4].try_borrow_data()?;
+    let geometry = accounts[5].try_borrow_data()?;
+    let x = crate::unified::plan::view(&s, &routes, &geometry, &[], None).map_err(|_| no(PROOF))?;
+    let index = u32_at(&state, 170)?;
+    let position = u32_at(&state, 156)?;
+    let entry = x.entry(position, index).map_err(no)?;
+    let raw = response(program, &accounts[1], accounts[0].key, &state)?;
+    let body = Body::parse(&raw)?;
+    let read = usize::from(u16_at(data, 1)?);
+    let first = usize::from(u16_at(data, 3)?);
+    let count = usize::from(u16_at(data, 5)?);
+    if read >= body.read_count || count == 0 || read_bits(&state)? >> read & 1 == 1 {
+        return Err(no(MALFORMED));
+    }
+    let route = x.route(&entry, read as u16).map_err(no)?;
+    let row = body.row(read)?;
+    let (witness, kind, proof) = body.section(read)?;
+    if kind != 2 || route.binding_kind != 2 || witness.len() != route.byte_length as usize {
+        return Err(no(ROUTE));
+    }
+    let slots = usize::try_from(route.range_end - route.range_first).map_err(|_| no(ROUTE))?;
+    let end = first.checked_add(count).ok_or(no(MALFORMED))?;
+    if slots > MAX_RANGE_SLOTS || end > slots {
+        return Err(no(MALFORMED));
+    }
+    let in_flight = usize::from(u16_at(&state, 406)?);
+    let next = usize::from(u16_at(&state, 408)?);
+    if (first == 0 && in_flight != 0) || (first != 0 && (in_flight != read + 1 || first != next)) {
+        return Err(no(MALFORMED));
+    }
+    let q0 = route
+        .range_first
+        .checked_add(u32::try_from(first).map_err(|_| no(MALFORMED))?)
+        .ok_or(no(MALFORMED))?;
+    let q_end = q0
+        .checked_add(u32::try_from(count).map_err(|_| no(MALFORMED))?)
+        .ok_or(no(MALFORMED))?;
+    let leaves = unified_range_leaves(
+        &x,
+        &state,
+        &accounts[7],
+        &descriptor,
+        route,
+        witness,
+        q0..q_end,
+    )?;
+    for (i, leaf) in leaves.iter().enumerate() {
+        let at = OUTPUT_AT + 32 * (first + i);
+        state[at..at + 32].copy_from_slice(leaf);
+    }
+    if end == slots {
+        let all: Vec<[u8; 32]> = state[OUTPUT_AT..OUTPUT_AT + 32 * slots]
+            .chunks_exact(32)
+            .map(|v| v.try_into().expect("32-byte slot digest"))
+            .collect();
+        unified_range_close(
+            &x,
+            &state,
+            &accounts[7],
+            &descriptor,
+            route,
+            row,
+            proof,
+            &all,
+        )?;
+        drop(raw);
+        drop(x);
+        drop(s);
+        drop(routes);
+        drop(geometry);
+        drop(doc);
+        let bits = read_bits(&state)? | 1u128 << read;
+        put_read_bits(&mut state, bits);
+        state[OUTPUT_AT..OUTPUT_AT + 32 * slots].fill(0);
+        state[406..414].fill(0);
+    } else {
+        u16_put(&mut state, 406, (read + 1) as u16);
+        u16_put(&mut state, 408, end as u16);
+    }
+    challenge::respond_event(accounts[0].key, &state, TAG_VERIFY_RANGE_SLOTS, 1, state[4]);
+    Ok(())
+}
+
 /// Close the executor's staged response and clear all generic verification
 /// progress so it can retry before the unchanged deadline.
-fn restage(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn restage(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
     if data.len() != 1
         || data[0] != TAG_RESTAGE
         || accounts.len() != 3
@@ -1733,7 +2276,7 @@ fn restage(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     {
         return Err(no(MALFORMED));
     }
-    live(program, &accounts[2])?;
+    live(program, &accounts[2], manifest)?;
     let mut state = accounts[2].try_borrow_mut_data()?;
     if &state[40..72] != accounts[1].key.as_ref() {
         return Err(no(STATE));
@@ -1781,11 +2324,16 @@ fn restage(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 
 /// Verify that the app's claimed output bytes produce every committed write
 /// digest before an app replay is allowed to compare its output.
-fn verify_outputs(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn verify_outputs(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
     if data.len() != 1 || data[0] != TAG_VERIFY_OUTPUTS || accounts.len() != 2 {
         return Err(no(MALFORMED));
     }
-    live(program, &accounts[0])?;
+    live(program, &accounts[0], manifest)?;
     let mut state = accounts[0].try_borrow_mut_data()?;
     if state[176] != 1 || state[404] != 0 || accounts[1].key.as_ref() != &state[184..216] {
         return Err(no(STATE));

@@ -51,11 +51,13 @@ source, and empty or core-overlapping magic.
 
 At runtime, an empty instruction byte array is refused. A core tag is sent to
 `process_instruction_with_manifest` with the wrapped kernel/form manifest.
-Generic dispute tags 120, 121, 126, and 128 are sent to
-`closure_v2_generic::process_generic_dispute_tag`; tags 122–124, 127, and 129
-reach that dispatcher and remain refused until their corresponding engine
-paths are implemented. These tags bypass ordinary app handlers; applications
-supply their form and artifact behavior through the dispute hooks.
+Generic dispute tags 120–124 and 126–129 are sent to
+`closure_v2_generic::process_generic_dispute_tag`. Tags 122, 123, and 127
+delegate artifact interpretation to `ArtifactWitnessVerifier`; tag 124 calls
+the application's replay hook before comparing committed writes and ruling;
+tag 129 verifies a bounded unified range-read continuation. These tags bypass
+ordinary app handlers; applications supply their form and artifact behavior
+through the dispute hooks.
 Other non-core tags are looked up in the sorted app table; their DCG account
 rules run before preflight, and preflight runs before the handler. A tag absent
 from the app table falls back to the core dispatcher, preserving feature-gated
@@ -124,25 +126,27 @@ The static instruction table does not replace `ApplicationHooks` or
 `DecisionRouteSelector`. Those remain the existing manifest's revision-8
 policy and typed-decision interfaces. `ApplicationDisputeHooks` and
 `ArtifactWitnessVerifier` isolate application form replay and model-artifact
-semantics from the generic DCR1/DRU1 state transitions. The current generic
-engine handles the unified DCR1 revision-8 path; application replay tags 122,
-123, 124, and 127 and range continuation tag 129 remain refused.
+semantics from the generic DCR1/DRU1 state transitions. The generic engine
+accepts unified DCR1 v5 with DCM2 v6 or v7. Its shared record and document
+validators also accept DCR1 v2/v4 with their legacy DCM2 formats on the
+hook-backed paths. Full v2/v4 tag-120/121 replay, tag-124 chunked output
+replay, and legacy tag-129 page-pick continuation are not yet ported.
+Unsupported application forms return custom 740 before a tag reads its
+response or document accounts. The test application used by the generic SBF
+suite is a mechanics harness around ByteSum; it is not a production form
+catalog or model adapter.
+
 For tags 120, 121, and 128, DCR1/DRU1 identity failures pass through DCG's
 shared provenance gate and return custom refusal 734; the Basanos response
 reader used custom 731 for some DRU1 owner/address failures. Tag 126 already
-used proof refusal 734 for a response-address mismatch. The source's older
-owner-only DCR1 check can also surface `IncorrectProgramId`, while DCG maps an
-identity-gate failure to custom 734. These code mappings are part of the
-documented account-provenance seam.
-
-This port is not yet full source parity. Basanos's generic `live()` path also
-refuses unsupported forms with custom 740, which this DCG engine does not
-currently emit. The source accepts DCR1 v2/v4 and unified v5 records, including
-DCM2 v6; the current DCG generic engine accepts only unified revision-8 DCR1
-v5 with DCM2 v7. Therefore the 120/121/126/128 routes below that boundary are
-not claimed to have identical acceptance behavior. Per-tag code lists and the
-SBF setup limitation are recorded in
-[`dcg-2b-engine-a-2026-10-01`](experiments/dcg-2b-engine-a-2026-10-01.md).
+used proof refusal 734 for a response-address mismatch. The same mapping
+applies to the new tags where they validate DCR1/DRU1 identity. Basanos's
+older owner-only DCR1 checks can also surface `IncorrectProgramId`, while DCG
+maps an identity-gate failure to custom 734. Application hook refusals are
+passed through as returned, so their parity depends on the selected app
+adapter. These code mappings are part of the documented account-provenance
+seam. Per-tag code lists and SBF results are recorded in
+[`dcg-2b-engine-b-2026-10-01`](experiments/dcg-2b-engine-b-2026-10-01.md).
 
 ## Region-content commitments
 

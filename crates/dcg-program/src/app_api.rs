@@ -836,6 +836,17 @@ pub trait ApplicationDisputeHooks: Sync {
         request: ApplicationReplayRequest<'_>,
         output: &mut [u8],
     ) -> Result<usize, u32>;
+
+    /// Whether the selected application form requires tags 122 and 123
+    /// before replay. The form/operation catalog remains application-owned.
+    fn requires_weight_rows(&self, _form: u16, _operation: u16) -> bool {
+        false
+    }
+
+    /// Whether the selected application form requires tag 127 before replay.
+    fn requires_artifact_block(&self, _form: u16, _operation: u16) -> bool {
+        false
+    }
 }
 
 /// Inputs to one application-owned PT1 replay. The generic handler supplies
@@ -848,6 +859,9 @@ pub struct ApplicationReplayRequest<'a> {
     pub payload: &'a [u8],
     pub reads: &'a [&'a [u8]],
     pub artifact_operands: &'a [&'a [u8]],
+    /// Original tag-124 bytes, for application-defined bounded replay
+    /// continuations. DCG validates the tag and passes the bytes unchanged.
+    pub instruction_data: &'a [u8],
     pub output_range: Option<(u32, u32)>,
 }
 
@@ -893,6 +907,22 @@ pub trait ArtifactWitnessVerifier: Sync {
         row_count: u16,
         width: u32,
     ) -> Result<(), u32>;
+
+    /// Authenticate the rows required by an application entry. The witness
+    /// envelope is generic DGR1 data; tensor naming and row selection belong
+    /// to the application, so DCG does not decode model-specific payloads.
+    fn verify_weight_rows_for_entry(
+        &self,
+        _witness: &[u8],
+        _anchor: ArtifactRowAnchor,
+        _machine: u8,
+        _form: u16,
+        _operation: u16,
+        _payload: &[u8],
+        _read_operands: &[&[u8]],
+    ) -> Result<(), u32> {
+        Err(734)
+    }
 
     /// Authenticate a tag-127 artifact block for the selected application
     /// form and operation against the document model root.

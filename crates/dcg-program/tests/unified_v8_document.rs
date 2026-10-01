@@ -4839,6 +4839,7 @@ fn f47_honest_body(
     logits: &[i64],
     wrong_option_write_order: bool,
     wrong_duplicate_probability: bool,
+    test_kernel_output: bool,
     position_root_at: &mut [u8; 32],
 ) -> (Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>) {
     let gather_index = f47_gather_before(x, position, decision_entry);
@@ -4964,9 +4965,25 @@ fn f47_honest_body(
         &flat_rows,
     ]);
 
-    let result = fixture_decision_record(logits);
-    let mut claimed = vec![0u8; 256 * 4];
-    claimed[..result.len()].copy_from_slice(&result);
+    let mut claimed = if test_kernel_output {
+        let mut kernel_output = [0u8; 256];
+        dcg_program::kernel::Kernel::execute(
+            &dcg_program::kernel::test_kernel::BYTE_SUM,
+            &gathered[..64],
+            &mut kernel_output,
+        )
+        .expect("test ByteSum produces its replay word");
+        let mut output = vec![0u8; 256 * 4];
+        for lane in output.chunks_exact_mut(4) {
+            lane.copy_from_slice(&kernel_output[..4]);
+        }
+        output
+    } else {
+        let result = fixture_decision_record(logits);
+        let mut output = vec![0u8; 256 * 4];
+        output[..result.len()].copy_from_slice(&result);
+        output
+    };
     if wrong_option_write_order {
         assert!(logits.len() >= 2);
         let first_probability = claimed[4..8].to_vec();
@@ -5092,6 +5109,38 @@ fn f47_honest_body(
         body[*offset..*offset + section.len()].copy_from_slice(section);
     }
     (body, gather_preimage, target_leaf, root, claimed)
+}
+
+/// Give the retained Form-47 fixture a tiny app-owned descriptor and row
+/// witness so tags 122/123 can exercise the test application before tag 124.
+fn f47_test_hook_body(body: &[u8]) -> Vec<u8> {
+    let read_count = usize::from(u16::from_le_bytes(body[6..8].try_into().unwrap()));
+    assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), 1);
+    let old_head = 28 + 4 * read_count;
+    let new_head = 36 + 4 * read_count;
+    let core = b"DCGTEST-DESCRIPTOR/1";
+    let weights = b"DCGTEST-ROWS/1";
+    let copied = body.len() - old_head;
+    let core_at = new_head + copied;
+    let weights_at = core_at + core.len();
+    let mut out = vec![0u8; body.len() + 8 + core.len() + weights.len()];
+    out[..4].copy_from_slice(b"DGR1");
+    f47_put_u16(&mut out, 4, 2);
+    f47_put_u16(&mut out, 6, read_count as u16);
+    out[8..12].copy_from_slice(&body[8..12]);
+    for read in 0..read_count {
+        let old_at = 28 + 4 * read;
+        let offset = u32::from_le_bytes(body[old_at..old_at + 4].try_into().unwrap()) + 8;
+        f47_put_u32(&mut out, 36 + 4 * read, offset);
+    }
+    out[new_head..new_head + copied].copy_from_slice(&body[old_head..]);
+    f47_put_u32(&mut out, 12, core_at as u32);
+    f47_put_u32(&mut out, 16, core.len() as u32);
+    f47_put_u32(&mut out, 20, weights_at as u32);
+    f47_put_u32(&mut out, 24, weights.len() as u32);
+    out[core_at..weights_at].copy_from_slice(core);
+    out[weights_at..].copy_from_slice(weights);
+    out
 }
 
 /// A full form-48 responder body with one shared producer multiproof. The route
@@ -5540,9 +5589,9 @@ async fn f47_measured_refusal(
         result.result,
         Err(TransactionError::InstructionError(
             2,
-            InstructionError::InvalidInstructionData
+            InstructionError::Custom(740)
         )),
-        "{case} remains deferred"
+        "{case} is refused by the test application's replay hook"
     );
     result
         .metadata
@@ -5670,7 +5719,7 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
                 .collect::<Vec<_>>()
         };
         let mut position_root = [0u8; 32];
-        let (body, producer_preimage, target_leaf, root, _claimed) = f47_honest_body(
+        let (legacy_body, producer_preimage, target_leaf, root, _claimed) = f47_honest_body(
             &x,
             &descriptor,
             position,
@@ -5679,8 +5728,10 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             &logits,
             wrong_mapping,
             wrong_duplicate_probability,
+            !wrong_mapping && !wrong_duplicate_probability,
             &mut position_root,
         );
+        let body = f47_test_hook_body(&legacy_body);
         assert_eq!(root, position_root);
         let roots = f47_document_roots(&f, position, position_root);
         let (descriptor, created) = f
@@ -5846,7 +5897,28 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             &format!("Form 47 K={k} role_swapped={role_swapped} tag121"),
         )
         .await;
-        let execute = f47_measured_refusal(
+        let verify_anchor = f47_measured_send(
+            &mut f,
+            vec![122],
+            vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new_readonly(response_key, false),
+                AccountMeta::new_readonly(created[0], false),
+            ],
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag122"),
+        )
+        .await;
+        let verify_rows = f47_measured_send(
+            &mut f,
+            vec![123],
+            vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new_readonly(response_key, false),
+            ],
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag123"),
+        )
+        .await;
+        let execute = f47_measured_send(
             &mut f,
             vec![124],
             vec![
@@ -5860,7 +5932,61 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             &format!("Form 47 K={k} role_swapped={role_swapped} tag124"),
         )
         .await;
-        let line = format!("role_swapped={role_swapped} K={k} tag120={verify_target} tag121={verify_reads} tag124={execute}");
+        let expected_winner = if wrong_mapping || wrong_duplicate_probability {
+            2
+        } else {
+            1
+        };
+        let ruled = f.account(challenge_key).await;
+        assert_eq!(ruled[4], challenge::PHASE_RULED);
+        assert_eq!(ruled[5], expected_winner, "tag 124's test-kernel ruling");
+        let final_doc = f.account(created[0]).await;
+        assert_eq!(
+            u16_at(&final_doc, 6) & FLAG_REFUTED,
+            if expected_winner == 2 {
+                FLAG_REFUTED
+            } else {
+                0
+            }
+        );
+        let (bond_escrow, _) = address::bond_escrow(&f.program, &descriptor);
+        f.ctx.set_account(&bond_escrow, &shared(system_funded()));
+        let executor = f.executor.pubkey();
+        let settlement_winner = if expected_winner == 2 {
+            challenger
+        } else {
+            executor
+        };
+        let settle = f47_measured_send(
+            &mut f,
+            vec![dcg_program::root_only_challenge::TAG_SETTLE],
+            vec![
+                AccountMeta::new(challenge_key, false),
+                AccountMeta::new(response_key, false),
+                AccountMeta::new(settlement_winner, false),
+                AccountMeta::new(executor, false),
+                AccountMeta::new(created[0], false),
+                AccountMeta::new(incinerator::ID, false),
+                AccountMeta::new(challenger, false),
+                AccountMeta::new(bond_escrow, false),
+                AccountMeta::new_readonly(SYSTEM, false),
+            ],
+            &format!("Form 47 K={k} role_swapped={role_swapped} tag131 settle"),
+        )
+        .await;
+        assert_eq!(f.account(challenge_key).await[4], challenge::PHASE_SETTLED);
+        eprintln!("DCG_GENERIC_SBF_CU|122|f47-test-hook|{verify_anchor}");
+        eprintln!("DCG_GENERIC_SBF_CU|123|f47-test-hook|{verify_rows}");
+        eprintln!(
+            "DCG_GENERIC_SBF_CU|124|f47-test-hook-{}|{execute}",
+            if expected_winner == 2 {
+                "cheat"
+            } else {
+                "honest"
+            }
+        );
+        eprintln!("DCG_GENERIC_SBF_CU|131|f47-settle|{settle}");
+        let line = format!("role_swapped={role_swapped} K={k} tag120={verify_target} tag121={verify_reads} tag122={verify_anchor} tag123={verify_rows} tag124={execute} tag131={settle}");
         let mode = if std::env::var_os("BASANOS_DCG_V8_SBF").is_some() {
             "release-SBF"
         } else {
@@ -5889,7 +6015,7 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn f47_honest_dispute_tags_120_121_and_deferred_124_at_owner_boundaries() {
+async fn f47_full_dispute_tags_120_121_122_123_124_at_owner_boundaries() {
     for role_swapped in f47_measure_roles() {
         run_f47_dispute_at_owner_boundaries(role_swapped).await;
     }
