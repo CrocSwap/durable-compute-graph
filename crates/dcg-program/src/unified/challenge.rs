@@ -800,6 +800,57 @@ fn verify_app_route_opening(
     Ok(())
 }
 
+/// The revision-8 typed-decision check performed by the challenge fix-point.
+/// A well-bound table may retain its committed order and duplicate ids; only
+/// an option id outside the fixed logits row convicts at this stage.
+fn fix_point_decision_option_code(code: u32, form: u16, options: &[u32]) -> u32 {
+    if code == 0
+        && cfg!(feature = "revision-8")
+        && matches!(
+            form,
+            crate::kernels::decision::FORM_ID | crate::kernels::decision::GATHER_FORM_ID
+        )
+        && crate::kernels::decision::check_options(
+            options,
+            crate::kernels::decision::LOGITS_ROW_LENGTH,
+        )
+        .is_err_and(|error| error.0 == crate::kernels::decision::ERR_OPTION_RANGE)
+    {
+        crate::kernels::decision::ERR_OPTION_RANGE
+    } else {
+        code
+    }
+}
+
+#[cfg(all(test, feature = "revision-8"))]
+mod fix_point_decision_option_tests {
+    use super::fix_point_decision_option_code;
+    use crate::kernels::decision::{ERR_OPTION_RANGE, FORM_ID, GATHER_FORM_ID, LOGITS_ROW_LENGTH};
+
+    #[test]
+    fn fix_point_preserves_unsorted_and_duplicate_option_tables() {
+        assert_eq!(fix_point_decision_option_code(0, FORM_ID, &[5, 3]), 0);
+        assert_eq!(fix_point_decision_option_code(0, FORM_ID, &[17, 17]), 0);
+        assert_eq!(
+            fix_point_decision_option_code(0, GATHER_FORM_ID, &[17, 17]),
+            0
+        );
+    }
+
+    #[test]
+    fn fix_point_still_convicts_an_option_outside_the_logits_row() {
+        assert_eq!(
+            fix_point_decision_option_code(0, FORM_ID, &[LOGITS_ROW_LENGTH as u32]),
+            ERR_OPTION_RANGE
+        );
+        assert_eq!(fix_point_decision_option_code(123, FORM_ID, &[5, 3]), 123);
+        assert_eq!(
+            fix_point_decision_option_code(0, 99, &[LOGITS_ROW_LENGTH as u32]),
+            0
+        );
+    }
+}
+
 /// The per-instance check at a fix-point `(p, segment, local)`. Accounts
 /// `plan_accounts` = [PT2S, base routes, base geometry, DRP2, PT1S] as DCM2
 /// names them. A coordinate that names no committed entry refuses (581);
@@ -879,14 +930,7 @@ fn fix_point(
                     .chunks_exact(4)
                     .map(|token| u32::from_le_bytes(token.try_into().unwrap()))
                     .collect::<Vec<_>>();
-                if crate::kernels::decision::check_options(
-                    &options,
-                    crate::kernels::decision::LOGITS_ROW_LENGTH,
-                )
-                .is_err_and(|error| error.0 == crate::kernels::decision::ERR_OPTION_RANGE)
-                {
-                    code = crate::kernels::decision::ERR_OPTION_RANGE;
-                }
+                code = fix_point_decision_option_code(code, e.kernel_index, &options);
             }
         }
         #[cfg(feature = "revision-8")]
