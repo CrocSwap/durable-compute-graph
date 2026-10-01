@@ -1,8 +1,11 @@
 # DCG graph and plan v2 wire profile
 
-**Status: proposed frozen bytes for review.** This document turns the shared
-DCG v2 interface draft dated 2026-10-01 into canonical bytes. The numeric
-limits below are designed admission ceilings, not measured chain capacity.
+**Status: v2.0-frozen (DCGG/DCPL format version 1).** This document freezes
+the graph and plan profile derived from the shared DCG v2 interface draft
+dated 2026-10-01. The numeric limits below are designed admission ceilings,
+not measured chain capacity. Any change to bytes, validity rules, or the
+cross-region lifecycle contract requires stages 2, 3, and 4 to update together
+and publish a replacement shared golden corpus before implementation.
 The Python implementation is a reference for consensus bytes and structural
 refusals; it does not implement kernels, compiler lowering, or SVM handlers.
 
@@ -201,80 +204,23 @@ table for compatibility with the shared IR, but profile 1 only admits the
 single SHA-256 Merkle scheme and therefore has no usable cross-scheme
 translation. A profile-1 plan with a translation is refused.
 
+A cross-region boundary is an import edge, not permission to consume a
+provisional value. Under v2.0, the source region must be final before the
+destination region may execute or commit a value derived from it. Optimistic
+regions therefore wait through the source challenge window and any open
+dispute. Profile 1 has no rollback or provisional-import path; this fixed
+policy is not an extra plan field. A future policy change requires a new
+profile and a coordinated update across stages 2, 3, and 4.
+
 ## 4. Kernel capability declaration (`DCKC`)
 
-The shared draft names the `KernelCapabilityManifest/1` fields but does not
-give them bytes. This section defines a proposed canonical manifest envelope
-so `kernel_manifest_root` can be recomputed. It is not part of `DCGG` or
-`DCPL`; a plan binds its 32-byte root. Manifest field IDs that describe an
-application ABI remain registry-owned and are not guessed by the codec.
-
-`DCKC` has magic `[4]="DCKC"`, `format_version:u16=1`, `flags:u16=0`,
-`body_length:u32` (bytes following its 16-byte header), and
-`kernel_count:u32`. `kernel_count` is in `1..4,096`; complete DCKC bytes are
-at most 4 MiB. The body is kernel records sorted by
-`(kernel_id,semantic_version,abi_version)`. A kernel record is length-prefixed
-and contains, in order:
-
-1. `kernel_id:[16], semantic_version:u16, abi_version:u16,
-   implementation_id:[32]`.
-2. `parameter_layout_id:u32, parameter_layout_version:u16,
-   max_parameter_bytes:u32`.
-3. `input_port_count:u16, output_port_count:u16`, then input ports and output
-   ports. Each port has `port_id:u16, layout_id:u32, layout_version:u16,
-   scalar_type:u8, rank:u8, byte_order:u8, alignment:u16,
-   mutability:u8, alias_rule:u8, max_byte_length:u32, dimensions[rank]:u32[]`.
-   Port IDs increase within each direction. Integer ports use byte order `1`
-   (little-endian); opaque-byte ports use `0`. Mutability is read-only `0` or
-   kernel-written `1`. Alias rule is `0` (no alias), `1` (read-only sharing),
-   or `2` (exact in-place alias); profile 1 graph edges do not imply aliasing.
-4. `state_present:u8, state_schema_id:u32, state_schema_version:u16,
-   max_state_bytes:u32, cursor_schema_id:u32, cursor_schema_version:u16,
-   initial_state_length:u32, initial_state_bytes[],
-   complete_state_commitment:u8, state_component_count:u16`, then state
-   components sorted by `component_id:u16`. A component is
-   `component_id:u16, layout_id:u32, layout_version:u16, max_read_bytes:u32,
-   max_write_bytes:u32, initial_bytes_length:u32, initial_bytes[]`. When
-   `state_present=0`, every state field, count, and payload is zero/empty.
-   When present, the state schema and maximum are nonzero, initial bytes fit
-   the maximum, and `complete_state_commitment` is `0` or `1`.
-5. `step_abi_id:u32, step_abi_version:u16, decomposition_id:u32,
-   decomposition_version:u16, max_step_count:u32, whole_sweep_supported:u8`.
-   Step and decomposition identities and versions are nonzero; maximum count
-   is in `1..16,384`; the Boolean is `0` or `1`.
-6. `mode_count:u16`, then mode declarations sorted by `(mode_id,version)`. Each
-   declaration is `mode_id:u32, version:u16, required_capability_count:u16`,
-   sorted required capability entries `capability_id:[16], version:u16`,
-   `scheme_count:u16`, sorted schemes `scheme_id:u32, version:u16`,
-   `replay_present:u8`, then the fixed replay fields
-   `replay_abi_id:u32, replay_abi_version:u16, max_input_spans:u16,
-   max_prior_state_bytes:u32, max_output_bytes:u32, max_next_state_bytes:u32,
-   max_authentication_path_nodes:u16, max_opening_bytes:u32,
-   allowed_account_roles:u32, max_svm_cu:u64`. If replay is absent, all replay
-   fields are zero. If present, replay ABI ID/version and opening maximum are
-   nonzero; the opening maximum is at most 4 KiB. Account-role bits are
-   application-registered; unknown bits are refused by the image manifest.
-7. Resource limits, in order:
-   `max_input_bytes:u32, max_output_bytes:u32, max_operations:u32,
-   max_accounts:u16, max_cu:u64, max_heap_bytes:u32, max_stack_bytes:u32,
-   max_concurrent_live_states:u32, max_live_state_bytes:u32`.
-8. `error_mapping_count:u16`, then error mappings sorted by
-   `condition_id:u16`: `condition_id:u16, stable_error_code:u16`. Both values
-   are nonzero and each condition appears once. A kernel's malformed input,
-   overflow, invalid length, forbidden alias, and domain refusal map to these
-   stable codes when those conditions are possible for its ABI.
-
-Presence bytes and Booleans are exactly zero or one. Records are exact-length;
-all variable lengths are checked before reading. Manifest IDs are not inferred
-from a source path or local build directory. `implementation_id` and
-`app_image_id` are 32-byte identities supplied by the reproducible build
-process. The proposed manifest root is
+Kernel capabilities use the normative `DCKC` format in
+[`kernel-capability-v2.md`](kernel-capability-v2.md). The manifest is not part
+of `DCGG` or `DCPL`; a plan binds its 32-byte root. Its exact root is
 `SHA256(ASCII("dcg.kernel.manifest.id.v2") || 0x00 || canonical_DCKC_bytes)`.
-This is a flat domain-separated hash, not a Merkle tree.
-
-The `DCKC` byte layout and its extra field choices are proposed because the
-shared draft specifies capability contents but no record codec. Director
-confirmation is required before another implementation treats it as frozen.
+Profile-1 alias rule `2` is OPEN and refused until the record can identify the
+paired in-place input and output ports. The capability/vector spec owns the
+DCKC field layout and the DCTV test-vector envelope.
 
 ## 5. Identity and commitment hashes
 
@@ -293,9 +239,8 @@ Every row is SHA-256 of its preimage. For the run identity, each fixed-width
 external input reference is
 `external_id:u32, layout_id:u32, layout_version:u16, scheme_id:u32,
 scheme_version:u16, byte_length:u32, value_digest:[32]` (52 bytes), sorted by
-ascending `external_id`, with no duplicate ID. The `u32` count is a proposed
-explicit delimiter selected because the shared draft only says the references
-are fixed-width and sorted.
+ascending `external_id`, with no duplicate ID. The `u32` count is the frozen
+record delimiter for this profile.
 
 `ValueRefV1` is `node_id:u32, direction:u8, port_id:u16, layout_id:u32,
 layout_version:u16, scheme_id:u32, scheme_version:u16, byte_length:u32,
@@ -354,8 +299,8 @@ the whole-port edge rule: every edge consumes a distinct destination input
 port, and at least one output port is required, so at most 16,383 distinct
 edges can be represented with 16,384 total ports. The vectors exercise that
 maximum structurally possible count and separately exercise refusal above the
-declared edge count. The unreachable `16,384` exact-edge boundary is left for
-the director to reconcile with the port ceiling.
+declared edge count. The exact `16,384` edge endpoint is unrepresentable under
+the port ceiling and is not a valid graph.
 
 Every count, record size, port product, offset, and total envelope size uses
 checked arithmetic. Oversize or unrepresentable values refuse before an
@@ -366,7 +311,7 @@ ceilings are validated independently; they are not CU evidence.
 
 The reference is `python/dcg/graph/v2.py`. `encode_graph` and `decode_graph`
 implement DCGG; `encode_plan` and `decode_plan` implement DCPL. The module also
-implements the proposed identity hashes and the region leaf/node/root
+implements the frozen identity hashes and the region leaf/node/root
 encodings. It is pure Python and uses only the standard library.
 
 Golden TSVs live in `tests/golden/dcg/graph_plan_v2/`. The generator is
@@ -392,44 +337,86 @@ The suite includes the minimal two-level optimistic graph (child `add_i32/1`,
 parent `identity_i32/1`), declared profile-size boundaries, the maximal
 port-compatible edge count, the 4 MiB graph and plan endpoints, and malformed
 headers, records, ordering, references, shapes, trees, DAGs, segments, costs,
-and openings. The canonical `DCKC` manifest for the two pure kernels has its
-own byte-for-byte golden and round-trip test.
+and openings. The graph-plan corpus retains its DCKC bytes for compatibility;
+the authoritative DCKC/DCTV corpus and round-trip tests are in
+`tests/golden/dcg/kernel_capability_v2/`.
 
-## 8. Choices needing confirmation
+## 8. Owner-answer reconciliation and frozen byte choices
 
-The shared draft is intentionally a planning interface, not a complete codec.
-This freeze proposal made the following byte-level choices for director review:
+The 2026-10-01 owner answers in the shared draft resolve the profile decisions
+that previously blocked a freeze:
 
-1. Body-length fields count bytes after the full fixed header; the plan's body
-   includes its compiler parameter bytes.
-2. The run reference is 52 bytes and has an explicit `u32` count before the
-   sorted records. The shared draft did not specify its fields or delimiter.
-3. Step leaf bytes include `region_id` both as a direct leaf field and within
-   the supplied step coordinate, matching the two listed bindings literally.
-4. Merkle first-parent level is zero. The shared draft required `level:u16`
-   but did not pick its origin.
-5. Stateless boundaries use cursor schema `(0,0)`. Stateful cursor meaning and
-   the run-record cursor value remain owned by the cursor ABI.
-6. A plan has exactly one cost row per step, per region, and one run row;
-   run unused keys are zero. The draft names scope kinds but not multiplicity.
-7. DCKC is a proposed envelope and record schema because §4.1 lists semantic
-   fields without an encoding. Its field order, byte-order/mutability/alias
-   codes, account-role bit assignments, stable-error mapping shape, and flat
-   manifest hash domain need confirmation. The proposed manifest ceiling is
-   4 MiB with at most 4,096 kernels, chosen to bound the reference codec.
-8. Registry-owned mode, scheme, layout, port-layout, decomposition,
-   admission-rule, replay, state-schema and capability IDs must be assigned by
-   the shared registries. Unknown graph profile modes/schemes/layouts refuse.
-9. The checkpointed layout's exact parameters, complete state component
-   encoding, initial root, checkpoint coordinate list and terminal replay ABI
-   are not defined by the shared draft; Python graph/plan bytes preserve the
-   versioned parameter payloads but do not claim to validate that ABI.
-10. Kernel/image identity derivation, mode-specific parameter validation,
-    detailed cost admission against a real program image, run record bytes,
-    and fixed-index shard account bytes remain outside this graph/plan codec.
-11. The stated 16,384 edge ceiling conflicts with 16,384 ports under the
-    one-source-per-input rule; the maximum representable edge count is 16,383.
+- **D8 — shared testnet program.** The first slice uses a shared, pre-deployed
+testnet program with the general kernel library; custom kernels use an
+app-specific static image. The plan still binds the exact application image
+and manifest root. The program address/image match is checked by admission and
+is not a display string in graph bytes.
+- **D9 — no graph loops.** `DCGG` is a DAG and the plan's kernel decomposition
+is finite. Iteration is bounded inside a kernel or performed by repeated graph
+calls; dynamic graph expansion, self-edges, and cycles are refused.
+- **D11 — finality-gated imports.** A cross-region consumer waits for its
+source region's final result. V2.0 has no optimistic import or rollback.
+- **D13 — on-chain plan shards.** Graph and plan bytes are written once as
+immutable fixed-index template shards before runs. Off-chain plan availability
+and repeated full-plan run payloads are outside this profile.
 
-Until these choices are confirmed, the vectors freeze this proposed reference
-profile for stages 2–4 to review; they are not evidence of an on-chain
-implementation or capability.
+### Changes from the draft
+
+1. Promoted the graph/plan profile from proposed bytes to `v2.0-frozen`, while
+   keeping the existing `DCGG` and `DCPL` wire format version fields at `1`.
+2. Recorded the accepted D8 shared pre-deployed testnet program and D9, D11,
+   and D13 lifecycle decisions above; these add no DCGG/DCPL fields.
+3. Moved the full DCKC layout and hash rule into
+   [`kernel-capability-v2.md`](kernel-capability-v2.md), and made that
+   companion the sole normative home for DCKC and DCTV.
+4. Promoted the existing body-length, run-reference, step-leaf, Merkle-level,
+   stateless-cursor, and cost-row choices from review notes to frozen rules.
+5. Reconciled the edge/port ceiling: the profile cap is 16,384 edges, but at
+   most 16,383 can be represented with 16,384 ports and the whole-port input
+   rule. The exact 16,384 edge endpoint is invalid.
+6. Added coordinated change control: any bytes, validity-rule, or
+   cross-region-policy change requires stages 2, 3, and 4 to update together.
+
+The existing graph/plan bytes are unchanged. The graph/plan golden generator
+was re-run after this spec edit and reproduced the existing five TSV files
+byte-for-byte, so there are no graph/plan golden content changes in this
+freeze. The new DCKC/DCTV corpus is separate under
+`tests/golden/dcg/kernel_capability_v2/`.
+
+The following byte choices are now normative and are covered by the existing
+reference encoder and golden corpus: body lengths count bytes after the fixed
+header; the run identity uses a 52-byte input-reference record preceded by a
+`u32` count; step leaves include `region_id` both as a direct field and in the
+coordinate; the first Merkle parent level is zero; stateless boundaries use
+cursor schema `(0,0)`; cost admissions have one row per step, one per region,
+and one run row with unused keys zero. Region, step, segment, boundary,
+translation, cost, and hash ordering remain as specified above. These choices
+do not change the current encoded golden bytes.
+
+`DCKC` field order, hash domain, and the vector envelope are defined
+normatively in [`kernel-capability-v2.md`](kernel-capability-v2.md). The
+profile's shared interfaces are frozen at v2.0, subject only to the explicit
+OPEN items in that companion spec and the out-of-profile items below.
+
+## 9. Open semantics outside the frozen profile
+
+These OPEN areas do not change the canonical v2.0 `DCGG`/`DCPL` bytes or make
+an unsupported capability admissible:
+
+- The `checkpointed-state-layout/1` registry entry's state encoding, initial
+  root, checkpoint coordinates, and terminal replay ABI are not specified by
+  this graph/plan codec. Its parameter payload remains opaque; an image must
+  refuse to execute it until its layout ABI is registered and validated.
+- Kernel/image build identity derivation, mode-specific parameter validation,
+  detailed cost admission for a real program image, run-record bytes, and
+  fixed-index account/shard bytes are separate versioned interfaces.
+- The declared edge ceiling is 16,384, while the 16,384-port ceiling and
+  whole-port source rule make 16,383 the largest structurally representable
+  edge count. Inputs above either applicable limit are refused; the
+  unrepresentable exact-edge endpoint does not require a special encoding.
+
+A spec or implementation change that alters this frozen profile is a shared
+change: stages 2, 3, and 4 update together, regenerate the shared vectors, and
+publish the new version before integration resumes. These frozen bytes and
+Python vectors establish codec agreement only; they do not prove compiler
+correctness, kernel behavior, SVM execution, or a deployed program capability.
