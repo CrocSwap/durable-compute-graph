@@ -10,7 +10,7 @@ pub mod app_api;
 #[cfg(feature = "sbf-real-lifecycle-test")]
 pub mod closure_v2;
 #[cfg(not(feature = "sbf-real-lifecycle-test"))]
-pub(crate) mod closure_v2;
+pub mod closure_v2;
 pub(crate) mod closure_v2_accounts;
 #[cfg(feature = "legacy-hclosure-handlers")]
 pub(crate) mod closure_v2_bootstrap;
