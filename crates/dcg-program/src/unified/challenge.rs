@@ -7,7 +7,8 @@
 //! 136 local:u32 | 140 response_len:u32 (advisory since revision 6; the
 //!   executor-declared DRU1 total governs the respond path) | 144 PT2P
 //!   source = 1 | 145 machine:u8 (revision 6.1: the DRP2 replay machine
-//!   bound at open, 1 A16, 2 V7) | 148 deadline:u64
+//!   bound at open, 1 A16, 2 V7) | 146 canonical bump:u8 and 147 marker:u8
+//!   (revision 8) | 148 deadline:u64
 //! 156 position:u32 | 160 segment:u16 | 162 bond:u64 | 170 t:u32 | 174 form:u16
 //! ```
 //! Phases: 1 respond, 2 sealed, 3 ruled, 4 settled, 5 executor reveals a
@@ -37,7 +38,7 @@ use super::{
     CL_PATH, DCR1_AUTH, DCR1_BAD, DCR1_DEADLINE, DCR1_INCOMPLETE, DCR1_PHASE, DCR1_PROOF,
     PLAN_BINDING, REGISTRY_ROOT, REVEAL_MISMATCH, REVEAL_ORDER, SETTLEMENT_PROGRAM,
 };
-use crate::account_provenance::{expect_derived, AccountKind, RoleFlags};
+use crate::account_provenance::{expect_derived, expect_derived_with_bump, AccountKind, RoleFlags};
 use crate::closure_v2::{self as h, Node};
 use crate::hash;
 use crate::pt2p::Pt2p;
@@ -88,8 +89,14 @@ pub const FTR_AT: usize = 3_072;
 pub const FTR_ROOTS_AT: usize = FTR_AT + 8;
 pub const PT2P_MODE_AT: usize = 144;
 /// Replay machine selector (`registry::machine_selector`), written at open
-/// (revision 6.1); 146..148 stay zero.
+/// (revision 6.1). Revision-8 open uses bytes 146 and 147 for the challenge
+/// bump and a marker; revision-7's legacy layout keeps them zero.
 pub const MACHINE_AT: usize = 145;
+/// Reserved bytes repurposed in revision 8 to keep tag 184's address check
+/// independent of a challenger-controlled canonical-bump search. Marker 1
+/// identifies records opened by this image; marker 0 is the legacy layout.
+pub const RECORD_BUMP_AT: usize = 146;
+pub const RECORD_BUMP_MARKER_AT: usize = 147;
 pub const PHASE_RESPOND: u8 = 1;
 pub const PHASE_SEALED: u8 = 2;
 pub const PHASE_RULED: u8 = 3;
@@ -256,26 +263,35 @@ fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> Prog
     let descriptor = d32(&raw, 72, DCR1_BAD)?;
     let challenger = Pubkey::new_from_array(d32(&raw, 8, DCR1_BAD)?);
     let nonce = u32_at(&raw, 140, DCR1_BAD)?;
+    let nonce_bytes = nonce.to_le_bytes();
     // DCR1 v5/v6 carries its only challenge nonce. This check closes wrong
     // address, owner, kind, size, and privilege substitutions; the current
     // account list has no independent challenge identity anchor, so its seed
     // source remains a documented next-version provenance gap.
-    expect_derived(
-        account,
-        program,
-        &[
-            address::CHALLENGE_SEED,
-            &descriptor,
-            challenger.as_ref(),
-            &nonce.to_le_bytes(),
-        ],
-        AccountKind::exact(b"DCR1", SIZE),
-        RoleFlags {
-            writable: true,
-            signer: false,
-        },
-    )
-    .map_err(|_| no(DCR1_AUTH))?;
+    let seeds = [
+        address::CHALLENGE_SEED,
+        &descriptor[..],
+        challenger.as_ref(),
+        &nonce_bytes,
+    ];
+    let kind = AccountKind::exact(b"DCR1", SIZE);
+    let role = RoleFlags {
+        writable: true,
+        signer: false,
+    };
+    match raw[RECORD_BUMP_MARKER_AT] {
+        0 => {
+            // Open challenges that predate the reserved-byte bump marker can
+            // still finish under this image; newly opened records take the
+            // fixed-cost branch below.
+            expect_derived(account, program, &seeds, kind, role).map_err(|_| no(DCR1_AUTH))?;
+        }
+        1 => {
+            expect_derived_with_bump(account, program, &seeds, raw[RECORD_BUMP_AT], kind, role)
+                .map_err(|_| no(DCR1_AUTH))?;
+        }
+        _ => return Err(no(DCR1_AUTH)),
+    }
     Ok(())
 }
 
@@ -310,7 +326,19 @@ fn record_document(
     writable: bool,
 ) -> ProgramResult {
     let descriptor = d32(raw, 72, DCR1_BAD)?;
-    document::document_v8(program, doc, Some(&descriptor), writable, DCR1_AUTH)?;
+    let document_bump = doc
+        .try_borrow_data()?
+        .get(document::DCM2_BUMP_AT)
+        .copied()
+        .ok_or(no(DCR1_AUTH))?;
+    document::document_v8_with_bump(
+        program,
+        doc,
+        Some(&descriptor),
+        writable,
+        DCR1_AUTH,
+        document_bump,
+    )?;
     if doc.try_borrow_data()?[40..72] != raw[40..72] {
         return Err(no(DCR1_AUTH));
     }
@@ -1020,7 +1048,7 @@ fn fix_point(
 /// an executor win changes no DCM2 byte. Logs the `RULING` event, which the
 /// caller must leave as its last action.
 #[cfg(feature = "revision-7")]
-fn rule(
+pub fn rule(
     challenge: &Pubkey,
     raw: &mut [u8],
     doc: &AccountInfo,
@@ -1080,7 +1108,7 @@ fn rule(
 /// its document reader admits only DCM2 v7. This refusal shim satisfies the
 /// unreachable v6 arm without compiling revision 7's ruling behavior here.
 #[cfg(feature = "revision-8")]
-fn rule(
+pub fn rule(
     _challenge: &Pubkey,
     _raw: &mut [u8],
     _doc: &AccountInfo,
@@ -1112,7 +1140,7 @@ pub fn rule_v8(
     if winner == 0 && cause != events::CAUSE_APP_IDENTITY_CHANGED {
         return Err(no(DCR1_AUTH));
     }
-    document::document_v8(program, doc, Some(&descriptor), winner == 2, DCR1_AUTH)?;
+    document::document_v8_stored(program, doc, Some(&descriptor), winner == 2, DCR1_AUTH)?;
     if doc.try_borrow_data()?[40..72] != raw[40..72] {
         return Err(no(DCR1_AUTH));
     }
@@ -1295,11 +1323,11 @@ fn open_checks(
     {
         return Err(no(DCR1_PHASE));
     }
-    document::document_v8(program, dcm2, Some(descriptor), true, DCR1_AUTH)?;
+    document::document_v8_stored(program, dcm2, Some(descriptor), true, DCR1_AUTH)?;
     let d = dcm2.try_borrow_data()?;
     let p_count = u32_at(&d, 72, DCR1_BAD)?;
     let positions_complete = u32_at(&d, 84, DCR1_BAD)?;
-    document::positions(program, dpr2, descriptor, p_count, false, DCR1_AUTH)?;
+    document::positions_from_document(program, dpr2, dcm2, descriptor, p_count, false, DCR1_AUTH)?;
     bind_plan(program, &d, pt2s, routes, geometry, Some(drp2))?;
     if u16_at(&d, 6, DCR1_BAD)? & FLAG_FINAL == 0 || d[40..72] == challenger.key.to_bytes() {
         return Err(no(DCR1_AUTH));
@@ -1388,6 +1416,11 @@ fn open_record(
     raw[72..104].copy_from_slice(descriptor);
     raw[PT2P_MODE_AT] = 1;
     raw[MACHINE_AT] = machine;
+    #[cfg(feature = "revision-8")]
+    {
+        raw[RECORD_BUMP_AT] = bump;
+        raw[RECORD_BUMP_MARKER_AT] = 1;
+    }
     raw[148..156].copy_from_slice(&deadline.to_le_bytes());
     raw[156..160].copy_from_slice(&position.to_le_bytes());
     raw[160..162].copy_from_slice(&segment.to_le_bytes());
@@ -1676,14 +1709,26 @@ pub fn reveal_position_with_manifest(
     };
     let deadline = if end == n {
         let d = accounts[2].try_borrow_data()?;
-        document::positions(
-            program,
-            &accounts[3],
-            &descriptor,
-            u32_at(&d, 72, DCR1_BAD)?,
-            false,
-            DCR1_AUTH,
-        )?;
+        if cfg!(feature = "revision-8") {
+            document::positions_from_document(
+                program,
+                &accounts[3],
+                &accounts[2],
+                &descriptor,
+                u32_at(&d, 72, DCR1_BAD)?,
+                false,
+                DCR1_AUTH,
+            )?;
+        } else {
+            document::positions(
+                program,
+                &accounts[3],
+                &descriptor,
+                u32_at(&d, 72, DCR1_BAD)?,
+                false,
+                DCR1_AUTH,
+            )?;
+        }
         bind_plan(program, &d, &accounts[4], &accounts[5], &accounts[6], None)?;
         let s = accounts[4].try_borrow_data()?;
         let (rb, gb) = (
@@ -2927,7 +2972,7 @@ fn record_document_v8(
     writable: bool,
 ) -> ProgramResult {
     let descriptor = d32(raw, 72, DCR1_BAD)?;
-    document::document_v8(program, doc, Some(&descriptor), writable, DCR1_AUTH)?;
+    document::document_v8_stored(program, doc, Some(&descriptor), writable, DCR1_AUTH)?;
     if doc.try_borrow_data()?[40..72] != raw[40..72] {
         return Err(no(DCR1_AUTH));
     }
@@ -3016,7 +3061,7 @@ pub fn settle_v8_with_hooks<'a>(
     {
         return Err(no(DCR1_AUTH));
     }
-    let (bond, challenger_won, neutral, descriptor, terms, bond_state, ruling_winner) = {
+    let (bond, challenger_won, neutral, descriptor, terms, bond_state, ruling_winner, escrow_bump) = {
         let raw = record_acc.try_borrow_data()?;
         let who = match raw[5] {
             1 => &raw[40..72],
@@ -3044,6 +3089,7 @@ pub fn settle_v8_with_hooks<'a>(
             terms,
             doc[529],
             d32(&raw, 8, DCR1_BAD)?,
+            doc[document::BOND_ESCROW_BUMP_AT],
         )
     };
     let custom = terms.bond_policy_kind == BOND_POLICY_CUSTOM;
@@ -3132,7 +3178,12 @@ pub fn settle_v8_with_hooks<'a>(
     let (pot, winner_payout, remainder_payout, incinerator_payout) = if live {
         let bond_pot = terms.executor_bond_lamports;
         if custom {
-            super::bond::validate_escrow(program, policy_winner, &descriptor)?;
+            super::bond::validate_escrow_with_bump(
+                program,
+                policy_winner,
+                &descriptor,
+                escrow_bump,
+            )?;
             super::bond::escrow_pot(dcm2, policy_winner, bond_pot)?;
             super::bond::mark_escrowed(&mut dcm2.try_borrow_mut_data()?);
             (bond_pot, 0, 0, 0)

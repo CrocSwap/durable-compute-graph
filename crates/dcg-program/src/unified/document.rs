@@ -37,7 +37,7 @@ use super::{
     CL_AFTER_FINAL, CL_AUTHORITY, CL_COORDINATE, CL_MALFORMED, CL_MISSING, CL_OVERFLOW, CL_ROOT,
     DCR1_BAD, EPOCH, PLAN_BINDING, REGISTRY_ROOT,
 };
-use crate::account_provenance::{expect_derived, AccountKind, RoleFlags};
+use crate::account_provenance::{expect_derived, expect_derived_with_bump, AccountKind, RoleFlags};
 use crate::hash;
 use crate::pt2p::Pt2p;
 use crate::pt2p_onchain as S;
@@ -779,8 +779,7 @@ pub fn document(
         )
         .map_err(|_| no(code))?;
     }
-    if descriptor.is_some_and(|want| *want != d) || *account.key != document_address(program, &d).0
-    {
+    if descriptor.is_some_and(|want| *want != d) {
         return Err(no(code));
     }
     Ok(d)
@@ -794,7 +793,7 @@ pub fn document(
     writable: bool,
     code: u32,
 ) -> Result<[u8; 32], ProgramError> {
-    document_v8(program, account, descriptor, writable, code)
+    document_v8_stored(program, account, descriptor, writable, code)
 }
 
 /// The DCM2 version at the account's PDA (owner, magic and `version:u16`
@@ -812,7 +811,7 @@ pub fn revision(program: &Pubkey, account: &AccountInfo, code: u32) -> Result<u1
 
 #[cfg(feature = "revision-8")]
 pub fn revision(program: &Pubkey, account: &AccountInfo, code: u32) -> Result<u16, ProgramError> {
-    document_v8(program, account, None, false, code)?;
+    document_v8_stored(program, account, None, false, code)?;
     Ok(7)
 }
 
@@ -844,6 +843,24 @@ pub fn document_v8_with_bump(
     document_v8_inner(program, account, descriptor, writable, code, Some(bump))
 }
 
+/// Validate a revision-8 document using the canonical bump saved by its
+/// creator. Call only after the caller has selected this DCM2 role; the
+/// descriptor remains subject to the caller's independent-identity rules.
+pub fn document_v8_stored(
+    program: &Pubkey,
+    account: &AccountInfo,
+    descriptor: Option<&[u8; 32]>,
+    writable: bool,
+    code: u32,
+) -> Result<[u8; 32], ProgramError> {
+    let bump = account
+        .try_borrow_data()?
+        .get(DCM2_BUMP_AT)
+        .copied()
+        .ok_or(no(code))?;
+    document_v8_with_bump(program, account, descriptor, writable, code, bump)
+}
+
 fn document_v8_inner(
     program: &Pubkey,
     account: &AccountInfo,
@@ -858,16 +875,29 @@ fn document_v8_inner(
         kind = kind.with_bump(DCM2_BUMP_AT);
     }
     if let Some(descriptor) = descriptor {
-        expect_derived(
-            account,
-            program,
-            &[address::DOCUMENT_SEED, descriptor],
-            kind,
-            RoleFlags {
-                writable,
-                signer: false,
-            },
-        )
+        let role = RoleFlags {
+            writable,
+            signer: false,
+        };
+        if let Some(bump) = bump {
+            expect_derived_with_bump(
+                account,
+                program,
+                &[address::DOCUMENT_SEED, descriptor],
+                bump,
+                kind,
+                role,
+            )
+        } else {
+            expect_derived(
+                account,
+                program,
+                &[address::DOCUMENT_SEED, descriptor],
+                kind,
+                role,
+            )
+            .map(|_| ())
+        }
         .map_err(|_| no(code))?;
     }
     let raw = account.try_borrow_data()?;
@@ -896,28 +926,25 @@ fn document_v8_inner(
     }
     let d = d32(&raw, 8, code)?;
     if descriptor.is_none() {
-        expect_derived(
-            account,
-            program,
-            &[address::DOCUMENT_SEED, &d],
-            kind,
-            RoleFlags {
-                writable,
-                signer: false,
-            },
-        )
+        let role = RoleFlags {
+            writable,
+            signer: false,
+        };
+        if let Some(bump) = bump {
+            expect_derived_with_bump(
+                account,
+                program,
+                &[address::DOCUMENT_SEED, &d],
+                bump,
+                kind,
+                role,
+            )
+        } else {
+            expect_derived(account, program, &[address::DOCUMENT_SEED, &d], kind, role).map(|_| ())
+        }
         .map_err(|_| no(code))?;
     }
-    let expected = if let Some(bump) = bump {
-        Pubkey::create_program_address(&[address::DOCUMENT_SEED, &d, &[bump]], program)
-            .map_err(|_| no(code))?
-    } else {
-        document_address(program, &d).0
-    };
-    if descriptor.is_some_and(|want| *want != d)
-        || *account.key != expected
-        || bump.is_some_and(|b| raw[DCM2_BUMP_AT] != b)
-    {
+    if descriptor.is_some_and(|want| *want != d) {
         return Err(no(code));
     }
     Ok(d)
@@ -1015,6 +1042,26 @@ pub fn positions_with_bump(
     )
 }
 
+/// Validate DPR2 using the bump recorded in its already-validated DCM2 parent.
+pub fn positions_from_document(
+    program: &Pubkey,
+    positions: &AccountInfo,
+    document: &AccountInfo,
+    descriptor: &[u8; 32],
+    p_count: u32,
+    writable: bool,
+    code: u32,
+) -> ProgramResult {
+    let bump = document
+        .try_borrow_data()?
+        .get(DPR2_BUMP_AT)
+        .copied()
+        .ok_or(no(code))?;
+    positions_with_bump(
+        program, positions, descriptor, p_count, writable, code, bump,
+    )
+}
+
 fn positions_inner(
     program: &Pubkey,
     account: &AccountInfo,
@@ -1024,28 +1071,35 @@ fn positions_inner(
     code: u32,
     bump: Option<u8>,
 ) -> ProgramResult {
-    expect_derived(
-        account,
-        program,
-        &[address::POSITIONS_SEED, descriptor],
-        AccountKind::variable(b"DPR2", DPR2_HEADER, DPR2_HEADER + 32 * p_count as usize)
-            .with_version(4, 1),
-        RoleFlags {
-            writable,
-            signer: false,
-        },
-    )
+    let kind = AccountKind::variable(b"DPR2", DPR2_HEADER, DPR2_HEADER + 32 * p_count as usize)
+        .with_version(4, 1);
+    let role = RoleFlags {
+        writable,
+        signer: false,
+    };
+    if let Some(bump) = bump {
+        expect_derived_with_bump(
+            account,
+            program,
+            &[address::POSITIONS_SEED, descriptor],
+            bump,
+            kind,
+            role,
+        )
+    } else {
+        expect_derived(
+            account,
+            program,
+            &[address::POSITIONS_SEED, descriptor],
+            kind,
+            role,
+        )
+        .map(|_| ())
+    }
     .map_err(|_| no(code))?;
     let raw = account.try_borrow_data()?;
-    let expected = if let Some(bump) = bump {
-        Pubkey::create_program_address(&[address::POSITIONS_SEED, descriptor, &[bump]], program)
-            .map_err(|_| no(code))?
-    } else {
-        position_page_address(program, descriptor).0
-    };
     if account.owner != program
         || (writable && !account.is_writable)
-        || *account.key != expected
         || raw.len() < DPR2_HEADER
         || raw.len() > DPR2_HEADER + 32 * p_count as usize
         || raw[..4] != *b"DPR2"
@@ -2080,7 +2134,7 @@ pub fn land_position_roots_v8_with_hooks(
     let first = u32_at(data, 33, CL_MALFORMED)?;
     let count = data[37] as u32;
     // 2. PDAs and a v7 header.
-    document_v8(program, &accounts[1], Some(&descriptor), true, CL_MALFORMED)?;
+    document_v8_stored(program, &accounts[1], Some(&descriptor), true, CL_MALFORMED)?;
     let (p_count, complete, flags, authority) = {
         let doc = accounts[1].try_borrow_data()?;
         (
@@ -2090,9 +2144,10 @@ pub fn land_position_roots_v8_with_hooks(
             d32(&doc, 40, CL_MALFORMED)?,
         )
     };
-    positions(
+    positions_from_document(
         program,
         &accounts[2],
+        &accounts[1],
         &descriptor,
         p_count,
         true,
@@ -2343,7 +2398,7 @@ pub fn finalize_v8_with_hooks(
     }
     let descriptor = d32(data, 1, CL_MALFORMED)?;
     let n = u32_at(data, 33, CL_MALFORMED)?;
-    document_v8(program, &accounts[1], Some(&descriptor), true, CL_MALFORMED)?;
+    document_v8_stored(program, &accounts[1], Some(&descriptor), true, CL_MALFORMED)?;
     let binding = {
         let doc = accounts[1].try_borrow_data()?;
         Binding2::decode(&doc[BINDING_AT_V8..BINDING_AT_V8 + BINDING_BYTES_V8]).map_err(no)?

@@ -461,10 +461,7 @@ async fn send_quiet_cached(
         }
         Err(error) => panic!("the banks client refused the cached transaction: {error:?}"),
     };
-    if matches!(
-        &result,
-        Err(TransactionError::AlreadyProcessed | TransactionError::BlockhashNotFound)
-    ) {
+    if matches!(&result, Err(TransactionError::AlreadyProcessed)) {
         let slot = ctx
             .banks_client
             .get_sysvar::<solana_program::clock::Clock>()
@@ -475,7 +472,7 @@ async fn send_quiet_cached(
         cache.blockhash = Some(
             ctx.get_new_latest_blockhash()
                 .await
-                .expect("a fresh retry blockhash"),
+                .expect("a cached retry blockhash"),
         );
         cache.uses = 0;
         let inner = ctx
@@ -602,17 +599,58 @@ async fn send_cu(
         },
     ];
     let tx = Transaction::new_signed_with_payer(&ixs, Some(&signer.pubkey()), &[signer], blockhash);
-    match ctx.banks_client.process_transaction_with_metadata(tx).await {
-        Ok(result) => {
-            result.result?;
-            Ok(result
-                .metadata
-                .as_ref()
-                .map(|m| m.compute_units_consumed)
-                .unwrap_or(0))
-        }
-        Err(error) => panic!("the banks client refused the measured transaction: {error:?}"),
+    let first = ctx
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("the banks client refused the measured transaction: {error:?}")
+        });
+    let (mut result, mut compute_units) = (
+        first.result,
+        first
+            .metadata
+            .as_ref()
+            .map(|m| m.compute_units_consumed)
+            .unwrap_or(0),
+    );
+    if matches!(&result, Err(TransactionError::AlreadyProcessed)) {
+        // A preceding negative control can submit the same instruction bytes
+        // with the same recent blockhash. Advance one slot so the measured
+        // happy path reaches the program instead of the replay filter.
+        let slot = ctx
+            .banks_client
+            .get_sysvar::<solana_program::clock::Clock>()
+            .await
+            .unwrap()
+            .slot;
+        ctx.warp_to_slot(slot + 1).unwrap();
+        let retry_blockhash = ctx
+            .get_new_latest_blockhash()
+            .await
+            .expect("a retry blockhash");
+        let retry = Transaction::new_signed_with_payer(
+            &ixs,
+            Some(&signer.pubkey()),
+            &[signer],
+            retry_blockhash,
+        );
+        let retry_result = ctx
+            .banks_client
+            .process_transaction_with_metadata(retry)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the banks client refused the measured retry: {error:?}")
+            });
+        result = retry_result.result;
+        compute_units = retry_result
+            .metadata
+            .as_ref()
+            .map(|m| m.compute_units_consumed)
+            .unwrap_or(0);
     }
+    result?;
+    Ok(compute_units)
 }
 
 fn custom(result: Result<(), TransactionError>) -> u32 {
@@ -3466,6 +3504,92 @@ async fn rev8_attest_refuses_a_stale_or_wrong_descriptor() {
     )
     .await
     .expect("the honest attest");
+
+    // Exercise each revision-8 lifecycle record role through the real tag-177
+    // handler. Wrong-kind images keep the expected size, second instances have
+    // the same valid image at a different descriptor PDA, and stale images
+    // retain the address while carrying a non-canonical stored bump.
+    let roles = [
+        (1usize, created[0], document::DCM2_BUMP_AT, "DCM2"),
+        (2usize, created[1], document::DPR2_BUMP_AT, "DPR2"),
+        (3usize, created[3], result::RESULT_PDA_BUMP_AT_V6, "DCR2"),
+    ];
+    for (meta_at, key, bump_at, role) in roles {
+        let original = f.account(key).await;
+        let mut wrong_kind = original.clone();
+        wrong_kind[..4].copy_from_slice(b"XXXX");
+        f.ctx
+            .set_account(&key, &shared(owned(&f.program, wrong_kind)));
+        assert_eq!(
+            custom(
+                send(
+                    &mut f.ctx,
+                    &f.signer,
+                    f.program,
+                    proof.data.clone(),
+                    metas.clone()
+                )
+                .await
+            ),
+            CL_MALFORMED,
+            "tag 177 rejects a same-sized wrong-kind {role}"
+        );
+        f.ctx
+            .set_account(&key, &shared(owned(&f.program, original.clone())));
+
+        let second_descriptor = [0xA7; 32];
+        let second_key = match role {
+            "DCM2" => address::document(&f.program, &second_descriptor).0,
+            "DPR2" => address::positions(&f.program, &second_descriptor).0,
+            _ => address::result(&f.program, &second_descriptor).0,
+        };
+        f.ctx
+            .set_account(&second_key, &shared(owned(&f.program, original.clone())));
+        let mut second_instance = metas.clone();
+        second_instance[meta_at] = AccountMeta::new(second_key, false);
+        assert_eq!(
+            custom(
+                send(
+                    &mut f.ctx,
+                    &f.signer,
+                    f.program,
+                    proof.data.clone(),
+                    second_instance
+                )
+                .await
+            ),
+            CL_MALFORMED,
+            "tag 177 rejects a second {role} instance"
+        );
+
+        let stale_key = if role == "DPR2" { created[0] } else { key };
+        let stale_original = f.account(stale_key).await;
+        let mut stale = stale_original.clone();
+        stale[bump_at] = stale[bump_at].wrapping_add(1);
+        f.ctx
+            .set_account(&stale_key, &shared(owned(&f.program, stale)));
+        assert_eq!(
+            custom(
+                send(
+                    &mut f.ctx,
+                    &f.signer,
+                    f.program,
+                    proof.data.clone(),
+                    metas.clone()
+                )
+                .await
+            ),
+            CL_MALFORMED,
+            "tag 177 rejects a stale/non-canonical-bump {role}"
+        );
+        if stale_key != key {
+            f.ctx
+                .set_account(&stale_key, &shared(owned(&f.program, stale_original)));
+        }
+        f.ctx
+            .set_account(&key, &shared(owned(&f.program, original)));
+    }
+
     // **The retained packet, unmodified.** Its twelve path entries and its
     // SPP1 siblings are the revision-7 document's own digests over the
     // revision-7 descriptor, and it is sent against the revision-8 record.
@@ -9970,6 +10094,46 @@ async fn rev8_close_refusals() {
     let mut ro = good.clone();
     ro[7] = AccountMeta::new_readonly(good[7].pubkey, false);
     refused_here!(f, close_data(&c.descriptor), ro, SETTLEMENT_PROGRAM);
+    // The close path uses each stored bump without canonical search: DCM2's
+    // own address, the parent-stored DPR2 address, and DCR2's own address all
+    // refuse a stale bump through tag 172 with the existing malformed-record
+    // code. Restore each image before exercising the next role and the honest
+    // close below.
+    for (key, offset, role) in [
+        (c.dcm2, document::DCM2_BUMP_AT, "DCM2"),
+        (c.dcm2, document::DPR2_BUMP_AT, "DPR2"),
+        (c.dcr2, result::RESULT_PDA_BUMP_AT_V6, "DCR2"),
+    ] {
+        let original = f.account(key).await;
+        let lamports = f.lamports(key).await;
+        let mut stale = original.clone();
+        stale[offset] = stale[offset].wrapping_add(1);
+        f.ctx.set_account(
+            &key,
+            &shared(Account {
+                lamports,
+                data: stale,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+        assert_eq!(
+            refused_close(&mut f, &c, stranger, next()).await,
+            CL_MALFORMED,
+            "tag 172 refuses a stale {role} bump"
+        );
+        f.ctx.set_account(
+            &key,
+            &shared(Account {
+                lamports,
+                data: original,
+                owner: f.program,
+                executable: false,
+                rent_epoch: 0,
+            }),
+        );
+    }
     // And the honest list, once, on the same convicted document: it closes, and
     // the escrow is the document's own PDA.
     let pot = Terms2::decode(&f.terms_raw).unwrap().executor_bond_lamports;
@@ -11682,6 +11846,45 @@ fn challenge_position_data(descriptor: &[u8; 32], p: u32, nonce: u32) -> Vec<u8>
     data
 }
 
+/// Find a descriptor/challenger nonce whose canonical bump search tries at
+/// least 18 candidates. This reproduces the adversarial tag-184 address-search
+/// case without depending on one test run's randomly generated signer.
+fn ground_challenge_nonce(
+    program: &Pubkey,
+    descriptor: &[u8; 32],
+    challenger: &Pubkey,
+) -> (u32, u8) {
+    for nonce in 0..2_000_000u32 {
+        let (_, bump) = address::challenge(program, descriptor, challenger, nonce);
+        if bump <= 238 {
+            return (nonce, bump);
+        }
+    }
+    panic!("did not find a challenge nonce with at least 18 bump attempts");
+}
+
+/// Grind the user-chosen request id until its DCM2 descriptor has a costly
+/// canonical bump search. The on-chain readers must use the bump stored at init
+/// so that this chosen descriptor does not add variable address-search CU.
+fn ground_document_descriptor(
+    f: &Fix,
+    binding: &mut Binding2,
+    terms: &[u8],
+    family_count: u16,
+) -> ([u8; 32], u8, u32) {
+    for candidate in 0..2_000_000u32 {
+        let mut request_id = [0xa5; 32];
+        request_id[..4].copy_from_slice(&candidate.to_le_bytes());
+        binding.request_id = request_id;
+        let descriptor = f.descriptor(binding, terms, family_count);
+        let (_, bump) = address::document(&f.program, &descriptor);
+        if bump <= 238 {
+            return (descriptor, bump, candidate + 1);
+        }
+    }
+    panic!("did not find a descriptor with at least 18 bump attempts");
+}
+
 fn challenge_position_metas(f: &Fix, c: [Pubkey; 4], record: Pubkey) -> Vec<AccountMeta> {
     vec![
         AccountMeta::new(record, false),
@@ -11756,6 +11959,14 @@ async fn descend_position_challenge_with_witness(
     )
     .await
     .expect("tag 167 opens revision-8 challenge");
+
+    if std::env::var_os("BASANOS_EXPECT_STORED_CHALLENGE_BUMP").is_some() {
+        let opened = f.account(record).await;
+        let (_, expected_bump) =
+            address::challenge(&f.program, descriptor, &f.signer.pubkey(), nonce);
+        assert_eq!(opened[challenge::RECORD_BUMP_AT], expected_bump);
+        assert_eq!(opened[challenge::RECORD_BUMP_MARKER_AT], 1);
+    }
 
     let mut reveal_position = vec![TAG_REVEAL_POSITION, 0, 0, roots.len() as u8];
     for root in roots {
@@ -12000,25 +12211,70 @@ async fn executor_opens_app_witness(f: &mut Fix, record: Pubkey, document: Pubke
         .await
         .expect("tag 183 stages the executor's opening");
     }
+    let response_metas = vec![
+        AccountMeta::new(record, false),
+        AccountMeta::new(f.executor.pubkey(), true),
+        AccountMeta::new(document, false),
+        AccountMeta::new_readonly(f.pt2s, false),
+        AccountMeta::new_readonly(f.routes, false),
+        AccountMeta::new_readonly(f.geometry, false),
+        AccountMeta::new_readonly(f.drp2, false),
+        AccountMeta::new_readonly(f.pt1s_index, false),
+    ];
+    if std::env::var_os("BASANOS_EXPECT_STORED_CHALLENGE_BUMP").is_some() {
+        let original = f
+            .ctx
+            .banks_client
+            .get_account(document)
+            .await
+            .unwrap()
+            .expect("the DCM2 account remains open");
+        let mut corrupt = original.clone();
+        corrupt.data[document::DCM2_BUMP_AT] = corrupt.data[document::DCM2_BUMP_AT].wrapping_add(1);
+        f.ctx
+            .set_account(&document, &AccountSharedData::from(corrupt));
+        assert_eq!(
+            custom(
+                send(
+                    &mut f.ctx,
+                    &f.executor,
+                    f.program,
+                    vec![dcg_program::unified::TAG_RESPOND_APP_WITNESS],
+                    response_metas.clone(),
+                )
+                .await,
+            ),
+            DCR1_AUTH_REFUSAL,
+            "tag 184 must refuse a corrupted DCM2 stored bump"
+        );
+        f.ctx
+            .set_account(&document, &AccountSharedData::from(original));
+    }
     label("challenge-app-witness-respond-184");
-    send(
+    let compute_units = send_cu(
         &mut f.ctx,
         &f.executor,
         f.program,
         vec![dcg_program::unified::TAG_RESPOND_APP_WITNESS],
-        vec![
-            AccountMeta::new(record, false),
-            AccountMeta::new(f.executor.pubkey(), true),
-            AccountMeta::new(document, false),
-            AccountMeta::new_readonly(f.pt2s, false),
-            AccountMeta::new_readonly(f.routes, false),
-            AccountMeta::new_readonly(f.geometry, false),
-            AccountMeta::new_readonly(f.drp2, false),
-            AccountMeta::new_readonly(f.pt1s_index, false),
-        ],
+        response_metas,
     )
     .await
     .expect("tag 184 authenticates and replays the executor's opening");
+    eprintln!(
+        "CU tag 184 data 1 cu {compute_units} mode {} label {}",
+        if std::env::var_os("BASANOS_DCG_V8_SBF").is_some() {
+            "SBF"
+        } else {
+            "native"
+        },
+        current_label(),
+    );
+    if std::env::var_os("BASANOS_EXPECT_STORED_CHALLENGE_BUMP").is_some() {
+        assert!(
+            compute_units <= 1_329_427,
+            "tag 184 adapter work must fit under the admitted kernel cap"
+        );
+    }
 }
 
 async fn settle_and_close_standard_app_challenge(
@@ -12368,6 +12624,213 @@ async fn rev8_honest_leaf_challenge_uses_v7_document_reader_and_refuses_a_cheati
     );
     assert_eq!(u32_at(&dcr1, 140), 11, "the v8 record keeps the open nonce");
     assert_eq!(u32_at(&f.account(created[0]).await, 128), 1);
+
+    // The compatibility response tags 115–118 still read this revision-8
+    // DCR1 and its DRU1. Exercise both record gates with wrong-kind, second
+    // instance, and stale/non-canonical identity images through the dispatcher.
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let response_for =
+        |target: Pubkey| dcg_program::closure_v2_response::address(&f.program, &target).0;
+    let executor = f.executor.pubkey();
+    let body = [1u8, 2, 3];
+    let mut begin = vec![dcg_program::closure_v2_response::TAG_BEGIN];
+    begin.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    begin.extend_from_slice(&sha256(&[&body]));
+    let begin_accounts = |response_key, record_key| {
+        vec![
+            AccountMeta::new(response_key, false),
+            AccountMeta::new(executor, true),
+            AccountMeta::new_readonly(record_key, false),
+            AccountMeta::new_readonly(SYSTEM, false),
+        ]
+    };
+    let challenge_original = f
+        .ctx
+        .banks_client
+        .get_account(record)
+        .await
+        .unwrap()
+        .expect("the real tag-166 DCR1");
+    let mut wrong_kind = challenge_original.clone();
+    wrong_kind.data[..4].copy_from_slice(b"XXXX");
+    f.ctx
+        .set_account(&record, &AccountSharedData::from(wrong_kind));
+    assert_eq!(
+        custom(
+            send_fresh_with(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                begin.clone(),
+                begin_accounts(response, record),
+            )
+            .await
+        ),
+        736,
+        "tag 115 refuses a same-sized wrong-kind DCR1 before allocation"
+    );
+    f.ctx.set_account(
+        &record,
+        &AccountSharedData::from(challenge_original.clone()),
+    );
+    let second_nonce = 12;
+    let second_record =
+        address::challenge(&f.program, &descriptor, &f.signer.pubkey(), second_nonce).0;
+    f.ctx.set_account(
+        &second_record,
+        &AccountSharedData::from(challenge_original.clone()),
+    );
+    assert_eq!(
+        custom(
+            send_fresh_with(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                begin.clone(),
+                begin_accounts(response, second_record),
+            )
+            .await
+        ),
+        731,
+        "tag 115 refuses a second DCR1 instance"
+    );
+    let mut stale_challenge = challenge_original.clone();
+    stale_challenge.data[challenge::RECORD_BUMP_AT] =
+        stale_challenge.data[challenge::RECORD_BUMP_AT].wrapping_add(1);
+    f.ctx
+        .set_account(&record, &AccountSharedData::from(stale_challenge));
+    assert_eq!(
+        custom(
+            send_fresh_with(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                begin.clone(),
+                begin_accounts(response, record),
+            )
+            .await
+        ),
+        731,
+        "tag 115 refuses a stale/non-canonical-bump DCR1"
+    );
+    f.ctx
+        .set_account(&record, &AccountSharedData::from(challenge_original));
+
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        begin,
+        begin_accounts(response, record),
+    )
+    .await
+    .expect("tag 115 creates the honest DRU1 response");
+    let write = [dcg_program::closure_v2_response::TAG_WRITE, 0, 0, 0, 0]
+        .into_iter()
+        .chain(body)
+        .collect::<Vec<_>>();
+    let response_metas = vec![
+        AccountMeta::new(response, false),
+        AccountMeta::new(executor, true),
+        AccountMeta::new_readonly(record, false),
+    ];
+    let response_original = f
+        .ctx
+        .banks_client
+        .get_account(response)
+        .await
+        .unwrap()
+        .expect("the real tag-115 DRU1");
+    let mut wrong_kind = response_original.clone();
+    wrong_kind.data[..4].copy_from_slice(b"XXXX");
+    f.ctx
+        .set_account(&response, &AccountSharedData::from(wrong_kind));
+    assert_eq!(
+        custom(
+            send_fresh_with(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![dcg_program::closure_v2_response::TAG_GROW],
+                response_metas.clone(),
+            )
+            .await
+        ),
+        731,
+        "tag 116 refuses a same-sized wrong-kind DRU1"
+    );
+    f.ctx.set_account(
+        &response,
+        &AccountSharedData::from(response_original.clone()),
+    );
+    let second_response = response_for(second_record);
+    f.ctx.set_account(
+        &second_response,
+        &AccountSharedData::from(response_original.clone()),
+    );
+    let mut second_response_metas = response_metas.clone();
+    second_response_metas[0] = AccountMeta::new(second_response, false);
+    assert_eq!(
+        custom(
+            send_fresh_with(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![dcg_program::closure_v2_response::TAG_GROW],
+                second_response_metas,
+            )
+            .await
+        ),
+        731,
+        "tag 116 refuses a second DRU1 instance"
+    );
+    let mut stale_response = response_original.clone();
+    stale_response.data[8..40].copy_from_slice(second_record.as_ref());
+    f.ctx
+        .set_account(&response, &AccountSharedData::from(stale_response));
+    assert_eq!(
+        custom(
+            send_fresh_with(
+                &mut f.ctx,
+                &f.executor,
+                f.program,
+                vec![dcg_program::closure_v2_response::TAG_GROW],
+                response_metas.clone(),
+            )
+            .await
+        ),
+        733,
+        "tag 116 refuses a stale DRU1 bound to another challenge"
+    );
+    f.ctx
+        .set_account(&response, &AccountSharedData::from(response_original));
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::closure_v2_response::TAG_GROW],
+        response_metas.clone(),
+    )
+    .await
+    .expect("tag 116 grows the honest DRU1 response");
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        write,
+        response_metas.clone(),
+    )
+    .await
+    .expect("tag 117 writes the response body");
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::closure_v2_response::TAG_SEAL],
+        response_metas,
+    )
+    .await
+    .expect("tag 118 seals the response body");
 
     // Executor-side response, using the family-table round's real v8 reader.
     let mut reveal = vec![TAG_REVEAL_FAMILY_TABLE, 0, f.family_roots.len() as u8];
@@ -13357,7 +13820,9 @@ async fn rev8_app_respond_full_900_witness_k10240_sbf() {
     terms.settlement_program = [0; 32];
     terms.custom_settle_window_slots = 0;
     f.terms_raw = terms.encode().to_vec();
-    let binding = f.binding(29, 50);
+    let mut binding = f.binding(29, 50);
+    let (grounded_descriptor, document_bump, descriptor_attempts) =
+        ground_document_descriptor(&f, &mut binding, &f.terms_raw, 16);
     let (descriptor, created, roots, segment, actual_target, levels, witness) =
         commit_challenge_tree_with_route_witness_from_artifacts(
             &mut f,
@@ -13371,6 +13836,7 @@ async fn rev8_app_respond_full_900_witness_k10240_sbf() {
             k10240_artifacts().expect("the retained K=10,240 emission"),
         )
         .await;
+    assert_eq!(descriptor, grounded_descriptor);
     let doc_identity = document::application_identity_v8(&f.account(created[0]).await)
         .unwrap()
         .expect("the K=10,240 app-bound document stores ARI1");
@@ -13381,6 +13847,19 @@ async fn rev8_app_respond_full_900_witness_k10240_sbf() {
     );
     assert_eq!(actual_target, target_local);
     assert_eq!(witness.len(), 900);
+    let (nonce, bump) = ground_challenge_nonce(&f.program, &descriptor, &f.signer.pubkey());
+    eprintln!(
+        "tag-184 ground case descriptor={} document_bump={} descriptor_candidates={} nonce={} challenge_bump={} challenge_attempts={}",
+        descriptor
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        document_bump,
+        descriptor_attempts,
+        nonce,
+        bump,
+        256 - bump as u16,
+    );
     let record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -13391,7 +13870,7 @@ async fn rev8_app_respond_full_900_witness_k10240_sbf() {
         segment,
         actual_target,
         &levels,
-        151,
+        nonce,
         false,
         Some(&witness),
     )
@@ -13405,6 +13884,43 @@ async fn rev8_app_respond_full_900_witness_k10240_sbf() {
         descended[178],
         u32_at(&descended, challenge::DEV2_AT + 8),
     );
+    if std::env::var_os("BASANOS_EXPECT_STORED_CHALLENGE_BUMP").is_some() {
+        let original = f
+            .ctx
+            .banks_client
+            .get_account(record)
+            .await
+            .unwrap()
+            .expect("the challenge account remains open");
+        let mut corrupt = original.clone();
+        corrupt.data[challenge::RECORD_BUMP_AT] =
+            corrupt.data[challenge::RECORD_BUMP_AT].wrapping_add(1);
+        f.ctx
+            .set_account(&record, &AccountSharedData::from(corrupt));
+        let mut stage = vec![dcg_program::unified::TAG_STAGE_APP_WITNESS];
+        stage.extend_from_slice(&(witness.len() as u16).to_le_bytes());
+        stage.extend_from_slice(&0u16.to_le_bytes());
+        stage.push(witness[0]);
+        assert_eq!(
+            custom(
+                send(
+                    &mut f.ctx,
+                    &f.executor,
+                    f.program,
+                    stage,
+                    vec![
+                        AccountMeta::new(record, false),
+                        AccountMeta::new(f.executor.pubkey(), true),
+                    ],
+                )
+                .await,
+            ),
+            DCR1_AUTH_REFUSAL,
+            "a corrupted stored bump must fail before response bytes are read"
+        );
+        f.ctx
+            .set_account(&record, &AccountSharedData::from(original));
+    }
     label("challenge-app-witness-respond-184-full900-k10240");
     executor_opens_app_witness(&mut f, record, created[0], &witness).await;
     let ruled = f.account(record).await;
@@ -14563,9 +15079,9 @@ async fn rev8_removed_app_binding_after_admission_is_neutral_on_sbf() {
     settle_and_close_neutral_app_challenge(&mut f, record, created, descriptor, &terms).await;
 }
 
-/// Build only the real K=10,240 PT1X/PT2S registry and admission path. This
-/// isolates tags 159 and 160 from Basanos-only tag 150, so every measured
-/// admission instruction is a DCG SBF instruction.
+/// Build the retained K=10,240 PT1X/PT2S fixture and real registry/admission
+/// path. This isolates tags 159 and 160 from Basanos-only tag 150, so every
+/// measured admission instruction is a DCG SBF instruction.
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_pt1x_registry_and_admission_sbf() {
     let Some(mut f) = build_honest_pt1x().await else {
@@ -14575,6 +15091,168 @@ async fn rev8_pt1x_registry_and_admission_sbf() {
     let admission = f.account(f.dea2).await;
     assert_eq!(&admission[..4], b"DEA2");
     assert_eq!(u32_at(&admission, 136), f.k);
+}
+
+/// Tag 146 checks the binding-derived PT1O address before assigning or writing
+/// its output. Pin wrong-kind, second-instance and non-canonical-address
+/// substitutions against that real handler, then complete the honest output
+/// creation on the same PT1X/PT2S setup.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_pt1x_output_pda_provenance_sbf() {
+    // Tag 146 consumes the sealed template and PT1X index, not DEA2's class
+    // bitmap. Use the retained fixture setup here so the provenance matrix
+    // does not repeat the unrelated 10,240-position admission walk.
+    let Some(mut f) = build_with_pre_fix_seal_processor(false, false, false, false, true).await
+    else {
+        panic!("retained K=10,240 artifacts absent")
+    };
+    let (routes_image, geometry_image, payloads_image, pwr1, _) =
+        k10240_artifacts().expect("retained K=10,240 compiler-v1 template");
+    let payload_index = retained_payload_index(&payloads_image);
+    let template = Pt2p::new(
+        &routes_image,
+        &geometry_image,
+        &payloads_image,
+        Some(&payload_index),
+        pt2p::Program::decode(&pwr1).expect("compiler-v1 PWR1"),
+    )
+    .expect("PT2P template view");
+    let position = 0;
+    let first = (0..template
+        .entry_count(position)
+        .expect("position entry count"))
+        .find(|entry_index| {
+            !matches!(
+                template.entry(position, *entry_index).unwrap().kernel_index,
+                47 | 48
+            )
+        })
+        .expect("position has an entry without a DCM2 dependency");
+    let count = 1u16;
+    let (program, executor_pubkey) = (f.program, f.executor.pubkey());
+    let input_keys = [f.pt2s, f.pt1s_index, f.routes, f.geometry, f.payloads];
+    let input_refs = input_keys.iter().collect::<Vec<_>>();
+    let binding = dcg_program::pt1_onchain::pt1x_output_binding(
+        &program,
+        &input_refs,
+        position,
+        first,
+        u32::from(count),
+    );
+    let (output, canonical_bump) =
+        dcg_program::pt1_onchain::pt1x_output_address(&program, &binding);
+    let data = || {
+        [
+            vec![S::TAG_INSTANTIATE],
+            position.to_le_bytes().to_vec(),
+            first.to_le_bytes().to_vec(),
+            count.to_le_bytes().to_vec(),
+        ]
+        .concat()
+    };
+    let [pt2s, pt1x, routes, geometry, payloads] = input_keys;
+    let metas_for = |output_key| {
+        vec![
+            AccountMeta::new_readonly(pt2s, false),
+            AccountMeta::new_readonly(pt1x, false),
+            AccountMeta::new_readonly(routes, false),
+            AccountMeta::new_readonly(geometry, false),
+            AccountMeta::new_readonly(payloads, false),
+            AccountMeta::new(output_key, false),
+            AccountMeta::new_readonly(SYSTEM, false),
+            AccountMeta::new(executor_pubkey, true),
+        ]
+    };
+
+    let mut wrong_kind_data = f.account(f.dea2).await;
+    wrong_kind_data.resize(512, 0);
+    assert_eq!(&wrong_kind_data[..4], b"DEA2");
+    f.ctx
+        .set_account(&output, &shared(owned(&program, wrong_kind_data)));
+    let wrong_kind = send(&mut f.ctx, &f.executor, program, data(), metas_for(output)).await;
+    assert!(
+        matches!(
+            wrong_kind,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::InvalidAccountData
+            ))
+        ),
+        "tag 146 refuses a same-sized wrong-kind PT1O"
+    );
+
+    let other_binding = dcg_program::pt1_onchain::pt1x_output_binding(
+        &program,
+        &input_refs,
+        position,
+        first + 1,
+        u32::from(count),
+    );
+    let (second_output, _) =
+        dcg_program::pt1_onchain::pt1x_output_address(&program, &other_binding);
+    assert_ne!(output, second_output);
+    f.ctx.set_account(&second_output, &shared(system_funded()));
+    let second_instance = send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        data(),
+        metas_for(second_output),
+    )
+    .await;
+    assert!(
+        matches!(
+            second_instance,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::InvalidAccountData
+            ))
+        ),
+        "tag 146 refuses a PT1O derived for another output tuple"
+    );
+
+    let stale_bump = (0u8..=u8::MAX)
+        .find(|bump| {
+            *bump != canonical_bump
+                && solana_program::pubkey::Pubkey::create_program_address(
+                    &[&binding, &[*bump]],
+                    &program,
+                )
+                .is_ok()
+        })
+        .expect("a non-canonical bump also derives an address");
+    let noncanonical_output = solana_program::pubkey::Pubkey::create_program_address(
+        &[&binding, &[stale_bump]],
+        &program,
+    )
+    .unwrap();
+    assert_ne!(output, noncanonical_output);
+    f.ctx
+        .set_account(&noncanonical_output, &shared(system_funded()));
+    let stale = send(
+        &mut f.ctx,
+        &f.executor,
+        program,
+        data(),
+        metas_for(noncanonical_output),
+    )
+    .await;
+    assert!(
+        matches!(
+            stale,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::InvalidAccountData
+            ))
+        ),
+        "tag 146 refuses a non-canonical PT1O address planted at another key"
+    );
+
+    f.ctx.set_account(&output, &shared(system_funded()));
+    send(&mut f.ctx, &f.executor, program, data(), metas_for(output))
+        .await
+        .expect("tag 146 creates the honest PT1O output");
+    assert_eq!(&f.account(output).await[..4], b"PT1O");
 }
 
 /// The manifest-aware tag-160 walk admits a Form-22 class with multiple plan

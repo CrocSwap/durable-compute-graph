@@ -9,7 +9,9 @@
 //! identity. Instruction tags 230..=239 are reserved by the test application
 //! adapter and are outside revision 8's dispatch table.
 
-use crate::account_provenance::{create_derived_account, expect_derived, AccountKind, RoleFlags};
+use crate::account_provenance::{
+    create_derived_account, expect_derived, expect_keyed, AccountKind, RoleFlags,
+};
 use crate::kernel::{
     KernelId, ModeId, StateSchema, StateSpanMut, StatefulKernel, VersionedId, ViewAbi,
     MAX_DECLARED_KERNEL_COMPUTE_UNITS,
@@ -17,7 +19,6 @@ use crate::kernel::{
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program::invoke_signed,
     program_error::ProgramError, pubkey::Pubkey, rent::Rent, system_instruction, system_program,
-    sysvar::Sysvar,
 };
 
 pub const TAG_OPEN_SESSION: u8 = 230;
@@ -412,10 +413,13 @@ fn checked_stream(
     writable: bool,
 ) -> ProgramResult {
     check_program_owned(account, program, writable)?;
-    expect_derived(
+    if session.stream_key == Pubkey::default() {
+        return Err(refusal(REFUSAL_SESSION));
+    }
+    expect_keyed(
         account,
         program,
-        &[STREAM_SEED, session_account.key.as_ref()],
+        &session.stream_key,
         AccountKind::exact(
             STREAM_MAGIC,
             CHILD_HEADER_BYTES + session.capacity as usize * SLOT_BYTES,
@@ -429,8 +433,7 @@ fn checked_stream(
     .map_err(|_| refusal(REFUSAL_SESSION))?;
     let raw = account.try_borrow_data()?;
     let expected_len = CHILD_HEADER_BYTES + session.capacity as usize * SLOT_BYTES;
-    if account.key != &session.stream_key
-        || raw.len() != expected_len
+    if raw.len() != expected_len
         || &raw[..4] != STREAM_MAGIC
         || read_u16(&raw, 4) != WIRE_VERSION as u16
         || raw[6] != KIND_STREAM
@@ -464,11 +467,13 @@ fn state_meta(
     if index >= MAX_STATE_SPANS {
         return Err(refusal(REFUSAL_STATE));
     }
-    let index_seed = [index as u8];
-    expect_derived(
+    if session.state_keys[index] == Pubkey::default() {
+        return Err(refusal(REFUSAL_STATE));
+    }
+    expect_keyed(
         account,
         program,
-        &[STATE_SEED, session_account.key.as_ref(), &index_seed],
+        &session.state_keys[index],
         AccountKind::variable(STATE_MAGIC, CHILD_HEADER_BYTES + 1, 10 * 1024 * 1024)
             .with_version(4, WIRE_VERSION as u16),
         RoleFlags {
@@ -479,7 +484,6 @@ fn state_meta(
     .map_err(|_| refusal(REFUSAL_STATE))?;
     let raw = account.try_borrow_data()?;
     if index >= MAX_STATE_SPANS
-        || account.key != &session.state_keys[index]
         || raw.len() < CHILD_HEADER_BYTES
         || &raw[..4] != STATE_MAGIC
         || read_u16(&raw, 4) != WIRE_VERSION as u16
@@ -533,11 +537,13 @@ fn view_meta(
         KIND_SCRATCH => 2,
         _ => return Err(refusal(REFUSAL_VIEW)),
     };
-    let role_seed = [role];
-    expect_derived(
+    if session.view_keys[view_index] == Pubkey::default() {
+        return Err(refusal(REFUSAL_VIEW));
+    }
+    expect_keyed(
         account,
         program,
-        &[VIEW_SEED, session_account.key.as_ref(), &role_seed],
+        &session.view_keys[view_index],
         AccountKind::variable(
             VIEW_MAGIC,
             CHILD_HEADER_BYTES + 1,
@@ -551,8 +557,7 @@ fn view_meta(
     )
     .map_err(|_| refusal(REFUSAL_VIEW))?;
     let raw = account.try_borrow_data()?;
-    if account.key != &session.view_keys[view_index]
-        || raw.len() < CHILD_HEADER_BYTES
+    if raw.len() < CHILD_HEADER_BYTES
         || &raw[..4] != VIEW_MAGIC
         || read_u16(&raw, 4) != WIRE_VERSION as u16
         || raw[6] != role

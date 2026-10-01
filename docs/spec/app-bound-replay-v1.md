@@ -145,6 +145,17 @@ until tag 184, timeout, or a neutral identity rule. The relevant bytes are:
 | `7168..8068` | witness staging buffer, maximum 900 bytes |
 | `8068..8100` | saved segment root for the challenged consumer |
 
+Revision-8 challenge open also writes its canonical PDA bump at byte `146` and
+marker `1` at byte `147` for both DCR1 v5 and v6 records. These bytes were
+reserved in the earlier layout. Readers use the stored bump for a fixed-cost
+address check; marker `0` retains the canonical-search path for records opened
+before this image, and any other marker is refused. Revision-7 builds leave
+both bytes zero. The DCR1 record size and instruction encodings are unchanged.
+The address inputs are still the descriptor, challenger, and nonce read from
+DCR1 itself because these challenge account lists have no independent identity
+anchor; the stored bump limits search cost but does not close that provenance
+gap.
+
 While staging counters occupy `170..174`, DEV2 retains the fix-point entry
 index and form. Any terminal ruling restores the ordinary `t:u32 | form:u16`
 words at `170..176` after clearing the staging region.

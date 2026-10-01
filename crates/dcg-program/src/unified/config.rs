@@ -20,7 +20,7 @@ use super::{
     address, d32, no, registry, u16_at, u32_at, CL_AUTHORITY, CL_MALFORMED, CL_OVERFLOW,
     PLAN_BINDING, REGISTRY_ACCOUNT,
 };
-use crate::account_provenance::{expect_keyed, AccountKind, RoleFlags};
+use crate::account_provenance::{expect_derived, expect_derived_with_bump, AccountKind, RoleFlags};
 use crate::compatibility::{ApplicationHooks, REVISION8_COMPATIBILITY};
 use crate::hash;
 use crate::pt2p_onchain as S;
@@ -546,6 +546,20 @@ pub fn template_seal_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     if *record.key != want || !record.is_writable {
         return Err(no(CL_MALFORMED));
     }
+    if !record.data_is_empty() {
+        expect_derived_with_bump(
+            record,
+            program,
+            &[address::TEMPLATE_SEAL_SEED, pt2s.key.as_ref(), &digest],
+            bump,
+            AccountKind::exact(b"DTA1", SEAL_BYTES).with_version(4, 1),
+            RoleFlags {
+                writable: true,
+                signer: false,
+            },
+        )
+        .map_err(|_| no(TEMPLATE_SEAL))?;
+    }
     let state = if record.data_is_empty() {
         0
     } else {
@@ -594,9 +608,19 @@ pub fn approved(
     pt2s: &Pubkey,
     digest: &[u8; 32],
 ) -> ProgramResult {
+    expect_derived(
+        record,
+        program,
+        &[address::TEMPLATE_SEAL_SEED, pt2s.as_ref(), digest],
+        AccountKind::exact(b"DTA1", SEAL_BYTES).with_version(4, 1),
+        RoleFlags {
+            writable: false,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(TEMPLATE_SEAL))?;
     let raw = record.try_borrow_data()?;
     if record.owner != program
-        || *record.key != address::template_seal(program, pt2s, digest).0
         || raw.len() != SEAL_BYTES
         || raw[..4] != *b"DTA1"
         || raw[6] != SEAL_APPROVED
@@ -804,20 +828,22 @@ fn template_record(
     pt2s: &Pubkey,
     digest: &[u8; 32],
 ) -> Result<TemplateView, ProgramError> {
-    let raw = record.try_borrow_data()?;
-    let use_bump = raw.get(7).copied().ok_or(no(TEMPLATE_SEAL))?;
-    let use_address = Pubkey::create_program_address(
-        &[
-            address::TEMPLATE_USE_SEED,
-            pt2s.as_ref(),
-            digest,
-            &[use_bump],
-        ],
+    expect_derived(
+        record,
         program,
+        &[address::TEMPLATE_USE_SEED, pt2s.as_ref(), digest],
+        AccountKind::exact(b"DTU1", DTU1_BYTES)
+            .with_version(4, DTU1_VERSION)
+            .with_bump(7),
+        RoleFlags {
+            writable: false,
+            signer: false,
+        },
     )
     .map_err(|_| no(TEMPLATE_SEAL))?;
+    let raw = record.try_borrow_data()?;
+    let use_bump = raw.get(7).copied().ok_or(no(TEMPLATE_SEAL))?;
     if record.owner != program
-        || *record.key != use_address
         || raw.len() != DTU1_BYTES
         || raw[..4] != *b"DTU1"
         || u16_at(&raw, 4, TEMPLATE_SEAL)? != DTU1_VERSION
@@ -994,17 +1020,6 @@ pub fn close_unpublished_template(
             {
                 return Err(no(CL_AUTHORITY));
             }
-            expect_keyed(
-                account,
-                program,
-                key.key,
-                AccountKind::exact(b"", 0),
-                RoleFlags {
-                    writable: true,
-                    signer: true,
-                },
-            )
-            .map_err(|_| no(CL_AUTHORITY))?;
             // The zero-data allocation's own key is the only provable payee.
             // Keep its lamports at that key and return ownership to System;
             // no caller-selected third account receives rent.

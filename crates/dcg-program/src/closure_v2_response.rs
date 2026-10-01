@@ -3,6 +3,8 @@
 //! digest before parsing proofs. Each instruction touches at most one 900-byte
 //! chunk or grows the account by at most 10,240 bytes.
 
+#[cfg(feature = "revision-8")]
+use crate::account_provenance::expect_derived_with_bump;
 use crate::account_provenance::{allocate_derived_account, expect_derived, AccountKind, RoleFlags};
 use crate::hash;
 use core::cell::Ref;
@@ -76,11 +78,42 @@ fn challenge<'a>(
     let raw = challenge.try_borrow_data()?;
     if raw.len() != 8192
         || raw[..4] != *b"DCR1"
+        || (cfg!(feature = "revision-8") && !matches!(u16::from_le_bytes([raw[6], raw[7]]), 5 | 6))
         || !matches!(raw[4], 1 | 2)
         || raw[40..72] != executor.key.to_bytes()
         || Clock::get()?.slot > u64_at(&raw, 148)?
     {
         return Err(no(DEADLINE));
+    }
+    #[cfg(feature = "revision-8")]
+    {
+        let descriptor: [u8; 32] = raw[72..104].try_into().expect("fixed width");
+        let challenger = Pubkey::new_from_array(raw[8..40].try_into().expect("fixed width"));
+        let nonce = &raw[140..144];
+        let seeds = [
+            crate::unified::address::CHALLENGE_SEED,
+            &descriptor[..],
+            challenger.as_ref(),
+            nonce,
+        ];
+        let kind = AccountKind::exact(b"DCR1", 8192);
+        let role = RoleFlags {
+            writable: false,
+            signer: false,
+        };
+        match raw[crate::unified::challenge::RECORD_BUMP_MARKER_AT] {
+            0 => expect_derived(challenge, program, &seeds, kind, role).map(|_| ()),
+            1 => expect_derived_with_bump(
+                challenge,
+                program,
+                &seeds,
+                raw[crate::unified::challenge::RECORD_BUMP_AT],
+                kind,
+                role,
+            ),
+            _ => Err(ProgramError::InvalidAccountData),
+        }
+        .map_err(|_| no(AUTH))?;
     }
     Ok(Ref::map(raw, |data| &data[..]))
 }
@@ -293,7 +326,7 @@ pub fn sealed<'a>(
         response,
         program,
         &[b"dcg-hcl-response", challenge.key.as_ref()],
-        AccountKind::exact(b"DRU1", HEADER + total).with_version(4, 1),
+        AccountKind::variable(b"DRU1", HEADER, HEADER + MAX_BODY).with_version(4, 1),
         RoleFlags {
             writable: false,
             signer: false,
@@ -336,7 +369,7 @@ pub fn sealed_view<'a>(
         response,
         program,
         &[b"dcg-hcl-response", challenge.as_ref()],
-        AccountKind::exact(b"DRU1", HEADER + total).with_version(4, 1),
+        AccountKind::variable(b"DRU1", HEADER, HEADER + MAX_BODY).with_version(4, 1),
         RoleFlags {
             writable: false,
             signer: false,

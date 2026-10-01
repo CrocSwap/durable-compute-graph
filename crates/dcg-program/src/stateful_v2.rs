@@ -5,7 +5,9 @@
 //! the statically linked kernel, and stages multi-account views in resumable
 //! phases before one atomic publication transaction.
 
-use crate::account_provenance::{create_derived_account, expect_derived, AccountKind, RoleFlags};
+use crate::account_provenance::{
+    create_derived_account, expect_derived, expect_keyed, AccountKind, RoleFlags,
+};
 use crate::kernel::{
     AccountSpan, KernelId, ModeId, StateSchema, StateSpanMut, StatefulKernel, VersionedId, ViewAbi,
     ViewPhase, MAX_DECLARED_KERNEL_COMPUTE_UNITS,
@@ -626,10 +628,13 @@ fn stream_pda_check(
     writable: bool,
 ) -> ProgramResult {
     check_program_owned(account, program, writable)?;
-    expect_derived(
+    if session.stream_key == Pubkey::default() {
+        return Err(refusal(REFUSAL_SESSION));
+    }
+    expect_keyed(
         account,
         program,
-        &[STREAM_SEED, session_account.key.as_ref()],
+        &session.stream_key,
         AccountKind::exact(
             STREAM_MAGIC,
             CHILD_HEADER_BYTES + session.capacity as usize * SLOT_BYTES,
@@ -643,8 +648,7 @@ fn stream_pda_check(
     .map_err(|_| refusal(REFUSAL_SESSION))?;
     let raw = account.try_borrow_data()?;
     let expected_len = CHILD_HEADER_BYTES + session.capacity as usize * SLOT_BYTES;
-    if account.key != &session.stream_key
-        || raw.len() != expected_len
+    if raw.len() != expected_len
         || &raw[..4] != STREAM_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
         || raw[6] != KIND_STREAM
@@ -939,12 +943,18 @@ fn grow_state(
     }
     check_program_owned(state, program, true)?;
     let schema = validate_kernel(kernel)?;
-    let (expected, _) = state_pda(program, session_account.key, index as u8);
-    let index_seed = [index as u8];
-    expect_derived(
+    let expected = Pubkey::new_from_array(
+        session_raw[state_key_offset..state_key_offset + 32]
+            .try_into()
+            .expect("fixed width"),
+    );
+    if expected == Pubkey::default() {
+        return Err(refusal(REFUSAL_STATE));
+    }
+    expect_keyed(
         state,
         program,
-        &[STATE_SEED, session_account.key.as_ref(), &index_seed],
+        &expected,
         AccountKind::variable(STATE_MAGIC, CHILD_HEADER_BYTES + 1, ACCOUNT_MAX_BYTES)
             .with_version(4, WIRE_VERSION as u16),
         RoleFlags {
@@ -954,8 +964,7 @@ fn grow_state(
     )
     .map_err(|_| refusal(REFUSAL_STATE))?;
     let raw = state.try_borrow_data()?;
-    if state.key != &expected
-        || raw.len() < CHILD_HEADER_BYTES
+    if raw.len() < CHILD_HEADER_BYTES
         || &raw[..4] != STATE_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
         || raw[6] != KIND_STATE
@@ -1125,15 +1134,14 @@ fn grow_view(
     } else {
         return Err(refusal(REFUSAL_VIEW));
     };
-    if expected_key == Pubkey::default() || view.key != &expected_key {
+    if expected_key == Pubkey::default() {
         return Err(refusal(REFUSAL_VIEW));
     }
     check_program_owned(view, program, true)?;
-    let role_seed = [role];
-    expect_derived(
+    expect_keyed(
         view,
         program,
-        &[VIEW_SEED, session_account.key.as_ref(), &role_seed],
+        &expected_key,
         AccountKind::variable(VIEW_MAGIC, CHILD_HEADER_BYTES + 1, ACCOUNT_MAX_BYTES)
             .with_version(4, WIRE_VERSION as u16),
         RoleFlags {
@@ -1198,11 +1206,13 @@ fn state_meta(
     if index >= MAX_STATE_SPANS {
         return Err(refusal(REFUSAL_STATE));
     }
-    let index_seed = [index as u8];
-    expect_derived(
+    if session.state_keys[index] == Pubkey::default() {
+        return Err(refusal(REFUSAL_STATE));
+    }
+    expect_keyed(
         account,
         program,
-        &[STATE_SEED, session_account.key.as_ref(), &index_seed],
+        &session.state_keys[index],
         AccountKind::variable(STATE_MAGIC, CHILD_HEADER_BYTES + 1, ACCOUNT_MAX_BYTES)
             .with_version(4, WIRE_VERSION as u16),
         RoleFlags {
@@ -1213,7 +1223,6 @@ fn state_meta(
     .map_err(|_| refusal(REFUSAL_STATE))?;
     let raw = account.try_borrow_data()?;
     if index >= MAX_STATE_SPANS
-        || account.key != &session.state_keys[index]
         || raw.len() < CHILD_HEADER_BYTES
         || &raw[..4] != STATE_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
@@ -1481,11 +1490,13 @@ fn view_meta(
     } else {
         return Err(refusal(REFUSAL_VIEW));
     };
-    let role_seed = [role];
-    expect_derived(
+    if expected_key == Pubkey::default() {
+        return Err(refusal(REFUSAL_VIEW));
+    }
+    expect_keyed(
         account,
         program,
-        &[VIEW_SEED, session_account.key.as_ref(), &role_seed],
+        &expected_key,
         AccountKind::variable(VIEW_MAGIC, CHILD_HEADER_BYTES + 1, ACCOUNT_MAX_BYTES)
             .with_version(4, WIRE_VERSION as u16),
         RoleFlags {
@@ -1495,9 +1506,7 @@ fn view_meta(
     )
     .map_err(|_| refusal(REFUSAL_VIEW))?;
     let raw = account.try_borrow_data()?;
-    if expected_key == Pubkey::default()
-        || account.key != &expected_key
-        || raw.len() < CHILD_HEADER_BYTES
+    if raw.len() < CHILD_HEADER_BYTES
         || &raw[..4] != VIEW_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
         || raw[6] != kind

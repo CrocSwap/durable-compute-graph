@@ -194,6 +194,7 @@ fn custom(remainder: Pubkey, settlement: Pubkey) -> Terms2 {
 /// length check -- so this is a record of the shape the program would accept at
 /// init and nothing more.
 fn dcm2_v7(
+    program: &Pubkey,
     descriptor: &[u8; 32],
     executor: &Pubkey,
     t: &Terms2,
@@ -215,6 +216,10 @@ fn dcm2_v7(
     out[40..72].copy_from_slice(executor.as_ref());
     out[72..76].copy_from_slice(&80u32.to_le_bytes());
     out[76..78].copy_from_slice(&34u16.to_le_bytes());
+    out[document::DCM2_BUMP_AT] = address::document(program, descriptor).1;
+    out[document::DPR2_BUMP_AT] = address::positions(program, descriptor).1;
+    out[document::DFS2_BUMP_AT] = address::family_slots(program, descriptor).1;
+    out[document::BOND_ESCROW_BUMP_AT] = address::bond_escrow(program, descriptor).1;
     out[84..88].copy_from_slice(&40u32.to_le_bytes());
     out[88..96].copy_from_slice(&504_606_552u64.to_le_bytes());
     out[128..132].copy_from_slice(&open.to_le_bytes());
@@ -566,8 +571,12 @@ impl Fx {
     /// Install a result image at the result address, and an escrow balance at
     /// the escrow address. Both own the borrow, so a call site never holds the
     /// fixture's `&mut` and its `&` at once.
-    fn install_result(&mut self, image: Vec<u8>, lamports: u64) {
+    fn install_result(&mut self, mut image: Vec<u8>, lamports: u64) {
         let (key, program) = (self.dcr2(), self.ids.program);
+        if image.starts_with(b"DCR2") && image.len() > result::RESULT_PDA_BUMP_AT_V6 {
+            let descriptor: [u8; 32] = image[8..40].try_into().expect("DCR2 descriptor");
+            image[result::RESULT_PDA_BUMP_AT_V6] = address::result(&program, &descriptor).1;
+        }
         put(&mut self.ctx, &key, owned(&program, image, lamports));
     }
     fn install_escrow(&mut self, lamports: u64) {
@@ -670,7 +679,15 @@ async fn stage(
     // executor that never sealed a response. The settle's own check admits it
     // and drains nothing.
     put(&mut f.ctx, &response_key, system_funded(1));
-    let doc = dcm2_v7(&d, &f.ids.executor, t, 1, bond_state, winner);
+    let doc = dcm2_v7(
+        &f.ids.program,
+        &d,
+        &f.ids.executor,
+        t,
+        1,
+        bond_state,
+        winner,
+    );
     put(
         &mut f.ctx,
         &dcm2_key,
@@ -1583,6 +1600,46 @@ async fn every_retry_refusal() {
         CL_CLOSE,
         "an escrow that is not the document's"
     );
+    let second_descriptor = [0xA7; 32];
+    let second_escrow = address::bond_escrow(&f.ids.program, &second_descriptor).0;
+    f.install_at(second_escrow, system_funded(ESCROW_FLOOR));
+    let mut other_document_escrow = good.clone();
+    other_document_escrow[2] = AccountMeta::new(second_escrow, false);
+    assert_eq!(
+        refuse(
+            &mut f,
+            vec![TAG_RETRY_BOND_SETTLEMENT],
+            other_document_escrow
+        )
+        .await,
+        CL_CLOSE,
+        "an escrow derived for a different descriptor"
+    );
+    // The expected address still has to be a writable, empty, System-owned
+    // account. These two same-key substitutions exercise its owner and data
+    // checks separately from the key check above.
+    let escrow_key = f.escrow();
+    f.install_at(escrow_key, owned(&f.ids.program, vec![], ESCROW_FLOOR));
+    assert_eq!(
+        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
+        SETTLEMENT_PROGRAM,
+        "the expected escrow has the wrong owner"
+    );
+    f.install_at(
+        escrow_key,
+        Account {
+            lamports: ESCROW_FLOOR,
+            data: vec![1],
+            owner: SYSTEM,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    assert_eq!(
+        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
+        SETTLEMENT_PROGRAM,
+        "the expected escrow is not empty"
+    );
     f.install_escrow(0);
     assert_eq!(
         refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
@@ -1908,6 +1965,60 @@ async fn every_settle_refusal_on_a_revision_eight_document() {
         DCR1_AUTH,
         "and the ninth meta is not the system program"
     );
+    let escrow_key = g.escrow();
+    let mut other_escrow = g.settle_metas(escrow_key, SYSTEM);
+    let second_descriptor = [0x5C; 32];
+    let second_escrow = address::bond_escrow(&g.ids.program, &second_descriptor).0;
+    g.install_at(second_escrow, system_funded(ESCROW_FLOOR));
+    other_escrow[7] = AccountMeta::new(second_escrow, false);
+    assert_eq!(
+        settle_refuse(&mut g, other_escrow).await,
+        CL_CLOSE,
+        "CUSTOM tag 131 refuses a second document's escrow"
+    );
+    g.install_at(escrow_key, owned(&g.ids.program, vec![], ESCROW_FLOOR));
+    let metas = g.settle_metas(escrow_key, SYSTEM);
+    assert_eq!(
+        settle_refuse(&mut g, metas).await,
+        SETTLEMENT_PROGRAM,
+        "CUSTOM tag 131 refuses an escrow with the wrong owner"
+    );
+    g.install_at(
+        escrow_key,
+        Account {
+            lamports: ESCROW_FLOOR,
+            data: vec![1],
+            owner: SYSTEM,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let metas = g.settle_metas(escrow_key, SYSTEM);
+    assert_eq!(
+        settle_refuse(&mut g, metas).await,
+        SETTLEMENT_PROGRAM,
+        "CUSTOM tag 131 refuses an escrow with data"
+    );
+    let document_key = g.dcm2();
+    let original_dcm2 = g.data(document_key).await;
+    let dcm2_lamports = g.lamports(document_key).await;
+    let mut stale_escrow_bump = original_dcm2.clone();
+    stale_escrow_bump[document::BOND_ESCROW_BUMP_AT] =
+        stale_escrow_bump[document::BOND_ESCROW_BUMP_AT].wrapping_add(1);
+    g.install_at(
+        document_key,
+        owned(&g.ids.program, stale_escrow_bump, dcm2_lamports),
+    );
+    let metas = g.settle_metas(escrow_key, SYSTEM);
+    assert_eq!(
+        settle_refuse(&mut g, metas).await,
+        CL_CLOSE,
+        "CUSTOM tag 131 refuses a stale stored escrow bump"
+    );
+    g.install_at(
+        document_key,
+        owned(&g.ids.program, original_dcm2, dcm2_lamports),
+    );
     // 733: the record is not in phase 3.
     let mut h = build().await;
     let t3 = standard(h.ids.remainder, 2_500);
@@ -1936,7 +2047,7 @@ async fn every_settle_refusal_on_a_revision_eight_document() {
     let mut i = build().await;
     let t4 = standard(i.ids.remainder, 2_500);
     let d = i.descriptor();
-    let doc = dcm2_v7(&d, &i.ids.executor, &t4, 1, BOND_HELD, None);
+    let doc = dcm2_v7(&i.ids.program, &d, &i.ids.executor, &t4, 1, BOND_HELD, None);
     i.install_at(
         i.dcm2(),
         owned(&i.ids.program, doc, rent_exempt(dcm2_bytes())),

@@ -14,6 +14,7 @@
 use super::classes::{self, rs1_height};
 use super::registry::{self, find_row, HEADER as DRP2_HEADER};
 use super::{no, plan, u16_at, u32_at, ADMISSION_STATE, PLAN_BINDING, REGISTRY_ROOT};
+use crate::account_provenance::{expect_derived, AccountKind, RoleFlags};
 use crate::hash;
 use crate::kernel::{ApplicationManifest, CommittedReplayWitness, LegacyFormBinding};
 use crate::pt2p::Pt2p;
@@ -338,14 +339,25 @@ pub fn view(program: &Pubkey, account: &AccountInfo, popcount: bool) -> Result<V
         .base_classes
         .checked_add(v.generated_classes)
         .ok_or(bad())?;
-    let (key, _) = super::address::admission(
+    let registry = Pubkey::new_from_array(v.registry);
+    let pt2s = Pubkey::new_from_array(v.pt2s);
+    expect_derived(
+        account,
         program,
-        &Pubkey::new_from_array(v.registry),
-        &Pubkey::new_from_array(v.pt2s),
-        v.position_count,
-    );
-    if *account.key != key
-        || raw.len() != bytes(total)
+        &[
+            super::address::ADMISSION_SEED,
+            registry.as_ref(),
+            pt2s.as_ref(),
+            &v.position_count.to_le_bytes(),
+        ],
+        AccountKind::exact(b"DEA2", bytes(total)).with_version(4, VERSION),
+        RoleFlags {
+            writable: false,
+            signer: false,
+        },
+    )
+    .map_err(|_| bad())?;
+    if raw.len() != bytes(total)
         || v.admitted > total
         || v.complete != (v.admitted == total)
         || (total % 8 != 0 && raw[raw.len() - 1] >> (total % 8) != 0)

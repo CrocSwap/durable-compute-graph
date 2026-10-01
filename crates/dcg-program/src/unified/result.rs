@@ -37,9 +37,9 @@ use super::events::{self, Body};
 use super::terms::{Terms, Terms2, TERMS_BYTES, TERMS_BYTES_V2};
 use super::{
     d32, no, plan, u16_at, u32_at, u64_at, CL_COORDINATE, CL_MALFORMED, CL_MISSING, CL_OVERFLOW,
-    DCR1_PHASE, PLAN_BINDING, SETTLEMENT_PROGRAM,
+    DCR1_PHASE, PLAN_BINDING,
 };
-use crate::account_provenance::{expect_derived, AccountKind, RoleFlags};
+use crate::account_provenance::{expect_derived, expect_derived_with_bump, AccountKind, RoleFlags};
 use crate::closure_v2::{self as h, Coordinate};
 use crate::hash;
 use solana_program::{
@@ -167,7 +167,6 @@ pub fn view(
     let raw = account.try_borrow_data()?;
     if account.owner != program
         || (writable && !account.is_writable)
-        || *account.key != address::result(program, descriptor).0
         || raw.len() < HEADER
         || raw[..4] != *b"DCR2"
         || u16_at(&raw, 4, CL_MALFORMED)? != VERSION
@@ -233,13 +232,14 @@ pub fn view_v8_status(
     writable: bool,
     max_status: u8,
 ) -> Result<View, ProgramError> {
+    let bump = stored_result_bump(account)?;
     view_v8_status_inner(
         program,
         account,
         descriptor,
         writable,
         max_status,
-        None,
+        Some(bump),
         &crate::compatibility::REVISION8_COMPATIBILITY,
     )
 }
@@ -252,13 +252,26 @@ pub fn view_v8_status_with_hooks(
     max_status: u8,
     hooks: &dyn crate::compatibility::ApplicationHooks,
 ) -> Result<View, ProgramError> {
+    let bump = stored_result_bump(account)?;
     view_v8_status_inner(
-        program, account, descriptor, writable, max_status, None, hooks,
+        program,
+        account,
+        descriptor,
+        writable,
+        max_status,
+        Some(bump),
+        hooks,
     )
 }
 
-/// The close's bounded CU path checks the DCR2 PDA using the bump stored at
-/// creation. Other revision-8 readers keep the canonical search helper.
+fn stored_result_bump(account: &AccountInfo) -> Result<u8, ProgramError> {
+    let data = account.try_borrow_data().map_err(|_| no(CL_MALFORMED))?;
+    data.get(RESULT_PDA_BUMP_AT_V6)
+        .copied()
+        .ok_or(no(CL_MALFORMED))
+}
+
+/// Revision-8 readers check the DCR2 PDA using the bump stored at creation.
 pub fn view_v8_status_with_bump(
     program: &Pubkey,
     account: &AccountInfo,
@@ -312,27 +325,33 @@ fn view_v8_status_inner(
     if bump.is_some() {
         kind = kind.with_bump(RESULT_PDA_BUMP_AT_V6);
     }
-    expect_derived(
-        account,
-        program,
-        &[address::RESULT_SEED, descriptor],
-        kind,
-        RoleFlags {
-            writable,
-            signer: false,
-        },
-    )
+    let role = RoleFlags {
+        writable,
+        signer: false,
+    };
+    if let Some(bump) = bump {
+        expect_derived_with_bump(
+            account,
+            program,
+            &[address::RESULT_SEED, descriptor],
+            bump,
+            kind,
+            role,
+        )
+    } else {
+        expect_derived(
+            account,
+            program,
+            &[address::RESULT_SEED, descriptor],
+            kind,
+            role,
+        )
+        .map(|_| ())
+    }
     .map_err(|_| no(CL_MALFORMED))?;
     let raw = account.try_borrow_data()?;
-    let expected = if let Some(bump) = bump {
-        Pubkey::create_program_address(&[address::RESULT_SEED, descriptor, &[bump]], program)
-            .map_err(|_| no(CL_MALFORMED))?
-    } else {
-        address::result(program, descriptor).0
-    };
     if account.owner != program
         || (writable && !account.is_writable)
-        || *account.key != expected
         || raw.len() < HEADER_V6
         || raw[..4] != *b"DCR2"
         || u16_at(&raw, 4, CL_MALFORMED)? != VERSION_V6
@@ -341,7 +360,6 @@ fn view_v8_status_inner(
         || raw[8..40] != *descriptor
         || raw[209..212] != [0; 3]
         || raw[411..416] != [0; 5]
-        || bump.is_some_and(|b| raw[RESULT_PDA_BUMP_AT_V6] != b)
     {
         return Err(no(CL_MALFORMED));
     }
@@ -832,7 +850,7 @@ pub fn attest_v8_with_hooks(
     }
     let descriptor = d32(data, 1, CL_MALFORMED)?;
     let index = u32_at(data, 33, CL_MALFORMED)?;
-    document::document_v8(program, dcm2, Some(&descriptor), false, CL_MALFORMED)?;
+    document::document_v8_stored(program, dcm2, Some(&descriptor), false, CL_MALFORMED)?;
     // 0. Attest after finalize.
     if u16_at(&dcm2.try_borrow_data()?, 6, CL_MALFORMED)? & document::FLAG_FINAL == 0 {
         return Err(no(CL_MISSING));
@@ -874,7 +892,15 @@ pub fn attest_v8_with_hooks(
             u32_at(&doc, 72, CL_MALFORMED)?,
         )
     };
-    document::positions(program, dpr2, &descriptor, p_count, false, CL_MALFORMED)?;
+    document::positions_from_document(
+        program,
+        dpr2,
+        dcm2,
+        &descriptor,
+        p_count,
+        false,
+        CL_MALFORMED,
+    )?;
     if pt2s.key.as_ref() != &dcm2.try_borrow_data()?[200..232]
         || hash::sha256(&[&pt2s.try_borrow_data()?]) != dcm2.try_borrow_data()?[232..264]
     {
@@ -1312,7 +1338,7 @@ pub fn resolve_v8_with_hooks(
         return Err(no(CL_MALFORMED));
     }
     let descriptor = d32(data, 1, CL_MALFORMED)?;
-    document::document_v8(program, dcm2, Some(&descriptor), false, CL_MALFORMED)?;
+    document::document_v8_stored(program, dcm2, Some(&descriptor), false, CL_MALFORMED)?;
     let v = view_v8_status_with_hooks(program, dcr2, &descriptor, true, STATUS_SETTLED, hooks)?;
     if v.status != STATUS_PENDING || v.closed || dcr2.data_len() != v.full {
         return Err(no(RESULT_STATE));
@@ -1487,12 +1513,21 @@ pub fn close_v7<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8])
         )
     };
     document::positions(program, dpr2, &descriptor, p_count, true, CL_MALFORMED)?;
-    if dfs2.owner != program
-        || *dfs2.key != address::family_slots(program, &descriptor).0
-        || !dfs2.is_writable
-    {
-        return Err(no(CL_MALFORMED));
-    }
+    expect_derived(
+        dfs2,
+        program,
+        &[address::FAMILY_SLOTS_SEED, &descriptor],
+        AccountKind::variable(
+            b"DFS2",
+            document::DFS2_HEADER,
+            document::DFS2_HEADER + 10 * 1024 * 1024,
+        ),
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(CL_MALFORMED))?;
     if !executor.is_writable || executor.key.as_ref() != &dcm2.try_borrow_data()?[40..72] {
         return Err(no(super::CL_AUTHORITY));
     }
@@ -1686,14 +1721,22 @@ pub fn close_v8_with_hooks<'a>(
         CL_MALFORMED,
         position_bump,
     )?;
-    let family_key = Pubkey::create_program_address(
-        &[address::FAMILY_SLOTS_SEED, &descriptor, &[family_bump]],
+    expect_derived_with_bump(
+        dfs2,
         program,
+        &[address::FAMILY_SLOTS_SEED, &descriptor],
+        family_bump,
+        AccountKind::variable(
+            b"DFS2",
+            document::DFS2_HEADER,
+            document::DFS2_HEADER + 10 * 1024 * 1024,
+        ),
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
     )
     .map_err(|_| no(CL_MALFORMED))?;
-    if dfs2.owner != program || *dfs2.key != family_key || !dfs2.is_writable {
-        return Err(no(CL_MALFORMED));
-    }
     // The rent's destination, and the one check that makes the permissionless
     // rows safe: the payer is the recorded payer, never the closer.
     if !payer.is_writable || payer.key.as_ref() != &dcm2.try_borrow_data()?[40..72] {
@@ -1946,15 +1989,11 @@ fn dispose_bond<'a>(
             program,
         )
         .map_err(|_| no(CL_MALFORMED))?;
-        // Preserve C4's close-side 582 for a wrong escrow key. The C3 helper
-        // then checks the account's owner, writability and empty data shape.
+        // Preserve C4's close-side 582 for a wrong escrow key. Check the
+        // account's shape after tail/burn and pot checks to keep their refusal
+        // precedence, then write only to the validated empty escrow.
         if aux.key != &key {
             return Err(no(super::CL_AUTHORITY));
-        }
-        // Preserve C3's shape-specific refusal before the general validator
-        // maps malformed escrow accounts to the close's generic refusal.
-        if !aux.is_writable || aux.is_signer {
-            return Err(no(SETTLEMENT_PROGRAM));
         }
         if *tail.key != system_program::id() || burn.key != &incinerator::ID || !burn.is_writable {
             return Err(no(super::CL_AUTHORITY));

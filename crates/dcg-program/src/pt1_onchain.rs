@@ -2,8 +2,8 @@
 //! seal; a route-tree frontier and payload index make the large rev7 template
 //! checkable without a single unbounded SBF instruction.
 use crate::account_provenance::{
-    allocate_derived_account, create_derived_account, expect_derived, expect_keyed, AccountKind,
-    RoleFlags,
+    allocate_derived_account, create_derived_account, expect_derived_with_bump, expect_keyed,
+    expect_system_account_shape, AccountKind, RoleFlags,
 };
 use crate::position_template as pt;
 use solana_program::{
@@ -206,16 +206,6 @@ fn init_pt1x(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    expect_keyed(
-        state,
-        program,
-        state.key,
-        AccountKind::variable(b"", OFF_INDEX + 4, PT1X_MAX_STATE_BYTES),
-        RoleFlags {
-            writable: true,
-            signer: true,
-        },
-    )?;
     if byte_accounts.iter().any(|a| !a.is_signer) {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -281,8 +271,8 @@ pub fn validate_pt1x_output_binding(
     binding: &[u8; 32],
     position: u32,
     first: u32,
-) -> Result<bool, ProgramError> {
-    let (expected, _) = pt1x_output_address(program, binding);
+) -> Result<(bool, u8), ProgramError> {
+    let (expected, bump) = pt1x_output_address(program, binding);
     if !output.is_writable || *system.key != system_program::ID || output.key != &expected {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -291,12 +281,22 @@ pub fn validate_pt1x_output_binding(
             if output.data_len() != 0 {
                 return Err(ProgramError::InvalidAccountData);
             }
-            Ok(true)
+            Ok((true, bump))
         }
         owner if owner == program => {
+            expect_keyed(
+                output,
+                program,
+                &expected,
+                AccountKind::variable(b"", 4, 10 * 1024 * 1024),
+                RoleFlags {
+                    writable: true,
+                    signer: false,
+                },
+            )?;
             let raw = output.try_borrow_data()?;
             if raw.len() >= 4 && raw[..4] == *PT1X_OUTPUT_RESERVATION_MAGIC {
-                return Ok(false);
+                return Ok((false, bump));
             }
             if raw.len() < PT1X_OUTPUT_HEADER_BYTES
                 || raw[..4] != *OUTPUT_MAGIC
@@ -306,7 +306,7 @@ pub fn validate_pt1x_output_binding(
             {
                 return Err(ProgramError::InvalidAccountData);
             }
-            Ok(false)
+            Ok((false, bump))
         }
         _ => return Err(ProgramError::IllegalOwner),
     }
@@ -318,6 +318,7 @@ pub fn prepare_pt1x_output_pda<'a>(
     system: &AccountInfo<'a>,
     payer: &AccountInfo<'a>,
     binding: &[u8; 32],
+    bump: u8,
     count: u32,
     stream_bytes: usize,
     required_bytes: usize,
@@ -358,9 +359,6 @@ pub fn prepare_pt1x_output_pda<'a>(
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        let (_, bump) = pt1x_output_address(program, binding);
-        let space =
-            u64::try_from(allocation_bytes).map_err(|_| ProgramError::AccountDataTooSmall)?;
         if output.lamports() == 0 {
             create_derived_account(
                 program,
@@ -404,10 +402,11 @@ pub fn prepare_pt1x_output_pda<'a>(
         } else {
             OUTPUT_MAGIC.as_slice()
         };
-        expect_derived(
+        expect_derived_with_bump(
             output,
             program,
             &[binding],
+            bump,
             AccountKind::exact(magic, required_bytes),
             RoleFlags {
                 writable: true,
@@ -439,6 +438,7 @@ pub fn reserve_pt1x_output_pda<'a>(
     system: &AccountInfo<'a>,
     payer: &AccountInfo<'a>,
     binding: &[u8; 32],
+    bump: u8,
     required_bytes: usize,
 ) -> ProgramResult {
     if !cfg!(feature = "revision-8")
@@ -453,7 +453,9 @@ pub fn reserve_pt1x_output_pda<'a>(
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    let (expected, bump) = pt1x_output_address(program, binding);
+    let bump_seed = [bump];
+    let expected = Pubkey::create_program_address(&[binding, &bump_seed], program)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
     if output.key != &expected {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -500,10 +502,10 @@ pub fn reserve_pt1x_output_pda<'a>(
                 OUTPUT_MAGIC.as_slice()
             }
         };
-        expect_derived(
+        expect_keyed(
             output,
             program,
-            &[binding],
+            &expected,
             AccountKind::variable(magic, 4, required_bytes),
             RoleFlags {
                 writable: true,
@@ -512,9 +514,6 @@ pub fn reserve_pt1x_output_pda<'a>(
         )?;
     }
     let rent = Rent::get()?.minimum_balance(next);
-    let space = u64::try_from(next).map_err(|_| ProgramError::AccountDataTooSmall)?;
-    let bump_seed = [bump];
-    let signer_seeds: &[&[u8]] = &[binding, &bump_seed];
     if output.owner == &system_program::ID {
         if output.lamports() == 0 {
             create_derived_account(program, payer, output, system, &[binding], bump, next, next)?;
@@ -544,6 +543,7 @@ pub fn close_pt1x_output_reservation<'a>(
     output: &AccountInfo<'a>,
     payer: &AccountInfo<'a>,
     binding: &[u8; 32],
+    bump: u8,
     required_bytes: usize,
 ) -> ProgramResult {
     if output.owner != program
@@ -555,7 +555,9 @@ pub fn close_pt1x_output_reservation<'a>(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    let (expected, _) = pt1x_output_address(program, binding);
+    let bump_seed = [bump];
+    let expected = Pubkey::create_program_address(&[binding, &bump_seed], program)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
     if output.key != &expected {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -570,10 +572,12 @@ pub fn close_pt1x_output_reservation<'a>(
 
 /// Retained only for the legacy tag-98 handler, which revision 8 refuses at
 /// dispatch. Revision-8 tag 146 uses `prepare_pt1x_output_pda`.
-pub(crate) fn prepare_pt1x_output<'a>(
+pub fn prepare_pt1x_output<'a>(
     program: &Pubkey,
     output: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
+    binding: &[u8; 32],
+    bump: u8,
     count: u32,
     stream_bytes: usize,
     required_bytes: usize,
@@ -598,13 +602,42 @@ pub(crate) fn prepare_pt1x_output<'a>(
     if required_bytes < metadata_end || output.data_len() < required_bytes {
         return Err(ProgramError::AccountDataTooSmall);
     }
+    let bump_seed = [bump];
+    let expected = Pubkey::create_program_address(&[binding, &bump_seed], program)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if output.key != &expected {
+        return Err(ProgramError::InvalidAccountData);
+    }
     if validated_fresh {
+        if !output.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        expect_system_account_shape(
+            output,
+            RoleFlags {
+                writable: true,
+                signer: true,
+            },
+            true,
+        )?;
         invoke(
             &system_instruction::assign(output.key, program),
             &[output.clone(), system.clone()],
         )?;
-    } else if u32_at(&output.try_borrow_data()?, 12)? as usize != stream_bytes {
-        return Err(ProgramError::InvalidAccountData);
+    } else {
+        if u32_at(&output.try_borrow_data()?, 12)? as usize != stream_bytes {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        expect_keyed(
+            output,
+            program,
+            &expected,
+            AccountKind::variable(OUTPUT_MAGIC, required_bytes, 10 * 1024 * 1024),
+            RoleFlags {
+                writable: true,
+                signer: false,
+            },
+        )?;
     }
     let mut raw = output.try_borrow_mut_data()?;
     let trailer = raw
@@ -1343,9 +1376,9 @@ pub fn instantiate(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
             accounts[3].key,
         ];
         let binding = pt1x_output_binding(program, &keys, position, start, count);
-        let fresh =
+        let (fresh, bump) =
             validate_pt1x_output_binding(program, output, &accounts[5], &binding, position, start)?;
-        Some((binding, fresh))
+        Some((binding, fresh, bump))
     } else {
         None
     };
@@ -1362,7 +1395,7 @@ pub fn instantiate(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
             .checked_add(14 + row.len() - 6 + 40 * entry.route_count() as usize)
             .ok_or(ProgramError::AccountDataTooSmall)?;
     }
-    if let Some((_, fresh)) = output_binding {
+    if let Some((binding, fresh, bump)) = output_binding {
         let keys = [
             accounts[0].key,
             accounts[1].key,
@@ -1375,6 +1408,8 @@ pub fn instantiate(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
             program,
             output,
             &accounts[5],
+            &binding,
+            bump,
             count,
             stream_bytes,
             PT1X_OUTPUT_HEADER_BYTES
@@ -1438,7 +1473,7 @@ pub fn instantiate(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
         12,
         (at - if pt1x { PT1X_OUTPUT_HEADER_BYTES } else { 16 }) as u32,
     );
-    if let Some((binding, _)) = output_binding {
+    if let Some((binding, _, _)) = output_binding {
         out[16..48].copy_from_slice(&binding);
     }
     Ok(())

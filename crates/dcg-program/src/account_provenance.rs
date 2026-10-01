@@ -132,6 +132,37 @@ pub fn expect_derived(
     Ok(bump)
 }
 
+/// Check a PDA with a bump obtained from a trusted canonical derivation. This
+/// performs one address derivation and deliberately does not search for the
+/// canonical bump again. Use when the bump is stored by an existing creator or
+/// was just obtained by the caller's canonical PDA validation, and the caller
+/// has validated the independent seed source.
+pub fn expect_derived_with_bump(
+    account: &AccountInfo,
+    program: &Pubkey,
+    seeds: &[&[u8]],
+    bump: u8,
+    kind: AccountKind,
+    role: RoleFlags,
+) -> ProgramResult {
+    let bump_seed = [bump];
+    let mut derived_seeds = seeds.to_vec();
+    derived_seeds.push(&bump_seed);
+    let expected = Pubkey::create_program_address(&derived_seeds, program)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    expect_keyed(account, program, &expected, kind, role)?;
+    if kind.bump_offset.is_some_and(|offset| {
+        account
+            .try_borrow_data()
+            .ok()
+            .and_then(|data| data.get(offset).copied())
+            != Some(bump)
+    }) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 /// Check a fresh System-owned PDA before the program creates or assigns it.
 /// Pre-funded empty PDAs are accepted when `allow_prefunded` is true.
 pub fn expect_system_derived(
@@ -143,9 +174,21 @@ pub fn expect_system_derived(
     allow_prefunded: bool,
 ) -> Result<u8, ProgramError> {
     let (expected, bump) = Pubkey::find_program_address(seeds, program);
-    if account.key != &expected
-        || expected_bump.is_some_and(|given| given != bump)
-        || account.owner != &system_program::id()
+    if account.key != &expected || expected_bump.is_some_and(|given| given != bump) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    expect_system_account_shape(account, role, allow_prefunded)?;
+    Ok(bump)
+}
+
+/// Validate a target's System-owned empty-account shape after the caller has
+/// checked its exact expected PDA address.
+pub fn expect_system_account_shape(
+    account: &AccountInfo,
+    role: RoleFlags,
+    allow_prefunded: bool,
+) -> ProgramResult {
+    if account.owner != &system_program::id()
         || account.executable
         || account.is_writable != role.writable
         || account.is_signer != role.signer
@@ -154,7 +197,7 @@ pub fn expect_system_derived(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    Ok(bump)
+    Ok(())
 }
 
 /// Create a fresh account at the canonical address for `seeds`.
@@ -172,9 +215,12 @@ pub fn create_derived_account<'a>(
     data_len: usize,
     rent_size: usize,
 ) -> ProgramResult {
-    let (expected, bump) = Pubkey::find_program_address(seeds, program);
+    let bump_seed = [expected_bump];
+    let mut derived_seeds = seeds.to_vec();
+    derived_seeds.push(&bump_seed);
+    let expected = Pubkey::create_program_address(&derived_seeds, program)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
     if target.key != &expected
-        || expected_bump != bump
         || !target.is_writable
         || target.is_signer
         || target.executable
@@ -192,7 +238,6 @@ pub fn create_derived_account<'a>(
         return Err(ProgramError::InvalidAccountData);
     }
     let lamports = Rent::get()?.minimum_balance(rent_size);
-    let bump_seed = [bump];
     let mut signer_seeds = seeds.to_vec();
     signer_seeds.push(&bump_seed);
     invoke_signed(
@@ -221,9 +266,12 @@ pub fn allocate_derived_account<'a>(
     data_len: usize,
     rent_size: usize,
 ) -> ProgramResult {
-    let (expected, bump) = Pubkey::find_program_address(seeds, program);
+    let bump_seed = [expected_bump];
+    let mut derived_seeds = seeds.to_vec();
+    derived_seeds.push(&bump_seed);
+    let expected = Pubkey::create_program_address(&derived_seeds, program)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
     if target.key != &expected
-        || expected_bump != bump
         || !target.is_writable
         || target.is_signer
         || target.executable
@@ -246,7 +294,6 @@ pub fn allocate_derived_account<'a>(
             &[payer.clone(), target.clone(), system.clone()],
         )?;
     }
-    let bump_seed = [bump];
     let mut signer_seeds = seeds.to_vec();
     signer_seeds.push(&bump_seed);
     invoke_signed(

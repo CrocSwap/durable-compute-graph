@@ -17,7 +17,7 @@ use super::{
     no, u16_at, u32_at, EPOCH, REGISTRY_ACCOUNT, REGISTRY_EPOCH, REGISTRY_ROOT, REGISTRY_STATE,
     ROW_CAPABILITY, ROW_MALFORMED,
 };
-use crate::account_provenance::allocate_derived_account;
+use crate::account_provenance::{allocate_derived_account, expect_derived, AccountKind, RoleFlags};
 use crate::envelope_seal::{self as esl, RESPOND_GENERIC, WITNESS_TENSORS};
 use crate::hash;
 use solana_program::{
@@ -309,8 +309,21 @@ pub fn view(program: &Pubkey, account: &AccountInfo) -> Result<View, ProgramErro
     }
     let registry_id = u32_at(&raw, 12, REGISTRY_ACCOUNT)?;
     let row_count = u32_at(&raw, 16, REGISTRY_ACCOUNT)?;
-    if *account.key != super::address::registry(program, registry_id).0
-        || raw.len() != HEADER + row_count as usize * ROW_BYTES
+    let epoch = EPOCH.to_le_bytes();
+    let id = registry_id.to_le_bytes();
+    expect_derived(
+        account,
+        program,
+        &[super::address::REGISTRY_SEED, &epoch, &id],
+        AccountKind::variable(b"DRP2", HEADER, HEADER + MAX_ROWS as usize * ROW_BYTES)
+            .with_version(4, REGISTRY_VERSION),
+        RoleFlags {
+            writable: false,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(REGISTRY_ACCOUNT))?;
+    if raw.len() != HEADER + row_count as usize * ROW_BYTES
         || raw[184..192] != [0; 8]
         || u16_at(&raw, 6, REGISTRY_ACCOUNT)? & !1 != 0
     {

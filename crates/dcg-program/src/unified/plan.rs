@@ -6,10 +6,14 @@
 //! Every refusal here is 785 (`PLAN_BINDING`).
 
 use super::{no, u16_at, u32_at, PLAN_BINDING};
+use crate::account_provenance::{expect_keyed, AccountKind, RoleFlags};
 use crate::pt1_onchain;
 use crate::pt2p::{self, Pt2p};
 use crate::pt2p_onchain as S;
-use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
+use solana_program::{
+    account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
+    pubkey::Pubkey,
+};
 
 /// A sealed PT2S with its base routes and geometry (and, when given, base
 /// payloads) bound by key and length. Returns the PWR1 byte range.
@@ -31,19 +35,29 @@ pub fn bind_pt2s(
     {
         return Err(no(PLAN_BINDING));
     }
-    let bound = |kind: usize, a: &AccountInfo| -> Result<bool, ProgramError> {
-        Ok(
-            a.key.as_ref() == &s[S::OFF_KEYS + 32 * kind..S::OFF_KEYS + 32 * (kind + 1)]
-                && a.data_len() == u32_at(&s, S::OFF_LENGTHS + 4 * kind, PLAN_BINDING)? as usize,
+    let bound = |kind: usize, a: &AccountInfo| -> ProgramResult {
+        let expected = Pubkey::new_from_array(
+            s[S::OFF_KEYS + 32 * kind..S::OFF_KEYS + 32 * (kind + 1)]
+                .try_into()
+                .expect("fixed width"),
+        );
+        let len = u32_at(&s, S::OFF_LENGTHS + 4 * kind, PLAN_BINDING)? as usize;
+        expect_keyed(
+            a,
+            program,
+            &expected,
+            AccountKind::exact(b"", len),
+            RoleFlags {
+                writable: false,
+                signer: false,
+            },
         )
+        .map_err(|_| no(PLAN_BINDING))
     };
-    if !bound(0, routes)? || !bound(1, geometry)? {
-        return Err(no(PLAN_BINDING));
-    }
+    bound(0, routes)?;
+    bound(1, geometry)?;
     if let Some(p) = payloads {
-        if p.owner != program || !bound(2, p)? {
-            return Err(no(PLAN_BINDING));
-        }
+        bound(2, p)?;
     }
     Ok(S::OFF_PWR1..s.len())
 }
@@ -65,9 +79,24 @@ pub fn bind_pt1s(
     {
         return Err(no(PLAN_BINDING));
     }
+    let expected_pt1s = Pubkey::new_from_array(
+        s[S::OFF_PT1S..S::OFF_PT1S + 32]
+            .try_into()
+            .expect("fixed width"),
+    );
+    expect_keyed(
+        pt1s,
+        program,
+        &expected_pt1s,
+        AccountKind::variable(b"", 4, 10 * 1024 * 1024),
+        RoleFlags {
+            writable: false,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(PLAN_BINDING))?;
     let p = pt1s.try_borrow_data()?;
     if pt1s.owner != program
-        || pt1s.key.as_ref() != &s[S::OFF_PT1S..S::OFF_PT1S + 32]
         || !pt1_onchain::is_sealed_template(&p)
         || p.len() < pt1_onchain::OFF_PAYLOAD_INDEX + 4
     {
