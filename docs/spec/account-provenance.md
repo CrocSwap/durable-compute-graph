@@ -75,6 +75,25 @@ adapters:
   in its list. Revision-7 settlement retains the canonical DRU1 search because
   its records predate these bump fields. The account lists provide no independent challenge identity
   anchor, so the seed source remains self-seeded.
+- **Generic dispute tags 120/121/126/128.** The generic revision-8 engine
+  requires a fresh DCR1 record with marker `1` at byte 147, checks its
+  challenge PDA using the stored canonical bump at byte 146, and checks DRU1
+  using the response bump at byte 219. Tag 126 also requires the staged DRU1
+  to have the expected sealed revision and challenge key before clearing it.
+  The pre-extraction Basanos handler used its legacy owner/address helpers on
+  these paths; DCG's stored-bump checks are the intentional provenance seam.
+  The byte offsets and account order are unchanged for the unified DCR1 v5
+  path. DCG's generic engine currently accepts only revision-8 unified DCR1
+  records in RESPOND/PT2P mode; older DCR1 v2/v4 formats accepted by the
+  broader Basanos source remain outside this port and are not covered by the
+  parity result. For tags 120/121/128, DCG maps failures from the explicit
+  stored-bump DCR1/DRU1 provenance gate to 734; source DRU1 identity failures
+  could return 731, and source owner-only DCR1 checks could surface
+  `IncorrectProgramId`. The response reader then performs a legacy canonical
+  PDA check as a second defense; only an impossible-by-normal-creation
+  noncanonical stored response bump can reach that check after the stored-bump
+  gate and return 731. The per-tag audit records this edge separately from
+  the intended 731-to-734 mapping.
 - **DCM2 identity for tag 172.** Its account list contains no independent
   document identity anchor. The close path currently derives the document
   identity from DCM2/DCR2 data or instruction data. A future account list must

@@ -14,6 +14,9 @@ pub mod closure_v2;
 pub(crate) mod closure_v2_accounts;
 #[cfg(feature = "legacy-hclosure-handlers")]
 pub(crate) mod closure_v2_bootstrap;
+/// Shared revision-8 dispute verifier used by the statically selected app
+/// manifest. Application form execution remains behind the app API hooks.
+pub mod closure_v2_generic;
 pub mod closure_v2_response;
 pub(crate) mod closure_v2_tree;
 pub mod commit;
@@ -82,10 +85,15 @@ pub fn process_instruction_with_manifest(
         117 => closure_v2_response::write(program_id, accounts, data),
         118 => closure_v2_response::seal(program_id, accounts, data),
         125 => closure_v2_response::write_at(program_id, accounts, data),
-        // These paths need the application's compiled kernel adapter. The
-        // standalone test image contains only the tiny test kernel; Basanos
-        // retains its historical dispatcher for those profile-specific rows.
-        120..=124 | 126..=129 => Err(ProgramError::InvalidInstructionData),
+        120..=124 | 126..=129 => {
+            let application = app_api::ApplicationProgramManifest::new(manifest, &[]);
+            closure_v2_generic::process_generic_dispute_tag(
+                program_id,
+                accounts,
+                data,
+                &application,
+            )
+        }
         140 => pt1_onchain::init_fresh(program_id, accounts, data),
         141 => pt1_onchain::upload(program_id, accounts, data),
         142 => pt1_onchain::seal(program_id, accounts, data),

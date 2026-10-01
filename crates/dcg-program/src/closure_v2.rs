@@ -19,6 +19,7 @@ pub(crate) use crate::closure_v2_tree::*;
 #[path = "closure_v2_proof.rs"]
 pub mod proof;
 
-#[cfg(feature = "revision-8")]
-#[path = "closure_v2_generic.rs"]
-mod generic_dispute;
+/// Revision-8 application dispute handlers. The shared state machine lives in
+/// the program crate; application form and artifact semantics arrive through
+/// the static app manifest.
+pub use crate::closure_v2_generic::process_generic_dispute_tag;

@@ -816,6 +816,159 @@ pub type ApplicationHandler = for<'accounts, 'info> fn(
     &CheckedApplicationAccounts<'accounts, 'info>,
 ) -> ProgramResult;
 
+/// The application-specific part of generic dispute replay.
+///
+/// DCG owns the DCR1/DRU1 state machine, route and witness parsing, and the
+/// point at which a replay result is compared with committed output. An
+/// application supplies only its form catalog and PT1 implementation. The
+/// input and artifact byte slices have already passed the generic envelope
+/// checks when they reach this hook.
+pub trait ApplicationDisputeHooks: Sync {
+    /// Whether this application defines the selected form for the bound
+    /// machine. This does not execute the form.
+    fn supports_form(&self, machine: u8, form: u16) -> bool;
+
+    /// Replay one application form into the caller-provided output buffer.
+    /// `output_range` is used by forms whose result is verified in bounded
+    /// chunks; `None` requests the whole result.
+    fn replay_pt1(
+        &self,
+        request: ApplicationReplayRequest<'_>,
+        output: &mut [u8],
+    ) -> Result<usize, u32>;
+}
+
+/// Inputs to one application-owned PT1 replay. The generic handler supplies
+/// ordered authenticated read operands and only artifact operands approved by
+/// [`ArtifactWitnessVerifier`].
+pub struct ApplicationReplayRequest<'a> {
+    pub machine: u8,
+    pub form: u16,
+    pub operation: u16,
+    pub payload: &'a [u8],
+    pub reads: &'a [&'a [u8]],
+    pub artifact_operands: &'a [&'a [u8]],
+    pub output_range: Option<(u32, u32)>,
+}
+
+/// Row commitment returned by the application when tag 122 validates a
+/// model descriptor core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactRowAnchor {
+    pub root: [u8; 32],
+    pub leaf_count: u32,
+}
+
+/// Application-owned checks for model-artifact witness bytes used by tags
+/// 122, 123, and 127. Implementations must fail closed; DCG never interprets
+/// model tensor names, quantizer rows, or artifact-root domains.
+pub trait ArtifactWitnessVerifier: Sync {
+    /// Return the committed content digest for a form's application-supplied
+    /// read (for example, a fixed lookup table). The generic verifier binds
+    /// this digest to the DGR1 read row and checks witness bytes against it.
+    fn supplied_read_hash(
+        &self,
+        machine: u8,
+        form: u16,
+        region: u16,
+        byte_length: u32,
+    ) -> Result<[u8; 32], u32>;
+
+    /// Authenticate the staged descriptor core against the document's model
+    /// root and return its committed row anchor (tag 122).
+    fn verify_descriptor_row_anchor(
+        &self,
+        descriptor_core: &[u8],
+        model_root: &[u8; 32],
+    ) -> Result<ArtifactRowAnchor, u32>;
+
+    /// Authenticate the named row range within that descriptor anchor
+    /// (tag 123).
+    fn verify_weight_rows(
+        &self,
+        witness: &[u8],
+        anchor: ArtifactRowAnchor,
+        tensor_name: &[u8],
+        first_row: u32,
+        row_count: u16,
+        width: u32,
+    ) -> Result<(), u32>;
+
+    /// Authenticate a tag-127 artifact block for the selected application
+    /// form and operation against the document model root.
+    fn verify_artifact_block(
+        &self,
+        form: u16,
+        operation: u16,
+        position: u32,
+        witness: &[u8],
+        descriptor_core: &[u8],
+        model_root: &[u8; 32],
+    ) -> Result<(), u32>;
+}
+
+struct RejectDisputeHooks;
+
+impl ApplicationDisputeHooks for RejectDisputeHooks {
+    fn supports_form(&self, _machine: u8, _form: u16) -> bool {
+        false
+    }
+
+    fn replay_pt1(
+        &self,
+        _request: ApplicationReplayRequest<'_>,
+        _output: &mut [u8],
+    ) -> Result<usize, u32> {
+        Err(734)
+    }
+}
+
+impl ArtifactWitnessVerifier for RejectDisputeHooks {
+    fn supplied_read_hash(
+        &self,
+        _machine: u8,
+        _form: u16,
+        _region: u16,
+        _byte_length: u32,
+    ) -> Result<[u8; 32], u32> {
+        Err(734)
+    }
+
+    fn verify_descriptor_row_anchor(
+        &self,
+        _descriptor_core: &[u8],
+        _model_root: &[u8; 32],
+    ) -> Result<ArtifactRowAnchor, u32> {
+        Err(734)
+    }
+
+    fn verify_weight_rows(
+        &self,
+        _witness: &[u8],
+        _anchor: ArtifactRowAnchor,
+        _tensor_name: &[u8],
+        _first_row: u32,
+        _row_count: u16,
+        _width: u32,
+    ) -> Result<(), u32> {
+        Err(734)
+    }
+
+    fn verify_artifact_block(
+        &self,
+        _form: u16,
+        _operation: u16,
+        _position: u32,
+        _witness: &[u8],
+        _descriptor_core: &[u8],
+        _model_root: &[u8; 32],
+    ) -> Result<(), u32> {
+        Err(734)
+    }
+}
+
+static REJECT_DISPUTE_HOOKS: RejectDisputeHooks = RejectDisputeHooks;
+
 /// One statically linked application instruction and its semantic identity.
 #[derive(Clone, Copy)]
 pub struct ApplicationInstruction {
@@ -998,6 +1151,8 @@ fn encode_application_account_rule(rule: &ApplicationAccountRule) -> Vec<u8> {
 pub struct ApplicationProgramManifest {
     application: &'static ApplicationManifest,
     instructions: &'static [ApplicationInstruction],
+    dispute_hooks: &'static dyn ApplicationDisputeHooks,
+    artifact_witness_verifier: &'static dyn ArtifactWitnessVerifier,
 }
 
 impl ApplicationProgramManifest {
@@ -1008,6 +1163,23 @@ impl ApplicationProgramManifest {
     pub const fn new<const N: usize>(
         application: &'static ApplicationManifest,
         instructions: &'static [ApplicationInstruction; N],
+    ) -> Self {
+        Self::new_with_dispute_hooks(
+            application,
+            instructions,
+            &REJECT_DISPUTE_HOOKS,
+            &REJECT_DISPUTE_HOOKS,
+        )
+    }
+
+    /// Construct a manifest with the application's generic dispute and
+    /// artifact-witness adapters. The handler table retains its compile-time
+    /// tag checks and canonical order.
+    pub const fn new_with_dispute_hooks<const N: usize>(
+        application: &'static ApplicationManifest,
+        instructions: &'static [ApplicationInstruction; N],
+        dispute_hooks: &'static dyn ApplicationDisputeHooks,
+        artifact_witness_verifier: &'static dyn ArtifactWitnessVerifier,
     ) -> Self {
         let mut tags = [0u8; N];
         let mut i = 0usize;
@@ -1020,6 +1192,8 @@ impl ApplicationProgramManifest {
         Self {
             application,
             instructions,
+            dispute_hooks,
+            artifact_witness_verifier,
         }
     }
 
@@ -1031,6 +1205,18 @@ impl ApplicationProgramManifest {
     /// The canonical ascending static instruction table.
     pub const fn instructions(&self) -> &'static [ApplicationInstruction] {
         self.instructions
+    }
+
+    /// Application-owned form/replay adapter used by generic dispute tags.
+    pub const fn dispute_hooks(&self) -> &'static dyn ApplicationDisputeHooks {
+        self.dispute_hooks
+    }
+
+    /// Application-owned model-artifact verifier used by generic dispute
+    /// tags. Tags that need this hook remain refused until their engine path
+    /// is enabled.
+    pub const fn artifact_witness_verifier(&self) -> &'static dyn ArtifactWitnessVerifier {
+        self.artifact_witness_verifier
     }
 
     /// Versioned identity for the assembled application program contract.
@@ -1085,6 +1271,14 @@ pub fn process_instruction_with_application(
         return Err(ProgramError::InvalidInstructionData);
     };
 
+    // The application table supplies form/kernel/artifact hooks, while DCG
+    // owns these shared dispute transitions. Keep tag 125 on the core path.
+    if matches!(tag, 120..=124 | 126..=129) {
+        return crate::closure_v2_generic::process_generic_dispute_tag(
+            program_id, accounts, data, manifest,
+        );
+    }
+
     if is_core_instruction_tag_revision_8(tag) {
         return process_instruction_with_manifest(
             program_id,
@@ -1133,7 +1327,7 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use syn::{Expr, Lit, Pat};
 
-    const APP_TAG: u8 = 120;
+    const APP_TAG: u8 = 201;
     const PREFLIGHT_MARK: usize = 1;
     const HANDLER_MARK: usize = 2;
     static ORDER: AtomicUsize = AtomicUsize::new(0);
@@ -1318,6 +1512,9 @@ mod tests {
             .expect("core dispatcher exists");
         let mut found = DispatchMatch(Vec::new());
         syn::visit::Visit::visit_block(&mut found, &function.block);
+        // The dispute family has its own app-hook route and is intentionally
+        // omitted from CORE_INSTRUCTION_TAGS_REVISION_8.
+        found.0.retain(|tag| !matches!(*tag, 120..=124 | 126..=129));
         found.0.sort_unstable();
         found.0.dedup();
         found.0
@@ -1384,7 +1581,7 @@ mod tests {
     #[test]
     fn unknown_application_tag_is_refused() {
         let result =
-            process_instruction_with_application(&Pubkey::new_unique(), &[], &[121], app_program());
+            process_instruction_with_application(&Pubkey::new_unique(), &[], &[202], app_program());
         assert_eq!(result, Err(ProgramError::InvalidInstructionData));
     }
 
@@ -1396,6 +1593,8 @@ mod tests {
         static FORGED: ApplicationProgramManifest = ApplicationProgramManifest {
             application: &TEST_APPLICATION,
             instructions: &SHADOW_INSTRUCTIONS,
+            dispute_hooks: &REJECT_DISPUTE_HOOKS,
+            artifact_witness_verifier: &REJECT_DISPUTE_HOOKS,
         };
         let program_id = Pubkey::new_unique();
         let data = [125];
@@ -1605,6 +1804,8 @@ mod tests {
             ApplicationProgramManifest {
                 application: &TEST_APPLICATION,
                 instructions: &PROGRAM_KEY_INSTRUCTIONS,
+                dispute_hooks: &REJECT_DISPUTE_HOOKS,
+                artifact_witness_verifier: &REJECT_DISPUTE_HOOKS,
             };
 
         let program_id = Pubkey::new_unique();

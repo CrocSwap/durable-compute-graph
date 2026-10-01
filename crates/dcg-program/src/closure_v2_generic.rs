@@ -8,7 +8,8 @@
 
 use crate::{
     account_provenance::{expect_derived_with_bump, AccountKind, RoleFlags},
-    closure_v2_response,
+    closure_v2_response, position_template as pt,
+    pt2p::{self, Pt2p},
     unified::{address, challenge, document},
 };
 use solana_program::{
@@ -20,11 +21,26 @@ const MALFORMED: u32 = 730;
 const STATE: u32 = 733;
 const PROOF: u32 = 734;
 const DEADLINE: u32 = 736;
+const ROUTE: u32 = 738;
 const ROW_BYTES: usize = 120;
 const MAX_READS: usize = 128;
 const OUTPUT_AT: usize = 1024;
 const OUTPUT_BYTES: usize = 2048;
 const RESPONSE_BYTES: usize = 128 + closure_v2_response::MAX_BODY;
+const INPUT: &[u8] = b"basanos/dcg-hclosure-input/2";
+const READ_BYTES: &[u8] = b"basanos/dcg-hclosure-read-bytes/2";
+const LEAF_DOMAIN: &[u8] = b"basanos/dcg-hclosure-leaf/2";
+const DCM2_OPTION_ROUTE_REFERENCE: &[u8] = b"basanos/dcg-dcm2-option-table-route/1";
+const BASE: usize = 27;
+const WRITE_ROW: usize = 48;
+const MAX_PAYLOAD: usize = 66;
+const MAX_OUTPUT: usize = 2_048;
+const FORM48_READS: usize = 128;
+const PROMPT_AT: usize = 328;
+const SYNTHETIC_LEAF_FORM: u16 = 0x0100;
+const INCOMPLETE: u32 = 741;
+const PT2S_AT: usize = 448;
+const PT2S_END: usize = 480;
 pub const TAG_VERIFY_TARGET: u8 = 120;
 pub const TAG_VERIFY_READS: u8 = 121;
 pub const TAG_WEIGHTS_ANCHOR: u8 = 122;
@@ -47,6 +63,14 @@ fn u16_at(raw: &[u8], at: usize) -> Result<u16, ProgramError> {
             .try_into()
             .map_err(|_| no(MALFORMED))?,
     ))
+}
+
+fn u16_put(raw: &mut [u8], at: usize, value: u16) {
+    raw[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn u32_put(raw: &mut [u8], at: usize, value: u32) {
+    raw[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 fn u32_at(raw: &[u8], at: usize) -> Result<u32, ProgramError> {
@@ -161,6 +185,1523 @@ fn document(program: &Pubkey, account: &AccountInfo, state: &[u8]) -> ProgramRes
         return Err(no(PROOF));
     }
     Ok(())
+}
+
+/// One instantiated entry from the sealed PT2P plan, optionally resolved
+/// against the immutable DCM2 option table for forms 47 and 48.
+enum Target<'a> {
+    Pt2p(&'a Pt2p<'a>, pt2p::Entry),
+    Resolved {
+        form: u16,
+        reads: u16,
+        writes: u16,
+        routes: Vec<pt::InstantiatedRoute>,
+    },
+}
+
+impl Target<'_> {
+    fn route(&self, ordinal: u16) -> Result<pt::InstantiatedRoute, ProgramError> {
+        match self {
+            Self::Pt2p(x, entry) => x.route(entry, ordinal).map_err(no),
+            Self::Resolved { routes, .. } => {
+                routes.get(usize::from(ordinal)).copied().ok_or(no(ROUTE))
+            }
+        }
+    }
+
+    fn counts(&self) -> (u16, u16, u16) {
+        match self {
+            Self::Pt2p(_, e) => (e.kernel_index, e.read_count, e.write_count),
+            Self::Resolved {
+                form,
+                reads,
+                writes,
+                ..
+            } => (*form, *reads, *writes),
+        }
+    }
+}
+
+fn dcm2_option_route_reference(region: u16, length: u32, table_hash: &[u8; 32]) -> [u8; 32] {
+    crate::hash::sha256(&[
+        DCM2_OPTION_ROUTE_REFERENCE,
+        &region.to_le_bytes(),
+        &length.to_le_bytes(),
+        table_hash,
+    ])
+}
+
+fn dcm2_option_binding(
+    doc: &[u8],
+) -> Result<(usize, core::ops::Range<usize>, [u8; 32]), ProgramError> {
+    use crate::unified::document as d;
+    let count = usize::from(*doc.get(d::BINDING_AT_V8 + 151).ok_or(no(PROOF))?);
+    let end = d::OPTION_REGION_AT
+        .checked_add(count.checked_mul(4).ok_or(no(PROOF))?)
+        .ok_or(no(PROOF))?;
+    if doc.len() < d::OPTION_REGION_AT
+        || &doc[..4] != b"DCM2"
+        || u16_at(doc, 4)? != 7
+        || count == 0
+        || count > crate::kernels::decision::MAX_OPTIONS_SINGLE
+        || doc.len() != end
+    {
+        return Err(no(PROOF));
+    }
+    let table_hash: [u8; 32] = doc
+        .get(d::BINDING_AT_V8 + 164..d::BINDING_AT_V8 + 196)
+        .ok_or(no(PROOF))?
+        .try_into()
+        .map_err(|_| no(PROOF))?;
+    let table = d::OPTION_REGION_AT..end;
+    if crate::hash::sha256(&[doc.get(table.clone()).ok_or(no(PROOF))?]) != table_hash {
+        return Err(no(PROOF));
+    }
+    Ok((count, table, table_hash))
+}
+
+fn document_selected_gather_target(
+    x: &Pt2p<'_>,
+    entry: pt2p::Entry,
+    doc: &[u8],
+    routes: &[u8],
+    payload_override: Option<&[u8]>,
+) -> Result<Target<'static>, ProgramError> {
+    use crate::kernels::decision;
+    if entry.kernel_index != decision::GATHER_FORM_ID || entry.write_count != 1 {
+        return Err(no(ROUTE));
+    }
+    let pt2p::Item::Base(old) = entry.item else {
+        return Err(no(ROUTE));
+    };
+    let template = pt::entry_at(routes, old).map_err(no)?;
+    let (option_count, table_range, _) = dcm2_option_binding(doc)?;
+    let table = doc.get(table_range).ok_or(no(PROOF))?;
+    let mut payload = [0u8; 16];
+    if let Some(bytes) = payload_override {
+        if bytes.len() != payload.len() {
+            return Err(no(ROUTE));
+        }
+        payload.copy_from_slice(bytes);
+    } else {
+        x.payload(&entry, false, &mut payload).map_err(no)?;
+    }
+    if u16_at(&payload, 0)? != 1 || u16_at(&payload, 6)? != 0 || payload[8..16] != [0; 8] {
+        return Err(no(ROUTE));
+    }
+    let first = usize::from(u16_at(&payload, 2)?);
+    let capacity = usize::from(u16_at(&payload, 4)?);
+    if (first, capacity) != (0, 128) || usize::from(template.read_count) != capacity {
+        return Err(no(ROUTE));
+    }
+    let live = option_count.saturating_sub(first).min(capacity);
+    let (_, _, pxr) = pt::route_header_v4_shallow(routes).map_err(no)?;
+    let pxr = pxr.ok_or(no(ROUTE))?;
+    let mut resolved = Vec::with_capacity(live + 1);
+    for local in 0..live {
+        let global = first + local;
+        let token = u32::from_le_bytes(
+            table[global * 4..global * 4 + 4]
+                .try_into()
+                .map_err(|_| no(PROOF))?,
+        );
+        let (row, _) = pxr.find(token).map_err(no)?;
+        let producer_index = x
+            .old_to_new(row.producer_entry, entry.position)
+            .map_err(no)?
+            .ok_or(no(pt::PT2_PRODUCER))?;
+        if producer_index >= entry.index
+            || row.producer_write_ordinal as u32
+                >= x.entry(entry.position, producer_index)
+                    .map_err(no)?
+                    .write_count as u32
+        {
+            return Err(no(pt::PT2_PRODUCER));
+        }
+        let producer = x.entry(entry.position, producer_index).map_err(no)?;
+        if row.producer_write_ordinal >= 255 {
+            return Err(no(pt::PT2_PRODUCER));
+        }
+        let write = x
+            .route(&producer, producer.read_count + row.producer_write_ordinal)
+            .map_err(no)?;
+        if write.direction != 1
+            || write.region_id != pxr.region_id
+            || write.effective_offset != row.region_offset
+            || write.byte_length != row.byte_length
+            || write.producer_position != entry.position
+            || write.producer_entry != producer_index
+            || write.producer_write_ordinal != row.producer_write_ordinal as u8
+        {
+            return Err(no(pt::PT2_PRODUCER));
+        }
+        let placeholder = x.route(&entry, local as u16).map_err(no)?;
+        resolved.push(pt::InstantiatedRoute {
+            direction: 0,
+            ordinal: local as u16,
+            region_id: pxr.region_id,
+            effective_offset: write.effective_offset,
+            byte_length: write.byte_length,
+            read_class: 0,
+            binding_kind: 1,
+            source_supplied: false,
+            initial_content: false,
+            producer_position: entry.position,
+            producer_entry: producer_index,
+            producer_write_ordinal: row.producer_write_ordinal as u8,
+            range_first: 0,
+            range_end: 0,
+            family_ordinal: 0,
+            template_offset: placeholder.template_offset,
+        });
+    }
+    let mut output = x.route(&entry, template.read_count).map_err(no)?;
+    output.ordinal = 0;
+    resolved.push(output);
+    Ok(Target::Resolved {
+        form: entry.kernel_index,
+        reads: live as u16,
+        writes: 1,
+        routes: resolved,
+    })
+}
+
+fn document_selected_form47_target(
+    x: &Pt2p<'_>,
+    entry: pt2p::Entry,
+    doc: &[u8],
+    routes: &[u8],
+) -> Result<Target<'static>, ProgramError> {
+    use crate::kernels::decision;
+    if entry.kernel_index != decision::FORM_ID || entry.read_count != 2 || entry.write_count != 256
+    {
+        return Err(no(ROUTE));
+    }
+    let pt2p::Item::Base(old) = entry.item else {
+        return Err(no(ROUTE));
+    };
+    let template = pt::entry_at(routes, old).map_err(no)?;
+    if template.read_count != 2 || template.write_count != 256 {
+        return Err(no(ROUTE));
+    }
+    let (option_count, _, _) = dcm2_option_binding(doc)?;
+    let (_, _, pxr) = pt::route_header_v4_shallow(routes).map_err(no)?;
+    if pxr.is_none() {
+        return Err(no(PROOF));
+    }
+    let mut resolved = Vec::with_capacity(2 + 256);
+    let mut option_seen = false;
+    let mut gather_seen = false;
+    for ordinal in 0..entry.read_count {
+        let mut route = x.route(&entry, ordinal).map_err(no)?;
+        if route.region_id == u16::MAX {
+            if option_seen
+                || route.direction != 0
+                || route.read_class != 2
+                || route.binding_kind != 0
+                || route.source_supplied
+                || route.effective_offset != 0
+                || route.producer_entry != pt::NO_PRODUCER
+            {
+                return Err(no(ROUTE));
+            }
+            route.byte_length = u32::try_from(option_count.checked_mul(4).ok_or(no(PROOF))?)
+                .map_err(|_| no(PROOF))?;
+            option_seen = true;
+        } else {
+            if gather_seen
+                || route.direction != 0
+                || route.read_class != 0
+                || route.binding_kind != 1
+                || route.source_supplied
+                || route.producer_entry == pt::NO_PRODUCER
+                || route.byte_length != 128 * 8
+            {
+                return Err(no(ROUTE));
+            }
+            gather_seen = true;
+        }
+        resolved.push(route);
+    }
+    if !option_seen || !gather_seen {
+        return Err(no(ROUTE));
+    }
+    for ordinal in entry.read_count..entry.read_count + entry.write_count {
+        resolved.push(x.route(&entry, ordinal).map_err(no)?);
+    }
+    Ok(Target::Resolved {
+        form: entry.kernel_index,
+        reads: entry.read_count,
+        writes: entry.write_count,
+        routes: resolved,
+    })
+}
+
+fn document_selected_target(
+    x: &Pt2p<'_>,
+    entry: pt2p::Entry,
+    doc: &[u8],
+    routes: &[u8],
+    payload_override: Option<&[u8]>,
+) -> Result<Target<'static>, ProgramError> {
+    let target = match entry.kernel_index {
+        crate::kernels::decision::GATHER_FORM_ID => {
+            document_selected_gather_target(x, entry, doc, routes, payload_override)?
+        }
+        crate::kernels::decision::FORM_ID => {
+            document_selected_form47_target(x, entry, doc, routes)?
+        }
+        _ => return Err(no(ROUTE)),
+    };
+    let (form, _, writes) = target.counts();
+    let routes = match target {
+        Target::Resolved { routes, .. } => routes,
+        _ => return Err(no(ROUTE)),
+    };
+    let reads = (routes.len() as u16).checked_sub(writes).ok_or(no(ROUTE))?;
+    Ok(Target::Resolved {
+        form,
+        reads,
+        writes,
+        routes,
+    })
+}
+
+fn check_target(
+    state: &[u8],
+    body: &Body<'_>,
+    entry: &Target<'_>,
+    coordinate: pt::EntryCoordinate,
+    prompt: &[u8; 32],
+    lut: u16,
+    decision_options: Option<(usize, [u8; 32])>,
+    artifact_verifier: &dyn crate::app_api::ArtifactWitnessVerifier,
+    machine: u8,
+) -> ProgramResult {
+    let position = u32_at(state, 156)?;
+    let descriptor: [u8; 32] = state[72..104].try_into().map_err(|_| no(PROOF))?;
+    let target = body.target;
+    let (tp, ts, tl, kernel, reads, writes) =
+        crate::closure_v2::proof::preimage_fields(target, &descriptor)?;
+    let (form, read_count, write_count) = entry.counts();
+    if (form != SYNTHETIC_LEAF_FORM && crate::hash::sha256(&[target]) != state[104..136])
+        || tp != position
+        || ts != u16_at(state, 160)?
+        || tl != u32_at(state, 136)?
+        || ts != coordinate.segment
+        || tl != coordinate.local
+        || u16_at(target, BASE + 42)? != coordinate.operation_ordinal
+        || kernel != form
+        || form != u16_at(state, 174)?
+        || u16_at(target, BASE + 46)? != 2
+        || target[BASE + 50] != 0
+        || target[BASE + 84..BASE + 116] != [0; 32]
+        || reads != read_count
+        || usize::from(reads) != body.read_count
+        || writes.len() != usize::from(write_count) * WRITE_ROW
+    {
+        return Err(no(PROOF));
+    }
+    let read_count_bytes = reads.to_le_bytes();
+    let root = crate::hash::sha256(&[
+        INPUT,
+        &descriptor,
+        &target[BASE + 32..BASE + 42],
+        &target[BASE + 44..BASE + 46],
+        &read_count_bytes,
+        body.rows,
+    ]);
+    if root != target[BASE + 52..BASE + 84] {
+        return Err(no(PROOF));
+    }
+    for i in 0..body.read_count {
+        let route = entry.route(i as u16)?;
+        let row = body.row(i)?;
+        let prompt_ok =
+            route.source_supplied && route.binding_kind == 0 && row[56..88] == prompt[..];
+        let lut_ok = if !route.source_supplied
+            && route.binding_kind == 0
+            && route.region_id == lut
+            && route.effective_offset == 0
+            && route.byte_length == 8_192 * 8
+        {
+            let content_hash = artifact_verifier
+                .supplied_read_hash(machine, form, route.region_id, route.byte_length)
+                .map_err(no)?;
+            row[56..88] == lut_reference(route.region_id, route.byte_length as u64, &content_hash)
+        } else {
+            false
+        };
+        let option_ok = decision_options.is_some_and(|(count, table_hash)| {
+            !route.source_supplied
+                && route.binding_kind == 0
+                && route.read_class == 2
+                && route.effective_offset == 0
+                && route.byte_length as usize == count * 4
+                && row[56..88]
+                    == dcm2_option_route_reference(route.region_id, route.byte_length, &table_hash)
+        });
+        if route.direction != 0
+            || u16_at(row, 0)? != route.region_id
+            || row[2] != route.read_class
+            || row[3] != route.binding_kind
+            || row[4..8] != [0; 4]
+            || row[20..24] != [0; 4]
+            || u64_at(row, 8)? != route.effective_offset
+            || u32_at(row, 16)? != route.byte_length
+            || (route.binding_kind != 2 && row[88..120] != [0; 32])
+            || route.read_class == 1
+            || (route.read_class == 2 && !(prompt_ok || lut_ok || option_ok))
+        {
+            return Err(no(ROUTE));
+        }
+    }
+    let mut output_len = 0usize;
+    for j in 0..usize::from(write_count) {
+        let route = entry.route(read_count + j as u16)?;
+        let write = &writes[j * WRITE_ROW..(j + 1) * WRITE_ROW];
+        if route.direction != 1
+            || u16_at(write, 0)? != route.region_id
+            || write[2..4] != [0; 2]
+            || u32_at(write, 4)? != route.byte_length
+            || u64_at(write, 8)? != route.effective_offset
+        {
+            return Err(no(ROUTE));
+        }
+        output_len = output_len
+            .checked_add(route.byte_length as usize)
+            .ok_or(no(ROUTE))?;
+    }
+    if form == 4 && output_len > MAX_OUTPUT {
+        return Err(no(ROUTE));
+    }
+    Ok(())
+}
+
+fn lut_reference(region: u16, length: u64, content_hash: &[u8; 32]) -> [u8; 32] {
+    crate::hash::sha256(&[
+        b"basanos/dcg-pt2p-draft-supplied-lut/1",
+        &region.to_le_bytes(),
+        &length.to_le_bytes(),
+        content_hash,
+    ])
+}
+
+fn commit_target(
+    state: &mut [u8],
+    reads: u16,
+    writes: u16,
+    operation: u16,
+    response: &Pubkey,
+    routes: &Pubkey,
+    geometry: &Pubkey,
+    payload: &[u8],
+    pt2s: &Pubkey,
+) {
+    state[176] = 1;
+    state[177] = 0;
+    u16_put(state, 178, reads);
+    u16_put(state, 180, writes);
+    u16_put(state, 182, operation);
+    state[184..216].copy_from_slice(response.as_ref());
+    state[216..248].copy_from_slice(routes.as_ref());
+    state[248..280].copy_from_slice(geometry.as_ref());
+    u16_put(state, 280, payload.len() as u16);
+    state[282..282 + MAX_PAYLOAD].fill(0);
+    state[282..282 + payload.len()].copy_from_slice(payload);
+    state[348..356].fill(0);
+    u32_put(state, 392, 0);
+    state[396..406].fill(0);
+    state[448..480].copy_from_slice(pt2s.as_ref());
+}
+
+fn synthetic_leaf(
+    position: u32,
+    descriptor: &[u8; 32],
+    coordinate: pt::EntryCoordinate,
+) -> [u8; 32] {
+    let position = position.to_le_bytes();
+    let segment = coordinate.segment.to_le_bytes();
+    let local = coordinate.local.to_le_bytes();
+    let operation = coordinate.operation_ordinal.to_le_bytes();
+    let form = SYNTHETIC_LEAF_FORM.to_le_bytes();
+    let mode = 2u16.to_le_bytes();
+    let count = 0u16.to_le_bytes();
+    let input = crate::hash::sha256(&[
+        INPUT, descriptor, &position, &segment, &local, &form, &count,
+    ]);
+    let zero = [0u8; 32];
+    let mut preimage = Vec::with_capacity(147);
+    preimage.extend_from_slice(LEAF_DOMAIN);
+    preimage.extend_from_slice(descriptor);
+    preimage.extend_from_slice(&position);
+    preimage.extend_from_slice(&segment);
+    preimage.extend_from_slice(&local);
+    preimage.extend_from_slice(&operation);
+    preimage.extend_from_slice(&form);
+    preimage.extend_from_slice(&mode);
+    preimage.extend_from_slice(&count);
+    preimage.extend_from_slice(&[0, 0]);
+    preimage.extend_from_slice(&input);
+    preimage.extend_from_slice(&zero);
+    preimage.extend_from_slice(&count);
+    preimage.extend_from_slice(&[0, 0]);
+    crate::hash::sha256(&[&preimage])
+}
+
+fn verify_target_unified(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
+    if accounts.len() != 8 {
+        return Err(no(MALFORMED));
+    }
+    live(program, &accounts[0])?;
+    let mut state = accounts[0].try_borrow_mut_data()?;
+    if state[176] != 0 {
+        return Err(no(STATE));
+    }
+    document(program, &accounts[2], &state)?;
+    let doc = accounts[2].try_borrow_data()?;
+    if accounts[3].key.as_ref() != &doc[200..232]
+        || crate::hash::sha256(&[&accounts[3].try_borrow_data()?]) != doc[232..264]
+    {
+        return Err(no(PROOF));
+    }
+    crate::unified::plan::bind_pt2s(
+        program,
+        &accounts[3],
+        &accounts[5],
+        &accounts[6],
+        Some(&accounts[7]),
+    )
+    .map_err(|_| no(PROOF))?;
+    let index_at = crate::unified::plan::bind_pt1s(program, &accounts[3], &accounts[4])
+        .map_err(|_| no(PROOF))?;
+    let s = accounts[3].try_borrow_data()?;
+    let pts = accounts[4].try_borrow_data()?;
+    let routes = accounts[5].try_borrow_data()?;
+    let geometry = accounts[6].try_borrow_data()?;
+    let payloads = accounts[7].try_borrow_data()?;
+    let x = crate::unified::plan::view(&s, &routes, &geometry, &payloads, Some(&pts[index_at..]))
+        .map_err(|_| no(PROOF))?;
+    let index = u32_at(&state, 170)?;
+    let position = u32_at(&state, 156)?;
+    let entry = x.entry(position, index).map_err(no)?;
+    if entry.kernel_index != u16_at(&state, 174)? {
+        return Err(no(PROOF));
+    }
+    let coordinate = x.coordinate(position, index).map_err(no)?;
+    let raw = response(program, &accounts[1], accounts[0].key, &state)?;
+    let body = Body::parse(&raw)?;
+    let target = if matches!(
+        entry.kernel_index,
+        crate::kernels::decision::FORM_ID | crate::kernels::decision::GATHER_FORM_ID
+    ) {
+        document_selected_target(&x, entry, &doc, &routes, None)?
+    } else {
+        Target::Pt2p(&x, entry)
+    };
+    let prompt: [u8; 32] = doc[PROMPT_AT..PROMPT_AT + 32]
+        .try_into()
+        .map_err(|_| no(PROOF))?;
+    let decision_options = if entry.kernel_index == crate::kernels::decision::FORM_ID {
+        let (count, _, table_hash) = dcm2_option_binding(&doc)?;
+        Some((count, table_hash))
+    } else {
+        None
+    };
+    check_target(
+        &state,
+        &body,
+        &target,
+        coordinate,
+        &prompt,
+        x.g.lut_region,
+        decision_options,
+        manifest.artifact_witness_verifier(),
+        state[145],
+    )?;
+    if entry.kernel_index == SYNTHETIC_LEAF_FORM {
+        let descriptor: [u8; 32] = state[72..104].try_into().map_err(|_| no(PROOF))?;
+        if (entry.read_count, entry.write_count) != (0, 0)
+            || crate::hash::sha256(&[body.target])
+                != synthetic_leaf(position, &descriptor, coordinate)
+        {
+            return Err(no(PROOF));
+        }
+    }
+    let n = x.payload_len(&entry).map_err(no)?;
+    if n > MAX_PAYLOAD {
+        return Err(no(PROOF));
+    }
+    let mut patched = [0u8; MAX_PAYLOAD];
+    x.payload(&entry, true, &mut patched[..n]).map_err(no)?;
+    let (_, reads, writes) = target.counts();
+    drop(raw);
+    commit_target(
+        &mut state,
+        reads,
+        writes,
+        coordinate.operation_ordinal,
+        accounts[1].key,
+        accounts[5].key,
+        accounts[6].key,
+        &patched[..n],
+        accounts[3].key,
+    );
+    challenge::respond_event(accounts[0].key, &state, TAG_VERIFY_TARGET, 1, state[4]);
+    Ok(())
+}
+
+fn verify_target(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
+    if data.len() != 1 || accounts.len() != 8 {
+        return Err(no(MALFORMED));
+    }
+    verify_target_unified(program, accounts, manifest)
+}
+
+fn read_bits(state: &[u8]) -> Result<u128, ProgramError> {
+    Ok(u128::from(u64_at(state, 348)?) | (u128::from(u64_at(state, 396)?) << 64))
+}
+
+fn put_read_bits(state: &mut [u8], bits: u128) {
+    state[348..356].copy_from_slice(&(bits as u64).to_le_bytes());
+    state[396..404].copy_from_slice(&((bits >> 64) as u64).to_le_bytes());
+}
+
+fn pinned_tables(
+    program: &Pubkey,
+    state: &[u8],
+    routes: &AccountInfo,
+    geometry: &AccountInfo,
+) -> ProgramResult {
+    if routes.owner != program || geometry.owner != program {
+        return Err(no(PROOF));
+    }
+    if routes.key.as_ref() != &state[216..248] || geometry.key.as_ref() != &state[248..280] {
+        return Err(no(PROOF));
+    }
+    Ok(())
+}
+
+fn producer_route(
+    x: &Pt2p<'_>,
+    consumer_position: u32,
+    consumer_entry: u32,
+    route: pt::InstantiatedRoute,
+    read_row: &[u8],
+    input: &[u8],
+    producer_preimage: &[u8],
+    descriptor: &[u8; 32],
+) -> Result<crate::closure_v2::proof::Coordinate, ProgramError> {
+    if route.direction != 0
+        || route.binding_kind != 1
+        || route.read_class != 0
+        || route.producer_position > consumer_position
+        || (route.producer_position == consumer_position && route.producer_entry >= consumer_entry)
+        || read_row.len() != ROW_BYTES
+        || read_row[2] != 0
+        || read_row[3] != 1
+        || read_row[4..8] != [0; 4]
+        || read_row[20..24] != [0; 4]
+        || read_row[88..120] != [0; 32]
+        || u16_at(read_row, 0)? != route.region_id
+        || u64_at(read_row, 8)? != route.effective_offset
+        || u32_at(read_row, 16)? != route.byte_length
+        || input.len() != route.byte_length as usize
+    {
+        return Err(no(ROUTE));
+    }
+    let q = route.producer_position;
+    let location = x.coordinate(q, route.producer_entry).map_err(no)?;
+    let (position, segment, local, kernel, _, writes) =
+        crate::closure_v2::proof::preimage_fields(producer_preimage, descriptor)?;
+    let producer = x.entry(q, route.producer_entry).map_err(no)?;
+    if u16::from(route.producer_write_ordinal) >= producer.write_count
+        || writes.len() != usize::from(producer.write_count) * WRITE_ROW
+    {
+        return Err(no(ROUTE));
+    }
+    let declared = x
+        .route(
+            &producer,
+            producer.read_count + u16::from(route.producer_write_ordinal),
+        )
+        .map_err(no)?;
+    let write_at = usize::from(route.producer_write_ordinal)
+        .checked_mul(WRITE_ROW)
+        .ok_or(no(ROUTE))?;
+    let write = writes
+        .get(write_at..write_at + WRITE_ROW)
+        .ok_or(no(ROUTE))?;
+    if position != q
+        || segment != location.segment
+        || local != location.local
+        || kernel != producer.kernel_index
+        || u16_at(producer_preimage, BASE + 42)? != location.operation_ordinal
+        || declared.direction != 1
+        || declared.region_id != route.region_id
+        || declared.effective_offset != route.effective_offset
+        || declared.byte_length != route.byte_length
+        || u16_at(write, 0)? != route.region_id
+        || write[2..4] != [0; 2]
+        || u32_at(write, 4)? != route.byte_length
+        || u64_at(write, 8)? != route.effective_offset
+    {
+        return Err(no(ROUTE));
+    }
+    let leaf = crate::hash::sha256(&[producer_preimage]);
+    let coordinate = crate::closure_v2::proof::Coordinate {
+        position,
+        segment,
+        entry: local,
+    };
+    let digest = crate::closure_v2::write_digest(
+        descriptor,
+        crate::closure_v2::Coordinate {
+            position,
+            segment,
+            entry: local,
+        },
+        route.region_id,
+        route.effective_offset,
+        input,
+    )
+    .map_err(|_| no(ROUTE))?;
+    if read_row[24..56] != digest || read_row[56..88] != leaf || write[16..48] != digest {
+        return Err(no(PROOF));
+    }
+    Ok(coordinate)
+}
+
+fn unified_producer(
+    x: &Pt2p<'_>,
+    dpr2: &AccountInfo,
+    descriptor: &[u8; 32],
+    at: crate::closure_v2::proof::Coordinate,
+    leaf: &[u8; 32],
+    siblings: &[u8],
+    c: &mut Cursor<'_>,
+) -> ProgramResult {
+    use crate::unified::challenge as u;
+    let mut ordinal = None;
+    for s in 0..usize::from(x.segment_count) {
+        let (id, entries) = x.segment_row(at.position, s).map_err(no)?;
+        if id == at.segment {
+            ordinal = Some((s as u16, entries));
+        }
+    }
+    let (ordinal, entries) = ordinal.ok_or(no(PROOF))?;
+    if siblings.len() % 32 != 0 {
+        return Err(no(PROOF));
+    }
+    let path: Vec<[u8; 32]> = siblings
+        .chunks_exact(32)
+        .map(|v| v.try_into().expect("32-byte chunk"))
+        .collect();
+    let tree =
+        u::dl_fold(descriptor, 1, at.position, entries, at.entry, leaf, &path).ok_or(no(PROOF))?;
+    let segment_root = crate::closure_v2::hash(
+        b"segment-root/2",
+        &[
+            descriptor,
+            &at.position.to_le_bytes(),
+            &at.segment.to_le_bytes(),
+            &entries.to_le_bytes(),
+            &tree,
+            &[1],
+        ],
+    );
+    let rest = c.data.get(c.at..).ok_or(no(PROOF))?;
+    let (spp1_ordinal, table, path, used) = u::decode_spp1(rest).map_err(|_| no(PROOF))?;
+    c.at += used;
+    if spp1_ordinal != ordinal {
+        return Err(no(PROOF));
+    }
+    let derived = x.segment_table_root(at.position).map_err(no)?;
+    let proven = u::spp1_position_root(
+        descriptor,
+        at.position,
+        x.segment_count,
+        &segment_root,
+        ordinal,
+        &table,
+        &path,
+        &derived,
+    )
+    .map_err(|_| no(PROOF))?;
+    let landed = document::landed_root(dpr2, at.position, PROOF)?;
+    if proven != Some(landed) {
+        return Err(no(PROOF));
+    }
+    Ok(())
+}
+
+fn unified_family<'a>(
+    state: &[u8],
+    dfs2: &'a [u8],
+    ordinal: u16,
+) -> Result<(&'a [u8], [u8; 32]), ProgramError> {
+    use crate::unified::challenge as u;
+    if state[u::FTR_AT] != 1 {
+        return Err(no(INCOMPLETE));
+    }
+    let body = dfs2.get(document::DFS2_HEADER..).ok_or(no(PROOF))?;
+    let families = document::parse_family_body(body).map_err(|_| no(PROOF))?;
+    let i = families
+        .iter()
+        .position(|family| family.0 == ordinal)
+        .ok_or(no(PROOF))?;
+    let root = state
+        .get(u::FTR_ROOTS_AT + 32 * i..u::FTR_ROOTS_AT + 32 * (i + 1))
+        .ok_or(no(PROOF))?
+        .try_into()
+        .map_err(|_| no(PROOF))?;
+    Ok((families[i].2, root))
+}
+
+fn unified_range_leaves(
+    x: &Pt2p<'_>,
+    state: &[u8],
+    dfs2: &AccountInfo,
+    descriptor: &[u8; 32],
+    route: pt::InstantiatedRoute,
+    witness: &[u8],
+    positions: core::ops::Range<u32>,
+) -> Result<Vec<[u8; 32]>, ProgramError> {
+    use crate::unified::rsp1;
+    if route.binding_kind != 2
+        || positions.start < route.range_first
+        || positions.end > route.range_end
+    {
+        return Err(no(ROUTE));
+    }
+    let raw = dfs2.try_borrow_data()?;
+    let (slots, _) = unified_family(state, &raw, route.family_ordinal)?;
+    let kind = rsp1::family_kind(x, route.family_ordinal).map_err(|_| no(PROOF))?;
+    let family = crate::closure_v2::family_id(descriptor, route.family_ordinal, kind);
+    let span = u64::from(route.range_end - route.range_first);
+    if span == 0 || witness.len() as u64 % span != 0 {
+        return Err(no(ROUTE));
+    }
+    let per_position = witness.len() as u64 / span;
+    let mut cursor = per_position * u64::from(positions.start - route.range_first);
+    let mut leaves = Vec::with_capacity((positions.end - positions.start) as usize);
+    for q in positions {
+        let before = cursor;
+        leaves.push(rsp1::summary_leaf_at(
+            x,
+            descriptor,
+            &family,
+            slots,
+            q,
+            route.region_id,
+            route.effective_offset,
+            witness,
+            &mut cursor,
+        )?);
+        if cursor - before != per_position {
+            return Err(no(ROUTE));
+        }
+    }
+    Ok(leaves)
+}
+
+fn unified_range_close(
+    x: &Pt2p<'_>,
+    state: &[u8],
+    dfs2: &AccountInfo,
+    descriptor: &[u8; 32],
+    route: pt::InstantiatedRoute,
+    row: &[u8],
+    proof: &[u8],
+    leaves: &[[u8; 32]],
+) -> ProgramResult {
+    use crate::unified::rsp1;
+    let raw = dfs2.try_borrow_data()?;
+    let (_, root) = unified_family(state, &raw, route.family_ordinal)?;
+    let auth_count = *proof.get(12).ok_or(no(PROOF))? as usize;
+    let size = rsp1::GROUP_HEADER
+        .checked_add(auth_count.checked_mul(32).ok_or(no(PROOF))?)
+        .ok_or(no(PROOF))?;
+    let group = rsp1::decode_group(proof.get(..size).ok_or(no(PROOF))?).map_err(|_| no(PROOF))?;
+    if group.family_ordinal != route.family_ordinal
+        || group.first != route.range_first
+        || group.end != route.range_end
+    {
+        return Err(no(PROOF));
+    }
+    let kind = rsp1::family_kind(x, route.family_ordinal).map_err(|_| no(PROOF))?;
+    let family = crate::closure_v2::family_id(descriptor, route.family_ordinal, kind);
+    if row[56..88] != family || row[88..120] != [0; 32] {
+        return Err(no(PROOF));
+    }
+    let auth: Vec<[u8; 32]> = group
+        .auth
+        .chunks_exact(32)
+        .map(|v| v.try_into().expect("32-byte chunk"))
+        .collect();
+    let height = crate::unified::classes::rs1_height(x.position_count);
+    let read_digest = rsp1::verify_leaves(
+        descriptor,
+        &family,
+        height,
+        x.position_count,
+        group.first,
+        group.end,
+        leaves,
+        &auth,
+        &root,
+    )
+    .map_err(|_| no(PROOF))?;
+    if read_digest != row[24..56] {
+        return Err(no(PROOF));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct SparseProofNode {
+    index: u32,
+    digest: [u8; 32],
+}
+
+struct Form48ProofGroup {
+    segment_ordinal: u16,
+    segment_root: [u8; 32],
+}
+
+struct Form48ProofLeaf<'a> {
+    coordinate: crate::closure_v2::proof::Coordinate,
+    preimage: &'a [u8],
+}
+
+fn sparse_node(
+    index: u32,
+    digest: [u8; 32],
+    span: u32,
+    leaf_count: u32,
+) -> Result<crate::closure_v2::Node, ProgramError> {
+    let first = index.checked_mul(span).ok_or(no(PROOF))?;
+    let end = first.checked_add(span).ok_or(no(PROOF))?.min(leaf_count);
+    Ok(crate::closure_v2::Node { digest, first, end })
+}
+
+fn fold_sparse_proof(
+    descriptor: &[u8; 32],
+    kind: u8,
+    scope: u32,
+    leaf_count: u32,
+    mut active: Vec<SparseProofNode>,
+    siblings: &[[u8; 32]],
+) -> Result<[u8; 32], ProgramError> {
+    if leaf_count == 0 || active.is_empty() {
+        return Err(no(PROOF));
+    }
+    let mut previous = None;
+    for node in &active {
+        if node.index >= leaf_count || previous.is_some_and(|index| index >= node.index) {
+            return Err(no(PROOF));
+        }
+        previous = Some(node.index);
+    }
+    let mut width = leaf_count;
+    let mut span = 1u32;
+    let mut sibling_at = 0usize;
+    let mut level = 0u8;
+    while width > 1 {
+        level = level.checked_add(1).ok_or(no(PROOF))?;
+        let mut next = Vec::with_capacity(active.len());
+        let mut i = 0usize;
+        while i < active.len() {
+            let current = active[i];
+            let left_index = current.index & !1;
+            let current_node = sparse_node(current.index, current.digest, span, leaf_count)?;
+            let (left, right, consumed) = if current.index & 1 == 0 {
+                if active
+                    .get(i + 1)
+                    .is_some_and(|node| node.index == current.index + 1)
+                {
+                    let other = active[i + 1];
+                    (
+                        current_node,
+                        sparse_node(other.index, other.digest, span, leaf_count)?,
+                        2,
+                    )
+                } else if current.index + 1 >= width {
+                    (current_node, current_node, 1)
+                } else {
+                    let digest = *siblings.get(sibling_at).ok_or(no(PROOF))?;
+                    sibling_at += 1;
+                    (
+                        current_node,
+                        sparse_node(current.index + 1, digest, span, leaf_count)?,
+                        1,
+                    )
+                }
+            } else {
+                let digest = *siblings.get(sibling_at).ok_or(no(PROOF))?;
+                sibling_at += 1;
+                (
+                    sparse_node(left_index, digest, span, leaf_count)?,
+                    current_node,
+                    1,
+                )
+            };
+            let parent = crate::closure_v2::parent(descriptor, kind, scope, level, left, right);
+            next.push(SparseProofNode {
+                index: current.index / 2,
+                digest: parent.digest,
+            });
+            i += consumed;
+        }
+        active = next;
+        width = width.div_ceil(2);
+        span = span.checked_mul(2).ok_or(no(PROOF))?;
+    }
+    if active.len() != 1 || active[0].index != 0 || sibling_at != siblings.len() {
+        return Err(no(PROOF));
+    }
+    Ok(active[0].digest)
+}
+
+/// Form 48's canonical sparse multiproof authenticates all selected producer
+/// leaves once, then binds every read row to one authenticated leaf.
+fn verify_form48_batch(
+    x: &Pt2p<'_>,
+    dpr2: &AccountInfo,
+    descriptor: &[u8; 32],
+    position: u32,
+    consumer_index: u32,
+    target: &Target<'_>,
+    body: &Body<'_>,
+    first: usize,
+    count: usize,
+    bits: &mut u128,
+) -> ProgramResult {
+    let (form, read_count, write_count) = target.counts();
+    if form != crate::kernels::decision::GATHER_FORM_ID
+        || usize::from(read_count) != body.read_count
+        || write_count != 1
+        || body.read_count == 0
+        || body.read_count > FORM48_READS
+        || first != 0
+        || count != body.read_count
+    {
+        return Err(no(MALFORMED));
+    }
+    if !body.core.is_empty() || !body.weights.is_empty() || !body.outputs.is_empty() {
+        return Err(no(MALFORMED));
+    }
+    let (first_witness, first_kind, envelope) = body.section_exact(0)?;
+    if first_witness.len() != target.route(0)?.byte_length as usize || first_kind != 1 {
+        return Err(no(ROUTE));
+    }
+    let mut c = Cursor {
+        data: envelope,
+        at: 0,
+    };
+    if c.take(4)? != b"F48M" || c.u16()? != 1 || usize::from(c.u16()?) != body.read_count {
+        return Err(no(MALFORMED));
+    }
+    let group_count = usize::from(c.u16()?);
+    let unique_count = usize::from(c.u16()?);
+    if group_count == 0
+        || group_count > FORM48_READS
+        || unique_count == 0
+        || unique_count > body.read_count
+        || group_count > unique_count
+    {
+        return Err(no(MALFORMED));
+    }
+    let mut mapping = Vec::with_capacity(body.read_count);
+    for _ in 0..body.read_count {
+        let unique = usize::from(c.u16()?);
+        if unique >= unique_count {
+            return Err(no(PROOF));
+        }
+        mapping.push(unique);
+    }
+    let mut leaves = Vec::with_capacity(unique_count);
+    let mut groups = Vec::with_capacity(group_count);
+    let mut previous_ordinal = None;
+    for _ in 0..group_count {
+        let segment_ordinal = c.u16()?;
+        let segment_id = c.u16()?;
+        let group_leaves = usize::from(c.u16()?);
+        if group_leaves == 0
+            || group_leaves > unique_count - leaves.len()
+            || previous_ordinal.is_some_and(|prior| prior >= segment_ordinal)
+            || u32::from(segment_ordinal) >= u32::from(x.segment_count)
+        {
+            return Err(no(PROOF));
+        }
+        let (expected_segment, segment_entries) = x
+            .segment_row(position, usize::from(segment_ordinal))
+            .map_err(no)?;
+        if segment_id != expected_segment {
+            return Err(no(PROOF));
+        }
+        previous_ordinal = Some(segment_ordinal);
+        let mut active = Vec::with_capacity(group_leaves);
+        let mut previous_entry = None;
+        for _ in 0..group_leaves {
+            let leaf_position = c.u32()?;
+            let leaf_segment = c.u16()?;
+            let leaf_entry = c.u32()?;
+            let preimage_len = usize::from(c.u16()?);
+            let preimage = c.take(preimage_len)?;
+            if leaf_position != position
+                || leaf_segment != segment_id
+                || leaf_entry >= segment_entries
+                || previous_entry.is_some_and(|prior| prior >= leaf_entry)
+            {
+                return Err(no(PROOF));
+            }
+            let (p, segment, local, _, _, _) =
+                crate::closure_v2::proof::preimage_fields(preimage, descriptor)?;
+            if (p, segment, local) != (leaf_position, leaf_segment, leaf_entry) {
+                return Err(no(PROOF));
+            }
+            let digest = crate::hash::sha256(&[preimage]);
+            active.push(SparseProofNode {
+                index: leaf_entry,
+                digest,
+            });
+            leaves.push(Form48ProofLeaf {
+                coordinate: crate::closure_v2::proof::Coordinate {
+                    position: leaf_position,
+                    segment: leaf_segment,
+                    entry: leaf_entry,
+                },
+                preimage,
+            });
+            previous_entry = Some(leaf_entry);
+        }
+        let sibling_count = usize::from(c.u16()?);
+        let sibling_bytes = sibling_count.checked_mul(32).ok_or(no(PROOF))?;
+        if sibling_count > group_leaves.saturating_mul(32)
+            || sibling_bytes > c.data.len().saturating_sub(c.at)
+        {
+            return Err(no(PROOF));
+        }
+        let mut siblings = Vec::with_capacity(sibling_count);
+        for _ in 0..sibling_count {
+            siblings.push(c.take(32)?.try_into().map_err(|_| no(PROOF))?);
+        }
+        let tree_root =
+            fold_sparse_proof(descriptor, 1, position, segment_entries, active, &siblings)?;
+        let segment_root = crate::closure_v2::hash(
+            b"segment-root/2",
+            &[
+                descriptor,
+                &position.to_le_bytes(),
+                &segment_id.to_le_bytes(),
+                &segment_entries.to_le_bytes(),
+                &tree_root,
+                &[1],
+            ],
+        );
+        groups.push(Form48ProofGroup {
+            segment_ordinal,
+            segment_root,
+        });
+    }
+    if leaves.len() != unique_count {
+        return Err(no(PROOF));
+    }
+    let outer_sibling_count = usize::from(c.u16()?);
+    let outer_sibling_bytes = outer_sibling_count.checked_mul(32).ok_or(no(PROOF))?;
+    if outer_sibling_count > group_count.saturating_mul(32)
+        || outer_sibling_bytes > c.data.len().saturating_sub(c.at)
+    {
+        return Err(no(PROOF));
+    }
+    let mut outer_siblings = Vec::with_capacity(outer_sibling_count);
+    for _ in 0..outer_sibling_count {
+        outer_siblings.push(c.take(32)?.try_into().map_err(|_| no(PROOF))?);
+    }
+    if c.at != c.data.len() {
+        return Err(no(MALFORMED));
+    }
+    let outer = groups
+        .iter()
+        .map(|group| SparseProofNode {
+            index: u32::from(group.segment_ordinal),
+            digest: group.segment_root,
+        })
+        .collect();
+    let segment_tree = fold_sparse_proof(
+        descriptor,
+        2,
+        position,
+        u32::from(x.segment_count),
+        outer,
+        &outer_siblings,
+    )?;
+    let table_root = x.segment_table_root(position).map_err(no)?;
+    let position_root = crate::closure_v2::hash(
+        b"position-root/2",
+        &[
+            descriptor,
+            &position.to_le_bytes(),
+            &x.segment_count.to_le_bytes(),
+            &table_root,
+            &segment_tree,
+            &[1],
+        ],
+    );
+    if document::landed_root(dpr2, position, PROOF)? != position_root {
+        return Err(no(PROOF));
+    }
+    let mut used = vec![false; unique_count];
+    for i in 0..body.read_count {
+        let route = target.route(i as u16)?;
+        let row = body.row(i)?;
+        let (witness, kind, proof) = body.section_exact(i)?;
+        if kind != route.binding_kind
+            || kind != 1
+            || witness.len() != route.byte_length as usize
+            || (i != 0 && !proof.is_empty())
+        {
+            return Err(no(ROUTE));
+        }
+        let unique = mapping[i];
+        let leaf = leaves.get(unique).ok_or(no(PROOF))?;
+        let coordinate = producer_route(
+            x,
+            position,
+            consumer_index,
+            route,
+            row,
+            witness,
+            leaf.preimage,
+            descriptor,
+        )?;
+        if coordinate != leaf.coordinate {
+            return Err(no(PROOF));
+        }
+        used[unique] = true;
+        *bits |= 1u128 << i;
+    }
+    if used.iter().any(|is_used| !is_used) {
+        return Err(no(PROOF));
+    }
+    Ok(())
+}
+
+fn verify_reads(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
+    if data.len() < 5 || accounts.len() != 8 {
+        return Err(no(MALFORMED));
+    }
+    live(program, &accounts[0])?;
+    let mut state = accounts[0].try_borrow_mut_data()?;
+    if state[176] != 1 || accounts[1].key.as_ref() != &state[184..216] {
+        return Err(no(STATE));
+    }
+    if state[406..414].iter().any(|byte| *byte != 0) {
+        return Err(no(STATE));
+    }
+    document(program, &accounts[2], &state)?;
+    pinned_tables(program, &state, &accounts[4], &accounts[5])?;
+    if accounts[6].key.as_ref() != &state[PT2S_AT..PT2S_END] {
+        return Err(no(PROOF));
+    }
+    crate::unified::plan::bind_pt2s(program, &accounts[6], &accounts[4], &accounts[5], None)
+        .map_err(|_| no(PROOF))?;
+    let doc = accounts[2].try_borrow_data()?;
+    let descriptor: [u8; 32] = state[72..104].try_into().map_err(|_| no(PROOF))?;
+    if accounts[7].owner != program || accounts[7].key.as_ref() != &doc[456..488] {
+        return Err(no(PROOF));
+    }
+    document::positions(
+        program,
+        &accounts[3],
+        &descriptor,
+        u32_at(&doc, 72)?,
+        false,
+        PROOF,
+    )?;
+    let s = accounts[6].try_borrow_data()?;
+    let routes = accounts[4].try_borrow_data()?;
+    let geometry = accounts[5].try_borrow_data()?;
+    let x = crate::unified::plan::view(&s, &routes, &geometry, &[], None).map_err(|_| no(PROOF))?;
+    let index = u32_at(&state, 170)?;
+    let position = u32_at(&state, 156)?;
+    let base_entry = x.entry(position, index).map_err(no)?;
+    let entry = if matches!(
+        base_entry.kernel_index,
+        crate::kernels::decision::FORM_ID | crate::kernels::decision::GATHER_FORM_ID
+    ) {
+        let payload_len = usize::from(u16_at(&state, 280)?);
+        let payload = state.get(282..282 + payload_len).ok_or(no(PROOF))?;
+        document_selected_target(&x, base_entry, &doc, &routes, Some(payload))?
+    } else {
+        Target::Pt2p(&x, base_entry)
+    };
+    let raw = response(program, &accounts[1], accounts[0].key, &state)?;
+    let body = Body::parse(&raw)?;
+    let first = usize::from(u16_at(data, 1)?);
+    let count = usize::from(u16_at(data, 3)?);
+    let end = first.checked_add(count).ok_or(no(MALFORMED))?;
+    if count == 0 || end > body.read_count {
+        return Err(no(MALFORMED));
+    }
+    let mut bits = read_bits(&state)?;
+    if base_entry.kernel_index == crate::kernels::decision::GATHER_FORM_ID {
+        if first != 0 || count != body.read_count || data.len() != 5 {
+            return Err(no(MALFORMED));
+        }
+        verify_form48_batch(
+            &x,
+            &accounts[3],
+            &descriptor,
+            position,
+            index,
+            &entry,
+            &body,
+            first,
+            count,
+            &mut bits,
+        )?;
+        drop(raw);
+        drop(entry);
+        drop(s);
+        drop(routes);
+        drop(geometry);
+        put_read_bits(&mut state, bits);
+        challenge::respond_event(accounts[0].key, &state, TAG_VERIFY_READS, 1, state[4]);
+        return Ok(());
+    }
+    for i in first..end {
+        let route = entry.route(i as u16)?;
+        let row = body.row(i)?;
+        let (witness, kind, proof) = body.section(i)?;
+        if kind != route.binding_kind || witness.len() != route.byte_length as usize {
+            return Err(no(ROUTE));
+        }
+        let mut cursor = Cursor { data: proof, at: 0 };
+        match kind {
+            1 => {
+                let (preimage, siblings) = cursor.producer()?;
+                let at = producer_route(
+                    &x,
+                    position,
+                    index,
+                    route,
+                    row,
+                    witness,
+                    preimage,
+                    &descriptor,
+                )?;
+                unified_producer(
+                    &x,
+                    &accounts[3],
+                    &descriptor,
+                    at,
+                    &crate::hash::sha256(&[preimage]),
+                    siblings,
+                    &mut cursor,
+                )?;
+            }
+            2 => {
+                let leaves = unified_range_leaves(
+                    &x,
+                    &state,
+                    &accounts[7],
+                    &descriptor,
+                    route,
+                    witness,
+                    route.range_first..route.range_end,
+                )?;
+                unified_range_close(
+                    &x,
+                    &state,
+                    &accounts[7],
+                    &descriptor,
+                    route,
+                    row,
+                    proof,
+                    &leaves,
+                )?;
+            }
+            0 if route.read_class == 2
+                && u16_at(&state, 174)? == crate::kernels::decision::FORM_ID
+                && !route.source_supplied =>
+            {
+                if route.binding_kind != 0 || route.effective_offset != 0 {
+                    return Err(no(ROUTE));
+                }
+                let (option_count, range, table_hash) = dcm2_option_binding(&doc)?;
+                let table = doc.get(range).ok_or(no(PROOF))?;
+                if route.byte_length as usize != option_count * 4
+                    || witness != table
+                    || row[56..88]
+                        != dcm2_option_route_reference(
+                            route.region_id,
+                            route.byte_length,
+                            &table_hash,
+                        )
+                {
+                    return Err(no(PROOF));
+                }
+                let digest = crate::hash::sha256(&[
+                    READ_BYTES,
+                    &descriptor,
+                    &consumer_bytes(position, u16_at(&state, 160)?, u32_at(&state, 136)?),
+                    &row[0..2],
+                    &row[8..16],
+                    &row[16..20],
+                    witness,
+                ]);
+                if digest != row[24..56] {
+                    return Err(no(PROOF));
+                }
+            }
+            0 if route.read_class == 2 && !route.source_supplied => {
+                let expected = manifest
+                    .artifact_witness_verifier()
+                    .supplied_read_hash(
+                        state[145],
+                        u16_at(&state, 174)?,
+                        route.region_id,
+                        route.byte_length,
+                    )
+                    .map_err(no)?;
+                if crate::hash::sha256(&[witness]) != expected {
+                    return Err(no(PROOF));
+                }
+                let digest = crate::hash::sha256(&[
+                    READ_BYTES,
+                    &descriptor,
+                    &consumer_bytes(position, u16_at(&state, 160)?, u32_at(&state, 136)?),
+                    &row[0..2],
+                    &row[8..16],
+                    &row[16..20],
+                    witness,
+                ]);
+                if digest != row[24..56] {
+                    return Err(no(PROOF));
+                }
+            }
+            0 if route.read_class == 2 => {
+                let len = cursor.u32()? as usize;
+                let content = cursor.take(len)?;
+                let at = usize::try_from(route.effective_offset).map_err(|_| no(ROUTE))?;
+                if !route.source_supplied
+                    || row[2] != 2
+                    || slice(content, at, witness.len())? != witness
+                {
+                    return Err(no(ROUTE));
+                }
+                let seed = crate::region_commitment::seed_v1(route.region_id, len as u64, 1);
+                let fold = crate::region_commitment::fold_account_v1(
+                    &seed,
+                    0,
+                    len as u64,
+                    &crate::hash::sha256(&[content]),
+                );
+                if doc[PROMPT_AT..PROMPT_AT + 32] != fold || row[56..88] != fold {
+                    return Err(no(PROOF));
+                }
+                let digest = crate::hash::sha256(&[
+                    READ_BYTES,
+                    &descriptor,
+                    &consumer_bytes(position, u16_at(&state, 160)?, u32_at(&state, 136)?),
+                    &row[0..2],
+                    &row[8..16],
+                    &row[16..20],
+                    witness,
+                ]);
+                if digest != row[24..56] {
+                    return Err(no(PROOF));
+                }
+            }
+            0 => {
+                if !route.initial_content
+                    || row[2] != 0
+                    || row[56..88] != [0; 32]
+                    || witness.iter().any(|b| *b != 0)
+                {
+                    return Err(no(ROUTE));
+                }
+                let digest = crate::hash::sha256(&[
+                    READ_BYTES,
+                    &descriptor,
+                    &consumer_bytes(position, u16_at(&state, 160)?, u32_at(&state, 136)?),
+                    &row[0..2],
+                    &row[8..16],
+                    &row[16..20],
+                    witness,
+                ]);
+                if digest != row[24..56] {
+                    return Err(no(PROOF));
+                }
+            }
+            _ => return Err(no(ROUTE)),
+        }
+        bits |= 1u128 << i;
+    }
+    if data.len() != 5 {
+        return Err(no(MALFORMED));
+    }
+    drop(raw);
+    drop(entry);
+    drop(s);
+    drop(routes);
+    drop(geometry);
+    put_read_bits(&mut state, bits);
+    challenge::respond_event(accounts[0].key, &state, TAG_VERIFY_READS, 1, state[4]);
+    Ok(())
+}
+
+fn consumer_bytes(position: u32, segment: u16, entry: u32) -> [u8; 10] {
+    let mut bytes = [0u8; 10];
+    bytes[..4].copy_from_slice(&position.to_le_bytes());
+    bytes[4..6].copy_from_slice(&segment.to_le_bytes());
+    bytes[6..10].copy_from_slice(&entry.to_le_bytes());
+    bytes
+}
+
+/// Process one tag from the generic revision-8 dispute family.
+///
+/// DCG owns the shared DCR1/DRU1 transitions. Application form execution and
+/// artifact verification are exposed through the manifest hooks, but their
+/// tags remain refused until the corresponding part-B engine paths land.
+pub fn process_generic_dispute_tag(
+    program: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &crate::app_api::ApplicationProgramManifest,
+) -> ProgramResult {
+    match data.first().copied() {
+        Some(TAG_VERIFY_TARGET) => verify_target(program, accounts, data, manifest),
+        Some(TAG_VERIFY_READS) => verify_reads(program, accounts, data, manifest),
+        Some(TAG_RESTAGE) => restage(program, accounts, data),
+        Some(TAG_VERIFY_OUTPUTS) => verify_outputs(program, accounts, data),
+        // 122/123/124/127 perform application model-artifact or kernel work;
+        // 129 is the separately chunked range-proof continuation.
+        Some(
+            TAG_WEIGHTS_ANCHOR
+            | TAG_WEIGHTS_ROWS
+            | TAG_EXECUTE
+            | TAG_VERIFY_ARTIFACTS
+            | TAG_VERIFY_RANGE_SLOTS,
+        ) => Err(ProgramError::InvalidInstructionData),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
 }
 
 /// Close the executor's staged response and clear all generic verification
