@@ -567,6 +567,26 @@ fn publication_accounts(
     ]
 }
 
+fn workspace_first_publication_accounts(
+    authority: Pubkey,
+    session: Pubkey,
+    state_writable: bool,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(view_pda(&session, v3::WORKSPACE_ROLE), false),
+        AccountMeta::new_readonly(authority, true),
+        AccountMeta::new(session, false),
+        AccountMeta::new_readonly(resource_pda(&session), false),
+        if state_writable {
+            AccountMeta::new(state_pda(&session, 0), false)
+        } else {
+            AccountMeta::new_readonly(state_pda(&session, 0), false)
+        },
+        AccountMeta::new_readonly(view_pda(&session, 0), false),
+        AccountMeta::new(view_pda(&session, v3::SCRATCH_ROLE), false),
+    ]
+}
+
 fn begin_view(authority: Pubkey, session: Pubkey) -> Instruction {
     begin_view_with_accounts(authority, publication_accounts(authority, session, false))
 }
@@ -587,6 +607,30 @@ fn run_view(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction {
         payload,
         publication_accounts(authority, session, false),
     )
+}
+
+fn run_view_workspace_first(
+    authority: Pubkey,
+    session: Pubkey,
+    cursor: u32,
+    state_writable: bool,
+) -> Instruction {
+    run_view_with_accounts(
+        authority,
+        cursor,
+        workspace_first_publication_accounts(authority, session, state_writable),
+    )
+}
+
+fn run_view_with_accounts(
+    authority: Pubkey,
+    cursor: u32,
+    accounts: Vec<AccountMeta>,
+) -> Instruction {
+    let mut payload = vec![v3::WIRE_VERSION, 1];
+    payload.extend_from_slice(&cursor.to_le_bytes());
+    payload.extend_from_slice(&500_000u32.to_le_bytes());
+    instruction(sw::TAG_PUBLISH_VIEWS, payload, accounts)
 }
 
 fn commit_view(authority: Pubkey, session: Pubkey) -> Instruction {
@@ -642,6 +686,43 @@ async fn send(
         eprintln!("stateful-v3 CU instruction={label} transaction={cu}");
     }
     cu
+}
+
+async fn send_not_enough_account_keys(
+    context: &mut ProgramTestContext,
+    ix: Instruction,
+    signers: &[&Keypair],
+    label: &str,
+) {
+    let blockhash = context.get_new_latest_blockhash().await.unwrap();
+    let mut all_signers = vec![&context.payer];
+    all_signers.extend_from_slice(signers);
+    let tx = Transaction::new(
+        &all_signers,
+        solana_message::Message::new(&[ix], Some(&context.payer.pubkey())),
+        blockhash,
+    );
+    let result = context
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            &result.result,
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::NotEnoughAccountKeys
+            ))
+        ),
+        "{label}: expected NotEnoughAccountKeys, got {:?}\n{}",
+        result.result,
+        result
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.log_messages.join("\n"))
+            .unwrap_or_default()
+    );
 }
 
 async fn send_many(
@@ -723,13 +804,27 @@ async fn open_fixed_small(
     id: u64,
     resource: &[u8],
 ) -> (Pubkey, Pubkey, Pubkey) {
+    open_fixed_small_with_workspace_mode(context, authority, id, resource, false).await
+}
+
+async fn open_fixed_small_with_workspace_mode(
+    context: &mut ProgramTestContext,
+    authority: &Keypair,
+    id: u64,
+    resource: &[u8],
+    workspace_first: bool,
+) -> (Pubkey, Pubkey, Pubkey) {
     let payer = context.payer.pubkey();
     let session = session_pda(&authority.pubkey(), id);
     let stream = stream_pda(&session);
     let state = state_pda(&session, 0);
+    let mut open = open_primary(payer, authority.pubkey(), id, resource_root(resource));
+    if workspace_first {
+        open.data[17..33].copy_from_slice(&app::V3_WORKSPACE_ENGINE.manifest().id.0);
+    }
     send(
         context,
-        open_primary(payer, authority.pubkey(), id, resource_root(resource)),
+        open,
         &[authority],
         "OPEN_SESSION-v3-small-fixture",
         Ok(()),
@@ -1297,6 +1392,176 @@ async fn stateful_v3_primary_prefix_halt_resource_views_and_phased_init() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stateful_v3_workspace_first_ordering_refusals_header_and_clear_policy() {
+    let resource = vec![0x5A; RESOURCE_LEN];
+    let (mut context, _) = start_sbf_with_resource(resource.clone()).await;
+    let payer = context.payer.pubkey();
+
+    let ordinary_authority = keypair(81);
+    let (ordinary_session, _, _) = open_fixed_small_with_workspace_mode(
+        &mut context,
+        &ordinary_authority,
+        81,
+        &resource,
+        false,
+    )
+    .await;
+    for (label, ix) in [
+        ("ordinary-output", create_view(payer, ordinary_session)),
+        (
+            "ordinary-workspace",
+            create_workspace(payer, ordinary_session),
+        ),
+        (
+            "ordinary-scratch",
+            create_staging_scratch(payer, ordinary_session),
+        ),
+    ] {
+        send(&mut context, ix, &[], label, Ok(()), false).await;
+    }
+    send(
+        &mut context,
+        begin_view(ordinary_authority.pubkey(), ordinary_session),
+        &[&ordinary_authority],
+        "BEGIN_PHASE-v3-workspace-first-refusal-control",
+        Ok(()),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        run_view_workspace_first(ordinary_authority.pubkey(), ordinary_session, 0, false),
+        &[&ordinary_authority],
+        "RUN_PHASE-v3-workspace-first-refused-without-opt-in",
+        Err(v3::REFUSAL_VIEW),
+        false,
+    )
+    .await;
+    send(
+        &mut context,
+        abort_view(ordinary_authority.pubkey(), ordinary_session, 0),
+        &[&ordinary_authority],
+        "ABORT_PHASE-v3-workspace-first-refusal-control",
+        Ok(()),
+        false,
+    )
+    .await;
+
+    let authority = keypair(82);
+    let (session, stream, _) =
+        open_fixed_small_with_workspace_mode(&mut context, &authority, 82, &resource, true).await;
+    for (label, ix) in [
+        ("workspace-output", create_view(payer, session)),
+        ("workspace-child", create_workspace(payer, session)),
+        ("workspace-scratch", create_staging_scratch(payer, session)),
+    ] {
+        send(&mut context, ix, &[], label, Ok(()), false).await;
+    }
+    let workspace_key = view_pda(&session, v3::WORKSPACE_ROLE);
+    let before_live_close = account(&mut context, workspace_key).await;
+    send(
+        &mut context,
+        close_child(
+            session,
+            workspace_key,
+            authority.pubkey(),
+            v3::KIND_WORKSPACE,
+        ),
+        &[],
+        "CLOSE_ACCOUNT-v3-live-workspace-refused-before-halt",
+        Err(v3::REFUSAL_LIVE),
+        false,
+    )
+    .await;
+    assert_eq!(
+        account(&mut context, workspace_key).await,
+        before_live_close
+    );
+    let mut seeded_workspace = account(&mut context, workspace_key).await;
+    seeded_workspace.data[128..].fill(0xA5);
+    context.set_account(&workspace_key, &AccountSharedData::from(seeded_workspace));
+    send(
+        &mut context,
+        begin_view(authority.pubkey(), session),
+        &[&authority],
+        "BEGIN_PHASE-v3-opted-workspace-preserves-payload",
+        Ok(()),
+        false,
+    )
+    .await;
+    let workspace_before = account(&mut context, workspace_key).await;
+    assert!(workspace_before.data[128..]
+        .iter()
+        .all(|byte| *byte == 0xA5));
+
+    let mut malformed = workspace_first_publication_accounts(authority.pubkey(), session, true);
+    malformed[0] = AccountMeta::new(stream, false);
+    send_not_enough_account_keys(
+        &mut context,
+        run_view_with_accounts(authority.pubkey(), 0, malformed),
+        &[&authority],
+        "RUN_PHASE-v3-workspace-first-wrong-first-account-refused",
+    )
+    .await;
+
+    let mut wrong_count = workspace_first_publication_accounts(authority.pubkey(), session, true);
+    wrong_count.pop();
+    send(
+        &mut context,
+        run_view_with_accounts(authority.pubkey(), 0, wrong_count),
+        &[&authority],
+        "RUN_PHASE-v3-workspace-first-wrong-account-count-refused",
+        Err(v3::REFUSAL_VIEW),
+        false,
+    )
+    .await;
+
+    send(
+        &mut context,
+        run_view_workspace_first(authority.pubkey(), session, 0, true),
+        &[&authority],
+        "RUN_PHASE-v3-workspace-first-restores-header",
+        Ok(()),
+        false,
+    )
+    .await;
+    let after_restored_header = account(&mut context, workspace_key).await;
+    assert_eq!(
+        &after_restored_header.data[..128],
+        &workspace_before.data[..128]
+    );
+    assert_eq!(after_restored_header.data[128], 0xA6);
+    assert_eq!(&after_restored_header.data[129..133], &[0; 4]);
+    assert_eq!(after_restored_header.data[128 + 63], 0xA5);
+    assert_eq!(
+        &account(&mut context, view_pda(&session, 0)).await.data[128..144],
+        &[0; 16],
+        "RUN_PHASE stages output but does not publish it"
+    );
+
+    send(
+        &mut context,
+        run_view_workspace_first(authority.pubkey(), session, 16, true),
+        &[&authority],
+        "RUN_PHASE-v3-workspace-first-header-mutation-refused",
+        Err(v3::REFUSAL_KERNEL),
+        false,
+    )
+    .await;
+    let after_mutation_refusal = account(&mut context, workspace_key).await;
+    assert_eq!(after_mutation_refusal.data, after_restored_header.data);
+    send(
+        &mut context,
+        abort_view(authority.pubkey(), session, 0),
+        &[&authority],
+        "ABORT_PHASE-v3-workspace-first-partial-publication",
+        Ok(()),
+        false,
+    )
+    .await;
 }
 
 fn open_default(payer: Pubkey, authority: Pubkey, id: u64) -> Instruction {
