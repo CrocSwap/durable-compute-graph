@@ -146,9 +146,12 @@ until tag 184, timeout, or a neutral identity rule. The relevant bytes are:
 | `8068..8100` | saved segment root for the challenged consumer |
 
 Revision-8 challenge open writes its canonical PDA bump at byte `146`, marker
-`1` at byte `147`, and the canonical DRU1 response bump staged at byte `181`
-at open then moved to byte `219` after tag 164 consumes position roots, for both
-DCR1 v5 and v6 records. These bytes were reserved in the earlier layout.
+`1` at byte `147`, and the canonical DRU1 response bump at both staged byte
+`181` and stable byte `219`, for both DCR1 v5 and v6 records. Tag 164 refreshes
+byte `219` from byte `181` when it consumes position roots. A tag 132 timeout
+ruling in POSITION_REVEAL or SELECT also copies the staged bump to byte `219`
+so tag 131 can settle without a preceding tag 164. These bytes were reserved
+in the earlier layout.
 Readers use the stored bumps for fixed-cost address checks. A fresh revision-8
 program address requires marker `1`; a marker-0 record from an older image is
 refused. Revision-7 builds leave these reserved bytes zero. The DCR1 record

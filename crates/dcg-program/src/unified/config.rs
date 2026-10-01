@@ -621,6 +621,41 @@ pub fn approved(
     Ok(())
 }
 
+/// Revision-8 UnifiedInit variant: DTU1 saved the canonical DTA1 bump at
+/// approval time, so validate the exact address without another canonical
+/// search.
+pub fn approved_with_bump(
+    program: &Pubkey,
+    record: &AccountInfo,
+    pt2s: &Pubkey,
+    digest: &[u8; 32],
+    bump: u8,
+) -> ProgramResult {
+    expect_derived_with_bump(
+        record,
+        program,
+        &[address::TEMPLATE_SEAL_SEED, pt2s.as_ref(), digest],
+        bump,
+        AccountKind::exact(b"DTA1", SEAL_BYTES).with_version(4, 1),
+        RoleFlags {
+            writable: false,
+            signer: false,
+        },
+    )
+    .map_err(|_| no(TEMPLATE_SEAL))?;
+    let raw = record.try_borrow_data()?;
+    if record.owner != program
+        || raw.len() != SEAL_BYTES
+        || raw[..4] != *b"DTA1"
+        || raw[6] != SEAL_APPROVED
+        || raw[8..40] != pt2s.to_bytes()
+        || raw[40..72] != *digest
+    {
+        return Err(no(TEMPLATE_SEAL));
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------ DTU1 (rev 8)
 
 /// **DTU1**, the per-template use counter (spec §1.7, revision 8). PDA
@@ -869,10 +904,15 @@ pub fn template_use(
     record: &AccountInfo,
     pt2s: &Pubkey,
     digest: &[u8; 32],
-) -> Result<(u32, TemplateLimits), ProgramError> {
+) -> Result<(u32, TemplateLimits, u8, u8), ProgramError> {
     let view = template_record(program, record, pt2s, digest)?;
     match view.state {
-        DTU1_STATE_LIVE => Ok((view.documents, view.limits)),
+        DTU1_STATE_LIVE => Ok((
+            view.documents,
+            view.limits,
+            view.seal_bump,
+            view.admission_bump,
+        )),
         DTU1_STATE_RETIRED | DTU1_STATE_REVOKED => Err(no(TEMPLATE_SEAL)),
         _ => Err(no(TEMPLATE_SEAL)),
     }

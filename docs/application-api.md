@@ -26,12 +26,19 @@ account provenance before calling application code.
 Construct an entry with `ApplicationInstruction::new` and the array-valued
 `ApplicationProgramManifest::new`. The constructor validates at compile time
 that application tags are strictly ascending, unique, and disjoint from the
-revision-8 core set. `process_instruction_with_application` takes a
+revision-8 core set, PDA seed prefixes, and app-owned account kinds. App PDA
+seeds begin with the application id, which must contain 1–32 bytes; the id may
+not appear again in the seed list. `ProgramKey` may not source its key from
+instruction bytes. Program-owned `ProgramPda` and `ProgramKey` kinds require a
+non-empty magic that does not prefix or share a prefix with a DCG core magic.
+`process_instruction_with_application` takes a
 `&'static ApplicationProgramManifest`, so production dispatch must use the
 validated static value and collision checks run during compilation. The public
 `validate_application_tags` function applies the same const-time rules to a
 tag list; its documentation includes compile-fail examples for duplicate app
-tags, overlap with tag 125, and a collision routed through `new`.
+tags, overlap with tag 125, and a collision routed through `new`. Compile-fail
+examples also cover a missing app-id PDA prefix, a `ProgramKey` instruction
+source, and empty or core-overlapping magic.
 
 At runtime, an empty instruction byte array is refused. A core tag is sent to
 `process_instruction_with_manifest` with the wrapped kernel/form manifest. A
@@ -52,15 +59,25 @@ wire-revision set.
 
 Each instruction rule covers one ordered account. Its identity is an exact key
 with an optional owner constraint, a program-owned PDA, a program-owned exact
-key, or a system-owned PDA. Key sources can be fixed, read from instruction
-bytes, derived from a required signer, or taken from an earlier account that
-has already passed its rule. PDA seeds can use fixed byte strings,
-instruction-data slices, or validated earlier account keys. Every rule also
-declares minimum writable/signer privileges and an optional writable alias
-group. DCG validates the full rule array before calling application code. A
-program-owned account is not validated by owner equality alone, and a PDA seed
-must come from an independently validated parent, signer, fixed value, or
-checked instruction identity.
+key, a system-owned PDA, a DCG core record, or a DCR1 response PDA validated
+with its stored bump. `ExactKey` refuses an account owned by the current DCG
+program, even if its key and optional owner constraint match. Key sources can
+be fixed, read from instruction bytes, derived from a required signer, or
+taken from an earlier account that has already passed its rule; `ProgramKey`
+is restricted to the fixed, signer, or validated-account sources. PDA seeds
+can use the app-id prefix, fixed byte strings, instruction-data slices, or
+validated earlier account keys. Every rule also declares minimum
+writable/signer privileges and an optional writable alias group. DCG validates
+the full rule array before calling application code. A program-owned account
+is not validated by owner equality alone, and a PDA seed must come from an
+independently validated parent, signer, fixed value, or checked instruction
+identity.
+
+`CoreRecord` calls DCG's own revision-8 DCM2 or DCR1 reader with a read-only
+role. `StoredBumpPda` currently accepts only the DRU1 PDA derived from a prior
+read-only validated DCR1 v5/v6 record and its stable response bump at byte 219.
+These variants let an app handler refer to core records without duplicating
+their parsing or treating an unvalidated stored byte as a bump.
 
 `CheckedApplicationAccounts` is a borrowed ordered view available to a handler
 only after DCG validates every account rule and the application preflight
@@ -73,7 +90,7 @@ or bypass this dispatcher entirely; it must route every entrypoint through
 ### Program identity
 
 `ApplicationProgramManifest::identity_digest()` uses the versioned
-`dcg/application-program-manifest/2` domain. It commits:
+`dcg/application-program-manifest/3` domain. It commits:
 
 1. `ApplicationManifest::identity_digest()` (application id and version);
 2. `ApplicationManifest::admission_identity_digest()` (including its static

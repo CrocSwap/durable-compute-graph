@@ -39,7 +39,9 @@ use super::{
     d32, no, plan, u16_at, u32_at, u64_at, CL_COORDINATE, CL_MALFORMED, CL_MISSING, CL_OVERFLOW,
     DCR1_PHASE, PLAN_BINDING,
 };
-use crate::account_provenance::{expect_derived, expect_derived_with_bump, AccountKind, RoleFlags};
+use crate::account_provenance::{
+    expect_derived, expect_derived_with_bump, AccountKind, CanonicalBump, RoleFlags,
+};
 use crate::closure_v2::{self as h, Coordinate};
 use crate::hash;
 use solana_program::{
@@ -472,10 +474,28 @@ pub fn create_v8_with_hooks<'a>(
     binding: &Binding2,
     hooks: &dyn crate::compatibility::ApplicationHooks,
 ) -> ProgramResult {
+    let (_, bump) = address::result(program, descriptor);
+    create_v8_with_hooks_and_bump(
+        program, executor, dcr2, system, descriptor, terms, binding, hooks, bump,
+    )
+}
+
+/// UnifiedInit variant that receives the result PDA bump already derived by
+/// its caller while checking the full account list.
+pub fn create_v8_with_hooks_and_bump<'a>(
+    program: &Pubkey,
+    executor: &AccountInfo<'a>,
+    dcr2: &AccountInfo<'a>,
+    system: &AccountInfo<'a>,
+    descriptor: &[u8; 32],
+    terms: &[u8],
+    binding: &Binding2,
+    hooks: &dyn crate::compatibility::ApplicationHooks,
+    bump: CanonicalBump,
+) -> ProgramResult {
     let full =
         bytes_v8(binding.output_count, binding.output_width).ok_or(no(super::RUN_BINDING))?;
-    let (key, bump) = address::result(program, descriptor);
-    if *dcr2.key != key {
+    if dcr2.key != bump.address() {
         return Err(no(CL_MALFORMED));
     }
     super::registry::create_pda(

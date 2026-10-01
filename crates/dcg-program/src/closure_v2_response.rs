@@ -7,7 +7,7 @@ use crate::account_provenance::{
     allocate_derived_account, expect_derived, AccountKind, CanonicalBump, RoleFlags,
 };
 #[cfg(feature = "revision-8")]
-use crate::account_provenance::{expect_derived_with_bump, expect_system_derived_with_bump};
+use crate::account_provenance::{expect_derived_with_bump, expect_system_derived};
 use crate::hash;
 use core::cell::Ref;
 use solana_program::{
@@ -202,11 +202,14 @@ pub fn begin(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
         return Err(no(BAD));
     }
     #[cfg(feature = "revision-8")]
-    let bump = expect_system_derived_with_bump(
+    // Creation accepts only a bump paired with the full canonical search.
+    // The DCR1 byte is still checked as the expected value, so stale or
+    // non-canonical records fail before allocation.
+    let bump = expect_system_derived(
         response,
         program,
         &[b"dcg-hcl-response", target.key.as_ref()],
-        challenge_record[crate::unified::challenge::RESPONSE_BUMP_AT],
+        Some(challenge_record[crate::unified::challenge::RESPONSE_BUMP_AT]),
         RoleFlags {
             writable: true,
             signer: false,

@@ -1635,6 +1635,11 @@ pub fn init_v8_with_application(
         binding,
         documents,
         app_identity,
+        doc_bump,
+        pos_bump,
+        fam_bump,
+        escrow_bump,
+        result_bump,
     ) = {
         let s = pt2s.try_borrow_data()?;
         let (r_bytes, g_bytes) = (routes.try_borrow_data()?, geometry.try_borrow_data()?);
@@ -1651,16 +1656,19 @@ pub fn init_v8_with_application(
         if !executor.is_signer {
             return Err(no(RUN_BINDING));
         }
-        // 2b. The template-seal approval of this exact PT2S (793).
+        // 2b. The template-use record carries the trusted DTA1 and DEA2
+        // canonical bumps, so the following checks need only fixed-cost
+        // derivations.
         let pt2s_sha = hash::sha256(&[&s]);
-        super::config::approved(program, dta1, pt2s.key, &pt2s_sha)?;
         // 2c. The template's use counter (spec §1.7): DTU1 is the PDA of
         // `(PT2S, sha256)`, and state 0 is the only state that admits a
         // document -- 1 and 2 (retired, revoked) are 793 and 3 (closed) is 812.
         // The `documents + 1` is a checked add (598), because the field is a
         // `u32` and a template's live count is the one quantity nothing else
         // bounds.
-        let (documents, limits) = super::config::template_use(program, dtu1, pt2s.key, &pt2s_sha)?;
+        let (documents, limits, seal_bump, admission_bump) =
+            super::config::template_use(program, dtu1, pt2s.key, &pt2s_sha)?;
+        super::config::approved_with_bump(program, dta1, pt2s.key, &pt2s_sha, seal_bump)?;
         // 2c'. **The per-template limits, checks 17-20 (791).** This is the
         // whole of what DCG enforces about a document's windows: it may not
         // exceed the ones its template's owner published. The four protocol-wide
@@ -1672,9 +1680,8 @@ pub fn init_v8_with_application(
         terms.check_template(&limits).map_err(no)?;
         // 3. Registry and admission record.
         let reg = registry::frozen(program, drp2, None)?;
-        let adm = admission::view(program, dea2, true)?;
-        if *dea2.key != address::admission(program, drp2.key, pt2s.key, p_count).0 || !adm.complete
-        {
+        let adm = admission::view_with_bump(program, dea2, true, admission_bump)?;
+        if !adm.complete {
             return Err(no(ADMISSION_STATE));
         }
         if adm.registry != drp2.key.to_bytes() || adm.root != reg.root {
@@ -1739,11 +1746,16 @@ pub fn init_v8_with_application(
         // Revision 6: a pre-funded target address is topped up by
         // `create_pda`, not refused; only a non-system or non-empty
         // account is (580).
+        let (document_key, doc_bump) = document_address(program, &descriptor);
+        let (positions_key, pos_bump) = position_page_address(program, &descriptor);
+        let (families_key, fam_bump) = family_slots_address(program, &descriptor);
+        let (result_key, result_bump) = result_address(program, &descriptor);
+        let (_, escrow_bump) = address::bond_escrow(program, &descriptor);
         for (account, key) in [
-            (dcm2, document_address(program, &descriptor).0),
-            (dpr2, position_page_address(program, &descriptor).0),
-            (dfs2, family_slots_address(program, &descriptor).0),
-            (dcr2, result_address(program, &descriptor).0),
+            (dcm2, document_key),
+            (dpr2, positions_key),
+            (dfs2, families_key),
+            (dcr2, result_key),
         ] {
             if *account.key != key
                 || !account.data_is_empty()
@@ -1773,14 +1785,15 @@ pub fn init_v8_with_application(
             binding,
             documents,
             app_identity,
+            doc_bump,
+            pos_bump,
+            fam_bump,
+            escrow_bump,
+            result_bump,
         )
     };
     let option_end = OPTION_REGION_AT + 4 * binding.option_count as usize;
     let dcm2_bytes = option_end + app_identity.map_or(0, |_| APP_IDENTITY_BYTES);
-    let (_, doc_bump) = document_address(program, &descriptor);
-    let (_, pos_bump) = position_page_address(program, &descriptor);
-    let (_, fam_bump) = family_slots_address(program, &descriptor);
-    let (_, escrow_bump) = address::bond_escrow(program, &descriptor);
     // 7. Create and write DCM2 v7, DPR2 and DFS2.
     let full_positions = DPR2_HEADER
         .checked_add(
@@ -1902,7 +1915,7 @@ pub fn init_v8_with_application(
         )?;
     }
     // 9. The PENDING DCR2 v6 result record.
-    super::result::create_v8_with_hooks(
+    super::result::create_v8_with_hooks_and_bump(
         program,
         executor,
         dcr2,
@@ -1911,6 +1924,7 @@ pub fn init_v8_with_application(
         terms_raw,
         &binding,
         hooks,
+        result_bump,
     )?;
     // 9a. DTU1's one increment (spec §1.7). It is the **last** write, after
     // every account this instruction creates exists, so a document can never

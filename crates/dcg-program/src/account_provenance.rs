@@ -76,9 +76,9 @@ pub struct RoleFlags {
     pub signer: bool,
 }
 
-/// A bump paired with the PDA found by the canonical search (or with the
-/// account address validated using a stored bump). Its fields are private so
-/// creation callers cannot pass an instruction byte as a bump.
+/// A bump paired with the PDA found by a full canonical search. Its fields are
+/// private so creation callers cannot pass an instruction byte or stored bump
+/// as if it came from that search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CanonicalBump {
     value: u8,
@@ -98,7 +98,29 @@ impl CanonicalBump {
         self.value
     }
 
-    /// The PDA returned by the full canonical search or validated read.
+    /// The PDA returned by the full canonical search.
+    pub const fn address(&self) -> &Pubkey {
+        &self.address
+    }
+}
+
+/// A bump read from an existing account and checked against that account's
+/// address. This type is intentionally distinct from [`CanonicalBump`]: a
+/// stored bump is suitable for validating a read, but creation helpers accept
+/// only a bump paired with a full canonical search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredBump {
+    value: u8,
+    address: Pubkey,
+}
+
+impl StoredBump {
+    /// The checked stored bump byte.
+    pub const fn value(self) -> u8 {
+        self.value
+    }
+
+    /// The address derived from the checked stored bump.
     pub const fn address(&self) -> &Pubkey {
         &self.address
     }
@@ -172,7 +194,7 @@ pub fn expect_derived_with_bump(
     bump: u8,
     kind: AccountKind,
     role: RoleFlags,
-) -> Result<CanonicalBump, ProgramError> {
+) -> Result<StoredBump, ProgramError> {
     let bump_seed = [bump];
     let mut derived_seeds = seeds.to_vec();
     derived_seeds.push(&bump_seed);
@@ -188,7 +210,7 @@ pub fn expect_derived_with_bump(
     }) {
         return Err(ProgramError::InvalidAccountData);
     }
-    Ok(CanonicalBump {
+    Ok(StoredBump {
         value: bump,
         address: expected,
     })
@@ -222,7 +244,7 @@ pub fn expect_system_derived_with_bump(
     bump: u8,
     role: RoleFlags,
     allow_prefunded: bool,
-) -> Result<CanonicalBump, ProgramError> {
+) -> Result<StoredBump, ProgramError> {
     let bump_seed = [bump];
     let mut derived_seeds = seeds.to_vec();
     derived_seeds.push(&bump_seed);
@@ -232,7 +254,7 @@ pub fn expect_system_derived_with_bump(
         return Err(ProgramError::InvalidAccountData);
     }
     expect_system_account_shape(account, role, allow_prefunded)?;
-    Ok(CanonicalBump {
+    Ok(StoredBump {
         value: bump,
         address,
     })
@@ -440,6 +462,20 @@ mod tests {
             .map(CanonicalBump::value),
             Ok(bump)
         );
+        let stored = expect_derived_with_bump(
+            &info,
+            &program,
+            &[b"child", parent.as_ref()],
+            bump,
+            kind,
+            RoleFlags {
+                writable: true,
+                signer: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(stored.value(), bump);
+        assert_eq!(stored.address(), &key);
         assert!(expect_derived(
             &info,
             &program,

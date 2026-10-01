@@ -39,10 +39,108 @@
 //!     125, "illegal/core-shadow", 1, &RULES, preflight, handler)];
 //! static INVALID: ApplicationProgramManifest = ApplicationProgramManifest::new(&APP, &INSTRUCTIONS);
 //! ```
+//!
+//! ```compile_fail,E0080
+//! use dcg_program::{
+//!     account_provenance::{AccountKind, RoleFlags},
+//!     app_api::{ApplicationAccountIdentity, ApplicationAccountRule, ApplicationInstruction,
+//!         ApplicationProgramManifest, ApplicationSeed},
+//!     compatibility::REVISION8_COMPATIBILITY,
+//!     kernel::{ApplicationManifest, LegacyFormBinding, OptimisticReplayBinding},
+//! };
+//! static KERNELS: [&'static dyn dcg_program::kernel::Kernel; 0] = [];
+//! static REPLAYS: [OptimisticReplayBinding; 0] = [];
+//! static FORMS: [LegacyFormBinding; 0] = [];
+//! static APP: ApplicationManifest = ApplicationManifest {
+//!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
+//!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
+//!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     decision_routes: &REVISION8_COMPATIBILITY,
+//! };
+//! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! fn handler(_: dcg_program::app_api::ApplicationInstructionContext<'_>,
+//!     _: &dcg_program::app_api::CheckedApplicationAccounts<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! static SEEDS: [ApplicationSeed; 1] = [ApplicationSeed::Literal(b"missing-app-id")];
+//! static RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
+//!     0, ApplicationAccountIdentity::ProgramPda {
+//!         seeds: &SEEDS, kind: AccountKind::exact(b"APP1", 4),
+//!     }, RoleFlags { writable: false, signer: false })];
+//! static INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+//!     42, "example/missing-prefix", 1, &RULES, preflight, handler)];
+//! static INVALID: ApplicationProgramManifest = ApplicationProgramManifest::new(&APP, &INSTRUCTIONS);
+//! ```
+//!
+//! ```compile_fail,E0080
+//! use dcg_program::{
+//!     account_provenance::{AccountKind, RoleFlags},
+//!     app_api::{ApplicationAccountIdentity, ApplicationAccountRule, ApplicationInstruction,
+//!         ApplicationKeySource, ApplicationProgramManifest},
+//!     compatibility::REVISION8_COMPATIBILITY,
+//!     kernel::{ApplicationManifest, LegacyFormBinding, OptimisticReplayBinding},
+//! };
+//! static KERNELS: [&'static dyn dcg_program::kernel::Kernel; 0] = [];
+//! static REPLAYS: [OptimisticReplayBinding; 0] = [];
+//! static FORMS: [LegacyFormBinding; 0] = [];
+//! static APP: ApplicationManifest = ApplicationManifest {
+//!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
+//!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
+//!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     decision_routes: &REVISION8_COMPATIBILITY,
+//! };
+//! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! fn handler(_: dcg_program::app_api::ApplicationInstructionContext<'_>,
+//!     _: &dcg_program::app_api::CheckedApplicationAccounts<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! static RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
+//!     0, ApplicationAccountIdentity::ProgramKey {
+//!         source: ApplicationKeySource::InstructionData { offset: 1 },
+//!         kind: AccountKind::exact(b"APP1", 4),
+//!     }, RoleFlags { writable: false, signer: false })];
+//! static INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+//!     42, "example/instruction-key", 1, &RULES, preflight, handler)];
+//! static INVALID: ApplicationProgramManifest = ApplicationProgramManifest::new(&APP, &INSTRUCTIONS);
+//! ```
+//!
+//! ```compile_fail,E0080
+//! use dcg_program::{
+//!     account_provenance::{AccountKind, RoleFlags},
+//!     app_api::{ApplicationAccountIdentity, ApplicationAccountRule, ApplicationInstruction,
+//!         ApplicationProgramManifest, ApplicationSeed},
+//!     compatibility::REVISION8_COMPATIBILITY,
+//!     kernel::{ApplicationManifest, LegacyFormBinding, OptimisticReplayBinding},
+//! };
+//! static KERNELS: [&'static dyn dcg_program::kernel::Kernel; 0] = [];
+//! static REPLAYS: [OptimisticReplayBinding; 0] = [];
+//! static FORMS: [LegacyFormBinding; 0] = [];
+//! static APP: ApplicationManifest = ApplicationManifest {
+//!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
+//!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
+//!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     decision_routes: &REVISION8_COMPATIBILITY,
+//! };
+//! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! fn handler(_: dcg_program::app_api::ApplicationInstructionContext<'_>,
+//!     _: &dcg_program::app_api::CheckedApplicationAccounts<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! static SEEDS: [ApplicationSeed; 1] = [ApplicationSeed::ApplicationId];
+//! static RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
+//!     0, ApplicationAccountIdentity::ProgramPda {
+//!         seeds: &SEEDS, kind: AccountKind::exact(b"DCR1", 4),
+//!     }, RoleFlags { writable: false, signer: false })];
+//! static INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+//!     42, "example/core-magic", 1, &RULES, preflight, handler)];
+//! static INVALID: ApplicationProgramManifest = ApplicationProgramManifest::new(&APP, &INSTRUCTIONS);
+//! static EMPTY_MAGIC_RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
+//!     0, ApplicationAccountIdentity::ProgramPda {
+//!         seeds: &SEEDS, kind: AccountKind::exact(b"", 4),
+//!     }, RoleFlags { writable: false, signer: false })];
+//! static EMPTY_MAGIC_INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+//!     43, "example/empty-magic", 1, &EMPTY_MAGIC_RULES, preflight, handler)];
+//! static INVALID_EMPTY_MAGIC: ApplicationProgramManifest = ApplicationProgramManifest::new(&APP, &EMPTY_MAGIC_INSTRUCTIONS);
+//! ```
 
 use crate::{
     account_provenance::{
-        expect_derived, expect_keyed, expect_system_derived_role, AccountKind, RoleFlags,
+        expect_derived, expect_derived_with_bump, expect_keyed, expect_system_derived_role,
+        AccountKind, RoleFlags,
     },
     hash::sha256,
     kernel::ApplicationManifest,
@@ -71,7 +169,7 @@ pub const fn is_core_instruction_tag_revision_8(tag: u8) -> bool {
         return true;
     }
     #[cfg(feature = "sbf-real-lifecycle-test")]
-    if (tag >= 230 && tag <= 239) || tag == 240 {
+    if (tag >= 230 && tag <= 239) || tag == crate::stateful::v3::RESOURCE_CHUNK_TAG {
         return true;
     }
     let mut low = 0usize;
@@ -141,9 +239,21 @@ pub struct ApplicationAccountCheckContext<'accounts, 'info> {
 /// earlier account entry that has already passed its own declared rule.
 #[derive(Clone, Copy)]
 pub enum ApplicationSeed {
+    /// The manifest's application id. App PDA rules must use this as seed 0.
+    ApplicationId,
     Literal(&'static [u8]),
     AccountKey(usize),
-    InstructionData { offset: usize, length: usize },
+    InstructionData {
+        offset: usize,
+        length: usize,
+    },
+}
+
+/// A DCG-owned revision-8 record validated by DCG's own read-only reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplicationCoreRecordKind {
+    DocumentV8,
+    ChallengeV8,
 }
 
 /// Authenticated source for a key-based app account rule.
@@ -178,6 +288,11 @@ pub enum ApplicationAccountIdentity {
         owner: Option<&'static Pubkey>,
         executable: bool,
     },
+    /// A core record is checked by DCG's reader with a read-only role.
+    CoreRecord { kind: ApplicationCoreRecordKind },
+    /// The closure-v2 DRU1 PDA, whose canonical bump is committed at byte 219
+    /// of an earlier, read-only validated DCR1 v5/v6 record.
+    StoredBumpPda { challenge_account_index: usize },
 }
 
 /// Complete address, role, and alias contract for one ordered app account.
@@ -254,10 +369,12 @@ fn account_seeds(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
     validated: &[bool],
+    application_id: &'static [u8],
 ) -> Result<Vec<Vec<u8>>, ProgramError> {
     seeds
         .iter()
         .map(|seed| match seed {
+            ApplicationSeed::ApplicationId => Ok(application_id.to_vec()),
             ApplicationSeed::Literal(bytes) => Ok(bytes.to_vec()),
             ApplicationSeed::AccountKey(index) => {
                 if *index >= current_index || !validated.get(*index).copied().unwrap_or(false) {
@@ -278,11 +395,125 @@ fn account_seeds(
         .collect()
 }
 
+const CORE_ACCOUNT_MAGICS: &[&[u8]] = &[
+    b"DCR1", b"DRU1", b"DCM2", b"DPR2", b"DFS2", b"DCR2", b"DCRZ", b"DRP2", b"DEA2", b"DCF1",
+    b"DTA1", b"DTU1", b"DSE1", b"DCO1", b"DHR2", b"DLP2", b"DSH2", b"DSC1", b"DSR1", b"DSR2",
+    b"DCD1", b"BDG1", b"DEA1", b"DRP1", b"ESG4", b"PXR1", b"PT1O", b"PT1P", b"PT1R", b"PT1S",
+    b"PT1X", b"PT2P", b"PT2S", b"PWR1", b"DPL1", b"DFT1", b"BDS2", b"DSB1", b"DSE2", b"DSS1",
+    b"DVW1", b"DSB2", b"DSS2", b"DVW2", b"DAN3", b"DRS3", b"DSB3", b"DSE3", b"DSS3", b"DVW3",
+    b"ARI1", b"ARW1", b"RWP1", b"BSS1", b"DEV2", b"DLE1", b"DDT1", b"DDT2", b"DRB1",
+];
+
+const fn app_magic_overlaps_core(magic: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < CORE_ACCOUNT_MAGICS.len() {
+        let core = CORE_ACCOUNT_MAGICS[i];
+        let shared = if magic.len() < core.len() {
+            magic.len()
+        } else {
+            core.len()
+        };
+        let mut j = 0usize;
+        let mut same_prefix = true;
+        while j < shared {
+            if magic[j] != core[j] {
+                same_prefix = false;
+                break;
+            }
+            j += 1;
+        }
+        if same_prefix {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+const fn validate_app_kind(kind: AccountKind) {
+    if kind.magic.is_empty() {
+        panic!("application program-owned account rules require a non-empty magic");
+    }
+    if app_magic_overlaps_core(kind.magic) {
+        panic!("application account magic overlaps a DCG core record magic");
+    }
+}
+
+const fn validate_app_seeds(application_id: &'static [u8], seeds: &[ApplicationSeed]) {
+    if application_id.is_empty() || application_id.len() > 32 {
+        panic!("application id used as a PDA prefix must contain 1..=32 bytes");
+    }
+    if seeds.is_empty() {
+        panic!("application PDA seeds must start with the application id");
+    }
+    match seeds[0] {
+        ApplicationSeed::ApplicationId => {}
+        _ => panic!("application PDA seeds must start with the application id"),
+    }
+    let mut i = 1usize;
+    while i < seeds.len() {
+        if matches!(seeds[i], ApplicationSeed::ApplicationId) {
+            panic!("the application id may appear only as the first PDA seed");
+        }
+        i += 1;
+    }
+}
+
+const fn validate_application_rules(
+    application_id: &'static [u8],
+    rules: &[ApplicationAccountRule],
+) {
+    let mut i = 0usize;
+    while i < rules.len() {
+        let rule = rules[i];
+        if rule.account_index != i {
+            panic!("application account rules must cover accounts in order");
+        }
+        match rule.identity {
+            ApplicationAccountIdentity::ProgramPda { seeds, kind } => {
+                validate_app_seeds(application_id, seeds);
+                validate_app_kind(kind);
+            }
+            ApplicationAccountIdentity::ProgramKey { source, kind } => {
+                if matches!(source, ApplicationKeySource::InstructionData { .. }) {
+                    panic!("ProgramKey cannot take its key from instruction data");
+                }
+                validate_app_kind(kind);
+            }
+            ApplicationAccountIdentity::SystemPda { seeds, .. } => {
+                validate_app_seeds(application_id, seeds);
+            }
+            ApplicationAccountIdentity::ExactKey { .. } => {}
+            ApplicationAccountIdentity::CoreRecord { kind } => {
+                if rule.role.writable || rule.role.signer {
+                    panic!("core-record application rules are read-only");
+                }
+                let _ = kind;
+            }
+            ApplicationAccountIdentity::StoredBumpPda {
+                challenge_account_index,
+            } => {
+                if challenge_account_index >= i {
+                    panic!("stored-bump PDA source must be an earlier account");
+                }
+                match rules[challenge_account_index].identity {
+                    ApplicationAccountIdentity::CoreRecord {
+                        kind: ApplicationCoreRecordKind::ChallengeV8,
+                    } => {}
+                    _ => panic!("stored-bump PDA source must be a validated DCR1 core record"),
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
 fn validate_application_account_rules(
     program_id: &Pubkey,
     instruction_data: &[u8],
     accounts: &[AccountInfo],
     rules: &'static [ApplicationAccountRule],
+    application_id: &'static [u8],
 ) -> ProgramResult {
     if rules.len() != accounts.len() {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -307,11 +538,21 @@ fn validate_application_account_rules(
         }
         match rule.identity {
             ApplicationAccountIdentity::ProgramPda { seeds, kind } => {
-                let values = account_seeds(seeds, index, accounts, instruction_data, &validated)?;
+                let values = account_seeds(
+                    seeds,
+                    index,
+                    accounts,
+                    instruction_data,
+                    &validated,
+                    application_id,
+                )?;
                 let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
                 expect_derived(account, program_id, &refs, kind, rule.role)?;
             }
             ApplicationAccountIdentity::ProgramKey { source, kind } => {
+                if matches!(source, ApplicationKeySource::InstructionData { .. }) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
                 let expected = account_key_source(
                     source,
                     index,
@@ -327,7 +568,14 @@ fn validate_application_account_rules(
                 seeds,
                 allow_prefunded,
             } => {
-                let values = account_seeds(seeds, index, accounts, instruction_data, &validated)?;
+                let values = account_seeds(
+                    seeds,
+                    index,
+                    accounts,
+                    instruction_data,
+                    &validated,
+                    application_id,
+                )?;
                 let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
                 expect_system_derived_role(account, program_id, &refs, rule.role, allow_prefunded)?;
             }
@@ -346,11 +594,67 @@ fn validate_application_account_rules(
                     rule.role,
                 )?;
                 if account.key != &expected
+                    || account.owner == program_id
                     || owner.is_some_and(|owner| account.owner != owner)
                     || account.executable != executable
                 {
                     return Err(ProgramError::InvalidAccountData);
                 }
+            }
+            ApplicationAccountIdentity::CoreRecord { kind } => {
+                if rule.role.writable
+                    || rule.role.signer
+                    || account.is_writable
+                    || account.is_signer
+                {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                match kind {
+                    ApplicationCoreRecordKind::DocumentV8 => {
+                        crate::unified::document::document_v8_stored(
+                            program_id,
+                            account,
+                            None,
+                            false,
+                            crate::unified::DCR1_AUTH,
+                        )?;
+                    }
+                    ApplicationCoreRecordKind::ChallengeV8 => {
+                        crate::unified::challenge::validate_v8_readonly(program_id, account)?;
+                    }
+                }
+            }
+            ApplicationAccountIdentity::StoredBumpPda {
+                challenge_account_index,
+            } => {
+                if challenge_account_index >= index
+                    || !validated
+                        .get(challenge_account_index)
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let challenge = &accounts[challenge_account_index];
+                let response_bump = challenge
+                    .try_borrow_data()?
+                    .get(crate::unified::challenge::RESPONSE_BUMP_AT)
+                    .copied()
+                    .ok_or(ProgramError::InvalidAccountData)?;
+                let kind = AccountKind::variable(
+                    b"DRU1",
+                    crate::closure_v2_response::HEADER,
+                    crate::closure_v2_response::HEADER + crate::closure_v2_response::MAX_BODY,
+                )
+                .with_version(4, 1);
+                expect_derived_with_bump(
+                    account,
+                    program_id,
+                    &[b"dcg-hcl-response", challenge.key.as_ref()],
+                    response_bump,
+                    kind,
+                    rule.role,
+                )?;
             }
         }
         validated[index] = true;
@@ -458,6 +762,7 @@ fn encode_seeds(seeds: &[ApplicationSeed], out: &mut Vec<u8>) {
     out.extend_from_slice(&(seeds.len() as u32).to_le_bytes());
     for seed in seeds {
         match seed {
+            ApplicationSeed::ApplicationId => out.push(3),
             ApplicationSeed::Literal(bytes) => {
                 out.push(0);
                 out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -563,6 +868,19 @@ fn encode_application_account_rule(rule: &ApplicationAccountRule) -> Vec<u8> {
             }
             out.push(u8::from(executable));
         }
+        ApplicationAccountIdentity::CoreRecord { kind } => {
+            out.push(4);
+            out.push(match kind {
+                ApplicationCoreRecordKind::DocumentV8 => 0,
+                ApplicationCoreRecordKind::ChallengeV8 => 1,
+            });
+        }
+        ApplicationAccountIdentity::StoredBumpPda {
+            challenge_account_index,
+        } => {
+            out.push(5);
+            encode_usize(challenge_account_index, &mut out);
+        }
     }
     out
 }
@@ -588,6 +906,7 @@ impl ApplicationProgramManifest {
         let mut i = 0usize;
         while i < N {
             tags[i] = instructions[i].tag;
+            validate_application_rules(application.application_id, instructions[i].account_rules);
             i += 1;
         }
         validate_application_tags(&tags);
@@ -619,7 +938,7 @@ impl ApplicationProgramManifest {
         let kernel_form_identity = self.application.admission_identity_digest();
         let instruction_count = (self.instructions.len() as u32).to_le_bytes();
         let mut digest = sha256(&[
-            b"dcg/application-program-manifest/2",
+            b"dcg/application-program-manifest/3",
             &application_identity,
             &kernel_form_identity,
             &instruction_count,
@@ -678,7 +997,13 @@ pub fn process_instruction_with_application(
         );
     };
     let instruction = &instructions[index];
-    validate_application_account_rules(program_id, data, accounts, instruction.account_rules)?;
+    validate_application_account_rules(
+        program_id,
+        data,
+        accounts,
+        instruction.account_rules,
+        manifest.application_manifest().application_id,
+    )?;
     let account_check_context = ApplicationAccountCheckContext {
         program_id,
         tag,
@@ -1032,8 +1357,10 @@ mod tests {
 
     #[test]
     fn program_pda_provenance_runs_before_application_preflight() {
-        static PDA_SEEDS: [ApplicationSeed; 1] =
-            [ApplicationSeed::Literal(b"dcg/app-api-test-pda")];
+        static PDA_SEEDS: [ApplicationSeed; 2] = [
+            ApplicationSeed::ApplicationId,
+            ApplicationSeed::Literal(b"dispatch-test-pda"),
+        ];
         static PDA_RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
             0,
             ApplicationAccountIdentity::ProgramPda {
@@ -1057,7 +1384,10 @@ mod tests {
             ApplicationProgramManifest::new(&TEST_APPLICATION, &PDA_INSTRUCTIONS);
 
         let program_id = Pubkey::new_unique();
-        let (key, _) = Pubkey::find_program_address(&[b"dcg/app-api-test-pda"], &program_id);
+        let (key, _) = Pubkey::find_program_address(
+            &[TEST_APPLICATION.application_id, b"dispatch-test-pda"],
+            &program_id,
+        );
         let wrong_owner = Pubkey::new_unique();
         let mut lamports = 1;
         let mut data = *b"APP1";
@@ -1083,6 +1413,236 @@ mod tests {
             Err(ProgramError::InvalidAccountData)
         );
         assert_eq!(PDA_ORDER.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn exact_key_rules_refuse_accounts_owned_by_the_dcg_program() {
+        static EXACT_RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
+            0,
+            ApplicationAccountIdentity::ExactKey {
+                source: ApplicationKeySource::SignerSelf,
+                owner: None,
+                executable: false,
+            },
+            RoleFlags {
+                writable: false,
+                signer: true,
+            },
+        )];
+        static EXACT_INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+            APP_TAG,
+            "example/exact-key-test",
+            1,
+            &EXACT_RULES,
+            role_preflight,
+            role_handler,
+        )];
+        static EXACT_PROGRAM: ApplicationProgramManifest =
+            ApplicationProgramManifest::new(&TEST_APPLICATION, &EXACT_INSTRUCTIONS);
+
+        let program_id = Pubkey::new_unique();
+        let key = Pubkey::new_unique();
+        let mut lamports = 1;
+        let mut data = [];
+        let account = AccountInfo::new(
+            &key,
+            true,
+            false,
+            &mut lamports,
+            &mut data,
+            &program_id,
+            false,
+            0,
+        );
+        ROLE_ORDER.store(0, Ordering::SeqCst);
+        assert_eq!(
+            process_instruction_with_application(
+                &program_id,
+                &[account],
+                &[APP_TAG, 7],
+                &EXACT_PROGRAM,
+            ),
+            Err(ProgramError::InvalidAccountData)
+        );
+        assert_eq!(ROLE_ORDER.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn program_key_runtime_guard_refuses_instruction_data_sources() {
+        static PROGRAM_KEY_RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
+            0,
+            ApplicationAccountIdentity::ProgramKey {
+                source: ApplicationKeySource::InstructionData { offset: 1 },
+                kind: AccountKind::exact(b"APP1", 4),
+            },
+            RoleFlags {
+                writable: false,
+                signer: false,
+            },
+        )];
+        static PROGRAM_KEY_INSTRUCTIONS: [ApplicationInstruction; 1] =
+            [ApplicationInstruction::new(
+                APP_TAG,
+                "example/program-key-runtime-test",
+                1,
+                &PROGRAM_KEY_RULES,
+                pda_preflight,
+                pda_handler,
+            )];
+        // The const constructor rejects this rule. This forged in-module value
+        // pins the dispatcher's runtime guard independently.
+        static FORGED_PROGRAM_KEY_PROGRAM: ApplicationProgramManifest =
+            ApplicationProgramManifest {
+                application: &TEST_APPLICATION,
+                instructions: &PROGRAM_KEY_INSTRUCTIONS,
+            };
+
+        let program_id = Pubkey::new_unique();
+        let key = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut lamports = 1;
+        let mut data = *b"APP1";
+        let account = AccountInfo::new(
+            &key,
+            false,
+            false,
+            &mut lamports,
+            &mut data,
+            &owner,
+            false,
+            0,
+        );
+        PDA_ORDER.store(0, Ordering::SeqCst);
+        assert_eq!(
+            process_instruction_with_application(
+                &program_id,
+                &[account],
+                &[APP_TAG, 7],
+                &FORGED_PROGRAM_KEY_PROGRAM,
+            ),
+            Err(ProgramError::InvalidAccountData)
+        );
+        assert_eq!(PDA_ORDER.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn core_challenge_and_its_stored_bump_response_are_checked_read_only() {
+        static DISPUTE_RULES: [ApplicationAccountRule; 2] = [
+            ApplicationAccountRule::new(
+                0,
+                ApplicationAccountIdentity::CoreRecord {
+                    kind: ApplicationCoreRecordKind::ChallengeV8,
+                },
+                RoleFlags {
+                    writable: false,
+                    signer: false,
+                },
+            ),
+            ApplicationAccountRule::new(
+                1,
+                ApplicationAccountIdentity::StoredBumpPda {
+                    challenge_account_index: 0,
+                },
+                RoleFlags {
+                    writable: false,
+                    signer: false,
+                },
+            ),
+        ];
+        static DISPUTE_INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+            APP_TAG,
+            "example/dispute-account-test",
+            1,
+            &DISPUTE_RULES,
+            pda_preflight,
+            pda_handler,
+        )];
+        static DISPUTE_PROGRAM: ApplicationProgramManifest =
+            ApplicationProgramManifest::new(&TEST_APPLICATION, &DISPUTE_INSTRUCTIONS);
+
+        let program_id = Pubkey::new_unique();
+        let descriptor = [9u8; 32];
+        let challenger = Pubkey::new_unique();
+        let nonce = 17u32.to_le_bytes();
+        let (challenge_key, challenge_bump) = Pubkey::find_program_address(
+            &[
+                crate::unified::address::CHALLENGE_SEED,
+                &descriptor,
+                challenger.as_ref(),
+                &nonce,
+            ],
+            &program_id,
+        );
+        let (response_key, response_bump) = Pubkey::find_program_address(
+            &[b"dcg-hcl-response", challenge_key.as_ref()],
+            &program_id,
+        );
+        let mut challenge_lamports = 1;
+        let mut challenge_data = vec![0u8; crate::unified::challenge::SIZE];
+        challenge_data[..4].copy_from_slice(b"DCR1");
+        challenge_data[4] = crate::unified::challenge::PHASE_RESPOND;
+        challenge_data[6..8].copy_from_slice(&crate::unified::challenge::VERSION.to_le_bytes());
+        challenge_data[8..40].copy_from_slice(challenger.as_ref());
+        challenge_data[72..104].copy_from_slice(&descriptor);
+        challenge_data[crate::unified::challenge::PT2P_MODE_AT] = 1;
+        challenge_data[140..144].copy_from_slice(&nonce);
+        challenge_data[crate::unified::challenge::RECORD_BUMP_AT] = challenge_bump;
+        challenge_data[crate::unified::challenge::RECORD_BUMP_MARKER_AT] = 1;
+        challenge_data[crate::unified::challenge::RESPONSE_BUMP_STAGED_AT] = response_bump;
+        challenge_data[crate::unified::challenge::RESPONSE_BUMP_AT] = response_bump;
+        let challenge_account = AccountInfo::new(
+            &challenge_key,
+            false,
+            false,
+            &mut challenge_lamports,
+            &mut challenge_data,
+            &program_id,
+            false,
+            0,
+        );
+        let original_challenge = challenge_account.try_borrow_data().unwrap().to_vec();
+
+        let mut response_lamports = 1;
+        let mut response_data = vec![0u8; crate::closure_v2_response::HEADER];
+        response_data[..4].copy_from_slice(b"DRU1");
+        response_data[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let response_account = AccountInfo::new(
+            &response_key,
+            false,
+            false,
+            &mut response_lamports,
+            &mut response_data,
+            &program_id,
+            false,
+            0,
+        );
+        let mut writable_challenge = challenge_account.clone();
+        writable_challenge.is_writable = true;
+        assert_eq!(
+            process_instruction_with_application(
+                &program_id,
+                &[writable_challenge, response_account.clone()],
+                &[APP_TAG, 7],
+                &DISPUTE_PROGRAM,
+            ),
+            Err(ProgramError::InvalidAccountData),
+            "a handler cannot receive a writable core challenge through a read-only rule"
+        );
+        PDA_ORDER.store(0, Ordering::SeqCst);
+        assert_eq!(
+            process_instruction_with_application(
+                &program_id,
+                &[challenge_account.clone(), response_account],
+                &[APP_TAG, 7],
+                &DISPUTE_PROGRAM,
+            ),
+            Ok(())
+        );
+        assert_eq!(PDA_ORDER.load(Ordering::SeqCst), HANDLER_MARK);
+        assert_eq!(
+            challenge_account.try_borrow_data().unwrap().as_ref(),
+            original_challenge
+        );
     }
 
     #[cfg(feature = "sbf-lifecycle-test")]

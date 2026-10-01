@@ -261,10 +261,18 @@ fn record(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> Program
 
 /// Revision-8 DCR1 stores its canonical challenge bump and response bump.
 /// Revision 7 continues to use record() unchanged.
-fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> ProgramResult {
+fn record_v8_with_role(
+    program: &Pubkey,
+    account: &AccountInfo,
+    phase: Option<u8>,
+    writable: bool,
+) -> ProgramResult {
     #[cfg(feature = "revision-8")]
     {
-        if account.owner != program || !account.is_writable || account.data_len() != SIZE {
+        if account.owner != program
+            || (writable && !account.is_writable)
+            || account.data_len() != SIZE
+        {
             return Err(no(DCR1_AUTH));
         }
         let raw = account.try_borrow_data()?;
@@ -295,7 +303,7 @@ fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> Prog
     ];
     let kind = AccountKind::exact(b"DCR1", SIZE);
     let role = RoleFlags {
-        writable: true,
+        writable,
         signer: false,
     };
     match raw[RECORD_BUMP_MARKER_AT] {
@@ -306,6 +314,25 @@ fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> Prog
         _ => return Err(no(DCR1_AUTH)),
     }
     Ok(())
+}
+
+/// Validate a revision-8 DCR1 record through the core reader without requiring
+/// write privilege. Used by application account preflight before app handlers.
+pub fn validate_v8_readonly(program: &Pubkey, account: &AccountInfo) -> ProgramResult {
+    #[cfg(feature = "revision-8")]
+    {
+        record_v8_with_role(program, account, None, false)
+    }
+    #[cfg(not(feature = "revision-8"))]
+    {
+        let _ = (program, account);
+        Err(no(DCR1_AUTH))
+    }
+}
+
+#[cfg(feature = "revision-8")]
+fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> ProgramResult {
+    record_v8_with_role(program, account, phase, true)
 }
 
 #[cfg(feature = "revision-8")]
@@ -1167,6 +1194,12 @@ pub fn rule_v8(
     if *challenge != expected {
         return Err(no(DCR1_AUTH));
     }
+    // Timeouts in these two phases can settle before tag 164 moves the
+    // response bump out of scratch. Commit the staged value in the stable
+    // byte whenever either phase rules the dispute.
+    if matches!(raw[4], PHASE_POSITION_REVEAL | PHASE_SELECT) {
+        raw[RESPONSE_BUMP_AT] = raw[RESPONSE_BUMP_STAGED_AT];
+    }
     if winner == 0 && cause != events::CAUSE_APP_IDENTITY_CHANGED {
         return Err(no(DCR1_AUTH));
     }
@@ -1450,11 +1483,13 @@ fn open_record(
     {
         raw[RECORD_BUMP_AT] = bump.value();
         raw[RECORD_BUMP_MARKER_AT] = 1;
-        raw[RESPONSE_BUMP_STAGED_AT] = crate::account_provenance::CanonicalBump::find(
+        let response_bump = crate::account_provenance::CanonicalBump::find(
             &[b"dcg-hcl-response", accounts[0].key.as_ref()],
             program,
         )
         .value();
+        raw[RESPONSE_BUMP_STAGED_AT] = response_bump;
+        raw[RESPONSE_BUMP_AT] = response_bump;
     }
     raw[148..156].copy_from_slice(&deadline.to_le_bytes());
     raw[156..160].copy_from_slice(&position.to_le_bytes());

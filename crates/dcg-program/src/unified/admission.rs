@@ -14,7 +14,7 @@
 use super::classes::{self, rs1_height};
 use super::registry::{self, find_row, HEADER as DRP2_HEADER};
 use super::{no, plan, u16_at, u32_at, ADMISSION_STATE, PLAN_BINDING, REGISTRY_ROOT};
-use crate::account_provenance::{expect_derived, AccountKind, RoleFlags};
+use crate::account_provenance::{expect_derived, expect_derived_with_bump, AccountKind, RoleFlags};
 use crate::hash;
 use crate::kernel::{ApplicationManifest, CommittedReplayWitness, LegacyFormBinding};
 use crate::pt2p::Pt2p;
@@ -300,6 +300,26 @@ pub struct View {
 /// `popcount` the bitmap is also counted (UnifiedInit; handlers that only
 /// set bits keep the count by construction).
 pub fn view(program: &Pubkey, account: &AccountInfo, popcount: bool) -> Result<View, ProgramError> {
+    view_inner(program, account, popcount, None)
+}
+
+/// Validate DEA2 using the canonical bump committed in its trusted DTU1
+/// template record. This keeps UnifiedInit to one fixed-cost derivation.
+pub fn view_with_bump(
+    program: &Pubkey,
+    account: &AccountInfo,
+    popcount: bool,
+    bump: u8,
+) -> Result<View, ProgramError> {
+    view_inner(program, account, popcount, Some(bump))
+}
+
+fn view_inner(
+    program: &Pubkey,
+    account: &AccountInfo,
+    popcount: bool,
+    bump: Option<u8>,
+) -> Result<View, ProgramError> {
     if account.owner != program {
         return Err(no(ADMISSION_STATE));
     }
@@ -341,21 +361,23 @@ pub fn view(program: &Pubkey, account: &AccountInfo, popcount: bool) -> Result<V
         .ok_or(bad())?;
     let registry = Pubkey::new_from_array(v.registry);
     let pt2s = Pubkey::new_from_array(v.pt2s);
-    expect_derived(
-        account,
-        program,
-        &[
-            super::address::ADMISSION_SEED,
-            registry.as_ref(),
-            pt2s.as_ref(),
-            &v.position_count.to_le_bytes(),
-        ],
-        AccountKind::exact(b"DEA2", bytes(total)).with_version(4, VERSION),
-        RoleFlags {
-            writable: false,
-            signer: false,
-        },
-    )
+    let positions = v.position_count.to_le_bytes();
+    let seeds = [
+        super::address::ADMISSION_SEED,
+        registry.as_ref(),
+        pt2s.as_ref(),
+        &positions,
+    ];
+    let kind = AccountKind::exact(b"DEA2", bytes(total)).with_version(4, VERSION);
+    let role = RoleFlags {
+        writable: false,
+        signer: false,
+    };
+    if let Some(bump) = bump {
+        expect_derived_with_bump(account, program, &seeds, bump, kind, role).map(|_| ())
+    } else {
+        expect_derived(account, program, &seeds, kind, role).map(|_| ())
+    }
     .map_err(|_| bad())?;
     if raw.len() != bytes(total)
         || v.admitted > total

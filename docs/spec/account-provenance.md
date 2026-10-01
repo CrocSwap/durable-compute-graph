@@ -23,8 +23,10 @@ The shared `account_provenance::expect_derived` gate checks the canonical PDA,
 program owner, non-executable status, required writable/signer privileges,
 magic, data-length bounds, and optional version. `expect_derived_with_bump`
 uses one address derivation with a bump stored by an existing creator that used
-the canonical search; it checks a configured bump field but does not search
-again. A read role accepts a writable meta when the frozen account list already
+the canonical search; it returns a `StoredBump`, checks a configured bump field,
+and does not search again. `expect_system_derived_with_bump` returns the same
+read-only token after checking a stored bump against an empty System-owned
+target. A read role accepts a writable meta when the frozen account list already
 grants it; a writer must receive a writable meta. `expect_keyed` applies the
 same shape and privilege checks when the identity is an independently
 authenticated non-PDA key, such as the key of a fresh account whose signature
@@ -35,14 +37,12 @@ creating or assigning the account; `allocate_derived_account` keeps the
 format's existing pre-funding behavior.
 
 Every program-owned PDA creation must use `CanonicalBump`: the opaque type
-pairs the address with the bump returned by a full canonical search, or by a
-stored bump that has passed the account's expected-address and kind checks.
-Creation helpers accept that type instead of an arbitrary byte, use its paired
-address, and sign with its bump without deriving the address a second time.
-This makes the canonical-bump invariant explicit at the creation boundary. A
-stored bump is trusted only because DCG created the record through the
-full-search path; readers then verify the address with one fixed-cost
-derivation.
+pairs the address with the bump returned by a full canonical search. Creation
+helpers accept that type instead of an arbitrary byte, use its paired address,
+and sign with its bump without deriving the address a second time. A
+`StoredBump` cannot be passed to creation helpers. A stored bump is trusted
+only because DCG created the record through the full-search path; readers then
+verify the address with one fixed-cost derivation.
 
 Callers must validate the seed sources before invoking these helpers. The
 helpers cannot infer whether arbitrary bytes passed as `seeds` came from a
@@ -64,8 +64,10 @@ adapters:
 - **DCR1 challenge records and closure-v2 response tags 115–118/125.** Open
   validates the new address from the instruction descriptor, challenger
   signer, and nonce, then stores the canonical challenge bump at byte 146,
-  marker `1` at byte 147, and the canonical DRU1 response bump staged at byte
-  181, then moved to byte 219 after tag 164 consumes position roots.
+  marker `1` at byte 147, and the canonical DRU1 response bump at byte 181
+  and stable byte 219. Tag 164 refreshes byte 219 from byte 181 after it
+  consumes position roots; a tag 132 ruling in POSITION_REVEAL or SELECT does
+  the same before tag 131 settlement.
   Challenge readers require marker `1`; this image is intended for a fresh
   program address, so pre-image marker-0 DCR1 records are refused. Revision-8
   tag 131 uses the stored DCR1 and DRU1 bumps for fixed-cost address checks;

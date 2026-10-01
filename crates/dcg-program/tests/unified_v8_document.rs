@@ -468,10 +468,7 @@ async fn send_quiet_cached(
         }
         Err(error) => panic!("the banks client refused the cached transaction: {error:?}"),
     };
-    if matches!(
-        &result,
-        Err(TransactionError::AlreadyProcessed | TransactionError::BlockhashNotFound)
-    ) {
+    if matches!(&result, Err(TransactionError::AlreadyProcessed)) {
         let slot = ctx
             .banks_client
             .get_sysvar::<solana_program::clock::Clock>()
@@ -1654,17 +1651,19 @@ async fn build_with_pre_fix_seal_processor(
     };
     let g = v7_golden();
     let e = executor();
-    let program = Pubkey::new_unique();
-    let mut executor_kp = Keypair::new();
-    let mut signer = Keypair::new();
+    // Stable account identities keep SBF CU comparisons on the same fixture
+    // across source revisions, including the tag-160 admission measurement.
+    let program = Pubkey::new_from_array([0x80; 32]);
+    let mut executor_kp = Keypair::new_from_array([0x81; 32]);
+    let mut signer = Keypair::new_from_array([0x82; 32]);
     if swap_executor_and_challenger {
         std::mem::swap(&mut executor_kp, &mut signer);
     }
-    let pt1x_kp = Keypair::new();
-    let pt2s_kp = Keypair::new();
-    let route_kp = Keypair::new();
-    let geometry_kp = Keypair::new();
-    let payload_kp = Keypair::new();
+    let pt1x_kp = Keypair::new_from_array([0x83; 32]);
+    let pt2s_kp = Keypair::new_from_array([0x84; 32]);
+    let route_kp = Keypair::new_from_array([0x85; 32]);
+    let geometry_kp = Keypair::new_from_array([0x86; 32]);
+    let payload_kp = Keypair::new_from_array([0x87; 32]);
     let pt1s_index = if full_honest_setup {
         pt1x_kp.pubkey()
     } else {
@@ -2347,10 +2346,9 @@ async fn build_with_pre_fix_seal_processor(
         .expect("permissionless admission begins from the sealed PT1X/PT2S");
         let mut first = 0u32;
         while first < class_total {
-            // Admission's K=10,240 class scan exceeds the release-SBF
-            // transaction budget for a multi-class step. Keep this mechanics
-            // fixture to one class per instruction.
-            let count = (class_total - first).min(1) as u16;
+            // Keep the historical 16-class transaction shape. App-bound
+            // K=10,240 admission needs a position cursor and is follow-up work.
+            let count = (class_total - first).min(16) as u16;
             let mut step = vec![160];
             step.extend_from_slice(&first.to_le_bytes());
             step.extend_from_slice(&count.to_le_bytes());
@@ -12598,6 +12596,53 @@ fn challenge_leaf_packet(f: &Fix, descriptor: &[u8; 32], proof: &Rekeyed, nonce:
     out
 }
 
+fn challenge_app_leaf_packet(
+    f: &Fix,
+    descriptor: &[u8; 32],
+    roots: &[[u8; 32]],
+    position: u32,
+    ordinal: usize,
+    segment: u16,
+    local: u32,
+    levels: &[Vec<ChallengeNode>],
+    nonce: u32,
+    witness: &[u8],
+) -> Vec<u8> {
+    let leaves = levels[0].iter().map(|node| node.digest).collect::<Vec<_>>();
+    let (path, _) = f47_tree_path(descriptor, 1, position, &leaves, local as usize);
+    let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
+    let x = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        None,
+        pt2p::Program::decode(&pwr1).unwrap(),
+    )
+    .unwrap();
+    let table_root = x.segment_table_root(position).unwrap();
+    let (spp_path, _) = f47_tree_path(descriptor, 2, position, roots, ordinal);
+    let mut out = vec![TAG_CHALLENGE_LEAF];
+    out.extend_from_slice(descriptor);
+    out.extend_from_slice(&position.to_le_bytes());
+    out.extend_from_slice(&segment.to_le_bytes());
+    out.extend_from_slice(&local.to_le_bytes());
+    out.extend_from_slice(&leaves[local as usize]);
+    out.push(path.len() as u8);
+    for sibling in &path {
+        out.extend_from_slice(sibling);
+    }
+    out.extend_from_slice(&(ordinal as u16).to_le_bytes());
+    out.push(spp_path.len() as u8);
+    out.push(0);
+    out.extend_from_slice(&table_root);
+    for sibling in &spp_path {
+        out.extend_from_slice(sibling);
+    }
+    out.extend_from_slice(&nonce.to_le_bytes());
+    out.extend_from_slice(witness);
+    out
+}
+
 fn challenge_leaf_metas(f: &Fix, c: [Pubkey; 4], record: Pubkey) -> Vec<AccountMeta> {
     vec![
         AccountMeta::new(record, false),
@@ -12653,6 +12698,17 @@ async fn rev8_honest_leaf_challenge_uses_v7_document_reader_and_refuses_a_cheati
         .await
         .expect("the retained attestation opens a challenge against DCM2 v7");
     let dcr1 = f.account(record).await;
+    let (_, expected_response_bump) =
+        dcg_program::closure_v2_response::address(&f.program, &record);
+    assert_eq!(
+        dcr1[challenge::RESPONSE_BUMP_STAGED_AT],
+        expected_response_bump.value()
+    );
+    assert_eq!(
+        dcr1[challenge::RESPONSE_BUMP_AT],
+        expected_response_bump.value(),
+        "tag 166 initializes the stable response bump at open"
+    );
     assert_eq!(
         dcr1[4],
         challenge::PHASE_RESPOND,
@@ -13316,6 +13372,17 @@ async fn rev8_position_challenge_rounds_convict_executor_and_burn_uncreditable_b
     );
     assert_eq!(dcr1[5], 2, "the challenger wins against a silent executor");
     assert_eq!(dcr1[178], events::CAUSE_TIMEOUT);
+    assert_eq!(
+        dcr1[challenge::RESPONSE_BUMP_AT],
+        dcr1[challenge::RESPONSE_BUMP_STAGED_AT],
+        "tag 132 commits the staged response bump when POSITION_REVEAL times out"
+    );
+    let (_, expected_response_bump) =
+        dcg_program::closure_v2_response::address(&f.program, &record);
+    assert_eq!(
+        dcr1[challenge::RESPONSE_BUMP_AT],
+        expected_response_bump.value()
+    );
     let doc = f.account(created[0]).await;
     assert_eq!(u16_at(&doc, 6) & FLAG_REFUTED, FLAG_REFUTED);
     assert_eq!(u32_at(&doc, 132), 1);
@@ -15127,6 +15194,151 @@ async fn rev8_pt1x_registry_and_admission_sbf() {
     let admission = f.account(f.dea2).await;
     assert_eq!(&admission[..4], b"DEA2");
     assert_eq!(u32_at(&admission, 136), f.k);
+}
+
+/// A timeout in SELECT can settle before tag 164 transfers the staged DRU1
+/// bump, so tag 132 must make byte 219 usable by tag 131.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_select_timeout_preserves_response_bump_for_settlement_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
+
+    let binding = f.binding(29, 50);
+    let (descriptor, created, roots, _, _, _) =
+        commit_challenge_tree(&mut f, &binding, 79, 0).await;
+    let nonce = 121;
+    let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), nonce).0;
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        challenge_position_data(&descriptor, 79, nonce),
+        challenge_position_metas(&f, created, record),
+    )
+    .await
+    .expect("tag 167 opens the position challenge");
+
+    let mut reveal = vec![TAG_REVEAL_POSITION, 0, 0, roots.len() as u8];
+    for root in &roots {
+        reveal.extend_from_slice(root);
+    }
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        reveal,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new_readonly(created[0], false),
+            AccountMeta::new_readonly(created[1], false),
+            AccountMeta::new_readonly(f.pt2s, false),
+            AccountMeta::new_readonly(f.routes, false),
+            AccountMeta::new_readonly(f.geometry, false),
+        ],
+    )
+    .await
+    .expect("tag 163 completes the position reveal");
+    let open = f.account(record).await;
+    assert_eq!(open[4], challenge::PHASE_SELECT);
+    clock_to(&mut f, u64_at(&open, 148) + 1).await;
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(created[0], false),
+        ],
+    )
+    .await
+    .expect("tag 132 rules for the executor after SELECT silence");
+
+    let dcr1 = f.account(record).await;
+    assert_eq!(dcr1[4], challenge::PHASE_RULED);
+    assert_eq!(dcr1[5], 1);
+    assert_eq!(dcr1[178], events::CAUSE_TIMEOUT);
+    assert_eq!(
+        dcr1[challenge::RESPONSE_BUMP_AT],
+        dcr1[challenge::RESPONSE_BUMP_STAGED_AT],
+        "tag 132 commits the staged response bump when SELECT times out"
+    );
+    let (_, expected_response_bump) =
+        dcg_program::closure_v2_response::address(&f.program, &record);
+    assert_eq!(
+        dcr1[challenge::RESPONSE_BUMP_AT],
+        expected_response_bump.value()
+    );
+    settle_and_close_standard_app_challenge(&mut f, record, created, descriptor, false, &terms)
+        .await;
+}
+
+/// Tag 166's app replay fast path can rule immediately. Its open-time stable
+/// DRU1 bump must remain available to tag 131 without a preceding tag 164.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_app_leaf_fast_conviction_settles_from_open_bump_sbf() {
+    let Some(mut f) = build().await else {
+        panic!("retained artifacts absent")
+    };
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
+
+    let binding = f.binding(29, 50);
+    let witness = app_route_producer_witness_with(&[4, 5, 6]);
+    let (descriptor, created, roots, segment, target, levels) =
+        commit_route_free_app_tree(&mut f, &binding, 79, 1, 256, &witness).await;
+    let nonce = 122;
+    let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), nonce).0;
+    let packet = challenge_app_leaf_packet(
+        &f,
+        &descriptor,
+        &roots,
+        79,
+        1,
+        segment,
+        target,
+        &levels,
+        nonce,
+        &witness,
+    );
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        packet,
+        challenge_leaf_metas(&f, created, record),
+    )
+    .await
+    .expect("tag 166 fast replay convicts the executor");
+    let dcr1 = f.account(record).await;
+    assert_eq!(dcr1[4], challenge::PHASE_RULED);
+    assert_eq!(dcr1[5], 2);
+    assert_eq!(dcr1[178], events::CAUSE_APP_REPLAY);
+    assert_eq!(
+        dcr1[challenge::RESPONSE_BUMP_AT],
+        dcr1[challenge::RESPONSE_BUMP_STAGED_AT],
+        "tag 166 initializes the stable bump before its immediate ruling"
+    );
+    let (_, expected_response_bump) =
+        dcg_program::closure_v2_response::address(&f.program, &record);
+    assert_eq!(
+        dcr1[challenge::RESPONSE_BUMP_AT],
+        expected_response_bump.value()
+    );
+    settle_and_close_standard_app_challenge(&mut f, record, created, descriptor, true, &terms)
+        .await;
 }
 
 /// Tag 146 checks the binding-derived PT1O address before assigning or writing
