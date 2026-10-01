@@ -22,7 +22,9 @@ observation or terminal result is recorded. After a dropped branch, the adapter
 may mark even never-signed descendants ``reconciliation_required``. It releases
 their pending slots only by journaling a reconciliation decision of ``abandon``
 and then a terminal ``abandoned`` summary; this outcome does not claim finalized
-commitment.
+commitment. Abandoning a signed step is the adapter's responsibility: it must
+have evidence that the signed packet can no longer land before recording that
+decision. A timeout, absent status, or provider error alone is not such evidence.
 
 After resume, the adapter must reconcile unresolved packets before signing new
 work. route_policy_digest must be the canonical digest of the configured
@@ -243,6 +245,11 @@ class StreamingPlan:
                     await self._condition.wait()
                 if self._journal.input_closed:
                     raise StreamClosed("stream input is closed")
+                known = set(self._journal.intents)
+                if any(dependency not in known for dependency in intent.dependencies):
+                    raise StreamError(
+                        "stream dependencies are no longer pending or retained after the capacity wait"
+                    )
             return await _run_thread(self._journal.append_intent, intent)
 
     async def record_signed_packet(

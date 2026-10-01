@@ -1,11 +1,13 @@
 """Versioned durable journal primitives for open-ended transaction streams.
 
-The stream WAL is append-only between checkpoints. A checkpoint stores only
-pending work, a deterministic terminal window, and observations/lifecycle rows
-for those live steps. It never copies segment history. Once its manifest pointer
-commits, older checkpoints and covered segments are deleted. Fixed-plan journal
-v1 remains implemented by journal.py and is unchanged. A complete final WAL row
-without a trailing newline is accepted and repaired when the stream resumes.
+The stream WAL is append-only between checkpoints. A checkpoint stores pending
+work, a deterministic terminal window with each retained generation's
+signature, observations/lifecycle rows for those steps, a bounded recent step-ID
+window, and recent orphan provider failures. It never copies segment history.
+Once its manifest pointer commits, older checkpoints and covered segments are
+deleted. Fixed-plan journal v1 remains implemented by journal.py and is
+unchanged. A complete final WAL row without a trailing newline is accepted and
+repaired when the stream resumes.
 
 An append may depend only on pending steps or one of the last
 ``max_pending_steps`` terminal steps by stream sequence. Older dependencies are
@@ -15,6 +17,8 @@ silently migrated. Applications
 must also use globally unique step IDs for the stream lifetime and map late
 provider failures to their original step, generation, and attempt. Compacted
 late failures are stored as orphan events because their packet records are gone.
+At most 64 orphan failures and 512 recent appended step IDs are retained across
+checkpoint compaction; duplicate checks cover the retained orphan window.
 
 For packets that invoke this stream program, every instruction account meta
 must appear in ``destination_accounts``. That includes the payer, authority,
@@ -43,6 +47,8 @@ from .types import JournalError
 
 
 STREAM_SCHEMA_VERSION = 4
+MAX_RETAINED_ORPHAN_FAILURES = 64
+MAX_RECENT_APPENDED_STEP_IDS = 512
 _ZERO_DIGEST = "0" * 64
 _SEQUENCE_DOMAIN = b"dcg-stream-sequence-v1\0"
 _INTENT_DOMAIN = b"dcg-stream-intent-v1\0"
@@ -570,14 +576,19 @@ class StreamJournal:
         self._identity = identity
         self._intents: dict[str, tuple[int, StreamIntent, str]] = {}
         self._intent_chain_digests: dict[str, str] = {}
+        self._known_step_ids: set[str] = set()
+        self._known_step_order: list[str] = []
         self._pending: dict[str, tuple[int, StreamIntent, str]] = {}
         self._terminals: dict[str, StreamTerminal] = {}
+        self._terminal_packet_signatures: dict[str, dict[int, str]] = {}
         self._reserve_left: dict[str, int] = {}
+        self._terminal_reserve_left: dict[str, int] = {}
         self._packet_index: dict[tuple[str, int], SignedPacketRecord] = {}
         self._attempt_index: dict[tuple[str, int], list[PacketAttempt]] = {}
         self._rebuild_authorizations: list[dict[str, Any]] = []
         self._observations_by_step: dict[str, list[StreamObservation]] = {}
         self._lifecycle_events_by_step: dict[str, list[StreamLifecycleEvent]] = {}
+        self._orphan_provider_failures: dict[tuple[str, int, int], StreamLifecycleEvent] = {}
         self._reconciliation_decisions: dict[tuple[str, int], tuple[int, str, str]] = {}
         self._next_event_sequence = 0
         self._next_stream_sequence = 1
@@ -678,7 +689,13 @@ class StreamJournal:
         with self._lock:
             return tuple(
                 sorted(
-                    (row for rows in self._lifecycle_events_by_step.values() for row in rows),
+                    (
+                        row
+                        for row in (
+                            [event for rows in self._lifecycle_events_by_step.values() for event in rows]
+                            + list(self._orphan_provider_failures.values())
+                        )
+                    ),
                     key=lambda row: row.event_sequence,
                 )
             )
@@ -690,8 +707,10 @@ class StreamJournal:
                 sorted(
                     (
                         row
-                        for rows in self._lifecycle_events_by_step.values()
-                        for row in rows
+                        for row in (
+                            [event for rows in self._lifecycle_events_by_step.values() for event in rows]
+                            + list(self._orphan_provider_failures.values())
+                        )
                         if row.event == "late_provider_failure"
                     ),
                     key=lambda row: row.event_sequence,
@@ -762,6 +781,8 @@ class StreamJournal:
                     self._intent_chain_digests[intent.step_id],
                     True,
                 )
+            if intent.step_id in self._known_step_ids:
+                raise StreamError(f"step {intent.step_id!r} was already appended in the retained stream history")
             if self._input_closed:
                 raise StreamClosed("stream input is closed")
             if len(self._pending) >= self.limits.max_pending_steps:
@@ -788,7 +809,7 @@ class StreamJournal:
                     "previous_sequence_digest": prior_digest,
                     "sequence_digest": chain_digest,
                 },
-                admission_reserve=self._step_reserve(intent),
+                admission_reserve=self._step_reserve(intent) + self._terminal_step_reserve(intent),
             )
             return StreamAppendReceipt(intent.step_id, sequence, chain_digest, False)
 
@@ -1033,6 +1054,8 @@ class StreamJournal:
                 or attempt <= 0
             ):
                 raise StreamError("late failure generation and attempt must be non-negative/positive integers")
+            if step_id not in self._known_step_ids:
+                raise StreamError("late provider failure references a step id that was never appended or is no longer retained")
             packet = self._packet_index.get((step_id, generation))
             orphan = step_id not in self._pending
             if packet is None and not orphan:
@@ -1064,7 +1087,8 @@ class StreamJournal:
                     for field in ("provider_id", "endpoint_id", "route_group", "route_affinity", "disposition")
                 ):
                     raise StreamError("late provider failure differs from the acknowledged provider receipt")
-            if any(
+            failure_key = (step_id, generation, attempt)
+            if failure_key in self._orphan_provider_failures or any(
                 event.step_id == step_id
                 and event.generation == generation
                 and event.data.get("attempt") == attempt
@@ -1256,6 +1280,13 @@ class StreamJournal:
                     raise StreamError("abandonment requires a journaled adapter decision to abandon")
                 if terminal.reconciliation_decision_event_sequence != decision[0]:
                     raise StreamError("abandonment does not reference the journaled reconciliation decision")
+                packet_signatures = {
+                    packet.signature
+                    for (candidate, _generation), packet in self._packet_index.items()
+                    if candidate == terminal.step_id
+                }
+                if terminal.signature is not None and terminal.signature not in packet_signatures:
+                    raise StreamError("abandoned terminal signature does not match one of its signed packets")
             else:
                 if not any(
                     key[0] == terminal.step_id and packet.signature == terminal.signature
@@ -1489,14 +1520,35 @@ class StreamJournal:
     def _restore_manifest_state(self, manifest: Mapping[str, Any]) -> None:
         self._pending.clear()
         self._intents.clear()
+        self._known_step_ids.clear()
+        self._known_step_order.clear()
         self._terminals.clear()
+        self._terminal_packet_signatures.clear()
         self._reserve_left.clear()
+        self._terminal_reserve_left.clear()
         self._intent_chain_digests.clear()
         for step_id, row in manifest.get("pending_intents", {}).items():
             self._restore_intent_row(step_id, row, pending=True)
+            self._terminal_reserve_left[step_id] = self._terminal_step_reserve(self._pending[step_id][1])
         for step_id, row in manifest.get("terminal_records", {}).items():
             self._restore_intent_row(step_id, row["intent_row"], pending=False)
-            self._terminals[step_id] = StreamTerminal.from_record(row["terminal"])
+            terminal = StreamTerminal.from_record(row["terminal"])
+            self._terminals[step_id] = terminal
+            self._terminal_reserve_left[step_id] = self._terminal_step_reserve(self._intents[step_id][1])
+            signatures = row.get("packet_signatures")
+            if signatures is not None:
+                validated = self._validated_generation_signatures(signatures)
+                if terminal.signature is not None and terminal.signature not in validated.values():
+                    raise StreamError("checkpoint terminal signature has no retained signed packet")
+                self._terminal_packet_signatures[step_id] = validated
+        self._known_step_ids.update(self._pending)
+        self._known_step_ids.update(self._terminals)
+        self._known_step_order = [
+            step_id
+            for step_id, _record in sorted(
+                self._intents.items(), key=lambda item: item[1][0]
+            )
+        ]
         self._next_stream_sequence = manifest["next_stream_sequence"]
         self._sequence_digest = manifest["sequence_digest"]
         self._next_event_sequence = manifest["event_high_water_mark"] + 1
@@ -1520,6 +1572,31 @@ class StreamJournal:
             "input_closed": checkpoint["input_closed"],
         }
         self._restore_manifest_state(state)
+        known_step_ids = checkpoint.get("known_step_ids")
+        recent_step_ids = checkpoint.get("recent_step_ids")
+        if known_step_ids is not None:
+            if (
+                not isinstance(known_step_ids, list)
+                or any(not isinstance(step_id, str) or not step_id for step_id in known_step_ids)
+                or known_step_ids != sorted(set(known_step_ids))
+            ):
+                raise StreamError("checkpoint known step IDs are invalid")
+            self._known_step_ids = set(known_step_ids)
+            if not (set(self._pending) | set(self._terminals)).issubset(self._known_step_ids):
+                raise StreamError("checkpoint known step IDs omit pending or retained terminal work")
+        else:
+            self._known_step_ids.update(self._pending)
+            self._known_step_ids.update(self._terminals)
+        if recent_step_ids is not None:
+            if (
+                not isinstance(recent_step_ids, list)
+                or len(recent_step_ids) > MAX_RECENT_APPENDED_STEP_IDS
+                or any(not isinstance(step_id, str) or not step_id for step_id in recent_step_ids)
+                or len(recent_step_ids) != len(set(recent_step_ids))
+                or not set(recent_step_ids).issubset(self._known_step_ids)
+            ):
+                raise StreamError("checkpoint recent step IDs are invalid")
+            self._known_step_order = list(recent_step_ids)
         if (
             self._next_stream_sequence != self._manifest["next_stream_sequence"]
             or self._sequence_digest != self._manifest["sequence_digest"]
@@ -1531,10 +1608,46 @@ class StreamJournal:
         self._rebuild_authorizations = list(checkpoint.get("rebuild_authorizations", []))
         self._packet_index.clear()
         self._attempt_index.clear()
+        self._orphan_provider_failures.clear()
         for row in checkpoint["unresolved_packets"]:
             self._restore_packet_row(row)
+        for step_id, row in checkpoint["terminal_records"].items():
+            signatures = row.get("packet_signatures")
+            if signatures is not None:
+                validated = self._validated_generation_signatures(signatures)
+                terminal = self._terminals[step_id]
+                if terminal.signature is not None and terminal.signature not in validated.values():
+                    raise StreamError("checkpoint terminal signature has no retained signed packet")
+                self._terminal_packet_signatures[step_id] = validated
+        orphan_rows = checkpoint.get("orphan_provider_failures", [])
+        if not isinstance(orphan_rows, list) or len(orphan_rows) > MAX_RETAINED_ORPHAN_FAILURES:
+            raise StreamError("checkpoint orphan provider failures are invalid")
+        orphan_sequences: set[int] = set()
+        for row in orphan_rows:
+            try:
+                event = StreamLifecycleEvent(
+                    row["event"],
+                    row["step_id"],
+                    row["generation"],
+                    row["event_sequence"],
+                    row["data"],
+                )
+                if event.event_sequence in orphan_sequences:
+                    raise ValueError
+                orphan_sequences.add(event.event_sequence)
+                self._remember_orphan_provider_failure(event)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StreamError("checkpoint orphan provider failure is invalid") from exc
         self._validate_checkpoint_packet_refs(checkpoint)
         self._restore_checkpoint_event_state(checkpoint)
+        expected_known_ids = (
+            set(self._pending)
+            | set(self._terminals)
+            | set(self._known_step_order)
+            | {event.step_id for event in self._orphan_provider_failures.values()}
+        )
+        if expected_known_ids != self._known_step_ids:
+            raise StreamError("checkpoint known step IDs do not match retained journal state")
         self._validate_restored_intents()
 
     def _restore_intent_row(self, step_id: str, row: Mapping[str, Any], *, pending: bool) -> None:
@@ -1552,7 +1665,7 @@ class StreamJournal:
                 or not isinstance(chain_digest, str)
                 or not isinstance(reserve_left, int)
                 or reserve_left < 0
-                or reserve_left > self._step_reserve(intent)
+                or reserve_left > max(self._step_reserve(intent), self._legacy_step_reserve(intent))
                 or _intent_digest(intent.to_record()) != record_digest
             ):
                 raise ValueError
@@ -1564,6 +1677,28 @@ class StreamJournal:
         if pending:
             self._pending[step_id] = record
             self._reserve_left[step_id] = reserve_left
+
+    @staticmethod
+    def _validated_generation_signatures(value: Any) -> dict[int, str]:
+        if not isinstance(value, dict):
+            raise StreamError("checkpoint terminal packet signatures are invalid")
+        signatures: dict[int, str] = {}
+        try:
+            for raw_generation, signature in value.items():
+                if not isinstance(raw_generation, str) or not raw_generation.isdecimal():
+                    raise ValueError
+                generation = int(raw_generation)
+                if (
+                    generation < 0
+                    or not isinstance(signature, str)
+                    or not signature
+                    or generation in signatures
+                ):
+                    raise ValueError
+                signatures[generation] = signature
+        except (TypeError, ValueError) as exc:
+            raise StreamError("checkpoint terminal packet signatures are invalid") from exc
+        return signatures
 
     def _validate_restored_intents(self) -> None:
         # A checkpoint intentionally prunes old terminal IDs, so the stream
@@ -1669,7 +1804,9 @@ class StreamJournal:
     def _restore_checkpoint_event_state(self, checkpoint: Mapping[str, Any]) -> None:
         live_ids = set(self._pending) | set(self._terminals)
         high_water = checkpoint["event_high_water_mark"]
-        seen_event_sequences: set[int] = set()
+        seen_event_sequences: set[int] = {
+            event.event_sequence for event in self._orphan_provider_failures.values()
+        }
         for row in checkpoint["observations"]:
             try:
                 if not isinstance(row, dict):
@@ -1686,16 +1823,20 @@ class StreamJournal:
                     raise ValueError
                 terminal = self._terminals.get(observation.step_id)
                 packet = self._packet_index.get((observation.step_id, observation.generation))
-                expected_signature = terminal.signature if terminal is not None else (
-                    None if packet is None else packet.signature
-                )
-                if (
-                    (terminal is not None and terminal.signature is None)
-                    or (expected_signature is not None and observation.signature != expected_signature)
-                ):
-                    raise ValueError
-                if terminal is None and packet is None:
-                    raise ValueError
+                if terminal is None:
+                    if packet is None or observation.signature != packet.signature:
+                        raise ValueError
+                else:
+                    generation_signatures = self._terminal_packet_signatures.get(observation.step_id)
+                    # Older schema-4 checkpoints did not retain terminal packet
+                    # signatures. Their checkpoint digest still binds the rows,
+                    # so keep them readable while validating new checkpoints by
+                    # the observation's own generation.
+                    if (
+                        generation_signatures is not None
+                        and generation_signatures.get(observation.generation) != observation.signature
+                    ):
+                        raise ValueError
                 seen_event_sequences.add(observation.event_sequence)
             except (TypeError, ValueError) as exc:
                 raise StreamError("checkpoint contains an invalid live observation") from exc
@@ -1742,7 +1883,10 @@ class StreamJournal:
                         decision,
                         evidence_digest,
                     )
-                self._lifecycle_events_by_step.setdefault(step_id, []).append(lifecycle)
+                if event == "late_provider_failure" and data.get("orphan") is True:
+                    self._remember_orphan_provider_failure(lifecycle)
+                else:
+                    self._lifecycle_events_by_step.setdefault(step_id, []).append(lifecycle)
                 seen_event_sequences.add(event_sequence)
             except (KeyError, TypeError, ValueError) as exc:
                 raise StreamError("checkpoint contains an invalid live lifecycle event") from exc
@@ -1796,6 +1940,8 @@ class StreamJournal:
         for step_id, remaining in self._reserve_left.items():
             if step_id not in self._pending or remaining < 0:
                 raise StreamError("pending-step quota reservation is invalid")
+        if set(self._terminal_reserve_left) != (set(self._pending) | set(self._terminals)):
+            raise StreamError("retained terminal-window quota reservation is invalid")
 
     def _apply_event(self, row: Mapping[str, Any], segment_index: int) -> None:
         self._ensure_usable()
@@ -1819,6 +1965,7 @@ class StreamJournal:
                 or data.get("sequence_digest")
                 != _advance_sequence_digest(self._sequence_digest, stream_sequence, record_digest)
                 or intent.step_id in self._intents
+                or intent.step_id in self._known_step_ids
                 or any(
                     dependency not in self._pending
                     and dependency not in self._terminal_keep_ids()
@@ -1833,6 +1980,9 @@ class StreamJournal:
             self._pending[intent.step_id] = row_value
             self._intent_chain_digests[intent.step_id] = data["sequence_digest"]
             self._reserve_left[intent.step_id] = self._step_reserve(intent)
+            self._terminal_reserve_left[intent.step_id] = self._terminal_step_reserve(intent)
+            self._known_step_ids.add(intent.step_id)
+            self._known_step_order.append(intent.step_id)
             self._next_stream_sequence += 1
             self._sequence_digest = data["sequence_digest"]
         elif name == "step_signed":
@@ -1857,7 +2007,10 @@ class StreamJournal:
             pass
         elif name == "late_provider_failure":
             lifecycle = StreamLifecycleEvent(name, data["step_id"], data["generation"], sequence, dict(data))
-            self._lifecycle_events_by_step.setdefault(lifecycle.step_id, []).append(lifecycle)
+            if data.get("orphan") is True:
+                self._remember_orphan_provider_failure(lifecycle)
+            else:
+                self._lifecycle_events_by_step.setdefault(lifecycle.step_id, []).append(lifecycle)
         elif name == "step_observed":
             observation = self._observation_from_event(data, sequence)
             self._observations_by_step.setdefault(observation.step_id, []).append(observation)
@@ -1918,6 +2071,13 @@ class StreamJournal:
                 )
                 if decision is None or decision[1] != "abandon":
                     raise StreamError("abandonment has no preceding adapter decision")
+                packet_signatures = {
+                    packet.signature
+                    for (candidate, _generation), packet in self._packet_index.items()
+                    if candidate == terminal.step_id
+                }
+                if terminal.signature is not None and terminal.signature not in packet_signatures:
+                    raise StreamError("abandoned terminal signature does not match one of its signed packets")
             else:
                 self._validate_terminal_policy(terminal)
                 if not any(
@@ -1932,6 +2092,11 @@ class StreamJournal:
             if name == "step_abandoned_after_reconciliation" and terminal.outcome != "abandoned":
                 raise StreamError("step_abandoned row has non-abandoned outcome")
             self._terminals[terminal.step_id] = terminal
+            self._terminal_packet_signatures[terminal.step_id] = {
+                generation: packet.signature
+                for (candidate, generation), packet in self._packet_index.items()
+                if candidate == terminal.step_id
+            }
             self._pending.pop(terminal.step_id)
             self._reserve_left.pop(terminal.step_id, None)
             lifecycle = StreamLifecycleEvent(
@@ -2187,8 +2352,21 @@ class StreamJournal:
         if len(encoded) > self.limits.max_segment_bytes:
             raise StreamQuotaExceeded("one stream event exceeds the configured segment bound")
         if self._active_bytes + len(encoded) > self.limits.max_segment_bytes and name != "stream_started":
+            next_row = self._event_row(name, data, self._next_event_sequence + 1)
+            next_encoded = _canonical_json(next_row) + b"\n"
+            if len(next_encoded) > self.limits.max_segment_bytes:
+                raise StreamQuotaExceeded("one stream event exceeds the configured segment bound")
+            after_reserve, extra_preserve = self._event_quota_reserve(
+                name, len(next_encoded), admission_reserve, reservation_step
+            )
             try:
-                self._rotate_checkpoint(self._terminal_prefix_sequence())
+                self._rotate_checkpoint(
+                    self._terminal_prefix_sequence(),
+                    following_event_required=(len(next_encoded) + after_reserve + extra_preserve),
+                    following_event_bytes=len(next_encoded),
+                )
+            except StreamQuotaExceeded:
+                raise
             except Exception:
                 self._poisoned = True
                 raise
@@ -2197,25 +2375,9 @@ class StreamJournal:
             if self._active_bytes + len(encoded) > self.limits.max_segment_bytes:
                 raise StreamQuotaExceeded("stream event cannot fit after a safe segment rotation")
 
-        reserve_total = sum(self._reserve_left.values())
-        after_reserve = reserve_total
-        if name == "step_appended":
-            after_reserve += admission_reserve
-            extra_preserve = self._append_reserve_bytes
-        elif reservation_step is not None:
-            available = self._reserve_left.get(reservation_step)
-            if available is None or len(encoded) > available:
-                raise StreamQuotaExceeded("event exceeds the reserved finish bytes for its admitted step")
-            after_reserve -= len(encoded)
-            if name in {
-                "step_confirmed",
-                "step_terminal_failure",
-                "step_abandoned_after_reconciliation",
-            }:
-                after_reserve -= available - len(encoded)
-            extra_preserve = 0
-        else:
-            extra_preserve = self._append_reserve_bytes
+        after_reserve, extra_preserve = self._event_quota_reserve(
+            name, len(encoded), admission_reserve, reservation_step
+        )
         self._ensure_quota(len(encoded) + after_reserve + extra_preserve)
         try:
             self._append_file(self._segment_path(self._manifest["active_segment"]), encoded)
@@ -2230,6 +2392,34 @@ class StreamJournal:
             raise
         return row
 
+    def _event_quota_reserve(
+        self,
+        name: str,
+        encoded_bytes: int,
+        admission_reserve: int,
+        reservation_step: str | None,
+    ) -> tuple[int, int]:
+        reserve_total = sum(self._reserve_left.values()) + sum(self._terminal_reserve_left.values())
+        after_reserve = reserve_total
+        if name == "step_appended":
+            after_reserve += admission_reserve
+            extra_preserve = self._append_reserve_bytes
+        elif reservation_step is not None:
+            available = self._reserve_left.get(reservation_step)
+            if available is None or encoded_bytes > available:
+                raise StreamQuotaExceeded("event exceeds the reserved finish bytes for its admitted step")
+            after_reserve -= encoded_bytes
+            if name in {
+                "step_confirmed",
+                "step_terminal_failure",
+                "step_abandoned_after_reconciliation",
+            }:
+                after_reserve -= available - encoded_bytes
+            extra_preserve = 0
+        else:
+            extra_preserve = self._append_reserve_bytes
+        return after_reserve, extra_preserve
+
     def _event_row(self, name: str, data: Mapping[str, Any], sequence: int) -> dict[str, Any]:
         return {
             "schema_version": STREAM_SCHEMA_VERSION,
@@ -2239,7 +2429,13 @@ class StreamJournal:
             "data": dict(data),
         }
 
-    def _rotate_checkpoint(self, through_sequence: int) -> StreamCheckpoint:
+    def _rotate_checkpoint(
+        self,
+        through_sequence: int,
+        *,
+        following_event_required: int | None = None,
+        following_event_bytes: int | None = None,
+    ) -> StreamCheckpoint:
         self._ensure_usable()
         high_water = self._next_stream_sequence - 1
         if through_sequence < 0 or through_sequence > high_water:
@@ -2280,6 +2476,11 @@ class StreamJournal:
             marker_sequence,
         )
         marker_bytes = _canonical_json(marker) + b"\n"
+        if (
+            following_event_bytes is not None
+            and len(marker_bytes) + following_event_bytes > self.limits.max_segment_bytes
+        ):
+            raise StreamQuotaExceeded("stream event cannot fit after a safe segment rotation")
         candidate = self._manifest_value_for_checkpoint(
             checkpoint_id,
             checkpoint_digest,
@@ -2295,11 +2496,40 @@ class StreamJournal:
         # The temporary peak includes the still-live segment and manifest. The
         # per-step reservation remains untouched until all admitted work is done.
         peak_extra = len(checkpoint_bytes) + len(marker_bytes) + len(manifest_bytes)
-        try:
-            self._ensure_quota(peak_extra + sum(self._reserve_left.values()))
-        except Exception:
-            self._poisoned = True
-            raise
+        pending_terminal_reserve = sum(
+            self._terminal_reserve_left.get(step_id, 0) for step_id in self._pending
+        )
+        self._ensure_quota(
+            peak_extra + sum(self._reserve_left.values()) + pending_terminal_reserve
+        )
+        if following_event_required is not None:
+            manifest_path = self.path / "manifest.json"
+            old_manifest_bytes = manifest_path.stat().st_size if manifest_path.exists() else 0
+            cleanup_paths = [
+                path
+                for path in (self.path / "segments").glob("segment-*.jsonl")
+                if path != new_segment_path
+            ] + [
+                path
+                for path in (self.path / "checkpoints").glob("checkpoint-*.json")
+                if path != checkpoint_path
+            ]
+            cleanup_bytes = sum(path.stat().st_size for path in cleanup_paths)
+            projected_disk_bytes = (
+                self._disk_bytes
+                + len(checkpoint_bytes)
+                + len(marker_bytes)
+                + len(manifest_bytes)
+                - old_manifest_bytes
+                - cleanup_bytes
+            )
+            if projected_disk_bytes + following_event_required > self.limits.max_journal_bytes:
+                raise StreamQuotaExceeded(
+                    f"stream journal quota exceeded after safe rotation: "
+                    f"{projected_disk_bytes} bytes projected before append, "
+                    f"{following_event_required} bytes required, "
+                    f"{self.limits.max_journal_bytes} byte limit"
+                )
         try:
             self._write_new_file(checkpoint_path.with_suffix(".json.tmp"), checkpoint_bytes)
             os.replace(checkpoint_path.with_suffix(".json.tmp"), checkpoint_path)
@@ -2316,6 +2546,8 @@ class StreamJournal:
         self._active_bytes = len(marker_bytes)
         self._next_event_sequence = marker_sequence + 1
         self._prune_memory_state(terminal_keep)
+        self._known_step_ids = set(checkpoint_record["known_step_ids"])
+        self._known_step_order = list(checkpoint_record["recent_step_ids"])
         try:
             latest_checkpoint = self.path / "checkpoints" / f"{checkpoint_id}.json"
             for path in (self.path / "segments").glob("segment-*.jsonl"):
@@ -2360,11 +2592,21 @@ class StreamJournal:
             step_id: {
                 "intent_row": self._serialize_one_intent(step_id),
                 "terminal": terminal.to_record(),
+                "packet_signatures": {
+                    str(generation): signature
+                    for generation, signature in sorted(
+                        self._terminal_packet_signatures.get(step_id, {}).items()
+                    )
+                },
             }
             for step_id, terminal in sorted(self._terminals.items())
             if step_id in terminal_keep
         }
         pending_ids = set(self._pending)
+        recent_step_ids = self._known_step_order[-MAX_RECENT_APPENDED_STEP_IDS:]
+        known_step_ids = pending_ids | terminal_keep | set(recent_step_ids) | {
+            event.step_id for event in self._orphan_provider_failures.values()
+        }
         packet_rows = [
             self._packet_record(packet)
             for packet in sorted(
@@ -2411,6 +2653,8 @@ class StreamJournal:
             "input_closed": self._input_closed,
             "pending_intents": pending_rows,
             "terminal_records": retained,
+            "known_step_ids": sorted(known_step_ids),
+            "recent_step_ids": recent_step_ids,
             "unresolved_packets": packet_rows,
             "unresolved_packet_references": refs,
             "observations": [
@@ -2420,8 +2664,22 @@ class StreamJournal:
             ],
             "lifecycle_events": [
                 self._lifecycle_to_record(event)
-                for event in self.lifecycle_events
+                for event in sorted(
+                    (
+                        event
+                        for rows in self._lifecycle_events_by_step.values()
+                        for event in rows
+                    ),
+                    key=lambda item: item.event_sequence,
+                )
                 if event.step_id in (pending_ids | terminal_keep)
+            ],
+            "orphan_provider_failures": [
+                self._lifecycle_to_record(event)
+                for event in sorted(
+                    self._orphan_provider_failures.values(),
+                    key=lambda item: item.event_sequence,
+                )
             ],
             "rebuild_authorizations": [
                 row for row in self._rebuild_authorizations if row["step_id"] in self._pending
@@ -2509,6 +2767,45 @@ class StreamJournal:
             "data": dict(event.data),
         }
 
+    def _remember_orphan_provider_failure(self, event: StreamLifecycleEvent) -> None:
+        data = event.data
+        step_id = event.step_id
+        generation = event.generation
+        attempt = data.get("attempt") if isinstance(data, dict) else None
+        if (
+            event.event != "late_provider_failure"
+            or not isinstance(step_id, str)
+            or not step_id
+            or step_id not in self._known_step_ids
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt <= 0
+            or not isinstance(data, dict)
+            or data.get("orphan") is not True
+            or data.get("step_id") != step_id
+        ):
+            raise StreamError("orphan late provider failure has invalid identity fields")
+        self._validate_route(
+            data.get("provider_id"),
+            data.get("endpoint_id"),
+            data.get("route_group"),
+            data.get("route_affinity"),
+            data.get("disposition"),
+        )
+        key = (step_id, generation, attempt)
+        if key in self._orphan_provider_failures:
+            raise StreamError("orphan late provider failure was already recorded for this attempt")
+        self._orphan_provider_failures[key] = event
+        if len(self._orphan_provider_failures) > MAX_RETAINED_ORPHAN_FAILURES:
+            oldest_key = min(
+                self._orphan_provider_failures,
+                key=lambda candidate: self._orphan_provider_failures[candidate].event_sequence,
+            )
+            del self._orphan_provider_failures[oldest_key]
+
     @staticmethod
     def _attempt_to_record(attempt: PacketAttempt) -> dict[str, Any]:
         return {
@@ -2543,6 +2840,7 @@ class StreamJournal:
         for step_id in tuple(self._terminals):
             if step_id not in terminal_keep:
                 self._terminals.pop(step_id, None)
+                self._terminal_packet_signatures.pop(step_id, None)
                 self._intents.pop(step_id, None)
                 self._intent_chain_digests.pop(step_id, None)
         for key in tuple(self._packet_index):
@@ -2564,6 +2862,11 @@ class StreamJournal:
             key: value
             for key, value in self._reconciliation_decisions.items()
             if key[0] in live_ids
+        }
+        self._terminal_reserve_left = {
+            step_id: reserve
+            for step_id, reserve in self._terminal_reserve_left.items()
+            if step_id in live_ids
         }
         self._rebuild_authorizations = [
             row for row in self._rebuild_authorizations if row["step_id"] in self._pending
@@ -2588,9 +2891,32 @@ class StreamJournal:
             + 3 * 1400
         )
         terminal = 1400
+        return self.limits.max_generations_per_step * per_generation + terminal
+
+    def _terminal_step_reserve(self, intent: StreamIntent) -> int:
+        """Reserve one retained terminal's bounded checkpoint representation."""
+
         intent_bytes = len(_canonical_json(intent.to_record()))
-        checkpoint_copy = (
-            intent_bytes
+        observations = (
+            self.limits.max_generations_per_step
+            * self.limits.max_observations_per_generation
+            * 1200
+        )
+        late_failures = (
+            self.limits.max_generations_per_step
+            * self.limits.max_attempts_per_generation
+            * 1400
+        )
+        lifecycle = self.limits.max_generations_per_step * 3 * 1400
+        return intent_bytes + 1400 + observations + late_failures + lifecycle + 1024
+
+    def _legacy_step_reserve(self, intent: StreamIntent) -> int:
+        """Upper bound for reserve values written by earlier schema-4 builds."""
+
+        packet_row = ((intent.max_packet_bytes + 2) // 3) * 4 + 1200
+        return (
+            self._step_reserve(intent)
+            + len(_canonical_json(intent.to_record()))
             + self.limits.max_generations_per_step
             * (
                 packet_row
@@ -2599,7 +2925,6 @@ class StreamJournal:
             )
             + 4096
         )
-        return self.limits.max_generations_per_step * per_generation + terminal + checkpoint_copy
 
     def _validate_route(
         self,

@@ -188,7 +188,9 @@ replace or replay them. Mark affected descendants `reconciliation_required`,
 check their signatures and state, then ask the application adapter to choose a
 new safe plan from the actual cursor/state. A dropped transaction is not proof
 that dependent transactions did not land. The adapter owns that recovery
-decision.
+decision. Before abandoning a signed step, the adapter must have evidence that
+its packet can no longer land. A timeout, missing status, provider error, or
+height observation alone is not sufficient evidence.
 
 ### Pipelining across write-lock lanes
 
