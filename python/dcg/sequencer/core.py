@@ -2133,7 +2133,10 @@ class SequencerStream:
                     if item.step_id == step.step_id and item.generation == packet_record.generation
                 )
                 attempts = packet_record.attempts
-            if status is None and not processed_observed and len(attempts) < self.plan.limits.max_attempts_per_generation:
+            # M1: RetryPolicy.NEVER sends a stream packet exactly once.
+            retry_allowed = step.retry_policy is not RetryPolicy.NEVER or not attempts
+            if (status is None and not processed_observed and retry_allowed
+                    and len(attempts) < self.plan.limits.max_attempts_per_generation):
                 receipt = await self._send_stream_packet(step, intent, packet_record)
                 if receipt is not None and receipt.signature != packet_record.signature:
                     raise AmbiguousFate("provider acknowledged a signature different from the journaled packet")
