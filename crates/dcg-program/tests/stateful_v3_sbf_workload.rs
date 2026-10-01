@@ -1461,6 +1461,25 @@ async fn stateful_v3_workspace_first_ordering_refusals_header_and_clear_policy()
         send(&mut context, ix, &[], label, Ok(()), false).await;
     }
     let workspace_key = view_pda(&session, v3::WORKSPACE_ROLE);
+    let before_live_close = account(&mut context, workspace_key).await;
+    send(
+        &mut context,
+        close_child(
+            session,
+            workspace_key,
+            authority.pubkey(),
+            v3::KIND_WORKSPACE,
+        ),
+        &[],
+        "CLOSE_ACCOUNT-v3-live-workspace-refused-before-halt",
+        Err(v3::REFUSAL_LIVE),
+        false,
+    )
+    .await;
+    assert_eq!(
+        account(&mut context, workspace_key).await,
+        before_live_close
+    );
     let mut seeded_workspace = account(&mut context, workspace_key).await;
     seeded_workspace.data[128..].fill(0xA5);
     context.set_account(&workspace_key, &AccountSharedData::from(seeded_workspace));
@@ -1485,6 +1504,18 @@ async fn stateful_v3_workspace_first_ordering_refusals_header_and_clear_policy()
         run_view_with_accounts(authority.pubkey(), 0, malformed),
         &[&authority],
         "RUN_PHASE-v3-workspace-first-wrong-first-account-refused",
+    )
+    .await;
+
+    let mut wrong_count = workspace_first_publication_accounts(authority.pubkey(), session, true);
+    wrong_count.pop();
+    send(
+        &mut context,
+        run_view_with_accounts(authority.pubkey(), 0, wrong_count),
+        &[&authority],
+        "RUN_PHASE-v3-workspace-first-wrong-account-count-refused",
+        Err(v3::REFUSAL_VIEW),
+        false,
     )
     .await;
 
