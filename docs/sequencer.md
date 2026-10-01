@@ -84,7 +84,8 @@ python -m unittest discover -s python/tests -v
 ```
 
 The default suite is offline. The opt-in local-validator test is skipped unless
-`DCG_RUN_LOCAL_VALIDATOR=1` is set.
+`DCG_RUN_LOCAL_VALIDATOR=1` is set. The 100k-step streaming persistence test is
+also opt-in; set `DCG_RUN_STREAM_100K=1` when invoking `unittest` to include it.
 
 ## First use
 
@@ -251,6 +252,15 @@ postcondition. A satisfied postcondition can confirm a step without transaction
 metadata. Unknown fee or CU metadata remains `null`; it is never converted to
 zero. A finalized program error is terminal even if an application might later
 choose to construct a different plan.
+
+In streaming mode, abandonment is also an application-adapter decision. Before
+it records an `abandon` reconciliation decision and terminal summary for a
+signed step, the adapter must have evidence that the packet can no longer land.
+A timeout, missing status, provider error, or block-height observation alone
+does not establish that. The journal records the adapter's evidence digest and
+decision; it cannot independently prove the packet's fate. Unsigned descendants
+can be abandoned after the adapter has reconciled their dependencies and
+application state.
 
 Every step has a time cap. The designed default is 90 seconds; on timeout the
 sequencer journals the cap event and leaves the last signed identity available
