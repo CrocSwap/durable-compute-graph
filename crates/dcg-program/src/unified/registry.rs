@@ -17,7 +17,9 @@ use super::{
     no, u16_at, u32_at, EPOCH, REGISTRY_ACCOUNT, REGISTRY_EPOCH, REGISTRY_ROOT, REGISTRY_STATE,
     ROW_CAPABILITY, ROW_MALFORMED,
 };
-use crate::account_provenance::{allocate_derived_account, expect_derived, AccountKind, RoleFlags};
+use crate::account_provenance::{
+    allocate_derived_account, expect_derived, AccountKind, CanonicalBump, RoleFlags,
+};
 use crate::envelope_seal::{self as esl, RESPOND_GENERIC, WITNESS_TENSORS};
 use crate::hash;
 use solana_program::{
@@ -365,6 +367,7 @@ pub(crate) fn create_pda<'a>(
     account: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
     seeds: &[&[u8]],
+    bump: CanonicalBump,
     size: usize,
     rent_size: usize,
     bad: u32,
@@ -380,21 +383,8 @@ pub(crate) fn create_pda<'a>(
     if *account.owner != system_program::id() || !account.data_is_empty() {
         return Err(no(state));
     }
-    let Some((bump_seed, base_seeds)) = seeds.split_last() else {
-        return Err(no(bad));
-    };
-    if bump_seed.len() != 1 {
-        return Err(no(bad));
-    }
     allocate_derived_account(
-        program,
-        payer,
-        account,
-        system,
-        base_seeds,
-        bump_seed[0],
-        size,
-        rent_size,
+        program, payer, account, system, seeds, bump, size, rent_size,
     )
     .map_err(|_| no(state))
 }
@@ -437,8 +427,8 @@ pub fn create(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
             super::address::REGISTRY_SEED,
             &EPOCH.to_le_bytes(),
             &registry_id.to_le_bytes(),
-            &[bump],
         ],
+        bump,
         size,
         size,
         REGISTRY_ACCOUNT,

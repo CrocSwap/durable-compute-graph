@@ -1,15 +1,16 @@
 # DCG application API
 
-This note documents the initial static app-instruction and region-commitment
-surface. It does not add an account-address policy or move application kernels
-into DCG.
+This note documents the static app-instruction and region-commitment surface.
+Application handlers remain app code, while the dispatcher validates declared
+account provenance before calling application code.
 
 ## Static instruction registration
 
 `dcg_program::app_api` exposes:
 
 - `ApplicationInstruction`, containing a wire tag, stable handler id,
-  non-zero semantic version, preflight function, and handler function;
+  non-zero semantic version, per-account address/role rules, preflight
+  function, and handler function;
 - `ApplicationProgramManifest`, which wraps a static
   `kernel::ApplicationManifest` and a statically allocated instruction array;
 - `ApplicationAccountCheckContext`, passed only to preflight with the invoked
@@ -25,15 +26,19 @@ into DCG.
 Construct an entry with `ApplicationInstruction::new` and the array-valued
 `ApplicationProgramManifest::new`. The constructor validates at compile time
 that application tags are strictly ascending, unique, and disjoint from the
-revision-8 core set. The public `validate_application_tags` function applies
-the same const-time rules to a tag list; its documentation includes two
-compile-fail examples for duplicate app tags and overlap with tag 125.
+revision-8 core set. `process_instruction_with_application` takes a
+`&'static ApplicationProgramManifest`, so production dispatch must use the
+validated static value and collision checks run during compilation. The public
+`validate_application_tags` function applies the same const-time rules to a
+tag list; its documentation includes compile-fail examples for duplicate app
+tags, overlap with tag 125, and a collision routed through `new`.
 
 At runtime, an empty instruction byte array is refused. A core tag is sent to
 `process_instruction_with_manifest` with the wrapped kernel/form manifest. A
-non-core tag is looked up in the sorted app table; its preflight runs before
-its handler. A tag owned by neither table returns
-`ProgramError::InvalidInstructionData`. The legacy
+non-core tag is looked up in the sorted app table; its DCG account rules run
+before preflight, and preflight runs before the handler. A tag absent from the
+app table falls back to the core dispatcher, preserving feature-gated and
+future core routes. The legacy
 `process_instruction_with_manifest` and `process_instruction` entry points
 remain available for DCG-only callers and retain their existing dispatch
 behavior.
@@ -45,31 +50,38 @@ wire-revision set.
 
 ### Preflight and account context
 
-Preflight receives untrusted instruction bytes and the original ordered
-accounts. It is responsible for parsing the complete instruction and checking
-the tag-specific roles, bounds, aliases, and address derivations before it
-returns success. A program-owned account is not validated by owner equality
-alone, and the derivation seed must come from an independently validated
-parent record or instruction identity.
+Each instruction rule covers one ordered account. Its identity is an exact key
+with an optional owner constraint, a program-owned PDA, a program-owned exact
+key, or a system-owned PDA. Key sources can be fixed, read from instruction
+bytes, derived from a required signer, or taken from an earlier account that
+has already passed its rule. PDA seeds can use fixed byte strings,
+instruction-data slices, or validated earlier account keys. Every rule also
+declares minimum writable/signer privileges and an optional writable alias
+group. DCG validates the full rule array before calling application code. A
+program-owned account is not validated by owner equality alone, and a PDA seed
+must come from an independently validated parent, signer, fixed value, or
+checked instruction identity.
 
-`CheckedApplicationAccounts` is currently a small borrowed view created after
-the callback succeeds. Its construction contains a TODO for the shared
-account-address rule helper from the separate `dcg-address-rule-fix` change;
-that helper's final API is intentionally not guessed here. Until the helper is
-merged and wired into this context, the wrapper is not evidence that DCG has
-independently checked an app account address. The app callback contract must
-not be used to claim the pending common address rule.
+`CheckedApplicationAccounts` is a borrowed ordered view available to a handler
+only after DCG validates every account rule and the application preflight
+returns success. The rules are included in the manifest identity digest, so
+changing address or role policy changes the committed app identity. An
+application that owns its Solana entrypoint can call a lower-level DCG function
+or bypass this dispatcher entirely; it must route every entrypoint through
+`process_instruction_with_application` to receive these checks.
 
 ### Program identity
 
 `ApplicationProgramManifest::identity_digest()` uses the versioned
-`dcg/application-program-manifest/1` domain. It commits:
+`dcg/application-program-manifest/2` domain. It commits:
 
 1. `ApplicationManifest::identity_digest()` (application id and version);
 2. `ApplicationManifest::admission_identity_digest()` (including its static
    form-to-kernel bindings);
 3. the table length and each ascending `(tag, handler id, handler version)`
-   row, with length-prefixed UTF-8 handler ids and little-endian integers.
+   row, with length-prefixed UTF-8 handler ids and little-endian integers;
+4. each instruction's ordered account rules, including identity source, PDA
+   seeds, account shape, roles, and alias group.
 
 Function addresses are not identity fields. If a handler's behavior changes,
 increment its semantic version or the application version. Keep this manifest

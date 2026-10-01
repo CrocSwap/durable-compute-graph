@@ -549,11 +549,8 @@ pub fn retry_with_hooks(
     //    and holding lamports. **599** if it holds none -- already settled, or
     //    never escrowed -- because "nothing to do" is a refusal and not a no-op
     //    (`outcome = 0` is unassigned and can never be emitted).
-    // Preserve the public refusal order: meta privilege errors are reported
-    // before the escrow address is checked.
-    if !escrow.is_writable || escrow.is_signer {
-        return Err(no(SETTLEMENT_PROGRAM));
-    }
+    // Validate the committed escrow address before its writable/signer shape;
+    // this preserves the baseline public refusal order.
     let bump = validate_escrow(program, escrow, &s.descriptor)?;
     let pot = escrow.lamports();
     if pot == 0 {

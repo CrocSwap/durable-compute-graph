@@ -3,9 +3,11 @@
 //! digest before parsing proofs. Each instruction touches at most one 900-byte
 //! chunk or grows the account by at most 10,240 bytes.
 
+use crate::account_provenance::{
+    allocate_derived_account, expect_derived, AccountKind, CanonicalBump, RoleFlags,
+};
 #[cfg(feature = "revision-8")]
-use crate::account_provenance::expect_derived_with_bump;
-use crate::account_provenance::{allocate_derived_account, expect_derived, AccountKind, RoleFlags};
+use crate::account_provenance::{expect_derived_with_bump, expect_system_derived_with_bump};
 use crate::hash;
 use core::cell::Ref;
 use solana_program::{
@@ -64,8 +66,19 @@ fn v5_respond(challenge: &Pubkey, raw: &[u8], tag: u8) {
         crate::unified::challenge::respond_event(challenge, raw, tag, 1, raw[4]);
     }
 }
-pub fn address(program: &Pubkey, challenge: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"dcg-hcl-response", challenge.as_ref()], program)
+pub fn address(program: &Pubkey, challenge: &Pubkey) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[b"dcg-hcl-response", challenge.as_ref()], program);
+    (*bump.address(), bump)
+}
+
+/// Derive the response address with its bump committed by challenge open.
+pub fn address_with_bump(
+    program: &Pubkey,
+    challenge: &Pubkey,
+    bump: u8,
+) -> Result<Pubkey, ProgramError> {
+    Pubkey::create_program_address(&[b"dcg-hcl-response", challenge.as_ref(), &[bump]], program)
+        .map_err(|_| ProgramError::InvalidAccountData)
 }
 fn challenge<'a>(
     program: &Pubkey,
@@ -102,7 +115,6 @@ fn challenge<'a>(
             signer: false,
         };
         match raw[crate::unified::challenge::RECORD_BUMP_MARKER_AT] {
-            0 => expect_derived(challenge, program, &seeds, kind, role).map(|_| ()),
             1 => expect_derived_with_bump(
                 challenge,
                 program,
@@ -120,14 +132,31 @@ fn challenge<'a>(
 fn account<'a>(
     program: &Pubkey,
     response: &'a AccountInfo,
-    challenge: &AccountInfo,
+    challenge_account: &AccountInfo,
     executor: &AccountInfo,
     phase: u16,
 ) -> Result<Ref<'a, [u8]>, ProgramError> {
+    #[cfg(feature = "revision-8")]
+    {
+        let challenge_raw = challenge(program, challenge_account, executor)?;
+        expect_derived_with_bump(
+            response,
+            program,
+            &[b"dcg-hcl-response", challenge_account.key.as_ref()],
+            challenge_raw[crate::unified::challenge::RESPONSE_BUMP_AT],
+            AccountKind::variable(b"DRU1", HEADER, HEADER + MAX_BODY).with_version(4, 1),
+            RoleFlags {
+                writable: true,
+                signer: false,
+            },
+        )
+        .map_err(|_| no(AUTH))?;
+    }
+    #[cfg(feature = "revision-7")]
     expect_derived(
         response,
         program,
-        &[b"dcg-hcl-response", challenge.key.as_ref()],
+        &[b"dcg-hcl-response", challenge_account.key.as_ref()],
         AccountKind::variable(b"DRU1", HEADER, HEADER + MAX_BODY).with_version(4, 1),
         RoleFlags {
             writable: true,
@@ -140,7 +169,7 @@ fn account<'a>(
         || raw[..4] != *b"DRU1"
         || raw[4..6] != 1u16.to_le_bytes()
         || raw[6..8] != phase.to_le_bytes()
-        || raw[8..40] != challenge.key.to_bytes()
+        || raw[8..40] != challenge_account.key.to_bytes()
         || raw[40..72] != executor.key.to_bytes()
         || raw[120..128] != [0; 8]
         || u32_at(&raw, 72)? == 0
@@ -167,12 +196,27 @@ pub fn begin(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     let response = &accounts[0];
     let executor = &accounts[1];
     let target = &accounts[2];
-    let _challenge = challenge(program, target, executor)?;
+    let challenge_record = challenge(program, target, executor)?;
     let total = u32_at(data, 1)? as usize;
     if total == 0 || total > MAX_BODY || data[5..37] == [0; 32] {
         return Err(no(BAD));
     }
+    #[cfg(feature = "revision-8")]
+    let bump = expect_system_derived_with_bump(
+        response,
+        program,
+        &[b"dcg-hcl-response", target.key.as_ref()],
+        challenge_record[crate::unified::challenge::RESPONSE_BUMP_AT],
+        RoleFlags {
+            writable: true,
+            signer: false,
+        },
+        true,
+    )
+    .map_err(|_| no(AUTH))?;
+    #[cfg(feature = "revision-7")]
     let (key, bump) = address(program, target.key);
+    #[cfg(feature = "revision-7")]
     if *response.key != key {
         return Err(no(AUTH));
     }
@@ -200,8 +244,8 @@ pub fn begin(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     raw[40..72].copy_from_slice(executor.key.as_ref());
     raw[72..76].copy_from_slice(&(total as u32).to_le_bytes());
     raw[80..112].copy_from_slice(&data[5..37]);
-    raw[112..120].copy_from_slice(&_challenge[148..156]);
-    v5_respond(target.key, &_challenge, TAG_BEGIN);
+    raw[112..120].copy_from_slice(&challenge_record[148..156]);
+    v5_respond(target.key, &challenge_record, TAG_BEGIN);
     Ok(())
 }
 

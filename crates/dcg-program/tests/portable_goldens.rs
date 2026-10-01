@@ -26,7 +26,7 @@ const PORTABLE_VECTORS: &[(&str, &str)] = &[
     ),
     (
         "unified_v8/record_layouts_v1.tsv",
-        "bbeb702b6f2100990ac73b209da612d09463d27ada5420d7f01a0959b415add3",
+        "28ff6893486e1d1e5c793d4486241a4be5c2302b2513479275013fcb1cd8fdd2",
     ),
     (
         "unified_v8/credit.tsv",

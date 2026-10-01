@@ -17,6 +17,7 @@
 //! DCM2 flag 32 marks a sealed document. The bootstrap v2 manifest tags
 //! (96, 97, 108) refuse it (their flag mask admits only ROOT_ONLY), and the
 //! bootstrap producer feed (136) refuses it. Refusals reuse 580-599.
+use crate::account_provenance::CanonicalBump;
 use crate::closure_v2::{
     self as h, document_address, position_page_address, DCM2_V3_HEADER, DPR2_HEADER,
 };
@@ -351,10 +352,13 @@ pub fn init_sealed(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     )?;
     let state_hash = hash::sha256(&[&accounts[4].try_borrow_data()?]);
     drop((routes, geometry, payloads));
-    let (doc_key, doc_bump) = document_address(program, &descriptor);
-    let (pos_key, pos_bump) = position_page_address(program, &descriptor);
-    let (fam_key, fam_bump) = family_table_address(program, &descriptor);
-    if *accounts[1].key != doc_key || *accounts[2].key != pos_key || *accounts[8].key != fam_key {
+    let doc_bump = CanonicalBump::find(&[b"dcg-hcl-document", &descriptor], program);
+    let pos_bump = CanonicalBump::find(&[b"dcg-hcl-positions", &descriptor], program);
+    let fam_bump = CanonicalBump::find(&[b"dcg-hcl-families", &descriptor], program);
+    if accounts[1].key != doc_bump.address()
+        || accounts[2].key != pos_bump.address()
+        || accounts[8].key != fam_bump.address()
+    {
         return Err(refuse(h::FORM));
     }
     let stride = 32usize
@@ -386,7 +390,8 @@ pub fn init_sealed(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
         &accounts[0],
         &accounts[1],
         &accounts[3],
-        &[b"dcg-hcl-document", &descriptor, &[doc_bump]],
+        &[b"dcg-hcl-document", &descriptor],
+        doc_bump,
         size.min(GROW_MAX),
         size,
     )?;
@@ -395,7 +400,8 @@ pub fn init_sealed(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
         &accounts[0],
         &accounts[2],
         &accounts[3],
-        &[b"dcg-hcl-positions", &descriptor, &[pos_bump]],
+        &[b"dcg-hcl-positions", &descriptor],
+        pos_bump,
         position_size.min(GROW_MAX),
         position_size,
     )?;
@@ -405,7 +411,8 @@ pub fn init_sealed(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
         &accounts[0],
         &accounts[8],
         &accounts[3],
-        &[b"dcg-hcl-families", &descriptor, &[fam_bump]],
+        &[b"dcg-hcl-families", &descriptor],
+        fam_bump,
         fam_size,
         fam_size,
     )?;

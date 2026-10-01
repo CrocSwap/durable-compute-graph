@@ -1938,6 +1938,13 @@ fn the_layout_goldens_tile_their_lengths() {
             "{name} covers its declared length exactly"
         );
     }
+    for name in ["DCR1_v5", "DCR1_v6"] {
+        let fields = layout(name);
+        assert!(fields.contains(&("challenge_pda_bump".to_owned(), 146, 1)));
+        assert!(fields.contains(&("challenge_pda_marker".to_owned(), 147, 1)));
+        assert!(fields.contains(&("response_pda_bump_staged".to_owned(), 181, 1)));
+        assert!(fields.contains(&("response_pda_bump".to_owned(), 219, 1)));
+    }
     assert!(
         !std::fs::read_to_string(golden_dir().join("record_layouts_v1.tsv"))
             .unwrap()

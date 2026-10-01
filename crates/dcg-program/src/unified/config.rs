@@ -150,7 +150,8 @@ pub fn init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         authority,
         config,
         system,
-        &[address::CONFIG_SEED, &[bump]],
+        &[address::CONFIG_SEED],
+        bump,
         CONFIG_BYTES,
         CONFIG_BYTES,
         CONFIG_AUTHORITY,
@@ -460,12 +461,8 @@ fn template_seal_v8_single(
             sealer,
             record,
             system,
-            &[
-                address::TEMPLATE_SEAL_SEED,
-                pt2s.key.as_ref(),
-                &digest,
-                &[seal_bump],
-            ],
+            &[address::TEMPLATE_SEAL_SEED, pt2s.key.as_ref(), &digest],
+            seal_bump,
             SEAL_BYTES,
             SEAL_BYTES,
             TEMPLATE_SEAL,
@@ -476,12 +473,8 @@ fn template_seal_v8_single(
             sealer,
             use_record,
             system,
-            &[
-                address::TEMPLATE_USE_SEED,
-                pt2s.key.as_ref(),
-                &digest,
-                &[use_bump],
-            ],
+            &[address::TEMPLATE_USE_SEED, pt2s.key.as_ref(), &digest],
+            use_bump,
             DTU1_BYTES,
             DTU1_BYTES,
             TEMPLATE_SEAL,
@@ -491,14 +484,14 @@ fn template_seal_v8_single(
         raw[..4].copy_from_slice(b"DTU1");
         raw[4..6].copy_from_slice(&DTU1_VERSION.to_le_bytes());
         raw[6] = DTU1_STATE_LIVE;
-        raw[7] = use_bump;
+        raw[7] = use_bump.value();
         raw[16..48].copy_from_slice(sealer.key.as_ref());
         raw[48..80].copy_from_slice(registry_account.key.as_ref());
         raw[80..88].copy_from_slice(&now.to_le_bytes());
         raw[DTU1_MAX_CHALLENGE_AT..128].copy_from_slice(&limits.encode());
         raw[DTU1_PAYER_AT..DTU1_PAYER_AT + 32].copy_from_slice(sealer.key.as_ref());
-        raw[DTU1_SEAL_BUMP_AT] = seal_bump;
-        raw[DTU1_ADMISSION_BUMP_AT] = admission_bump;
+        raw[DTU1_SEAL_BUMP_AT] = seal_bump.value();
+        raw[DTU1_ADMISSION_BUMP_AT] = admission_bump.value();
     } else {
         let mut raw = use_record.try_borrow_mut_data()?;
         raw[6] = DTU1_STATE_LIVE;
@@ -551,7 +544,7 @@ pub fn template_seal_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8])
             record,
             program,
             &[address::TEMPLATE_SEAL_SEED, pt2s.key.as_ref(), &digest],
-            bump,
+            bump.value(),
             AccountKind::exact(b"DTA1", SEAL_BYTES).with_version(4, 1),
             RoleFlags {
                 writable: true,
@@ -575,12 +568,8 @@ pub fn template_seal_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8])
             sealer,
             record,
             system,
-            &[
-                address::TEMPLATE_SEAL_SEED,
-                pt2s.key.as_ref(),
-                &digest,
-                &[bump],
-            ],
+            &[address::TEMPLATE_SEAL_SEED, pt2s.key.as_ref(), &digest],
+            bump,
             SEAL_BYTES,
             SEAL_BYTES,
             TEMPLATE_SEAL,
@@ -828,10 +817,16 @@ fn template_record(
     pt2s: &Pubkey,
     digest: &[u8; 32],
 ) -> Result<TemplateView, ProgramError> {
-    expect_derived(
+    let use_bump = record
+        .try_borrow_data()?
+        .get(7)
+        .copied()
+        .ok_or(no(TEMPLATE_SEAL))?;
+    expect_derived_with_bump(
         record,
         program,
         &[address::TEMPLATE_USE_SEED, pt2s.as_ref(), digest],
+        use_bump,
         AccountKind::exact(b"DTU1", DTU1_BYTES)
             .with_version(4, DTU1_VERSION)
             .with_bump(7),
@@ -842,7 +837,6 @@ fn template_record(
     )
     .map_err(|_| no(TEMPLATE_SEAL))?;
     let raw = record.try_borrow_data()?;
-    let use_bump = raw.get(7).copied().ok_or(no(TEMPLATE_SEAL))?;
     if record.owner != program
         || raw.len() != DTU1_BYTES
         || raw[..4] != *b"DTU1"
@@ -1169,7 +1163,7 @@ fn close_unpublished_pt1x_pt2s(program: &Pubkey, accounts: &[AccountInfo]) -> Pr
             invoke_signed(
                 &system_instruction::transfer(account.key, authority.key, account.lamports()),
                 &[account.clone(), authority.clone(), system.clone()],
-                &[&[seed, pt2s.key.as_ref(), &pt2s_digest, &[bump]]],
+                &[&[seed, pt2s.key.as_ref(), &pt2s_digest, &[bump.value()]]],
             )?;
         }
     }

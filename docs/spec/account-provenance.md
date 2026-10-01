@@ -1,8 +1,8 @@
 # Program account address provenance
 
 Status: implementation rule for DCG program-owned account reads and writes.
-Instruction layouts remain unchanged. Revision-8 DCR1 uses two previously
-reserved bytes for a stored challenge bump and marker.
+Revision-8 DCR1 uses reserved bytes for the challenge bump, marker, and response
+PDA bump.
 
 ## Rule
 
@@ -34,6 +34,16 @@ obtained by the caller and verify it with one address derivation before
 creating or assigning the account; `allocate_derived_account` keeps the
 format's existing pre-funding behavior.
 
+Every program-owned PDA creation must use `CanonicalBump`: the opaque type
+pairs the address with the bump returned by a full canonical search, or by a
+stored bump that has passed the account's expected-address and kind checks.
+Creation helpers accept that type instead of an arbitrary byte, use its paired
+address, and sign with its bump without deriving the address a second time.
+This makes the canonical-bump invariant explicit at the creation boundary. A
+stored bump is trusted only because DCG created the record through the
+full-search path; readers then verify the address with one fixed-cost
+derivation.
+
 Callers must validate the seed sources before invoking these helpers. The
 helpers cannot infer whether arbitrary bytes passed as `seeds` came from a
 validated parent; the caller's gate is part of the security argument.
@@ -53,10 +63,15 @@ adapters:
 
 - **DCR1 challenge records and closure-v2 response tags 115–118/125.** Open
   validates the new address from the instruction descriptor, challenger
-  signer, and nonce, then stores the canonical bump in reserved bytes 146–147.
-  New challenge/replay readers and the closure-v2 response reader use the
-  stored-bump gate; legacy marker-0 records retain the canonical search while
-  they are open. The account lists provide no independent challenge identity
+  signer, and nonce, then stores the canonical challenge bump at byte 146,
+  marker `1` at byte 147, and the canonical DRU1 response bump staged at byte
+  181, then moved to byte 219 after tag 164 consumes position roots.
+  Challenge readers require marker `1`; this image is intended for a fresh
+  program address, so pre-image marker-0 DCR1 records are refused. Revision-8
+  tag 131 uses the stored DCR1 and DRU1 bumps for fixed-cost address checks;
+  tag 132's timeout RULE uses the stored DCR1 bump. Tag 132 has no DRU1 account
+  in its list. Revision-7 settlement retains the canonical DRU1 search because
+  its records predate these bump fields. The account lists provide no independent challenge identity
   anchor, so the seed source remains self-seeded.
 - **DCM2 identity for tag 172.** Its account list contains no independent
   document identity anchor. The close path currently derives the document
@@ -118,9 +133,10 @@ registry, and plan readers. Existing direct checks remain where they also
 enforce lifecycle-specific rules.
 
 The source audit `account_provenance_lint.rs` discovers Rust files under
-`src/` and checks direct account-write calls in functions and `impl` methods of
-every visibility. It has a small named list of low-level writers whose callers
-must gate the account. This audit is not lint enforcement: it does not track
-data flow, account-to-gate correspondence, or whether a gate runs before the
-write. Code review must trace each seed and each write back to its validated
-source.
+`src/` and checks direct account-write calls in functions, trait defaults, and
+`impl` methods of every visibility. It compares findings with a reviewed
+allowlist, so a new unguarded writer fails the test until reviewed. Macro bodies
+are scanned for writer and gate identifiers where feasible. This audit does
+not track data flow, account-to-gate correspondence, or whether a gate runs
+before the write. Code review must trace each seed and each write back to its
+validated source.

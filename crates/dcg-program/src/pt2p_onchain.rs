@@ -1306,7 +1306,7 @@ fn instantiate_with_mode(
                     output,
                     rent_payer.unwrap(),
                     &binding,
-                    bump,
+                    bump.value(),
                     required_bytes,
                 )?;
                 return Ok(());

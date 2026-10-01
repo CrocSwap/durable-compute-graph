@@ -2,6 +2,7 @@
 //! DSC1 accounts are provisioned by the sealed PT1 adapter; no instruction
 //! here accepts caller-created geometry as an authority.
 
+use crate::account_provenance::CanonicalBump;
 use crate::closure_v2::{self as h, Node};
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
@@ -696,8 +697,20 @@ pub fn land_producer_leaf<'a>(
         path,
         &root,
     )?;
-    let (key, bump) = producer_leaf_address(program, &descriptor, coordinate);
-    if *accounts[5].key != key {
+    let position_bytes = coordinate.position.to_le_bytes();
+    let segment_bytes = coordinate.segment.to_le_bytes();
+    let entry_bytes = coordinate.entry.to_le_bytes();
+    let bump = CanonicalBump::find(
+        &[
+            b"dcg-hcl-producer",
+            &descriptor,
+            &position_bytes,
+            &segment_bytes,
+            &entry_bytes,
+        ],
+        program,
+    );
+    if accounts[5].key != bump.address() {
         return Err(refuse(h::FORM));
     }
     if accounts[5].lamports() != 0 {
@@ -718,11 +731,11 @@ pub fn land_producer_leaf<'a>(
         &[
             b"dcg-hcl-producer",
             &descriptor,
-            &coordinate.position.to_le_bytes(),
-            &coordinate.segment.to_le_bytes(),
-            &coordinate.entry.to_le_bytes(),
-            &[bump],
+            &position_bytes,
+            &segment_bytes,
+            &entry_bytes,
         ],
+        bump,
         DPL1_BYTES,
         DPL1_BYTES,
     )?;

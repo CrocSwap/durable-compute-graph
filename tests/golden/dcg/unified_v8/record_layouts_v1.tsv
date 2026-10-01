@@ -82,6 +82,14 @@ DCM2	v7	run_binding	1978	196	DRB1 v2, written at init, never changed
 DCM2	v7	abandon_deadline	2174	8	u64le, the PRODUCTION deadline: init_slot + abandon_after_slots at init, then min(slot + abandon_after_slots, init_slot + the TEMPLATE'S max_document_lifetime_slots) at every LandPositionRoots and ONCE at FinalizeDocumentV5.  AttestOutputV5 does NOT write it (revision 7 6.11 makes tag 177 permissionless); read only while finalize_slot == 0 or the executor withheld attestation
 DCM2	v7	option_table	2182	0	u32le[option_count], 4*option_count bytes, write-once at init
 DCM2	v7	(end)	2182	0	total bytes
+DCR1_v5	v5	challenge_pda_bump	146	1	u8, canonical `dcg-unified-challenge` PDA bump stored at revision-8 open
+DCR1_v5	v5	challenge_pda_marker	147	1	u8 = 1, required by a fresh revision-8 program image
+DCR1_v5	v5	response_pda_bump_staged	181	1	u8, canonical response bump stored at open until tag 164 consumes position roots
+DCR1_v5	v5	response_pda_bump	219	1	u8, canonical `dcg-hcl-response` PDA bump used after tag 164
+DCR1_v6	v6	challenge_pda_bump	146	1	u8, canonical `dcg-unified-challenge` PDA bump stored at revision-8 open
+DCR1_v6	v6	challenge_pda_marker	147	1	u8 = 1, required by a fresh revision-8 program image
+DCR1_v6	v6	response_pda_bump_staged	181	1	u8, canonical response bump stored at open until tag 164 consumes position roots
+DCR1_v6	v6	response_pda_bump	219	1	u8, canonical `dcg-hcl-response` PDA bump used after tag 164
 DCR2	v6	magic	0	4	u8[4] = "DCR2"
 DCR2	v6	version	4	2	u16le = 6
 DCR2	v6	status	6	1	u8: 0 PENDING, 1 FINAL, 2 REFUTED, 3 SETTLED, 4 WITHHELD (revision 8, the withheld close row)

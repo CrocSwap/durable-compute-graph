@@ -425,7 +425,14 @@ async fn send_quiet_cached(
         .nonce
         .checked_add(1)
         .expect("quiet sender nonce overflow");
-    let compute_limit = 1_400_000 - (nonce % 100_000) as u32;
+    // Tag 160's K=10,240 SBF path consumes nearly the full transaction cap.
+    // Keep its requested budget at the protocol maximum; the transaction's
+    // first/count fields already make each admission step unique.
+    let compute_limit = if data.first() == Some(&160) {
+        1_400_000
+    } else {
+        1_400_000 - (nonce % 100_000) as u32
+    };
     let make_transaction = |blockhash| {
         let ixs = vec![
             solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
@@ -461,7 +468,10 @@ async fn send_quiet_cached(
         }
         Err(error) => panic!("the banks client refused the cached transaction: {error:?}"),
     };
-    if matches!(&result, Err(TransactionError::AlreadyProcessed)) {
+    if matches!(
+        &result,
+        Err(TransactionError::AlreadyProcessed | TransactionError::BlockhashNotFound)
+    ) {
         let slot = ctx
             .banks_client
             .get_sysvar::<solana_program::clock::Clock>()
@@ -472,7 +482,7 @@ async fn send_quiet_cached(
         cache.blockhash = Some(
             ctx.get_new_latest_blockhash()
                 .await
-                .expect("a cached retry blockhash"),
+                .expect("a fresh retry blockhash"),
         );
         cache.uses = 0;
         let inner = ctx
@@ -743,9 +753,9 @@ fn dcm2_v7(
     out[40..72].copy_from_slice(authority);
     out[72..76].copy_from_slice(&k.to_le_bytes());
     out[76..78].copy_from_slice(&34u16.to_le_bytes());
-    out[document::DCM2_BUMP_AT] = address::document(program, descriptor).1;
-    out[document::DPR2_BUMP_AT] = address::positions(program, descriptor).1;
-    out[document::DFS2_BUMP_AT] = address::family_slots(program, descriptor).1;
+    out[document::DCM2_BUMP_AT] = address::document(program, descriptor).1.value();
+    out[document::DPR2_BUMP_AT] = address::positions(program, descriptor).1.value();
+    out[document::DFS2_BUMP_AT] = address::family_slots(program, descriptor).1.value();
     out[document::BOND_ESCROW_BUMP_AT] = address::bond_escrow(program, descriptor).1;
     out[84..88].copy_from_slice(&n.to_le_bytes());
     out[88..96].copy_from_slice(&(504_606_552u64).to_le_bytes());
@@ -794,7 +804,7 @@ fn dcr2_v6(program: &Pubkey, descriptor: &[u8; 32], binding: &Binding2, terms: &
     out[208] = binding.output_width;
     out[216..216 + TERMS_BYTES_V2].copy_from_slice(&terms.encode());
     out[384..392].copy_from_slice(&terms.result_retention_slots.to_le_bytes());
-    out[result::RESULT_PDA_BUMP_AT_V6] = address::result(program, descriptor).1;
+    out[result::RESULT_PDA_BUMP_AT_V6] = address::result(program, descriptor).1.value();
     out
 }
 
@@ -2337,10 +2347,10 @@ async fn build_with_pre_fix_seal_processor(
         .expect("permissionless admission begins from the sealed PT1X/PT2S");
         let mut first = 0u32;
         while first < class_total {
-            // `MAX_STEP` is a protocol ceiling, while 128 classes can exceed
-            // the release-SBF transaction budget for this 10,240-position
-            // bundle. Keep the honest end-to-end fixture within budget.
-            let count = (class_total - first).min(16) as u16;
+            // Admission's K=10,240 class scan exceeds the release-SBF
+            // transaction budget for a multi-class step. Keep this mechanics
+            // fixture to one class per instruction.
+            let count = (class_total - first).min(1) as u16;
             let mut step = vec![160];
             step.extend_from_slice(&first.to_le_bytes());
             step.extend_from_slice(&count.to_le_bytes());
@@ -11856,6 +11866,7 @@ fn ground_challenge_nonce(
 ) -> (u32, u8) {
     for nonce in 0..2_000_000u32 {
         let (_, bump) = address::challenge(program, descriptor, challenger, nonce);
+        let bump = bump.value();
         if bump <= 238 {
             return (nonce, bump);
         }
@@ -11878,6 +11889,7 @@ fn ground_document_descriptor(
         binding.request_id = request_id;
         let descriptor = f.descriptor(binding, terms, family_count);
         let (_, bump) = address::document(&f.program, &descriptor);
+        let bump = bump.value();
         if bump <= 238 {
             return (descriptor, bump, candidate + 1);
         }
@@ -11964,9 +11976,17 @@ async fn descend_position_challenge_with_witness(
         let opened = f.account(record).await;
         let (_, expected_bump) =
             address::challenge(&f.program, descriptor, &f.signer.pubkey(), nonce);
-        assert_eq!(opened[challenge::RECORD_BUMP_AT], expected_bump);
+        assert_eq!(opened[challenge::RECORD_BUMP_AT], expected_bump.value());
         assert_eq!(opened[challenge::RECORD_BUMP_MARKER_AT], 1);
     }
+    let opened = f.account(record).await;
+    let (_, expected_response_bump) =
+        dcg_program::closure_v2_response::address(&f.program, &record);
+    assert_eq!(
+        opened[challenge::RESPONSE_BUMP_STAGED_AT],
+        expected_response_bump.value(),
+        "tag 167 stores the canonical response bump"
+    );
 
     let mut reveal_position = vec![TAG_REVEAL_POSITION, 0, 0, roots.len() as u8];
     for root in roots {
@@ -12288,7 +12308,23 @@ async fn settle_and_close_standard_app_challenge(
     let third_party = Keypair::new();
     f.ctx
         .set_account(&third_party.pubkey(), &shared(system_funded()));
-    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let (response, response_bump) = dcg_program::closure_v2_response::address(&f.program, &record);
+    let settled_record = f.account(record).await;
+    assert_eq!(
+        settled_record[dcg_program::unified::challenge::RESPONSE_BUMP_AT],
+        response_bump.value(),
+        "the response bump remains committed through replay"
+    );
+    assert_eq!(
+        dcg_program::closure_v2_response::address_with_bump(
+            &f.program,
+            &record,
+            settled_record[dcg_program::unified::challenge::RESPONSE_BUMP_AT]
+        )
+        .unwrap(),
+        response,
+        "the committed response bump derives the response PDA"
+    );
     let record_before = f.lamports(record).await;
     let challenger_before = f.lamports(f.signer.pubkey()).await;
     let executor_before = f.lamports(f.executor.pubkey()).await;
@@ -15213,7 +15249,7 @@ async fn rev8_pt1x_output_pda_provenance_sbf() {
 
     let stale_bump = (0u8..=u8::MAX)
         .find(|bump| {
-            *bump != canonical_bump
+            *bump != canonical_bump.value()
                 && solana_program::pubkey::Pubkey::create_program_address(
                     &[&binding, &[*bump]],
                     &program,

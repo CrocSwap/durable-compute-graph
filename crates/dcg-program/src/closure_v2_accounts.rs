@@ -5,6 +5,7 @@
 //! `legacy-hclosure-handlers`; the default image links these helpers only for
 //! active root-only and sealed-document adapters.
 
+use crate::account_provenance::CanonicalBump;
 use crate::closure_v2_tree::*;
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program::invoke_signed,
@@ -22,10 +23,12 @@ pub(crate) fn create<'a>(
     account: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
     seeds: &[&[u8]],
+    bump: CanonicalBump,
     size: usize,
     rent_size: usize,
 ) -> ProgramResult {
-    if !payer.is_signer
+    if account.key != bump.address()
+        || !payer.is_signer
         || !payer.is_writable
         || !account.is_writable
         || *system.key != system_program::id()
@@ -34,12 +37,15 @@ pub(crate) fn create<'a>(
         return Err(refusal(AUTHORITY));
     }
     let lamports = Rent::get()?.minimum_balance(rent_size);
+    let bump_seed = [bump.value()];
+    let mut signer_seeds = seeds.to_vec();
+    signer_seeds.push(&bump_seed);
     let ix =
         system_instruction::create_account(payer.key, account.key, lamports, size as u64, program);
     invoke_signed(
         &ix,
         &[payer.clone(), account.clone(), system.clone()],
-        &[seeds],
+        &[&signer_seeds],
     )
 }
 pub(crate) fn doc_authority(
@@ -627,9 +633,6 @@ pub fn init_result<'a>(
     descriptor: &[u8; 32],
     count: u32,
 ) -> ProgramResult {
-    use solana_program::{
-        program::invoke_signed, rent::Rent, system_instruction, system_program, sysvar::Sysvar,
-    };
     let bootstrap = state.key == document.key;
     if bootstrap {
         doc_authority(program, state, payer, descriptor)?;
@@ -644,9 +647,10 @@ pub fn init_result<'a>(
     if !payer.is_signer || !payer.is_writable {
         return Err(refusal(AUTHORITY));
     }
+    let result_bump = CanonicalBump::find(&[b"dcg-hcl-result", descriptor], program);
     if count > facts.position_count
         || !result.is_writable
-        || *result.key != result_address(program, descriptor).0
+        || result.key != result_bump.address()
         || result.lamports() != 0
         || !result.data_is_empty()
         || *result.owner != system_program::id()
@@ -661,14 +665,15 @@ pub fn init_result<'a>(
     let profile: [u8; 32] = doc[40..72].try_into().map_err(|_| refusal(FORM))?;
     drop(doc);
     let size = result_bytes(count)?;
-    let rent = Rent::get()?.minimum_balance(size);
-    let (_, bump) = result_address(program, descriptor);
-    let bump_bytes = [bump];
-    let ix = system_instruction::create_account(payer.key, result.key, rent, size as u64, program);
-    invoke_signed(
-        &ix,
-        &[payer.clone(), result.clone(), system.clone()],
-        &[&[b"dcg-hcl-result", descriptor, &bump_bytes]],
+    create(
+        program,
+        payer,
+        result,
+        system,
+        &[b"dcg-hcl-result", descriptor],
+        result_bump,
+        size,
+        size,
     )?;
     let mut raw = result.try_borrow_mut_data()?;
     raw[..4].copy_from_slice(b"DCR2");

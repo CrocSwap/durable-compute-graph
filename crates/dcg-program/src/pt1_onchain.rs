@@ -3,7 +3,7 @@
 //! checkable without a single unbounded SBF instruction.
 use crate::account_provenance::{
     allocate_derived_account, create_derived_account, expect_derived_with_bump, expect_keyed,
-    expect_system_account_shape, AccountKind, RoleFlags,
+    expect_system_account_shape, AccountKind, CanonicalBump, RoleFlags,
 };
 use crate::position_template as pt;
 use solana_program::{
@@ -271,7 +271,7 @@ pub fn validate_pt1x_output_binding(
     binding: &[u8; 32],
     position: u32,
     first: u32,
-) -> Result<(bool, u8), ProgramError> {
+) -> Result<(bool, CanonicalBump), ProgramError> {
     let (expected, bump) = pt1x_output_address(program, binding);
     if !output.is_writable || *system.key != system_program::ID || output.key != &expected {
         return Err(ProgramError::InvalidAccountData);
@@ -318,7 +318,7 @@ pub fn prepare_pt1x_output_pda<'a>(
     system: &AccountInfo<'a>,
     payer: &AccountInfo<'a>,
     binding: &[u8; 32],
-    bump: u8,
+    bump: CanonicalBump,
     count: u32,
     stream_bytes: usize,
     required_bytes: usize,
@@ -406,7 +406,7 @@ pub fn prepare_pt1x_output_pda<'a>(
             output,
             program,
             &[binding],
-            bump,
+            bump.value(),
             AccountKind::exact(magic, required_bytes),
             RoleFlags {
                 writable: true,
@@ -438,7 +438,7 @@ pub fn reserve_pt1x_output_pda<'a>(
     system: &AccountInfo<'a>,
     payer: &AccountInfo<'a>,
     binding: &[u8; 32],
-    bump: u8,
+    bump: CanonicalBump,
     required_bytes: usize,
 ) -> ProgramResult {
     if !cfg!(feature = "revision-8")
@@ -453,9 +453,7 @@ pub fn reserve_pt1x_output_pda<'a>(
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    let bump_seed = [bump];
-    let expected = Pubkey::create_program_address(&[binding, &bump_seed], program)
-        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let expected = *bump.address();
     if output.key != &expected {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -662,8 +660,9 @@ pub fn pt1x_output_metadata(payer: &Pubkey, count: u32, input_keys: &[&Pubkey]) 
     metadata
 }
 
-pub fn pt1x_output_address(program: &Pubkey, binding: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[binding], program)
+pub fn pt1x_output_address(program: &Pubkey, binding: &[u8; 32]) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[binding], program);
+    (*bump.address(), bump)
 }
 
 /// Tag 198 closes one program-assigned PT1O and returns all lamports to the
@@ -1409,7 +1408,7 @@ pub fn instantiate(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
             output,
             &accounts[5],
             &binding,
-            bump,
+            bump.value(),
             count,
             stream_bytes,
             PT1X_OUTPUT_HEADER_BYTES

@@ -6,6 +6,7 @@
 //! authority instead of a profile digest. This path is deliberately marked
 //! as a stub in the runner's progress record; it is not a validity claim.
 
+use crate::account_provenance::CanonicalBump;
 use crate::closure_v2::{
     dcm2_header, document_address, page_address, page_bytes, position_page_address, position_root,
     DCM2_HEADER, DCM2_V2_HEADER, DPR2_HEADER,
@@ -67,9 +68,9 @@ pub fn init_small(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if entries < 2 || entries > 64 || window == 0 || data[39..71] == [0; 32] {
         return Err(refuse(COORDINATE));
     }
-    let (doc_key, doc_bump) = document_address(program, &digest);
-    let (pos_key, pos_bump) = position_page_address(program, &digest);
-    if *accounts[1].key != doc_key || *accounts[2].key != pos_key {
+    let doc_bump = CanonicalBump::find(&[b"dcg-hcl-document", &digest], program);
+    let pos_bump = CanonicalBump::find(&[b"dcg-hcl-positions", &digest], program);
+    if accounts[1].key != doc_bump.address() || accounts[2].key != pos_bump.address() {
         return Err(refuse(FORM));
     }
     create(
@@ -77,7 +78,8 @@ pub fn init_small(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         &accounts[0],
         &accounts[1],
         &accounts[3],
-        &[b"dcg-hcl-document", &digest, &[doc_bump]],
+        &[b"dcg-hcl-document", &digest],
+        doc_bump,
         DCM2_HEADER + 6,
         DCM2_HEADER + 6,
     )?;
@@ -86,7 +88,8 @@ pub fn init_small(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         &accounts[0],
         &accounts[2],
         &accounts[3],
-        &[b"dcg-hcl-positions", &digest, &[pos_bump]],
+        &[b"dcg-hcl-positions", &digest],
+        pos_bump,
         DPR2_HEADER + 32,
         DPR2_HEADER + 32,
     )?;
@@ -148,19 +151,18 @@ pub fn init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
     if sum != entries {
         return Err(refuse(FORM));
     }
-    let (doc_key, doc_bump) = document_address(program, &digest);
-    let (pos_key, pos_bump) = position_page_address(program, &digest);
-    if *accounts[1].key != doc_key || *accounts[2].key != pos_key {
+    let doc_bump = CanonicalBump::find(&[b"dcg-hcl-document", &digest], program);
+    let pos_bump = CanonicalBump::find(&[b"dcg-hcl-positions", &digest], program);
+    if accounts[1].key != doc_bump.address() || accounts[2].key != pos_bump.address() {
         return Err(refuse(FORM));
     }
-    let doc_bump_bytes = [doc_bump];
-    let pos_bump_bytes = [pos_bump];
     create(
         program,
         &accounts[0],
         &accounts[1],
         &accounts[3],
-        &[b"dcg-hcl-document", &digest, &doc_bump_bytes],
+        &[b"dcg-hcl-document", &digest],
+        doc_bump,
         DCM2_HEADER + manifest.len(),
         DCM2_HEADER + manifest.len(),
     )?;
@@ -169,7 +171,8 @@ pub fn init(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         &accounts[0],
         &accounts[2],
         &accounts[3],
-        &[b"dcg-hcl-positions", &digest, &pos_bump_bytes],
+        &[b"dcg-hcl-positions", &digest],
+        pos_bump,
         DPR2_HEADER + positions as usize * 32,
         DPR2_HEADER + positions as usize * 32,
     )?;
@@ -286,9 +289,9 @@ fn init_variable(
     if size > 10_485_760 {
         return Err(refuse(COORDINATE));
     }
-    let (doc_key, doc_bump) = document_address(program, &digest);
-    let (pos_key, pos_bump) = position_page_address(program, &digest);
-    if *accounts[1].key != doc_key || *accounts[2].key != pos_key {
+    let doc_bump = CanonicalBump::find(&[b"dcg-hcl-document", &digest], program);
+    let pos_bump = CanonicalBump::find(&[b"dcg-hcl-positions", &digest], program);
+    if accounts[1].key != doc_bump.address() || accounts[2].key != pos_bump.address() {
         return Err(refuse(FORM));
     }
     create(
@@ -296,7 +299,8 @@ fn init_variable(
         &accounts[0],
         &accounts[1],
         &accounts[3],
-        &[b"dcg-hcl-document", &digest, &[doc_bump]],
+        &[b"dcg-hcl-document", &digest],
+        doc_bump,
         size.min(GROW_MAX),
         size,
     )?;
@@ -308,7 +312,8 @@ fn init_variable(
         &accounts[0],
         &accounts[2],
         &accounts[3],
-        &[b"dcg-hcl-positions", &digest, &[pos_bump]],
+        &[b"dcg-hcl-positions", &digest],
+        pos_bump,
         position_size.min(GROW_MAX),
         position_size,
     )?;
@@ -568,9 +573,11 @@ pub fn init_root_group(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         return Err(refuse(FORM));
     }
     let segments = u16_at(&doc, 76)?;
-    let (root_key, root_bump) = root_only::root_page_address(program, &digest, group);
-    let (slots_key, slots_bump) = root_only::slot_counter_address(program, &digest, group);
-    if *accounts[2].key != root_key || *accounts[3].key != slots_key {
+    let root_bump =
+        CanonicalBump::find(&[b"dcg-hcl-roots", &digest, &group.to_le_bytes()], program);
+    let slots_bump =
+        CanonicalBump::find(&[b"dcg-hcl-slots", &digest, &group.to_le_bytes()], program);
+    if accounts[2].key != root_bump.address() || accounts[3].key != slots_bump.address() {
         return Err(refuse(FORM));
     }
     let root_size = root_only::root_page_bytes(segments)?;
@@ -580,7 +587,8 @@ pub fn init_root_group(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         &accounts[0],
         &accounts[2],
         &accounts[4],
-        &[b"dcg-hcl-roots", &digest, &group_bytes, &[root_bump]],
+        &[b"dcg-hcl-roots", &digest, &group_bytes],
+        root_bump,
         root_size.min(GROW_MAX),
         root_size,
     )?;
@@ -589,7 +597,8 @@ pub fn init_root_group(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         &accounts[0],
         &accounts[3],
         &accounts[4],
-        &[b"dcg-hcl-slots", &digest, &group_bytes, &[slots_bump]],
+        &[b"dcg-hcl-slots", &digest, &group_bytes],
+        slots_bump,
         root_only::DSC1_BYTES,
         root_only::DSC1_BYTES,
     )?;
@@ -690,19 +699,19 @@ pub fn init_page(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
         }
     }
     let entries = entries.ok_or(refuse(COORDINATE))?;
-    let (key, bump) = page_address(program, &digest, position, segment);
-    if *accounts[2].key != key {
-        return Err(refuse(FORM));
-    }
-    let bump_bytes = [bump];
     let p_bytes = position.to_le_bytes();
     let s_bytes = segment.to_le_bytes();
+    let bump = CanonicalBump::find(&[b"dcg-hcl-page", &digest, &p_bytes, &s_bytes], program);
+    if accounts[2].key != bump.address() {
+        return Err(refuse(FORM));
+    }
     create(
         program,
         &accounts[0],
         &accounts[2],
         &accounts[3],
-        &[b"dcg-hcl-page", &digest, &p_bytes, &s_bytes, &bump_bytes],
+        &[b"dcg-hcl-page", &digest, &p_bytes, &s_bytes],
+        bump,
         96,
         page_bytes(entries, consumers)?,
     )?;
@@ -818,19 +827,19 @@ pub fn collect_root(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
     }
     let root: [u8; 32] = page[64..96].try_into().map_err(|_| refuse(FORM))?;
     drop(page);
-    let (key, bump) = roots_address(program, &digest, position);
-    if *accounts[3].key != key || !accounts[3].is_writable {
+    let position_bytes = position.to_le_bytes();
+    let bump = CanonicalBump::find(&[b"dcg-hcl-roots", &digest, &position_bytes], program);
+    if accounts[3].key != bump.address() || !accounts[3].is_writable {
         return Err(refuse(FORM));
     }
     if accounts[3].lamports() == 0 {
-        let position_bytes = position.to_le_bytes();
-        let bump_bytes = [bump];
         create(
             program,
             &accounts[0],
             &accounts[3],
             &accounts[4],
-            &[b"dcg-hcl-roots", &digest, &position_bytes, &bump_bytes],
+            &[b"dcg-hcl-roots", &digest, &position_bytes],
+            bump,
             roots_bytes(count)?,
             roots_bytes(count)?,
         )?;

@@ -6,7 +6,7 @@
 //! phases before one atomic publication transaction.
 
 use crate::account_provenance::{
-    create_derived_account, expect_derived, expect_keyed, AccountKind, RoleFlags,
+    create_derived_account, expect_derived, expect_keyed, AccountKind, CanonicalBump, RoleFlags,
 };
 use crate::kernel::{
     AccountSpan, KernelId, ModeId, StateSchema, StateSpanMut, StatefulKernel, VersionedId, ViewAbi,
@@ -203,21 +203,25 @@ fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn session_pda(program: &Pubkey, authority: &Pubkey, id: u64) -> (Pubkey, u8) {
+fn session_pda(program: &Pubkey, authority: &Pubkey, id: u64) -> (Pubkey, CanonicalBump) {
     let id = id.to_le_bytes();
-    Pubkey::find_program_address(&[SESSION_SEED, authority.as_ref(), &id], program)
+    let bump = CanonicalBump::find(&[SESSION_SEED, authority.as_ref(), &id], program);
+    (*bump.address(), bump)
 }
 
-fn stream_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[STREAM_SEED, session.as_ref()], program)
+fn stream_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[STREAM_SEED, session.as_ref()], program);
+    (*bump.address(), bump)
 }
 
-fn state_pda(program: &Pubkey, session: &Pubkey, index: u8) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[STATE_SEED, session.as_ref(), &[index]], program)
+fn state_pda(program: &Pubkey, session: &Pubkey, index: u8) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[STATE_SEED, session.as_ref(), &[index]], program);
+    (*bump.address(), bump)
 }
 
-fn view_pda(program: &Pubkey, session: &Pubkey, role: u8) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[VIEW_SEED, session.as_ref(), &[role]], program)
+fn view_pda(program: &Pubkey, session: &Pubkey, role: u8) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[VIEW_SEED, session.as_ref(), &[role]], program);
+    (*bump.address(), bump)
 }
 
 fn validate_kernel(kernel: &dyn StatefulKernel) -> Result<StateSchema, ProgramError> {
@@ -456,7 +460,7 @@ fn create_pda<'a>(
     target: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
     seeds: &[&[u8]],
-    bump: u8,
+    bump: CanonicalBump,
     data_len: usize,
 ) -> ProgramResult {
     if data_len > ACCOUNT_MAX_BYTES {

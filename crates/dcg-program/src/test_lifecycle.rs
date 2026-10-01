@@ -6,6 +6,7 @@
 //! exercise a compiled kernel manifest and the optimistic one-step replay
 //! seam in an SBF image, using one four-entry ByteSum trace.
 
+use crate::account_provenance::CanonicalBump;
 use crate::kernel::{
     test_kernel::{MANIFEST_APP, MODE_OPTIMISTIC_V1},
     KernelId, ModeId,
@@ -75,7 +76,7 @@ fn create_pda<'a>(
     account: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
     seeds: &[&[u8]],
-    bump: u8,
+    bump: CanonicalBump,
     bytes: usize,
     lamports: u64,
 ) -> ProgramResult {
@@ -91,7 +92,10 @@ fn create_pda<'a>(
         solana_program::msg!("test lifecycle create-account precondition failed");
         return Err(refusal());
     }
-    let bump_seed = [bump];
+    if account.key != bump.address() {
+        return Err(refusal());
+    }
+    let bump_seed = [bump.value()];
     let mut signer_seeds = seeds.to_vec();
     signer_seeds.push(&bump_seed);
     invoke_signed(
@@ -316,22 +320,21 @@ fn register_template(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         return Err(refusal());
     }
     let case_seed = [case_id];
-    let (expected, bump) = Pubkey::find_program_address(
+    let bump = CanonicalBump::find(
         &[b"dcg-test-template", authority.key.as_ref(), &case_seed],
         program,
     );
-    if *template.key != expected {
+    if template.key != bump.address() {
         solana_program::msg!("test lifecycle template PDA mismatch");
         return Err(refusal());
     }
-    let bump_seed = [bump];
     create_pda(
         program,
         authority,
         template,
         system,
         &[b"dcg-test-template", authority.key.as_ref(), &case_seed],
-        bump_seed[0],
+        bump,
         TEMPLATE_BYTES,
         Rent::get()?.minimum_balance(TEMPLATE_BYTES),
     )?;
@@ -403,13 +406,12 @@ fn init_document(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     }
     let template_key = template.key.to_bytes();
     let case_seed = [case_id];
-    let (expected_doc, doc_bump) =
-        Pubkey::find_program_address(&[b"dcg-test-document", &template_key, &case_seed], program);
-    let (expected_bond, bond_bump) = Pubkey::find_program_address(
-        &[b"dcg-test-bond", expected_doc.as_ref(), &case_seed],
+    let doc_bump = CanonicalBump::find(&[b"dcg-test-document", &template_key, &case_seed], program);
+    let bond_bump = CanonicalBump::find(
+        &[b"dcg-test-bond", document.key.as_ref(), &case_seed],
         program,
     );
-    if *document.key != expected_doc || *bond.key != expected_bond {
+    if document.key != doc_bump.address() || bond.key != bond_bump.address() {
         return Err(refusal());
     }
     for i in 0..ENTRY_COUNT {

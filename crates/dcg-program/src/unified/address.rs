@@ -13,7 +13,13 @@
 //! DCR1 records are challenger-created (not PDAs), as v3/v4.
 
 use super::EPOCH;
+use crate::account_provenance::CanonicalBump;
 use solana_program::pubkey::Pubkey;
+
+fn canonical(program: &Pubkey, seeds: &[&[u8]]) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(seeds, program);
+    (*bump.address(), bump)
+}
 
 pub const CONFIG_SEED: &[u8] = b"dcg-config";
 pub const TEMPLATE_SEAL_SEED: &[u8] = b"dcg-template-seal";
@@ -35,39 +41,47 @@ pub const SETTLEMENT_ESCROW_SEED: &[u8] = b"dcg-hcl-settlement";
 /// still derives and no revision-8 document ever creates.
 pub const BOND_ESCROW_SEED: &[u8] = b"dcg-hcl-bond-escrow";
 
-pub fn config(program: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[CONFIG_SEED], program)
+pub fn config(program: &Pubkey) -> (Pubkey, CanonicalBump) {
+    canonical(program, &[CONFIG_SEED])
 }
-pub fn template_seal(program: &Pubkey, pt2s: &Pubkey, pt2s_sha256: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[TEMPLATE_SEAL_SEED, pt2s.as_ref(), pt2s_sha256], program)
+pub fn template_seal(
+    program: &Pubkey,
+    pt2s: &Pubkey,
+    pt2s_sha256: &[u8; 32],
+) -> (Pubkey, CanonicalBump) {
+    canonical(program, &[TEMPLATE_SEAL_SEED, pt2s.as_ref(), pt2s_sha256])
 }
-pub fn template_use(program: &Pubkey, pt2s: &Pubkey, pt2s_sha256: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[TEMPLATE_USE_SEED, pt2s.as_ref(), pt2s_sha256], program)
+pub fn template_use(
+    program: &Pubkey,
+    pt2s: &Pubkey,
+    pt2s_sha256: &[u8; 32],
+) -> (Pubkey, CanonicalBump) {
+    canonical(program, &[TEMPLATE_USE_SEED, pt2s.as_ref(), pt2s_sha256])
 }
 pub fn challenge(
     program: &Pubkey,
     descriptor: &[u8; 32],
     challenger: &Pubkey,
     nonce: u32,
-) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
+) -> (Pubkey, CanonicalBump) {
+    canonical(
+        program,
         &[
             CHALLENGE_SEED,
             descriptor,
             challenger.as_ref(),
             &nonce.to_le_bytes(),
         ],
-        program,
     )
 }
-pub fn registry(program: &Pubkey, registry_id: u32) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
+pub fn registry(program: &Pubkey, registry_id: u32) -> (Pubkey, CanonicalBump) {
+    canonical(
+        program,
         &[
             REGISTRY_SEED,
             &EPOCH.to_le_bytes(),
             &registry_id.to_le_bytes(),
         ],
-        program,
     )
 }
 pub fn admission(
@@ -75,28 +89,28 @@ pub fn admission(
     registry: &Pubkey,
     pt2s: &Pubkey,
     positions: u32,
-) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
+) -> (Pubkey, CanonicalBump) {
+    canonical(
+        program,
         &[
             ADMISSION_SEED,
             registry.as_ref(),
             pt2s.as_ref(),
             &positions.to_le_bytes(),
         ],
-        program,
     )
 }
-pub fn document(program: &Pubkey, descriptor: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[DOCUMENT_SEED, descriptor], program)
+pub fn document(program: &Pubkey, descriptor: &[u8; 32]) -> (Pubkey, CanonicalBump) {
+    canonical(program, &[DOCUMENT_SEED, descriptor])
 }
-pub fn positions(program: &Pubkey, descriptor: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[POSITIONS_SEED, descriptor], program)
+pub fn positions(program: &Pubkey, descriptor: &[u8; 32]) -> (Pubkey, CanonicalBump) {
+    canonical(program, &[POSITIONS_SEED, descriptor])
 }
-pub fn family_slots(program: &Pubkey, descriptor: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[FAMILY_SLOTS_SEED, descriptor], program)
+pub fn family_slots(program: &Pubkey, descriptor: &[u8; 32]) -> (Pubkey, CanonicalBump) {
+    canonical(program, &[FAMILY_SLOTS_SEED, descriptor])
 }
-pub fn result(program: &Pubkey, descriptor: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[RESULT_SEED, descriptor], program)
+pub fn result(program: &Pubkey, descriptor: &[u8; 32]) -> (Pubkey, CanonicalBump) {
+    canonical(program, &[RESULT_SEED, descriptor])
 }
 pub fn settlement_escrow(program: &Pubkey, challenge: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SETTLEMENT_ESCROW_SEED, challenge.as_ref()], program)
@@ -148,16 +162,20 @@ mod tests {
                 row[1].as_u64().unwrap() as u8,
             )
         };
+        let assert_canonical = |actual: (Pubkey, CanonicalBump), expected: (Pubkey, u8)| {
+            assert_eq!(actual.0, expected.0);
+            assert_eq!(actual.1.value(), expected.1);
+        };
         let program = key(&a["program"]);
         let descriptor: [u8; 32] = unhex(g["dpd2"]["digest"].as_str().unwrap())
             .try_into()
             .unwrap();
-        assert_eq!(config(&program), want("config"));
-        assert_eq!(registry(&program, 1), want("registry"));
-        assert_eq!(document(&program, &descriptor), want("document"));
-        assert_eq!(positions(&program, &descriptor), want("positions"));
-        assert_eq!(family_slots(&program, &descriptor), want("family_slots"));
-        assert_eq!(result(&program, &descriptor), want("result"));
+        assert_canonical(config(&program), want("config"));
+        assert_canonical(registry(&program, 1), want("registry"));
+        assert_canonical(document(&program, &descriptor), want("document"));
+        assert_canonical(positions(&program, &descriptor), want("positions"));
+        assert_canonical(family_slots(&program, &descriptor), want("family_slots"));
+        assert_canonical(result(&program, &descriptor), want("result"));
         let (challenge_key, _) = challenge(
             &program,
             &descriptor,

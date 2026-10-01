@@ -888,6 +888,7 @@ fn document_v8_inner(
                 kind,
                 role,
             )
+            .map(|_| ())
         } else {
             expect_derived(
                 account,
@@ -939,6 +940,7 @@ fn document_v8_inner(
                 kind,
                 role,
             )
+            .map(|_| ())
         } else {
             expect_derived(account, program, &[address::DOCUMENT_SEED, &d], kind, role).map(|_| ())
         }
@@ -1086,6 +1088,7 @@ fn positions_inner(
             kind,
             role,
         )
+        .map(|_| ())
     } else {
         expect_derived(
             account,
@@ -1428,7 +1431,8 @@ pub fn init_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         executor,
         dcm2,
         system,
-        &[address::DOCUMENT_SEED, &descriptor, &[doc_bump]],
+        &[address::DOCUMENT_SEED, &descriptor],
+        doc_bump,
         DCM2_V6_BYTES,
         DCM2_V6_BYTES,
         CL_MALFORMED,
@@ -1439,7 +1443,8 @@ pub fn init_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         executor,
         dpr2,
         system,
-        &[address::POSITIONS_SEED, &descriptor, &[pos_bump]],
+        &[address::POSITIONS_SEED, &descriptor],
+        pos_bump,
         full_positions.min(CPI_ALLOC),
         full_positions,
         CL_MALFORMED,
@@ -1450,7 +1455,8 @@ pub fn init_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         executor,
         dfs2,
         system,
-        &[address::FAMILY_SLOTS_SEED, &descriptor, &[fam_bump]],
+        &[address::FAMILY_SLOTS_SEED, &descriptor],
+        fam_bump,
         dfs2_size,
         dfs2_size,
         CL_MALFORMED,
@@ -1789,7 +1795,8 @@ pub fn init_v8_with_application(
         executor,
         dcm2,
         system,
-        &[address::DOCUMENT_SEED, &descriptor, &[doc_bump]],
+        &[address::DOCUMENT_SEED, &descriptor],
+        doc_bump,
         dcm2_bytes,
         dcm2_bytes,
         CL_MALFORMED,
@@ -1800,7 +1807,8 @@ pub fn init_v8_with_application(
         executor,
         dpr2,
         system,
-        &[address::POSITIONS_SEED, &descriptor, &[pos_bump]],
+        &[address::POSITIONS_SEED, &descriptor],
+        pos_bump,
         full_positions.min(CPI_ALLOC),
         full_positions,
         CL_MALFORMED,
@@ -1811,7 +1819,8 @@ pub fn init_v8_with_application(
         executor,
         dfs2,
         system,
-        &[address::FAMILY_SLOTS_SEED, &descriptor, &[fam_bump]],
+        &[address::FAMILY_SLOTS_SEED, &descriptor],
+        fam_bump,
         dfs2_size,
         dfs2_size,
         CL_MALFORMED,
@@ -1831,9 +1840,9 @@ pub fn init_v8_with_application(
         doc[40..72].copy_from_slice(executor.key.as_ref());
         doc[72..76].copy_from_slice(&p_count.to_le_bytes());
         doc[76..78].copy_from_slice(&s_count.to_le_bytes());
-        doc[DCM2_BUMP_AT] = doc_bump;
-        doc[DPR2_BUMP_AT] = pos_bump;
-        doc[DFS2_BUMP_AT] = fam_bump;
+        doc[DCM2_BUMP_AT] = doc_bump.value();
+        doc[DPR2_BUMP_AT] = pos_bump.value();
+        doc[DFS2_BUMP_AT] = fam_bump.value();
         doc[BOND_ESCROW_BUMP_AT] = escrow_bump;
         // The CHALLENGE deadline, written at init (spec §1.6) and rewritten at
         // finalize; never the anyone-can-close deadline, which is 2,174.

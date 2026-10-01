@@ -8,7 +8,8 @@
 //!   executor-declared DRU1 total governs the respond path) | 144 PT2P
 //!   source = 1 | 145 machine:u8 (revision 6.1: the DRP2 replay machine
 //!   bound at open, 1 A16, 2 V7) | 146 canonical bump:u8 and 147 marker:u8
-//!   (revision 8) | 148 deadline:u64
+//!   (revision 8) | 148 deadline:u64 | 181 opening DRU1 bump:u8
+//!   | 219 settled DRU1 bump:u8 (revision 8)
 //! 156 position:u32 | 160 segment:u16 | 162 bond:u64 | 170 t:u32 | 174 form:u16
 //! ```
 //! Phases: 1 respond, 2 sealed, 3 ruled, 4 settled, 5 executor reveals a
@@ -38,7 +39,7 @@ use super::{
     CL_PATH, DCR1_AUTH, DCR1_BAD, DCR1_DEADLINE, DCR1_INCOMPLETE, DCR1_PHASE, DCR1_PROOF,
     PLAN_BINDING, REGISTRY_ROOT, REVEAL_MISMATCH, REVEAL_ORDER, SETTLEMENT_PROGRAM,
 };
-use crate::account_provenance::{expect_derived, expect_derived_with_bump, AccountKind, RoleFlags};
+use crate::account_provenance::{expect_derived_with_bump, AccountKind, CanonicalBump, RoleFlags};
 use crate::closure_v2::{self as h, Node};
 use crate::hash;
 use crate::pt2p::Pt2p;
@@ -90,13 +91,18 @@ pub const FTR_ROOTS_AT: usize = FTR_AT + 8;
 pub const PT2P_MODE_AT: usize = 144;
 /// Replay machine selector (`registry::machine_selector`), written at open
 /// (revision 6.1). Revision-8 open uses bytes 146 and 147 for the challenge
-/// bump and a marker; revision-7's legacy layout keeps them zero.
+/// bump and required marker; revision-7's legacy layout keeps them zero.
 pub const MACHINE_AT: usize = 145;
 /// Reserved bytes repurposed in revision 8 to keep tag 184's address check
-/// independent of a challenger-controlled canonical-bump search. Marker 1
-/// identifies records opened by this image; marker 0 is the legacy layout.
+/// independent of a challenger-controlled canonical-bump search. A fresh
+/// revision-8 image requires marker 1; marker 0 belongs to the legacy layout.
 pub const RECORD_BUMP_AT: usize = 146;
 pub const RECORD_BUMP_MARKER_AT: usize = 147;
+/// Canonical DRU1 bump staged at open. Position-root staging occupies the
+/// eventual stable slot, so tag 164 moves this value after it consumes roots.
+pub const RESPONSE_BUMP_STAGED_AT: usize = 181;
+/// Stable canonical DRU1 bump used by ruling and settlement after tag 164.
+pub const RESPONSE_BUMP_AT: usize = HEADER + 43;
 pub const PHASE_RESPOND: u8 = 1;
 pub const PHASE_SEALED: u8 = 2;
 pub const PHASE_RULED: u8 = 3;
@@ -109,6 +115,19 @@ pub const OUTCOME_ADMITTED: u8 = 1;
 pub const OUTCOME_CONVICTED: u8 = 2;
 pub const OUTCOME_IDENTITY_CHANGED: u8 = 3;
 pub const OUTCOME_PENDING: u8 = 0;
+
+/// Clears the temporary descent/reveal area while retaining the revision-8
+/// DRU1 bump committed at challenge open. Older DCR1 layouts have no marker,
+/// so their scratch bytes keep the historical zeroing behavior.
+fn clear_challenge_scratch(raw: &mut [u8]) {
+    #[cfg(feature = "revision-8")]
+    let response_bump = (raw[RECORD_BUMP_MARKER_AT] == 1).then_some(raw[RESPONSE_BUMP_AT]);
+    raw[HEADER..PATH_LEN_AT].fill(0);
+    #[cfg(feature = "revision-8")]
+    if let Some(response_bump) = response_bump {
+        raw[RESPONSE_BUMP_AT] = response_bump;
+    }
+}
 
 fn is_challenge_version(raw: &[u8]) -> bool {
     raw.get(6..8)
@@ -240,8 +259,8 @@ fn record(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> Program
     Ok(())
 }
 
-/// Revision-8 DCR1 stores its open nonce at 140..144 so readers can rederive
-/// the challenge PDA. Revision 7 continues to use record() unchanged.
+/// Revision-8 DCR1 stores its canonical challenge bump and response bump.
+/// Revision 7 continues to use record() unchanged.
 fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> ProgramResult {
     #[cfg(feature = "revision-8")]
     {
@@ -280,12 +299,6 @@ fn record_v8(program: &Pubkey, account: &AccountInfo, phase: Option<u8>) -> Prog
         signer: false,
     };
     match raw[RECORD_BUMP_MARKER_AT] {
-        0 => {
-            // Open challenges that predate the reserved-byte bump marker can
-            // still finish under this image; newly opened records take the
-            // fixed-cost branch below.
-            expect_derived(account, program, &seeds, kind, role).map_err(|_| no(DCR1_AUTH))?;
-        }
         1 => {
             expect_derived_with_bump(account, program, &seeds, raw[RECORD_BUMP_AT], kind, role)
                 .map_err(|_| no(DCR1_AUTH))?;
@@ -937,7 +950,7 @@ fn fix_point(
     }
     if identity_changed || unsupported {
         cause = events::CAUSE_APP_IDENTITY_CHANGED;
-        raw[HEADER..PATH_LEN_AT].fill(0);
+        clear_challenge_scratch(raw);
         raw[6..8].copy_from_slice(&APP_REPLAY_VERSION.to_le_bytes());
         let identity = saved_identity.unwrap_or_else(|| {
             let mut identity = [0; APP_IDENTITY_BYTES];
@@ -1013,7 +1026,7 @@ fn fix_point(
         }
     }
     // Review R3: DEV2 lies inside the descent area; clear first, then write.
-    raw[HEADER..PATH_LEN_AT].fill(0);
+    clear_challenge_scratch(raw);
     if let Some(identity) = app_identity {
         // V6 is terminal here, so its identity can reuse the old path-length
         // byte without affecting any later challenge proof.
@@ -1119,9 +1132,10 @@ pub fn rule(
     Err(no(DCR1_AUTH))
 }
 
-/// Revision 8 RULE. DCR1[140..144] carries the nonce needed to rederive the
-/// challenge PDA. Its settle-deadline bytes stay zero because the custom settle
-/// window has no revision-8 meaning.
+/// Revision 8 RULE. DCR1 stores the canonical challenge bump at byte 146;
+/// bytes 140..144 retain the open nonce for the record identity. Its
+/// settle-deadline bytes stay zero because the custom settle window has no
+/// revision-8 meaning.
 pub fn rule_v8(
     program: &Pubkey,
     challenge: &Pubkey,
@@ -1134,7 +1148,23 @@ pub fn rule_v8(
     let descriptor = d32(raw, 72, DCR1_BAD)?;
     let challenger = Pubkey::new_from_array(d32(raw, 8, DCR1_BAD)?);
     let nonce = u32_at(raw, 140, DCR1_BAD)?;
-    if *challenge != address::challenge(program, &descriptor, &challenger, nonce).0 {
+    if raw[RECORD_BUMP_MARKER_AT] != 1 {
+        return Err(no(DCR1_AUTH));
+    }
+    let nonce_bytes = nonce.to_le_bytes();
+    let bump_seed = [raw[RECORD_BUMP_AT]];
+    let expected = Pubkey::create_program_address(
+        &[
+            address::CHALLENGE_SEED,
+            &descriptor,
+            challenger.as_ref(),
+            &nonce_bytes,
+            &bump_seed,
+        ],
+        program,
+    )
+    .map_err(|_| no(DCR1_AUTH))?;
+    if *challenge != expected {
         return Err(no(DCR1_AUTH));
     }
     if winner == 0 && cause != events::CAUSE_APP_IDENTITY_CHANGED {
@@ -1244,7 +1274,7 @@ fn open_checks(
     position: u32,
     nonce: u32,
     hooks: &dyn crate::compatibility::ApplicationHooks,
-) -> Result<([u8; 32], u64, u64, u8), ProgramError> {
+) -> Result<([u8; 32], u64, u64, CanonicalBump), ProgramError> {
     let [record_acc, challenger, dcm2, dpr2, system, pt2s, routes, geometry, drp2, ..] = accounts
     else {
         return Err(no(DCR1_BAD));
@@ -1303,7 +1333,7 @@ fn open_checks(
     position: u32,
     nonce: u32,
     hooks: &dyn crate::compatibility::ApplicationHooks,
-) -> Result<([u8; 32], u64, u64, u8), ProgramError> {
+) -> Result<([u8; 32], u64, u64, CanonicalBump), ProgramError> {
     let [record_acc, challenger, dcm2, dpr2, system, pt2s, routes, geometry, drp2, ..] = accounts
     else {
         return Err(no(DCR1_BAD));
@@ -1363,7 +1393,7 @@ fn open_record(
     accounts: &[AccountInfo],
     descriptor: &[u8; 32],
     nonce: u32,
-    bump: u8,
+    bump: crate::account_provenance::CanonicalBump,
     executor: &[u8; 32],
     position: u32,
     segment: u16,
@@ -1381,8 +1411,8 @@ fn open_record(
             descriptor,
             accounts[1].key.as_ref(),
             &nonce.to_le_bytes(),
-            &[bump],
         ],
+        bump,
         SIZE,
         SIZE,
         DCR1_BAD,
@@ -1418,8 +1448,13 @@ fn open_record(
     raw[MACHINE_AT] = machine;
     #[cfg(feature = "revision-8")]
     {
-        raw[RECORD_BUMP_AT] = bump;
+        raw[RECORD_BUMP_AT] = bump.value();
         raw[RECORD_BUMP_MARKER_AT] = 1;
+        raw[RESPONSE_BUMP_STAGED_AT] = crate::account_provenance::CanonicalBump::find(
+            &[b"dcg-hcl-response", accounts[0].key.as_ref()],
+            program,
+        )
+        .value();
     }
     raw[148..156].copy_from_slice(&deadline.to_le_bytes());
     raw[156..160].copy_from_slice(&position.to_le_bytes());
@@ -1826,7 +1861,9 @@ pub fn select_segment_with_manifest(
     };
     let deadline = response_deadline(&accounts[2], hooks)?;
     let mut raw = accounts[0].try_borrow_mut_data()?;
-    raw[HEADER..PATH_LEN_AT].fill(0);
+    let response_bump = raw[RESPONSE_BUMP_STAGED_AT];
+    clear_challenge_scratch(&mut raw);
+    raw[RESPONSE_BUMP_AT] = response_bump;
     raw[160..162].copy_from_slice(&segment_id.to_le_bytes());
     raw[HEADER + 32..HEADER + 36].copy_from_slice(&0u32.to_le_bytes());
     raw[HEADER + 36..HEADER + 40].copy_from_slice(&entries.to_le_bytes());
@@ -2868,6 +2905,9 @@ pub fn settle_v7<'a>(program: &Pubkey, accounts: &[AccountInfo<'a>], data: &[u8]
             return Err(no(SETTLEMENT_PROGRAM));
         }
     }
+    // Revision-7 records predate the reserved response-bump byte. Preserve
+    // their canonical-search path; revision-8 settlement below uses the bump
+    // written at open.
     let (response_key, _) = crate::closure_v2_response::address(program, record_acc.key);
     if response_acc.key != &response_key
         || (response_acc.owner != program
@@ -3145,7 +3185,10 @@ pub fn settle_v8_with_hooks<'a>(
             return Err(no(CL_AUTHORITY));
         }
     }
-    let (response_key, _) = crate::closure_v2_response::address(program, record_acc.key);
+    let response_bump = record_acc.try_borrow_data()?[RESPONSE_BUMP_AT];
+    let response_key =
+        crate::closure_v2_response::address_with_bump(program, record_acc.key, response_bump)
+            .map_err(|_| no(DCR1_AUTH))?;
     if response_acc.key != &response_key
         || (response_acc.owner != program
             && (*response_acc.owner != system_program::ID || !response_acc.data_is_empty()))

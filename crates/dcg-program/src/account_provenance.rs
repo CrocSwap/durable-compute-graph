@@ -76,6 +76,34 @@ pub struct RoleFlags {
     pub signer: bool,
 }
 
+/// A bump paired with the PDA found by the canonical search (or with the
+/// account address validated using a stored bump). Its fields are private so
+/// creation callers cannot pass an instruction byte as a bump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalBump {
+    value: u8,
+    address: Pubkey,
+}
+
+impl CanonicalBump {
+    /// Run Solana's full canonical search once and retain both outputs for a
+    /// later account check or signed creation.
+    pub fn find(seeds: &[&[u8]], program: &Pubkey) -> Self {
+        let (address, value) = Pubkey::find_program_address(seeds, program);
+        Self { value, address }
+    }
+
+    /// The canonical bump byte, for storing in the created account.
+    pub const fn value(self) -> u8 {
+        self.value
+    }
+
+    /// The PDA returned by the full canonical search or validated read.
+    pub const fn address(&self) -> &Pubkey {
+        &self.address
+    }
+}
+
 /// Validate a program-owned account whose identity is an exact independently
 /// authenticated key (for example, a signer-created account recorded by its
 /// parent). Use `expect_derived` when the role is a PDA.
@@ -117,15 +145,15 @@ pub fn expect_derived(
     seeds: &[&[u8]],
     kind: AccountKind,
     role: RoleFlags,
-) -> Result<u8, ProgramError> {
-    let (expected, bump) = Pubkey::find_program_address(seeds, program);
-    expect_keyed(account, program, &expected, kind, role)?;
+) -> Result<CanonicalBump, ProgramError> {
+    let bump = CanonicalBump::find(seeds, program);
+    expect_keyed(account, program, bump.address(), kind, role)?;
     if kind.bump_offset.is_some_and(|offset| {
         account
             .try_borrow_data()
             .ok()
             .and_then(|data| data.get(offset).copied())
-            != Some(bump)
+            != Some(bump.value())
     }) {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -144,7 +172,7 @@ pub fn expect_derived_with_bump(
     bump: u8,
     kind: AccountKind,
     role: RoleFlags,
-) -> ProgramResult {
+) -> Result<CanonicalBump, ProgramError> {
     let bump_seed = [bump];
     let mut derived_seeds = seeds.to_vec();
     derived_seeds.push(&bump_seed);
@@ -160,7 +188,10 @@ pub fn expect_derived_with_bump(
     }) {
         return Err(ProgramError::InvalidAccountData);
     }
-    Ok(())
+    Ok(CanonicalBump {
+        value: bump,
+        address: expected,
+    })
 }
 
 /// Check a fresh System-owned PDA before the program creates or assigns it.
@@ -172,12 +203,61 @@ pub fn expect_system_derived(
     expected_bump: Option<u8>,
     role: RoleFlags,
     allow_prefunded: bool,
-) -> Result<u8, ProgramError> {
-    let (expected, bump) = Pubkey::find_program_address(seeds, program);
-    if account.key != &expected || expected_bump.is_some_and(|given| given != bump) {
+) -> Result<CanonicalBump, ProgramError> {
+    let bump = CanonicalBump::find(seeds, program);
+    if account.key != bump.address() || expected_bump.is_some_and(|given| given != bump.value()) {
         return Err(ProgramError::InvalidAccountData);
     }
     expect_system_account_shape(account, role, allow_prefunded)?;
+    Ok(bump)
+}
+
+/// Validate a pre-funded System-owned PDA against a bump saved by a trusted
+/// creator. This avoids repeating the canonical search in the later creation
+/// instruction while still checking the exact derived key and empty shape.
+pub fn expect_system_derived_with_bump(
+    account: &AccountInfo,
+    program: &Pubkey,
+    seeds: &[&[u8]],
+    bump: u8,
+    role: RoleFlags,
+    allow_prefunded: bool,
+) -> Result<CanonicalBump, ProgramError> {
+    let bump_seed = [bump];
+    let mut derived_seeds = seeds.to_vec();
+    derived_seeds.push(&bump_seed);
+    let address = Pubkey::create_program_address(&derived_seeds, program)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if account.key != &address {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    expect_system_account_shape(account, role, allow_prefunded)?;
+    Ok(CanonicalBump {
+        value: bump,
+        address,
+    })
+}
+
+/// App-dispatch variant of `expect_system_derived`: it enforces minimum role
+/// privileges, so an otherwise read-only role can accept a writable meta.
+pub fn expect_system_derived_role(
+    account: &AccountInfo,
+    program: &Pubkey,
+    seeds: &[&[u8]],
+    role: RoleFlags,
+    allow_prefunded: bool,
+) -> Result<CanonicalBump, ProgramError> {
+    let bump = CanonicalBump::find(seeds, program);
+    if account.key != bump.address()
+        || account.owner != &system_program::id()
+        || account.executable
+        || (role.writable && !account.is_writable)
+        || (role.signer && !account.is_signer)
+        || !account.data_is_empty()
+        || (!allow_prefunded && account.lamports() != 0)
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
     Ok(bump)
 }
 
@@ -200,6 +280,24 @@ pub fn expect_system_account_shape(
     Ok(())
 }
 
+fn validate_creation_target(
+    target: &AccountInfo,
+    bump: CanonicalBump,
+    allow_prefunded: bool,
+) -> ProgramResult {
+    if target.key != bump.address()
+        || !target.is_writable
+        || target.is_signer
+        || target.executable
+        || target.owner != &system_program::id()
+        || (!allow_prefunded && target.lamports() != 0)
+        || !target.data_is_empty()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 /// Create a fresh account at the canonical address for `seeds`.
 ///
 /// The target must be a writable, empty System-owned account with zero
@@ -211,23 +309,13 @@ pub fn create_derived_account<'a>(
     target: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
     seeds: &[&[u8]],
-    expected_bump: u8,
+    expected_bump: CanonicalBump,
     data_len: usize,
     rent_size: usize,
 ) -> ProgramResult {
-    let bump_seed = [expected_bump];
-    let mut derived_seeds = seeds.to_vec();
-    derived_seeds.push(&bump_seed);
-    let expected = Pubkey::create_program_address(&derived_seeds, program)
-        .map_err(|_| ProgramError::InvalidAccountData)?;
-    if target.key != &expected
-        || !target.is_writable
-        || target.is_signer
-        || target.executable
-        || target.owner != &system_program::id()
-        || target.lamports() != 0
-        || !target.data_is_empty()
-        || !payer.is_signer
+    let bump_seed = [expected_bump.value()];
+    validate_creation_target(target, expected_bump, false)?;
+    if !payer.is_signer
         || !payer.is_writable
         || payer.executable
         || *system.key != system_program::id()
@@ -262,22 +350,13 @@ pub fn allocate_derived_account<'a>(
     target: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
     seeds: &[&[u8]],
-    expected_bump: u8,
+    expected_bump: CanonicalBump,
     data_len: usize,
     rent_size: usize,
 ) -> ProgramResult {
-    let bump_seed = [expected_bump];
-    let mut derived_seeds = seeds.to_vec();
-    derived_seeds.push(&bump_seed);
-    let expected = Pubkey::create_program_address(&derived_seeds, program)
-        .map_err(|_| ProgramError::InvalidAccountData)?;
-    if target.key != &expected
-        || !target.is_writable
-        || target.is_signer
-        || target.executable
-        || target.owner != &system_program::id()
-        || !target.data_is_empty()
-        || !payer.is_signer
+    let bump_seed = [expected_bump.value()];
+    validate_creation_target(target, expected_bump, true)?;
+    if !payer.is_signer
         || !payer.is_writable
         || payer.executable
         || *system.key != system_program::id()
@@ -357,7 +436,8 @@ mod tests {
                     writable: true,
                     signer: false
                 },
-            ),
+            )
+            .map(CanonicalBump::value),
             Ok(bump)
         );
         assert!(expect_derived(
@@ -381,7 +461,8 @@ mod tests {
                     writable: false,
                     signer: false
                 },
-            ),
+            )
+            .map(CanonicalBump::value),
             Ok(bump),
             "read roles accept writable metas from frozen account lists"
         );
@@ -487,5 +568,66 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn creation_rejects_an_account_at_a_noncanonical_bump_address() {
+        let program = Pubkey::new_unique();
+        let parent = Pubkey::new_unique();
+        let seeds: &[&[u8]] = &[b"child", parent.as_ref()];
+        let canonical = CanonicalBump::find(seeds, &program);
+        let noncanonical = (0..canonical.value())
+            .rev()
+            .find_map(|value| {
+                Pubkey::create_program_address(&[seeds[0], seeds[1], &[value]], &program).ok()
+            })
+            .expect("a second valid bump exists for this deterministic test seed");
+        assert_ne!(&noncanonical, canonical.address());
+        let system = system_program::id();
+        let mut lamports = 0;
+        let mut data = [];
+        let target = account(
+            &noncanonical,
+            &system,
+            &mut lamports,
+            &mut data,
+            true,
+            false,
+        );
+        let payer_key = Pubkey::new_unique();
+        let mut payer_lamports = 1;
+        let mut payer_data = [];
+        let payer = account(
+            &payer_key,
+            &system,
+            &mut payer_lamports,
+            &mut payer_data,
+            true,
+            true,
+        );
+        let mut system_lamports = 1;
+        let mut system_data = [];
+        let system_account = account(
+            &system,
+            &system,
+            &mut system_lamports,
+            &mut system_data,
+            false,
+            false,
+        );
+        assert_eq!(
+            create_derived_account(
+                &program,
+                &payer,
+                &target,
+                &system_account,
+                seeds,
+                canonical,
+                8,
+                8,
+            ),
+            Err(ProgramError::InvalidAccountData),
+            "creation requires the full-search address paired with its canonical bump"
+        );
     }
 }

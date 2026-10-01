@@ -61,12 +61,13 @@ set through DCG first, then checks the application table, and rejects
 everything else. Tag 125 stays DCG-owned; the application dispute/replay tags
 are the non-core members of 120–129.
 
-The preflight callback receives the full instruction bytes and raw ordered
-accounts. Its checked-account view is the seam for the shared address-rule
-helper being landed separately; do not treat the current placeholder as
-independent address-provenance evidence. The program-manifest digest commits
-the app identity, its form-to-kernel admission identity, and the canonical
-`(tag, handler id, handler version)` rows.
+Each app instruction declares a static rule for every ordered account.
+`process_instruction_with_application` validates the key or PDA derivation,
+owner, account shape, roles, and writable aliases before calling preflight;
+the handler then receives the ordered account view only after preflight passes.
+The app-manifest digest commits the app identity, its form-to-kernel admission
+identity, canonical `(tag, handler id, handler version)` rows, and account
+rules.
 
 Pure region-content folds are available from
 [`dcg_program::region_commitment`](crates/dcg-program/src/region_commitment.rs).

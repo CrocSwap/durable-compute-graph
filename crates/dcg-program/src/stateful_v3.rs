@@ -7,7 +7,7 @@
 
 use crate::account_provenance::{
     create_derived_account, expect_derived, expect_derived_with_bump, expect_keyed, AccountKind,
-    RoleFlags,
+    CanonicalBump, RoleFlags,
 };
 use crate::kernel::{
     AccountSpan, InitializationPhase, KernelId, ModeId, StateSchema, StateSpanMut, StatefulKernel,
@@ -268,17 +268,20 @@ fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn session_pda(program: &Pubkey, authority: &Pubkey, id: u64) -> (Pubkey, u8) {
+fn session_pda(program: &Pubkey, authority: &Pubkey, id: u64) -> (Pubkey, CanonicalBump) {
     let id = id.to_le_bytes();
-    Pubkey::find_program_address(&[SESSION_SEED, authority.as_ref(), &id], program)
+    let bump = CanonicalBump::find(&[SESSION_SEED, authority.as_ref(), &id], program);
+    (*bump.address(), bump)
 }
 
-fn resource_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[RESOURCE_SEED, session.as_ref()], program)
+fn resource_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[RESOURCE_SEED, session.as_ref()], program);
+    (*bump.address(), bump)
 }
 
-fn anchor_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[ANCHOR_SEED, session.as_ref()], program)
+fn anchor_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[ANCHOR_SEED, session.as_ref()], program);
+    (*bump.address(), bump)
 }
 
 fn resource_chunks(len: u32) -> u32 {
@@ -558,16 +561,19 @@ fn upload_resource_chunk(
     Ok(())
 }
 
-fn stream_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[STREAM_SEED, session.as_ref()], program)
+fn stream_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[STREAM_SEED, session.as_ref()], program);
+    (*bump.address(), bump)
 }
 
-fn state_pda(program: &Pubkey, session: &Pubkey, index: u8) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[STATE_SEED, session.as_ref(), &[index]], program)
+fn state_pda(program: &Pubkey, session: &Pubkey, index: u8) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[STATE_SEED, session.as_ref(), &[index]], program);
+    (*bump.address(), bump)
 }
 
-fn view_pda(program: &Pubkey, session: &Pubkey, role: u8) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[VIEW_SEED, session.as_ref(), &[role]], program)
+fn view_pda(program: &Pubkey, session: &Pubkey, role: u8) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[VIEW_SEED, session.as_ref(), &[role]], program);
+    (*bump.address(), bump)
 }
 
 fn validate_kernel(kernel: &dyn StatefulKernel) -> Result<StateSchema, ProgramError> {
@@ -869,7 +875,7 @@ fn create_pda<'a>(
     target: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
     seeds: &[&[u8]],
-    bump: u8,
+    bump: CanonicalBump,
     data_len: usize,
 ) -> ProgramResult {
     if data_len > ACCOUNT_MAX_BYTES {
@@ -1031,7 +1037,7 @@ fn open_session(
         session_account,
         &Session {
             id,
-            bump,
+            bump: bump.value(),
             status: STATUS_ACTIVE,
             policy,
             command_width: width,
@@ -1405,7 +1411,7 @@ fn grow_state(
     let schema = validate_kernel(kernel)?;
     let state_kind = if session.primary_state && index == 0 {
         let len = session.state_lengths[index] as usize;
-        AccountKind::variable(b"", len.min(HALT_BEFORE_RUNTIME_CHECK_BYTES), len)
+        AccountKind::variable(b"", len.min(CHILD_GROW_BYTES as usize), len)
     } else {
         AccountKind::variable(STATE_MAGIC, CHILD_HEADER_BYTES + 1, ACCOUNT_MAX_BYTES)
             .with_version(4, WIRE_VERSION as u16)

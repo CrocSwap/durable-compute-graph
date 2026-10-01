@@ -338,6 +338,7 @@ fn view_v8_status_inner(
             kind,
             role,
         )
+        .map(|_| ())
     } else {
         expect_derived(
             account,
@@ -413,7 +414,8 @@ pub fn create<'a>(
         executor,
         dcr2,
         system,
-        &[address::RESULT_SEED, descriptor, &[bump]],
+        &[address::RESULT_SEED, descriptor],
+        bump,
         full.min(CPI_ALLOC),
         full,
         CL_MALFORMED,
@@ -481,7 +483,8 @@ pub fn create_v8_with_hooks<'a>(
         executor,
         dcr2,
         system,
-        &[address::RESULT_SEED, descriptor, &[bump]],
+        &[address::RESULT_SEED, descriptor],
+        bump,
         full.min(CPI_ALLOC),
         full,
         CL_MALFORMED,
@@ -501,7 +504,7 @@ pub fn create_v8_with_hooks<'a>(
     let decoded = Terms2::decode_with(terms, hooks).map_err(no)?;
     raw[RETENTION_SLOTS_AT_V6..RETENTION_SLOTS_AT_V6 + 8]
         .copy_from_slice(&decoded.result_retention_slots.to_le_bytes());
-    raw[RESULT_PDA_BUMP_AT_V6] = bump;
+    raw[RESULT_PDA_BUMP_AT_V6] = bump.value();
     Ok(())
 }
 

@@ -216,9 +216,9 @@ fn dcm2_v7(
     out[40..72].copy_from_slice(executor.as_ref());
     out[72..76].copy_from_slice(&80u32.to_le_bytes());
     out[76..78].copy_from_slice(&34u16.to_le_bytes());
-    out[document::DCM2_BUMP_AT] = address::document(program, descriptor).1;
-    out[document::DPR2_BUMP_AT] = address::positions(program, descriptor).1;
-    out[document::DFS2_BUMP_AT] = address::family_slots(program, descriptor).1;
+    out[document::DCM2_BUMP_AT] = address::document(program, descriptor).1.value();
+    out[document::DPR2_BUMP_AT] = address::positions(program, descriptor).1.value();
+    out[document::DFS2_BUMP_AT] = address::family_slots(program, descriptor).1.value();
     out[document::BOND_ESCROW_BUMP_AT] = address::bond_escrow(program, descriptor).1;
     out[84..88].copy_from_slice(&40u32.to_le_bytes());
     out[88..96].copy_from_slice(&504_606_552u64.to_le_bytes());
@@ -313,6 +313,7 @@ fn dcrz_v2(
 /// byte is zero, which the settle does not read: the round walk, the proofs and
 /// the trees belong to instructions this slice is not driving.
 fn dcr1_ruled(
+    program: &Pubkey,
     descriptor: &[u8; 32],
     challenger: &Pubkey,
     executor: &Pubkey,
@@ -328,12 +329,31 @@ fn dcr1_ruled(
     out[8..40].copy_from_slice(challenger.as_ref());
     out[40..72].copy_from_slice(executor.as_ref());
     out[72..104].copy_from_slice(descriptor);
-    // Revision-8 RULE/settle readers rederive this DCR1 PDA from its open nonce.
+    // A fresh revision-8 image requires the canonical DCR1 and DRU1 bumps.
     out[140..144].copy_from_slice(&0u32.to_le_bytes());
     out[144] = 1;
+    let nonce = 0u32.to_le_bytes();
+    let (challenge_key, challenge_bump) = Pubkey::find_program_address(
+        &[
+            b"dcg-unified-challenge",
+            descriptor,
+            challenger.as_ref(),
+            &nonce,
+        ],
+        program,
+    );
+    out[146] = challenge_bump;
+    out[147] = 1;
     out[148..156].copy_from_slice(&1u64.to_le_bytes());
     out[162..170].copy_from_slice(&record_bond.to_le_bytes());
     out[178] = cause;
+    let response_bump =
+        Pubkey::find_program_address(&[b"dcg-hcl-response", challenge_key.as_ref()], program).1;
+    // The lifecycle moves the staged byte at 181 to the stable slot at 219
+    // after position-root staging completes. Settlement fixtures model that
+    // post-open state directly.
+    out[181] = response_bump;
+    out[dcg_program::unified::challenge::RESPONSE_BUMP_AT] = response_bump;
     out
 }
 
@@ -575,7 +595,7 @@ impl Fx {
         let (key, program) = (self.dcr2(), self.ids.program);
         if image.starts_with(b"DCR2") && image.len() > result::RESULT_PDA_BUMP_AT_V6 {
             let descriptor: [u8; 32] = image[8..40].try_into().expect("DCR2 descriptor");
-            image[result::RESULT_PDA_BUMP_AT_V6] = address::result(&program, &descriptor).1;
+            image[result::RESULT_PDA_BUMP_AT_V6] = address::result(&program, &descriptor).1.value();
         }
         put(&mut self.ctx, &key, owned(&program, image, lamports));
     }
@@ -663,6 +683,7 @@ async fn stage(
         f.response(),
     );
     let record = dcr1_ruled(
+        &program,
         &d,
         &f.ids.challenger,
         &f.ids.executor,
@@ -1600,6 +1621,18 @@ async fn every_retry_refusal() {
         CL_CLOSE,
         "an escrow that is not the document's"
     );
+    let mut wrong_read_only_escrow = good.clone();
+    wrong_read_only_escrow[2] = AccountMeta::new_readonly(f.ids.impostor, false);
+    assert_eq!(
+        refuse(
+            &mut f,
+            vec![TAG_RETRY_BOND_SETTLEMENT],
+            wrong_read_only_escrow,
+        )
+        .await,
+        CL_CLOSE,
+        "wrong escrow key is refused before its read-only role"
+    );
     let second_descriptor = [0xA7; 32];
     let second_escrow = address::bond_escrow(&f.ids.program, &second_descriptor).0;
     f.install_at(second_escrow, system_funded(ESCROW_FLOOR));
@@ -1900,6 +1933,7 @@ async fn every_settle_refusal_on_a_revision_eight_document() {
     );
     let wrong_record = f.ids.impostor;
     let forged_record = dcr1_ruled(
+        &f.ids.program,
         &f.descriptor(),
         &f.ids.challenger,
         &f.ids.executor,
@@ -2024,6 +2058,7 @@ async fn every_settle_refusal_on_a_revision_eight_document() {
     let t3 = standard(h.ids.remainder, 2_500);
     stage(&mut h, &t3, BOND_HELD, None, None, true).await;
     let mut record = dcr1_ruled(
+        &h.ids.program,
         &h.descriptor(),
         &h.ids.challenger,
         &h.ids.executor,
@@ -2052,7 +2087,15 @@ async fn every_settle_refusal_on_a_revision_eight_document() {
         i.dcm2(),
         owned(&i.ids.program, doc, rent_exempt(dcm2_bytes())),
     );
-    let record = dcr1_ruled(&d, &i.ids.challenger, &i.ids.executor, 1_000_000, 1, true);
+    let record = dcr1_ruled(
+        &i.ids.program,
+        &d,
+        &i.ids.challenger,
+        &i.ids.executor,
+        1_000_000,
+        1,
+        true,
+    );
     i.install_at(
         i.record(),
         owned(&i.ids.program, record, rent_exempt(REC_BYTES) + 1_000_000),
@@ -2118,6 +2161,7 @@ async fn revision8_refuses_legacy_timeout_record_before_bad_document() {
     let record_key = f.record();
     let dcm2_key = f.dcm2();
     let record = dcr1_ruled(
+        &f.ids.program,
         &f.descriptor(),
         &f.ids.challenger,
         &f.ids.executor,
@@ -2163,6 +2207,27 @@ async fn revision8_refuses_legacy_timeout_record_before_bad_document() {
     assert_eq!(
         code, DCR1_BAD,
         "the legacy DCR1 is refused before reading DCM2"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_revision8_image_refuses_marker_zero_dcr1_at_settlement() {
+    let mut f = build().await;
+    let terms = standard(f.ids.remainder, 2_500);
+    stage(&mut f, &terms, BOND_HELD, None, None, true).await;
+    let key = f.record();
+    let mut record = f.data(key).await;
+    assert_eq!(record[147], 1, "the fixture models the revision-8 opener");
+    record[147] = 0;
+    f.install_at(
+        key,
+        owned(&f.ids.program, record, rent_exempt(REC_BYTES) + 1_000_000),
+    );
+    let metas = f.settle_metas(f.ids.challenger, f.ids.remainder);
+    assert_eq!(
+        settle_refuse(&mut f, metas).await,
+        DCR1_AUTH,
+        "marker zero belongs to an older program address"
     );
 }
 

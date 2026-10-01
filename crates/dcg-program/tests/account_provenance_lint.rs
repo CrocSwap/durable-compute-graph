@@ -4,7 +4,7 @@ use std::{
 };
 use syn::{
     visit::{self, Visit},
-    Expr, ExprCall, ExprMethodCall, ImplItemFn, ItemFn,
+    Expr, ExprCall, ExprMethodCall, ImplItemFn, ItemFn, TraitItemFn,
 };
 
 // These low-level mutators have no identity inputs of their own. Their
@@ -23,6 +23,7 @@ const GATES: &[&str] = &[
     "expect_system_account_shape",
     "create_derived_account",
     "allocate_derived_account",
+    "validate_creation_target",
     "create_pda",
     "checked_session",
     "checked_session_from",
@@ -70,7 +71,73 @@ struct Calls {
 
 fn is_data_borrow_mut(node: &ExprMethodCall) -> bool {
     node.method == "borrow_mut"
-        && matches!(node.receiver.as_ref(), Expr::Field(field) if matches!(&field.member, syn::Member::Named(name) if name == "data"))
+        && matches!(node.receiver.as_ref(), Expr::Field(field) if matches!(&field.member, syn::Member::Named(name) if name == "data" || name == "lamports"))
+}
+
+fn macro_identifiers(tokens: &str) -> Vec<&str> {
+    tokens
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn macro_gate_calls(tokens: &str) -> Vec<String> {
+    let bytes = tokens.as_bytes();
+    let mut calls = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if !bytes[cursor].is_ascii_alphabetic() && bytes[cursor] != b'_' {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        cursor += 1;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        {
+            cursor += 1;
+        }
+        let name = &tokens[start..cursor];
+        if !GATES.contains(&name) {
+            continue;
+        }
+        let previous = bytes[..start]
+            .iter()
+            .rev()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .copied();
+        let next = bytes[cursor..]
+            .iter()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .copied();
+        // `$account` in a macro rule is a metavariable, not a call to the
+        // `account` provenance helper. Only count syntactic call positions.
+        if previous != Some(b'$') && matches!(next, Some(b'(' | b'!')) {
+            calls.push(name.to_owned());
+        }
+    }
+    calls
+}
+
+fn audit_macro_tokens(tokens: &str, calls: &mut Calls) {
+    let identifiers = macro_identifiers(tokens);
+    if identifiers.iter().any(|name| {
+        matches!(
+            *name,
+            "try_borrow_mut_data"
+                | "try_borrow_mut_lamports"
+                | "realloc"
+                | "assign"
+                | "borrow_mut"
+                | "invoke"
+                | "invoke_signed"
+                | "invoke_unchecked"
+                | "invoke_signed_unchecked"
+        )
+    }) {
+        calls.writes_account = true;
+    }
+    calls.names.extend(macro_gate_calls(tokens));
 }
 
 fn is_self_keyed(node: &ExprCall) -> bool {
@@ -127,6 +194,11 @@ impl<'ast> Visit<'ast> for Calls {
             }
         }
         visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+        audit_macro_tokens(&node.mac.tokens.to_string(), self);
+        visit::visit_expr_macro(self, node);
     }
 }
 
@@ -221,6 +293,38 @@ fn audit_functions(file: &str, source: &str) -> Vec<String> {
             );
             visit::visit_impl_item_fn(self, node);
         }
+
+        fn visit_trait_item_fn(&mut self, node: &'ast TraitItemFn) {
+            if let Some(block) = &node.default {
+                audit_block(
+                    self.file,
+                    &format!("trait default {}", node.sig.ident),
+                    block,
+                    self.failures,
+                );
+            }
+            visit::visit_trait_item_fn(self, node);
+        }
+
+        fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+            let mut calls = Calls::default();
+            audit_macro_tokens(&node.mac.tokens.to_string(), &mut calls);
+            if calls.writes_account
+                && !calls
+                    .names
+                    .iter()
+                    .any(|name| GATES.contains(&name.as_str()))
+            {
+                let macro_name = node
+                    .ident
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "anonymous".to_owned());
+                self.failures
+                    .push(format!("{}::macro {macro_name}", self.file));
+            }
+            visit::visit_item_macro(self, node);
+        }
     }
 
     Functions {
@@ -232,7 +336,7 @@ fn audit_functions(file: &str, source: &str) -> Vec<String> {
 }
 
 #[test]
-fn source_audit_reports_direct_writers_without_enforcing_them() {
+fn source_audit_matches_the_reviewed_writer_allowlist() {
     let mut failures = Vec::new();
     let sources = rust_sources();
     assert!(
@@ -242,14 +346,85 @@ fn source_audit_reports_direct_writers_without_enforcing_them() {
     for (file, source) in &sources {
         failures.extend(audit_functions(file, source));
     }
-    assert!(failures.contains(&"account_provenance.rs::pub create_derived_account".to_owned()));
-    assert!(failures.contains(&"stateful_v3.rs::private encode_session".to_owned()));
-    assert!(failures.contains(&"closure_v2_accounts.rs::restricted create".to_owned()));
+    failures.sort();
     eprintln!(
-        "account provenance source audit findings (report only; not enforcement):\n{}",
+        "account provenance source audit findings (must match the reviewed allowlist):\n{}",
         failures.join("\n")
     );
+    assert_eq!(
+        failures.iter().map(String::as_str).collect::<Vec<_>>(),
+        CURRENT_AUDIT_FINDINGS
+    );
 }
+
+// This sorted snapshot is the current set of writers without an in-function
+// provenance gate. Some are internal transaction steps whose role validation
+// happens at the dispatcher or caller; changing this inventory still requires
+// an explicit review.
+const CURRENT_AUDIT_FINDINGS: &[&str] = &[
+    "closure_v2_accounts.rs::pub finalize_segment",
+    "closure_v2_accounts.rs::pub land_leaves",
+    "closure_v2_accounts.rs::pub publish_checkpoint",
+    "closure_v2_accounts.rs::restricted create",
+    "closure_v2_bootstrap.rs::private init_variable",
+    "closure_v2_bootstrap.rs::pub collect_root",
+    "closure_v2_bootstrap.rs::pub finalize_from_roots",
+    "closure_v2_bootstrap.rs::pub grow_page",
+    "closure_v2_bootstrap.rs::pub grow_root_group",
+    "closure_v2_bootstrap.rs::pub grow_v2",
+    "closure_v2_bootstrap.rs::pub init",
+    "closure_v2_bootstrap.rs::pub init_page",
+    "closure_v2_bootstrap.rs::pub init_root_group",
+    "closure_v2_bootstrap.rs::pub init_small",
+    "closure_v2_bootstrap.rs::pub init_v4",
+    "closure_v2_bootstrap.rs::pub seal_v2",
+    "closure_v2_bootstrap.rs::pub upload_v2",
+    "desc_upload.rs::private store_dcd1",
+    "desc_upload.rs::pub process_alloc",
+    "desc_upload.rs::pub process_upload",
+    "envelope_seal.rs::private create_pda",
+    "envelope_seal.rs::pub admission_step",
+    "envelope_seal.rs::pub registry_freeze",
+    "envelope_seal.rs::pub registry_write",
+    "pt1_onchain.rs::private init_pt1x",
+    "pt1_onchain.rs::private init_with_magic",
+    "pt1_onchain.rs::pub init_variant",
+    "pt2p_onchain.rs::pub init",
+    "root_only.rs::private producer_record_binds_coordinate_in_pda",
+    "root_only.rs::pub increment_slots",
+    "root_only_sealed.rs::pub bind_manifest",
+    "root_only_sealed.rs::pub init_sealed",
+    "seal.rs::pub process_begin",
+    "seal.rs::pub process_step",
+    "stateful.rs::private drain_to_refund",
+    "stateful.rs::private encode_session",
+    "stateful_v2.rs::private drain_to_refund",
+    "stateful_v2.rs::private encode_session",
+    "stateful_v2.rs::private grow_child_data",
+    "stateful_v3.rs::private drain_to_refund",
+    "stateful_v3.rs::private encode_session",
+    "stateful_v3.rs::private grow_child_data",
+    "stateful_v3.rs::private grow_headerless_state",
+    "stateful_v3.rs::private initialize_resource_header",
+    "stateful_v3.rs::private write_anchor",
+    "test_lifecycle.rs::private admit",
+    "test_lifecycle.rs::private bisect",
+    "test_lifecycle.rs::private challenge",
+    "test_lifecycle.rs::private close",
+    "test_lifecycle.rs::private create_pda",
+    "test_lifecycle.rs::private finalize",
+    "test_lifecycle.rs::private land_roots",
+    "test_lifecycle.rs::private replay",
+    "test_lifecycle.rs::private resolve",
+    "test_lifecycle.rs::private settle",
+    "unified/challenge.rs::private assign_settlement_escrow",
+    "unified/challenge.rs::private built_in_settlement",
+    "unified/challenge.rs::pub rule",
+    "unified/config.rs::private close_unpublished_pt1x_pt2s",
+    "unified/result.rs::private close_conviction",
+    "unified/result.rs::private conviction",
+    "unified/result.rs::private drain_unchecked",
+];
 
 #[test]
 fn self_keyed_gates_do_not_cover_writes_and_private_impl_methods_are_audited() {
@@ -275,6 +450,17 @@ fn self_keyed_gates_do_not_cover_writes_and_private_impl_methods_are_audited() {
                 self.data.borrow_mut();
             }
         }
+        trait DefaultWriter {
+            fn default_write(&self) {
+                self.lamports.borrow_mut();
+            }
+        }
+        macro_rules! direct_write {
+            ($account:ident) => { $account.try_borrow_mut_lamports().unwrap(); };
+        }
+        fn macro_writer(account: &AccountInfo) {
+            direct_write!(account);
+        }
     "#;
     assert_eq!(
         audit_functions("fixture.rs", source),
@@ -285,6 +471,8 @@ fn self_keyed_gates_do_not_cover_writes_and_private_impl_methods_are_audited() {
             "fixture.rs::pub impl public_method".to_string(),
             "fixture.rs::restricted impl crate_method".to_string(),
             "fixture.rs::private impl hidden".to_string(),
+            "fixture.rs::trait default default_write".to_string(),
+            "fixture.rs::macro direct_write".to_string(),
         ]
     );
 }

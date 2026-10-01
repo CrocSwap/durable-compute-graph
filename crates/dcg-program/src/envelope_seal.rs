@@ -19,7 +19,10 @@
 //! position fit the row's measured shape. What it trusts (TA1): the compiled
 //! authority froze only measured CU numbers.
 
-use crate::{compatibility::profile_v1 as generic, hash, position_template as pt};
+use crate::{
+    account_provenance::CanonicalBump, compatibility::profile_v1 as generic, hash,
+    position_template as pt,
+};
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program::invoke_signed,
     program_error::ProgramError, pubkey::Pubkey, rent::Rent, system_instruction, system_program,
@@ -464,9 +467,11 @@ fn create_pda<'a>(
     account: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
     seeds: &[&[u8]],
+    bump: CanonicalBump,
     size: usize,
 ) -> ProgramResult {
-    if !payer.is_signer
+    if account.key != bump.address()
+        || !payer.is_signer
         || !payer.is_writable
         || !account.is_writable
         || *system.key != system_program::id()
@@ -480,10 +485,13 @@ fn create_pda<'a>(
         return Err(no(REGISTRY_STATE));
     }
     let lamports = Rent::get()?.minimum_balance(size);
+    let bump_seed = [bump.value()];
+    let mut signer_seeds = seeds.to_vec();
+    signer_seeds.push(&bump_seed);
     invoke_signed(
         &system_instruction::create_account(payer.key, account.key, lamports, size as u64, program),
         &[payer.clone(), account.clone(), system.clone()],
-        &[seeds],
+        &[&signer_seeds],
     )
 }
 
@@ -558,8 +566,10 @@ pub fn registry_create(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
     if rows == 0 || rows > MAX_ROWS || data[9..41] == [0; 32] {
         return Err(no(ROW_MALFORMED));
     }
-    let (key, bump) = registry_address(program, registry_id);
-    if *accounts[1].key != key {
+    let epoch_bytes = EPOCH.to_le_bytes();
+    let registry_id_bytes = registry_id.to_le_bytes();
+    let bump = CanonicalBump::find(&[REGISTRY_SEED, &epoch_bytes, &registry_id_bytes], program);
+    if accounts[1].key != bump.address() {
         return Err(no(REGISTRY_ACCOUNT));
     }
     let size = REGISTRY_HEADER + rows as usize * ROW_BYTES;
@@ -568,12 +578,8 @@ pub fn registry_create(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         &accounts[0],
         &accounts[1],
         &accounts[2],
-        &[
-            REGISTRY_SEED,
-            &EPOCH.to_le_bytes(),
-            &registry_id.to_le_bytes(),
-            &[bump],
-        ],
+        &[REGISTRY_SEED, &epoch_bytes, &registry_id_bytes],
+        bump,
         size,
     )?;
     let mut raw = accounts[1].try_borrow_mut_data()?;
@@ -753,8 +759,15 @@ pub fn admission_begin(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         payloads,
         pt2s,
     )?;
-    let (key, bump) = admission_address(program, accounts[2].key, accounts[3].key);
-    if *accounts[1].key != key {
+    let bump = CanonicalBump::find(
+        &[
+            ADMISSION_SEED,
+            accounts[2].key.as_ref(),
+            accounts[3].key.as_ref(),
+        ],
+        program,
+    );
+    if accounts[1].key != bump.address() {
         return Err(no(ADMISSION_STATE));
     }
     let (entries, positions, digest) = if is_pt1x {
@@ -793,8 +806,8 @@ pub fn admission_begin(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
             ADMISSION_SEED,
             accounts[2].key.as_ref(),
             accounts[3].key.as_ref(),
-            &[bump],
         ],
+        bump,
         admission_bytes(entries),
     )
     .map_err(|e| {

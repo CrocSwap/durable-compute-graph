@@ -15,8 +15,39 @@
 //! // Tag 125 belongs to DCG's revision-8 core dispatcher.
 //! const _: () = dcg_program::app_api::validate_application_tags(&[125]);
 //! ```
+//!
+//! ```compile_fail,E0080
+//! use dcg_program::{
+//!     app_api::{ApplicationAccountRule, ApplicationInstruction, ApplicationProgramManifest},
+//!     compatibility::REVISION8_COMPATIBILITY,
+//!     kernel::{ApplicationManifest, LegacyFormBinding, OptimisticReplayBinding},
+//! };
+//! static KERNELS: [&'static dyn dcg_program::kernel::Kernel; 0] = [];
+//! static REPLAYS: [OptimisticReplayBinding; 0] = [];
+//! static FORMS: [LegacyFormBinding; 0] = [];
+//! static APP: ApplicationManifest = ApplicationManifest {
+//!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
+//!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
+//!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     decision_routes: &REVISION8_COMPATIBILITY,
+//! };
+//! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! fn handler(_: dcg_program::app_api::ApplicationInstructionContext<'_>,
+//!     _: &dcg_program::app_api::CheckedApplicationAccounts<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
+//! static RULES: [ApplicationAccountRule; 0] = [];
+//! static INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+//!     125, "illegal/core-shadow", 1, &RULES, preflight, handler)];
+//! static INVALID: ApplicationProgramManifest = ApplicationProgramManifest::new(&APP, &INSTRUCTIONS);
+//! ```
 
-use crate::{hash::sha256, kernel::ApplicationManifest, process_instruction_with_manifest};
+use crate::{
+    account_provenance::{
+        expect_derived, expect_keyed, expect_system_derived_role, AccountKind, RoleFlags,
+    },
+    hash::sha256,
+    kernel::ApplicationManifest,
+    process_instruction_with_manifest,
+};
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
     pubkey::Pubkey,
@@ -35,6 +66,14 @@ pub const CORE_INSTRUCTION_TAGS_REVISION_8: &[u8] = &[
 
 /// Whether `tag` belongs to the DCG revision-8 core dispatcher.
 pub const fn is_core_instruction_tag_revision_8(tag: u8) -> bool {
+    #[cfg(feature = "sbf-lifecycle-test")]
+    if tag >= 240 && tag <= 250 {
+        return true;
+    }
+    #[cfg(feature = "sbf-real-lifecycle-test")]
+    if (tag >= 230 && tag <= 239) || tag == 240 {
+        return true;
+    }
     let mut low = 0usize;
     let mut high = CORE_INSTRUCTION_TAGS_REVISION_8.len();
     while low < high {
@@ -98,21 +137,238 @@ pub struct ApplicationAccountCheckContext<'accounts, 'info> {
     pub accounts: &'accounts [AccountInfo<'info>],
 }
 
+/// A seed component for an app PDA. Account-key sources must refer to an
+/// earlier account entry that has already passed its own declared rule.
+#[derive(Clone, Copy)]
+pub enum ApplicationSeed {
+    Literal(&'static [u8]),
+    AccountKey(usize),
+    InstructionData { offset: usize, length: usize },
+}
+
+/// Authenticated source for a key-based app account rule.
+#[derive(Clone, Copy)]
+pub enum ApplicationKeySource {
+    Fixed(&'static Pubkey),
+    AccountKey(usize),
+    InstructionData {
+        offset: usize,
+    },
+    /// The target itself, accepted only when its rule requires a signer.
+    SignerSelf,
+}
+
+/// Exact identity and owner policy for one app instruction account.
+#[derive(Clone, Copy)]
+pub enum ApplicationAccountIdentity {
+    ProgramPda {
+        seeds: &'static [ApplicationSeed],
+        kind: AccountKind,
+    },
+    ProgramKey {
+        source: ApplicationKeySource,
+        kind: AccountKind,
+    },
+    SystemPda {
+        seeds: &'static [ApplicationSeed],
+        allow_prefunded: bool,
+    },
+    ExactKey {
+        source: ApplicationKeySource,
+        owner: Option<&'static Pubkey>,
+        executable: bool,
+    },
+}
+
+/// Complete address, role, and alias contract for one ordered app account.
+#[derive(Clone, Copy)]
+pub struct ApplicationAccountRule {
+    pub account_index: usize,
+    pub identity: ApplicationAccountIdentity,
+    pub role: RoleFlags,
+    /// Repeated writable keys are refused unless both entries name the same
+    /// explicit alias group. Read-only duplicates are harmless.
+    pub alias_group: Option<u8>,
+}
+
+impl ApplicationAccountRule {
+    pub const fn new(
+        account_index: usize,
+        identity: ApplicationAccountIdentity,
+        role: RoleFlags,
+    ) -> Self {
+        Self {
+            account_index,
+            identity,
+            role,
+            alias_group: None,
+        }
+    }
+
+    pub const fn with_alias_group(mut self, alias_group: u8) -> Self {
+        self.alias_group = Some(alias_group);
+        self
+    }
+}
+
+fn account_key_source(
+    source: ApplicationKeySource,
+    current_index: usize,
+    account: &AccountInfo,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+    validated: &[bool],
+    role: RoleFlags,
+) -> Result<Pubkey, ProgramError> {
+    match source {
+        ApplicationKeySource::Fixed(key) => Ok(*key),
+        ApplicationKeySource::AccountKey(index) => {
+            if index >= current_index || !validated.get(index).copied().unwrap_or(false) {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            Ok(*accounts[index].key)
+        }
+        ApplicationKeySource::InstructionData { offset } => {
+            let key_end = offset
+                .checked_add(32)
+                .ok_or(ProgramError::InvalidInstructionData)?;
+            let bytes: [u8; 32] = instruction_data
+                .get(offset..key_end)
+                .ok_or(ProgramError::InvalidInstructionData)?
+                .try_into()
+                .map_err(|_| ProgramError::InvalidInstructionData)?;
+            Ok(Pubkey::new_from_array(bytes))
+        }
+        ApplicationKeySource::SignerSelf => {
+            if !role.signer || !account.is_signer {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
+            Ok(*account.key)
+        }
+    }
+}
+
+fn account_seeds(
+    seeds: &'static [ApplicationSeed],
+    current_index: usize,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+    validated: &[bool],
+) -> Result<Vec<Vec<u8>>, ProgramError> {
+    seeds
+        .iter()
+        .map(|seed| match seed {
+            ApplicationSeed::Literal(bytes) => Ok(bytes.to_vec()),
+            ApplicationSeed::AccountKey(index) => {
+                if *index >= current_index || !validated.get(*index).copied().unwrap_or(false) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                Ok(accounts[*index].key.to_bytes().to_vec())
+            }
+            ApplicationSeed::InstructionData { offset, length } => {
+                let end = offset
+                    .checked_add(*length)
+                    .ok_or(ProgramError::InvalidInstructionData)?;
+                Ok(instruction_data
+                    .get(*offset..end)
+                    .ok_or(ProgramError::InvalidInstructionData)?
+                    .to_vec())
+            }
+        })
+        .collect()
+}
+
+fn validate_application_account_rules(
+    program_id: &Pubkey,
+    instruction_data: &[u8],
+    accounts: &[AccountInfo],
+    rules: &'static [ApplicationAccountRule],
+) -> ProgramResult {
+    if rules.len() != accounts.len() {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let mut validated = vec![false; accounts.len()];
+    for (index, rule) in rules.iter().enumerate() {
+        if rule.account_index != index {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let account = &accounts[index];
+        if (rule.role.writable && !account.is_writable) || (rule.role.signer && !account.is_signer)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        for previous in 0..index {
+            if accounts[previous].key == account.key
+                && (accounts[previous].is_writable || account.is_writable)
+                && (rule.alias_group.is_none() || rule.alias_group != rules[previous].alias_group)
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+        match rule.identity {
+            ApplicationAccountIdentity::ProgramPda { seeds, kind } => {
+                let values = account_seeds(seeds, index, accounts, instruction_data, &validated)?;
+                let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+                expect_derived(account, program_id, &refs, kind, rule.role)?;
+            }
+            ApplicationAccountIdentity::ProgramKey { source, kind } => {
+                let expected = account_key_source(
+                    source,
+                    index,
+                    account,
+                    accounts,
+                    instruction_data,
+                    &validated,
+                    rule.role,
+                )?;
+                expect_keyed(account, program_id, &expected, kind, rule.role)?;
+            }
+            ApplicationAccountIdentity::SystemPda {
+                seeds,
+                allow_prefunded,
+            } => {
+                let values = account_seeds(seeds, index, accounts, instruction_data, &validated)?;
+                let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+                expect_system_derived_role(account, program_id, &refs, rule.role, allow_prefunded)?;
+            }
+            ApplicationAccountIdentity::ExactKey {
+                source,
+                owner,
+                executable,
+            } => {
+                let expected = account_key_source(
+                    source,
+                    index,
+                    account,
+                    accounts,
+                    instruction_data,
+                    &validated,
+                    rule.role,
+                )?;
+                if account.key != &expected
+                    || owner.is_some_and(|owner| account.owner != owner)
+                    || account.executable != executable
+                {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+            }
+        }
+        validated[index] = true;
+    }
+    Ok(())
+}
+
 /// Borrowed account view passed to a handler only after its preflight returns
 /// success.
 ///
-/// The view preserves account order and exposes the original references. The
-/// tag-specific preflight owns seed, role, bounds, and alias checks until the
-/// shared address-rule helper from `dcg-address-rule-fix` is available.
+/// The view preserves account order and exposes the original references.
+/// Every account passed the app entry's static provenance and role rules.
 pub struct CheckedApplicationAccounts<'accounts, 'info> {
     accounts: &'accounts [AccountInfo<'info>],
 }
 
 impl<'accounts, 'info> CheckedApplicationAccounts<'accounts, 'info> {
-    fn after_preflight(context: &ApplicationAccountCheckContext<'accounts, 'info>) -> Self {
-        // TODO(dcg-address-rule-fix): call the shared account-address rule
-        // helper here before constructing this view. Keep that helper's final
-        // signature in its owning change; do not mirror a guessed signature.
+    fn after_provenance(context: &ApplicationAccountCheckContext<'accounts, 'info>) -> Self {
         Self {
             accounts: context.accounts,
         }
@@ -158,6 +414,9 @@ pub struct ApplicationInstruction {
     pub handler_id: &'static str,
     /// Semantic handler version; increment when behavior changes.
     pub handler_version: u16,
+    /// Static per-account address and role contract, covering every account
+    /// position supplied to this instruction.
+    pub account_rules: &'static [ApplicationAccountRule],
     /// Tag-specific parsing and account preflight.
     pub preflight: ApplicationPreflight,
     /// Handler called only after preflight succeeds.
@@ -170,6 +429,7 @@ impl ApplicationInstruction {
         tag: u8,
         handler_id: &'static str,
         handler_version: u16,
+        account_rules: &'static [ApplicationAccountRule],
         preflight: ApplicationPreflight,
         handler: ApplicationHandler,
     ) -> Self {
@@ -183,10 +443,128 @@ impl ApplicationInstruction {
             tag,
             handler_id,
             handler_version,
+            account_rules,
             preflight,
             handler,
         }
     }
+}
+
+fn encode_usize(value: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(&(value as u64).to_le_bytes());
+}
+
+fn encode_seeds(seeds: &[ApplicationSeed], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(seeds.len() as u32).to_le_bytes());
+    for seed in seeds {
+        match seed {
+            ApplicationSeed::Literal(bytes) => {
+                out.push(0);
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+            ApplicationSeed::AccountKey(index) => {
+                out.push(1);
+                encode_usize(*index, out);
+            }
+            ApplicationSeed::InstructionData { offset, length } => {
+                out.push(2);
+                encode_usize(*offset, out);
+                encode_usize(*length, out);
+            }
+        }
+    }
+}
+
+fn encode_key_source(source: ApplicationKeySource, out: &mut Vec<u8>) {
+    match source {
+        ApplicationKeySource::Fixed(key) => {
+            out.push(0);
+            out.extend_from_slice(key.as_ref());
+        }
+        ApplicationKeySource::AccountKey(index) => {
+            out.push(1);
+            encode_usize(index, out);
+        }
+        ApplicationKeySource::InstructionData { offset } => {
+            out.push(2);
+            encode_usize(offset, out);
+        }
+        ApplicationKeySource::SignerSelf => out.push(3),
+    }
+}
+
+fn encode_kind(kind: AccountKind, out: &mut Vec<u8>) {
+    out.extend_from_slice(&(kind.magic.len() as u32).to_le_bytes());
+    out.extend_from_slice(kind.magic);
+    encode_usize(kind.min_len, out);
+    encode_usize(kind.max_len, out);
+    match kind.bump_offset {
+        Some(offset) => {
+            out.push(1);
+            encode_usize(offset, out);
+        }
+        None => out.push(0),
+    }
+    match kind.version {
+        Some((offset, version)) => {
+            out.push(1);
+            encode_usize(offset, out);
+            out.extend_from_slice(&version.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn encode_application_account_rule(rule: &ApplicationAccountRule) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_usize(rule.account_index, &mut out);
+    out.push(u8::from(rule.role.writable));
+    out.push(u8::from(rule.role.signer));
+    match rule.alias_group {
+        Some(group) => {
+            out.push(1);
+            out.push(group);
+        }
+        None => out.push(0),
+    }
+    match rule.identity {
+        ApplicationAccountIdentity::ProgramPda { seeds, kind } => {
+            out.push(0);
+            encode_seeds(seeds, &mut out);
+            encode_kind(kind, &mut out);
+        }
+        ApplicationAccountIdentity::ProgramKey { source, kind } => {
+            out.push(1);
+            encode_key_source(source, &mut out);
+            encode_kind(kind, &mut out);
+        }
+        ApplicationAccountIdentity::SystemPda {
+            seeds,
+            allow_prefunded,
+        } => {
+            out.push(2);
+            encode_seeds(seeds, &mut out);
+            out.push(u8::from(allow_prefunded));
+        }
+        ApplicationAccountIdentity::ExactKey {
+            source,
+            owner,
+            executable,
+        } => {
+            out.push(3);
+            encode_key_source(source, &mut out);
+            match owner {
+                Some(owner) => {
+                    out.push(1);
+                    out.extend_from_slice(owner.as_ref());
+                }
+                None => out.push(0),
+            }
+            out.push(u8::from(executable));
+        }
+    }
+    out
 }
 
 /// Static application manifest paired with a canonical instruction table.
@@ -232,15 +610,16 @@ impl ApplicationProgramManifest {
     /// Versioned identity for the assembled application program contract.
     ///
     /// It commits the app id/version digest, the existing form-to-kernel
-    /// admission digest, and each canonical `(tag, handler id, version)` row.
-    /// Function pointers are intentionally excluded: behavior changes must
-    /// change the stable handler id's semantic version or the app version.
+    /// admission digest, each canonical `(tag, handler id, version)` row, and
+    /// every ordered account rule. Function pointers are intentionally
+    /// excluded: behavior changes must change the stable handler id's semantic
+    /// version or the app version.
     pub fn identity_digest(&self) -> [u8; 32] {
         let application_identity = self.application.identity_digest();
         let kernel_form_identity = self.application.admission_identity_digest();
         let instruction_count = (self.instructions.len() as u32).to_le_bytes();
         let mut digest = sha256(&[
-            b"dcg/application-program-manifest/1",
+            b"dcg/application-program-manifest/2",
             &application_identity,
             &kernel_form_identity,
             &instruction_count,
@@ -249,13 +628,17 @@ impl ApplicationProgramManifest {
             let handler_id = instruction.handler_id.as_bytes();
             let handler_id_length = (handler_id.len() as u32).to_le_bytes();
             digest = sha256(&[
-                b"dcg/application-program-instruction/1",
+                b"dcg/application-program-instruction/2",
                 &digest,
                 &[instruction.tag],
                 &handler_id_length,
                 handler_id,
                 &instruction.handler_version.to_le_bytes(),
             ]);
+            for rule in instruction.account_rules {
+                let encoded = encode_application_account_rule(rule);
+                digest = sha256(&[b"dcg/application-program-account-rule/1", &digest, &encoded]);
+            }
         }
         digest
     }
@@ -264,13 +647,13 @@ impl ApplicationProgramManifest {
 /// Dispatch through DCG core first, then the selected application's table.
 ///
 /// A core-owned tag is sent to the compatibility dispatcher unchanged. For a
-/// non-core tag, the sorted app table is searched; unknown tags and empty data
-/// return `InvalidInstructionData`.
+/// non-core tag, the sorted app table is searched; unmatched tags fall back to
+/// the core dispatcher so feature-gated and future core routes keep working.
 pub fn process_instruction_with_application(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
-    manifest: &ApplicationProgramManifest,
+    manifest: &'static ApplicationProgramManifest,
 ) -> ProgramResult {
     let Some(tag) = data.first().copied() else {
         return Err(ProgramError::InvalidInstructionData);
@@ -287,9 +670,15 @@ pub fn process_instruction_with_application(
 
     let instructions = manifest.instructions();
     let Ok(index) = instructions.binary_search_by_key(&tag, |instruction| instruction.tag) else {
-        return Err(ProgramError::InvalidInstructionData);
+        return process_instruction_with_manifest(
+            program_id,
+            accounts,
+            data,
+            manifest.application_manifest(),
+        );
     };
     let instruction = &instructions[index];
+    validate_application_account_rules(program_id, data, accounts, instruction.account_rules)?;
     let account_check_context = ApplicationAccountCheckContext {
         program_id,
         tag,
@@ -297,7 +686,7 @@ pub fn process_instruction_with_application(
         accounts,
     };
     (instruction.preflight)(account_check_context)?;
-    let checked_accounts = CheckedApplicationAccounts::after_preflight(&account_check_context);
+    let checked_accounts = CheckedApplicationAccounts::after_provenance(&account_check_context);
     let context = ApplicationInstructionContext {
         program_id,
         tag,
@@ -310,11 +699,27 @@ pub fn process_instruction_with_application(
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use syn::{Expr, Lit, Pat};
 
     const APP_TAG: u8 = 120;
     const PREFLIGHT_MARK: usize = 1;
     const HANDLER_MARK: usize = 2;
     static ORDER: AtomicUsize = AtomicUsize::new(0);
+    static PDA_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static ROLE_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static EMPTY_KERNELS: [&'static dyn crate::kernel::Kernel; 0] = [];
+    static EMPTY_REPLAYS: [crate::kernel::OptimisticReplayBinding; 0] = [];
+    static EMPTY_FORMS: [crate::kernel::LegacyFormBinding; 0] = [];
+    static TEST_APPLICATION: ApplicationManifest = ApplicationManifest {
+        application_id: b"dcg/app-api-test/1",
+        version: 1,
+        kernels: &EMPTY_KERNELS,
+        optimistic_replays: &EMPTY_REPLAYS,
+        legacy_forms: &EMPTY_FORMS,
+        require_legacy_form_binding: false,
+        hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
+    };
 
     fn preflight(context: ApplicationAccountCheckContext<'_, '_>) -> ProgramResult {
         assert_eq!(context.tag, APP_TAG);
@@ -335,6 +740,32 @@ mod tests {
         Err(ProgramError::Custom(0xDC01))
     }
 
+    fn role_preflight(_: ApplicationAccountCheckContext<'_, '_>) -> ProgramResult {
+        ROLE_ORDER.store(PREFLIGHT_MARK, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn role_handler(
+        _: ApplicationInstructionContext<'_>,
+        _: &CheckedApplicationAccounts<'_, '_>,
+    ) -> ProgramResult {
+        ROLE_ORDER.store(HANDLER_MARK, Ordering::SeqCst);
+        Err(ProgramError::Custom(0xDC04))
+    }
+
+    fn pda_preflight(_: ApplicationAccountCheckContext<'_, '_>) -> ProgramResult {
+        PDA_ORDER.store(PREFLIGHT_MARK, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn pda_handler(
+        _: ApplicationInstructionContext<'_>,
+        _: &CheckedApplicationAccounts<'_, '_>,
+    ) -> ProgramResult {
+        PDA_ORDER.store(HANDLER_MARK, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn core_shadow_preflight(_: ApplicationAccountCheckContext<'_, '_>) -> ProgramResult {
         Err(ProgramError::Custom(0xDC02))
     }
@@ -346,45 +777,124 @@ mod tests {
         Err(ProgramError::Custom(0xDC03))
     }
 
+    static NO_RULES: [ApplicationAccountRule; 0] = [];
     static APP_INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
         APP_TAG,
         "example/dispatch-test",
         1,
+        &NO_RULES,
         preflight,
         handler,
     )];
-    fn app_program() -> ApplicationProgramManifest {
-        ApplicationProgramManifest::new(crate::application_manifest(), &APP_INSTRUCTIONS)
+    static APP_PROGRAM: ApplicationProgramManifest =
+        ApplicationProgramManifest::new(&TEST_APPLICATION, &APP_INSTRUCTIONS);
+    fn app_program() -> &'static ApplicationProgramManifest {
+        &APP_PROGRAM
     }
 
     static APP_INSTRUCTIONS_V2: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
         APP_TAG,
         "example/dispatch-test",
         2,
+        &NO_RULES,
         preflight,
         handler,
     )];
-    fn app_program_v2() -> ApplicationProgramManifest {
-        ApplicationProgramManifest::new(crate::application_manifest(), &APP_INSTRUCTIONS_V2)
+    static APP_PROGRAM_V2: ApplicationProgramManifest =
+        ApplicationProgramManifest::new(&TEST_APPLICATION, &APP_INSTRUCTIONS_V2);
+    fn app_program_v2() -> &'static ApplicationProgramManifest {
+        &APP_PROGRAM_V2
     }
 
     static SHADOW_INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
         125,
         "example/illegal-shadow",
         1,
+        &NO_RULES,
         core_shadow_preflight,
         core_shadow_handler,
     )];
+
+    fn dispatcher_handler_tags() -> Vec<u8> {
+        fn literal(expr: &Expr) -> Option<u8> {
+            let Expr::Lit(expr) = expr else { return None };
+            let Lit::Int(value) = &expr.lit else {
+                return None;
+            };
+            value.base10_parse().ok()
+        }
+        fn pattern_tags(pattern: &Pat, out: &mut Vec<u8>) {
+            match pattern {
+                Pat::Lit(lit) => {
+                    if let Lit::Int(value) = &lit.lit {
+                        if let Ok(tag) = value.base10_parse() {
+                            out.push(tag);
+                        }
+                    }
+                }
+                Pat::Range(range) => {
+                    let (Some(start), Some(end)) = (&range.start, &range.end) else {
+                        return;
+                    };
+                    let (Some(start), Some(end)) = (literal(start), literal(end)) else {
+                        return;
+                    };
+                    let exclusive_end = match &range.limits {
+                        syn::RangeLimits::Closed(_) => end.saturating_add(1),
+                        syn::RangeLimits::HalfOpen(_) => end,
+                    };
+                    out.extend(start..exclusive_end);
+                }
+                Pat::Or(or) => {
+                    for case in &or.cases {
+                        pattern_tags(case, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        struct DispatchMatch(Vec<u8>);
+        impl<'ast> syn::visit::Visit<'ast> for DispatchMatch {
+            fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+                if matches!(node.expr.as_ref(), Expr::Path(path) if path.path.is_ident("tag")) {
+                    for arm in &node.arms {
+                        let is_explicit_invalid = matches!(arm.body.as_ref(), Expr::Call(call)
+                            if matches!(call.func.as_ref(), Expr::Path(path) if path.path.is_ident("Err"))
+                            && call.args.iter().any(|arg| matches!(arg, Expr::Path(path)
+                                if path.path.segments.last().is_some_and(|segment| segment.ident == "InvalidInstructionData"))));
+                        if !is_explicit_invalid {
+                            pattern_tags(&arm.pat, &mut self.0);
+                        }
+                    }
+                }
+                syn::visit::visit_expr_match(self, node);
+            }
+        }
+        let syntax = syn::parse_file(include_str!("lib.rs")).expect("lib.rs parses");
+        let function = syntax
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function)
+                    if function.sig.ident == "process_instruction_with_manifest" =>
+                {
+                    Some(function)
+                }
+                _ => None,
+            })
+            .expect("core dispatcher exists");
+        let mut found = DispatchMatch(Vec::new());
+        syn::visit::Visit::visit_block(&mut found, &function.block);
+        found.0.sort_unstable();
+        found.0.dedup();
+        found.0
+    }
 
     #[test]
     fn revision8_core_tag_set_is_sorted_and_matches_the_dispatch_surface() {
         assert_eq!(
             CORE_INSTRUCTION_TAGS_REVISION_8,
-            &[
-                115, 116, 117, 118, 125, 131, 132, 140, 141, 142, 143, 144, 145, 146, 156, 157,
-                158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 172, 173, 174, 175,
-                176, 177, 178, 183, 184, 185, 186, 187, 193, 197, 198, 199, 200,
-            ]
+            dispatcher_handler_tags().as_slice()
         );
         assert!(CORE_INSTRUCTION_TAGS_REVISION_8
             .windows(2)
@@ -403,13 +913,13 @@ mod tests {
     #[test]
     fn empty_app_manifest_preserves_every_existing_revision8_dispatch_result() {
         static EMPTY_INSTRUCTIONS: [ApplicationInstruction; 0] = [];
-        let empty_program =
-            ApplicationProgramManifest::new(crate::application_manifest(), &EMPTY_INSTRUCTIONS);
+        static EMPTY_PROGRAM: ApplicationProgramManifest =
+            ApplicationProgramManifest::new(&TEST_APPLICATION, &EMPTY_INSTRUCTIONS);
         let program_id = Pubkey::new_unique();
         for tag in 0u8..=u8::MAX {
             let data = [tag];
             assert_eq!(
-                process_instruction_with_application(&program_id, &[], &data, &empty_program),
+                process_instruction_with_application(&program_id, &[], &data, &EMPTY_PROGRAM),
                 crate::process_instruction_with_manifest(
                     &program_id,
                     &[],
@@ -420,7 +930,7 @@ mod tests {
             );
         }
         assert_eq!(
-            process_instruction_with_application(&program_id, &[], &[], &empty_program),
+            process_instruction_with_application(&program_id, &[], &[], &EMPTY_PROGRAM),
             Err(ProgramError::InvalidInstructionData)
         );
     }
@@ -432,7 +942,7 @@ mod tests {
             &Pubkey::new_unique(),
             &[],
             &[APP_TAG, 7],
-            &app_program(),
+            app_program(),
         );
         assert_eq!(result, Err(ProgramError::Custom(0xDC01)));
         assert_eq!(ORDER.load(Ordering::SeqCst), HANDLER_MARK);
@@ -440,12 +950,8 @@ mod tests {
 
     #[test]
     fn unknown_application_tag_is_refused() {
-        let result = process_instruction_with_application(
-            &Pubkey::new_unique(),
-            &[],
-            &[121],
-            &app_program(),
-        );
+        let result =
+            process_instruction_with_application(&Pubkey::new_unique(), &[], &[121], app_program());
         assert_eq!(result, Err(ProgramError::InvalidInstructionData));
     }
 
@@ -454,8 +960,8 @@ mod tests {
         // External construction goes through `new`, which const-rejects this
         // overlap. This forged in-module value exercises the runtime
         // core-first defense independently.
-        let forged = ApplicationProgramManifest {
-            application: crate::application_manifest(),
+        static FORGED: ApplicationProgramManifest = ApplicationProgramManifest {
+            application: &TEST_APPLICATION,
             instructions: &SHADOW_INSTRUCTIONS,
         };
         let program_id = Pubkey::new_unique();
@@ -466,10 +972,132 @@ mod tests {
             &data,
             crate::application_manifest(),
         );
-        let actual = process_instruction_with_application(&program_id, &[], &data, &forged);
+        let actual = process_instruction_with_application(&program_id, &[], &data, &FORGED);
         assert_eq!(actual, expected);
         assert_ne!(actual, Err(ProgramError::Custom(0xDC02)));
         assert_ne!(actual, Err(ProgramError::Custom(0xDC03)));
+    }
+
+    #[test]
+    fn declared_account_roles_run_before_application_preflight() {
+        static SIGNER_RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
+            0,
+            ApplicationAccountIdentity::ExactKey {
+                source: ApplicationKeySource::SignerSelf,
+                owner: None,
+                executable: false,
+            },
+            RoleFlags {
+                writable: false,
+                signer: true,
+            },
+        )];
+        static SIGNER_INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+            APP_TAG,
+            "example/dispatch-test",
+            1,
+            &SIGNER_RULES,
+            role_preflight,
+            role_handler,
+        )];
+        static SIGNER_PROGRAM: ApplicationProgramManifest =
+            ApplicationProgramManifest::new(&TEST_APPLICATION, &SIGNER_INSTRUCTIONS);
+        let program_id = Pubkey::new_unique();
+        let key = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut lamports = 1;
+        let mut data = [];
+        let account = AccountInfo::new(
+            &key,
+            false,
+            false,
+            &mut lamports,
+            &mut data,
+            &owner,
+            false,
+            0,
+        );
+        ROLE_ORDER.store(0, Ordering::SeqCst);
+        assert_eq!(
+            process_instruction_with_application(
+                &program_id,
+                &[account],
+                &[APP_TAG, 7],
+                &SIGNER_PROGRAM,
+            ),
+            Err(ProgramError::InvalidAccountData)
+        );
+        assert_eq!(ROLE_ORDER.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn program_pda_provenance_runs_before_application_preflight() {
+        static PDA_SEEDS: [ApplicationSeed; 1] =
+            [ApplicationSeed::Literal(b"dcg/app-api-test-pda")];
+        static PDA_RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
+            0,
+            ApplicationAccountIdentity::ProgramPda {
+                seeds: &PDA_SEEDS,
+                kind: AccountKind::exact(b"APP1", 4),
+            },
+            RoleFlags {
+                writable: true,
+                signer: false,
+            },
+        )];
+        static PDA_INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+            APP_TAG,
+            "example/dispatch-test",
+            1,
+            &PDA_RULES,
+            pda_preflight,
+            pda_handler,
+        )];
+        static PDA_PROGRAM: ApplicationProgramManifest =
+            ApplicationProgramManifest::new(&TEST_APPLICATION, &PDA_INSTRUCTIONS);
+
+        let program_id = Pubkey::new_unique();
+        let (key, _) = Pubkey::find_program_address(&[b"dcg/app-api-test-pda"], &program_id);
+        let wrong_owner = Pubkey::new_unique();
+        let mut lamports = 1;
+        let mut data = *b"APP1";
+        let account = AccountInfo::new(
+            &key,
+            false,
+            true,
+            &mut lamports,
+            &mut data,
+            &wrong_owner,
+            false,
+            0,
+        );
+
+        PDA_ORDER.store(0, Ordering::SeqCst);
+        assert_eq!(
+            process_instruction_with_application(
+                &program_id,
+                &[account],
+                &[APP_TAG, 7],
+                &PDA_PROGRAM,
+            ),
+            Err(ProgramError::InvalidAccountData)
+        );
+        assert_eq!(PDA_ORDER.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "sbf-lifecycle-test")]
+    #[test]
+    fn lifecycle_workload_tags_are_classified_as_core() {
+        assert!((240..=250).all(is_core_instruction_tag_revision_8));
+    }
+
+    #[cfg(feature = "sbf-real-lifecycle-test")]
+    #[test]
+    fn real_lifecycle_workload_tags_are_classified_as_core() {
+        assert!((230..=239).all(is_core_instruction_tag_revision_8));
+        assert!(is_core_instruction_tag_revision_8(
+            crate::stateful::v3::RESOURCE_CHUNK_TAG
+        ));
     }
 
     #[test]
@@ -481,5 +1109,35 @@ mod tests {
             app_program_v2.identity_digest()
         );
         assert_eq!(app_program.identity_digest(), app_program.identity_digest());
+    }
+
+    #[test]
+    fn account_rules_are_committed_by_the_application_identity() {
+        static READ_RULES: [ApplicationAccountRule; 1] = [ApplicationAccountRule::new(
+            0,
+            ApplicationAccountIdentity::ExactKey {
+                source: ApplicationKeySource::SignerSelf,
+                owner: None,
+                executable: false,
+            },
+            RoleFlags {
+                writable: false,
+                signer: true,
+            },
+        )];
+        static WITH_READ_RULE: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
+            APP_TAG,
+            "example/dispatch-test",
+            1,
+            &READ_RULES,
+            preflight,
+            handler,
+        )];
+        static RULE_PROGRAM: ApplicationProgramManifest =
+            ApplicationProgramManifest::new(&TEST_APPLICATION, &WITH_READ_RULE);
+        assert_ne!(
+            app_program().identity_digest(),
+            RULE_PROGRAM.identity_digest()
+        );
     }
 }

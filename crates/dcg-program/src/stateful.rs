@@ -10,7 +10,7 @@
 //! adapter and are outside revision 8's dispatch table.
 
 use crate::account_provenance::{
-    create_derived_account, expect_derived, expect_keyed, AccountKind, RoleFlags,
+    create_derived_account, expect_derived, expect_keyed, AccountKind, CanonicalBump, RoleFlags,
 };
 use crate::kernel::{
     KernelId, ModeId, StateSchema, StateSpanMut, StatefulKernel, VersionedId, ViewAbi,
@@ -198,21 +198,25 @@ fn write_u64(bytes: &mut [u8], at: usize, value: u64) {
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn session_pda(program: &Pubkey, authority: &Pubkey, id: u64) -> (Pubkey, u8) {
+fn session_pda(program: &Pubkey, authority: &Pubkey, id: u64) -> (Pubkey, CanonicalBump) {
     let id_bytes = id.to_le_bytes();
-    Pubkey::find_program_address(&[SESSION_SEED, authority.as_ref(), &id_bytes], program)
+    let bump = CanonicalBump::find(&[SESSION_SEED, authority.as_ref(), &id_bytes], program);
+    (*bump.address(), bump)
 }
 
-fn stream_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[STREAM_SEED, session.as_ref()], program)
+fn stream_pda(program: &Pubkey, session: &Pubkey) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[STREAM_SEED, session.as_ref()], program);
+    (*bump.address(), bump)
 }
 
-fn state_pda(program: &Pubkey, session: &Pubkey, index: u8) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[STATE_SEED, session.as_ref(), &[index]], program)
+fn state_pda(program: &Pubkey, session: &Pubkey, index: u8) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[STATE_SEED, session.as_ref(), &[index]], program);
+    (*bump.address(), bump)
 }
 
-fn view_pda(program: &Pubkey, session: &Pubkey, role: u8) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[VIEW_SEED, session.as_ref(), &[role]], program)
+fn view_pda(program: &Pubkey, session: &Pubkey, role: u8) -> (Pubkey, CanonicalBump) {
+    let bump = CanonicalBump::find(&[VIEW_SEED, session.as_ref(), &[role]], program);
+    (*bump.address(), bump)
 }
 
 fn validate_kernel(kernel: &dyn StatefulKernel) -> Result<StateSchema, ProgramError> {
@@ -389,7 +393,7 @@ fn create_pda<'a>(
     target: &AccountInfo<'a>,
     system: &AccountInfo<'a>,
     seeds: &[&[u8]],
-    bump: u8,
+    bump: CanonicalBump,
     data_len: usize,
 ) -> ProgramResult {
     create_derived_account(
