@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! tpu-sender — a stdin -> TPU QUIC pump.
 //!
 //! Reads length-prefixed, fully signed Solana wire transactions from stdin and
@@ -1123,6 +1124,14 @@ async fn run(args: Args) -> Result<(), String> {
     } else {
         None
     };
+
+    // The Python parent waits for this handshake before writing any packet.
+    // Leader/RPC startup can take up to 45 seconds per attempt, including the
+    // fallback path, so accepting stdin before this point could lose frames to
+    // a fatal startup exit.
+    out_tx
+        .send("READY".to_string())
+        .map_err(|_| "stdout writer stopped before startup completed".to_string())?;
 
     let batch_wait = Duration::from_millis(args.batch_wait_ms);
     let inflight = Arc::new(Semaphore::new(args.max_inflight_batches));

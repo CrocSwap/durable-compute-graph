@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import sys
+import tempfile
 import unittest
 
 from solders.keypair import Keypair
@@ -10,10 +14,12 @@ from dcg.sequencer.providers import (
     RpcSendProvider,
     SendDisposition,
     TpuHelperDied,
+    TpuHelperConfigurationError,
     TpuQuicConfig,
     TpuQuicSendProvider,
+    _SubprocessTpuHelper,
 )
-from dcg.sequencer.types import FailureClass, RateLimited, SendReceipt
+from dcg.sequencer.types import FailureClass, RateLimited, RpcUnavailable, SendReceipt
 
 
 def signed_wire_packet() -> tuple[bytes, str]:
@@ -158,10 +164,118 @@ class SequencerProviderTests(unittest.IsolatedAsyncioTestCase):
             TpuQuicConfig(helper_binary="definitely-missing", rpc_url="http://127.0.0.1:8899")
         )
         try:
-            with self.assertRaises(FileNotFoundError):
+            with self.assertRaises(TpuHelperConfigurationError):
                 await provider.send_raw(self.packet, self.signature, self.route)
         finally:
             await provider.close()
+
+    async def test_tpu_configuration_rejects_unexecutable_helper(self) -> None:
+        with tempfile.NamedTemporaryFile() as helper_file:
+            os.chmod(helper_file.name, 0o600)
+            provider = TpuQuicSendProvider(
+                TpuQuicConfig(helper_binary=helper_file.name, rpc_url="http://127.0.0.1:8899")
+            )
+            try:
+                with self.assertRaises(TpuHelperConfigurationError):
+                    await provider.send_raw(self.packet, self.signature, self.route)
+            finally:
+                await provider.close()
+
+    async def test_tpu_helper_died_is_not_an_rpc_unavailable_error(self) -> None:
+        error = TpuHelperDied("helper exited", returncode=7)
+        self.assertIs(error.failure_class, FailureClass.AMBIGUOUS)
+        self.assertNotIsInstance(error, RpcUnavailable)
+
+
+class SubprocessTpuHelperTests(unittest.IsolatedAsyncioTestCase):
+    async def start_helper(self, script: str):
+        failures: list[tuple[str | None, str]] = []
+        failure_seen = asyncio.Event()
+        exited = asyncio.Event()
+
+        async def on_failure(signature: str | None, reason: str) -> None:
+            failures.append((signature, reason))
+            failure_seen.set()
+
+        async def on_exit(_helper: _SubprocessTpuHelper) -> None:
+            exited.set()
+
+        helper = _SubprocessTpuHelper(
+            [sys.executable, "-u", "-c", script],
+            on_failure,
+            on_exit,
+            startup_timeout_seconds=1.0,
+            pipe_drain_timeout_seconds=0.25,
+        )
+        await helper.start()
+        return helper, failures, failure_seen, exited
+
+    async def test_subprocess_protocol_frames_little_endian_length_and_payload(self) -> None:
+        script = (
+            "import struct,sys\n"
+            "print('READY', flush=True)\n"
+            "header=sys.stdin.buffer.read(4)\n"
+            "length=struct.unpack('<I', header)[0]\n"
+            "body=sys.stdin.buffer.read(length)\n"
+            "print(f'ERR - frame:{length}:{body.hex()}', flush=True)\n"
+            "sys.stdin.buffer.read()\n"
+        )
+        helper, failures, failure_seen, _exited = await self.start_helper(script)
+        payload = b"signed transaction bytes"
+        try:
+            await helper.send_raw(payload, "unused-signature")
+            await asyncio.wait_for(failure_seen.wait(), timeout=1.0)
+            self.assertEqual(failures, [(None, f"frame:{len(payload)}:{payload.hex()}")])
+        finally:
+            await helper.close()
+
+    async def test_startup_failure_reports_exit_and_stderr_tail(self) -> None:
+        script = "import sys\nsys.stderr.write('startup exploded\\n')\nsys.stderr.flush()\nsys.exit(7)\n"
+        failures: list[tuple[str | None, str]] = []
+
+        async def on_failure(signature: str | None, reason: str) -> None:
+            failures.append((signature, reason))
+
+        async def on_exit(_helper: _SubprocessTpuHelper) -> None:
+            pass
+
+        helper = _SubprocessTpuHelper(
+            [sys.executable, "-u", "-c", script],
+            on_failure,
+            on_exit,
+            startup_timeout_seconds=1.0,
+            pipe_drain_timeout_seconds=0.25,
+        )
+        with self.assertRaises(TpuHelperDied) as caught:
+            await helper.start()
+        self.assertEqual(caught.exception.returncode, 7)
+        self.assertIn("startup exploded", caught.exception.stderr_tail)
+        self.assertIn("startup exploded", str(caught.exception))
+        self.assertEqual(failures, [(None, "helper-exited rc=7")])
+
+    async def test_death_mid_stream_records_failure_and_retires_helper(self) -> None:
+        script = (
+            "import struct,sys\n"
+            "print('READY', flush=True)\n"
+            "header=sys.stdin.buffer.read(4)\n"
+            "if len(header)==4: sys.stdin.buffer.read(struct.unpack('<I',header)[0])\n"
+            "sys.stderr.write('fatal mid-stream\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.exit(9)\n"
+        )
+        helper, failures, _failure_seen, exited = await self.start_helper(script)
+        try:
+            await helper.send_raw(b"accepted then died", "unused-signature")
+            await asyncio.wait_for(exited.wait(), timeout=1.0)
+            self.assertIn((None, "helper-exited rc=9"), failures)
+            with self.assertRaises(TpuHelperDied) as caught:
+                await helper.send_raw(b"next frame", "unused-signature")
+            error = caught.exception
+            self.assertEqual(error.returncode, 9)
+            self.assertIn("fatal mid-stream", error.stderr_tail)
+            self.assertIn("fatal mid-stream", str(error))
+        finally:
+            await helper.close()
 
 
 if __name__ == "__main__":

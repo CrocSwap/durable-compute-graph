@@ -4,18 +4,30 @@ Integration contract
 --------------------
 Package C should construct :class:`EndpointPool` with one
 :class:`EndpointNodeConfig` for every RPC endpoint eligible for sends or
-observation. Wrap every outbound RPC operation in ``pool.request(kind, ...)``;
-use ``RequestKind.SEND`` for signed packet submission so both the node's send
-rate and total request rate are enforced. The yielded lease exposes the chosen
-``RpcEndpoint`` and an immutable ``EndpointRoute`` for the provider and
-journal. Report classified health through ``lease.observe`` and call
-``pool.remember_affinity`` after selecting the node for a prior step/lane.
+observation. Callers must wrap every outbound RPC operation in
+``pool.request(kind, ...)``. The pool is the authoritative pacing and
+admission limiter; configure a ``SolanaRpcEndpoint``'s own limiter so it does
+not impose a lower, competing rate. Use ``RequestKind.SEND`` for signed packet
+submission, including TPU sends, so the selected observer node's send and
+total-request budgets are enforced. ``EndpointRoute.endpoint_id`` is that
+selected observer identity and is recorded in the send receipt even when a
+shared TPU helper carries the packet.
+
+The yielded lease exposes the chosen ``RpcEndpoint`` and immutable
+``EndpointRoute``. Report classified health through ``lease.observe`` and call
+``pool.remember_affinity`` after selecting the node for a prior step/lane. If
+``lease.route.is_probe`` is true, the first eligible caller has acquired a
+probe lease: perform one bounded health probe, report it, close the lease, and
+acquire again before normal work. Every configured acquisition has a bounded
+deadline; an explicit ``deadline`` is an absolute value from the pool's
+monotonic clock.
 
 The caller supplies the endpoint implementations and decides what endpoint
 health means. In particular, account/cursor postconditions remain app policy.
-When ``probe_due`` names an endpoint, Package C must make one bounded health
-probe under ``RequestKind.PROBE`` and report its result before normal work can
-use that node again.
+When ``probe_due`` names an endpoint, Package C may acquire an explicit
+``RequestKind.PROBE`` lease and must report its result before normal work can
+use that node again. If all matching nodes are unavailable, the first normal
+acquirer after a cooldown is instead given a probe lease.
 """
 
 from __future__ import annotations
@@ -23,12 +35,13 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import AsyncIterator, Callable, Sequence
 
-from .types import RpcEndpoint
+from .types import FailureClass, RpcEndpoint, SequencerError
 
 
 class RequestKind(str, Enum):
@@ -47,6 +60,13 @@ class HealthSignal(str, Enum):
     TRANSPORT_ERROR = "transport-error"
     TIMEOUT = "timeout"
     UNHEALTHY = "unhealthy"
+
+
+class EndpointPoolExhausted(SequencerError):
+    """No endpoint could be admitted before the caller's pool deadline."""
+
+    failure_class = FailureClass.RESUMABLE
+    classification = "pool-exhausted"
 
 
 @dataclass(frozen=True)
@@ -161,7 +181,7 @@ class EndpointRoute:
 
 @dataclass(frozen=True)
 class EndpointSnapshot:
-    """Read-only operational state for diagnostics and tests."""
+    """Read-only state; ``waiter_count`` counts blocked routes including this node."""
 
     endpoint_id: str
     route_group: str
@@ -170,6 +190,7 @@ class EndpointSnapshot:
     cooldown_until: float
     probe_required: bool
     probe_in_flight: bool
+    waiter_count: int
 
 
 @dataclass
@@ -185,6 +206,7 @@ class _NodeState:
     probe_in_flight: bool = False
     cooldown_count: int = 0
     smooth_weight: float = 0.0
+    waiters: int = 0
 
 
 class EndpointLease:
@@ -248,19 +270,30 @@ class EndpointPool:
         *,
         health_policy: HealthPolicy = HealthPolicy(),
         clock: Callable[[], float] = time.monotonic,
+        default_acquire_timeout_seconds: float = 30.0,
+        max_affinity_entries: int = 4096,
     ):
         if not nodes:
             raise ValueError("endpoint pool requires at least one node")
         ids = [node.endpoint_id for node in nodes]
         if len(set(ids)) != len(ids):
             raise ValueError("endpoint IDs in a pool must be unique")
+        if (
+            not math.isfinite(default_acquire_timeout_seconds)
+            or default_acquire_timeout_seconds <= 0
+        ):
+            raise ValueError("default_acquire_timeout_seconds must be finite and positive")
+        if max_affinity_entries <= 0:
+            raise ValueError("max_affinity_entries must be positive")
         self.health_policy = health_policy
         self._clock = clock
+        self._default_acquire_timeout_seconds = default_acquire_timeout_seconds
+        self._max_affinity_entries = max_affinity_entries
         now = clock()
         self._nodes = {
             node.endpoint_id: _NodeState(node, health_updated_at=now) for node in nodes
         }
-        self._affinity: dict[str, str] = {}
+        self._affinity: OrderedDict[str, str] = OrderedDict()
         self._condition = asyncio.Condition()
 
     async def acquire(
@@ -270,8 +303,15 @@ class EndpointPool:
         route_group: str | None = None,
         endpoint_id: str | None = None,
         route_affinity: str | None = None,
+        deadline: float | None = None,
     ) -> EndpointLease:
-        """Wait for and reserve a node; retries must acquire a fresh route."""
+        """Reserve an endpoint before an absolute monotonic ``deadline``.
+
+        Calls without an explicit deadline use the configured bounded default.
+        When every matching node is cooling, the first caller eligible after a
+        cooldown receives a probe lease (``lease.kind == PROBE``); it must
+        perform a health check and acquire again before doing normal work.
+        """
 
         if not isinstance(kind, RequestKind):
             kind = RequestKind(kind)
@@ -285,54 +325,118 @@ class EndpointPool:
             raise ValueError("no endpoint matches the requested route group and endpoint")
         if route_affinity is not None and not route_affinity:
             raise ValueError("route_affinity must be non-empty when provided")
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("deadline must be finite when provided")
         async with self._condition:
+            matching = tuple(
+                state
+                for state in self._nodes.values()
+                if (endpoint_id is None or state.config.endpoint_id == endpoint_id)
+                and (route_group is None or state.config.route_group == route_group)
+            )
+            expires_at = (
+                deadline
+                if deadline is not None
+                else self._clock() + self._default_acquire_timeout_seconds
+            )
             while True:
                 now = self._clock()
-                eligible: list[_NodeState] = []
                 timed: list[float] = []
-                for state in self._nodes.values():
-                    if endpoint_id is not None and state.config.endpoint_id != endpoint_id:
-                        continue
-                    if route_group is not None and state.config.route_group != route_group:
-                        continue
+                healthy: list[_NodeState] = []
+                probes: list[_NodeState] = []
+                for state in matching:
                     if kind is RequestKind.PROBE:
                         if not state.probe_required or state.probe_in_flight:
                             continue
                         if state.cooldown_until > now:
                             timed.append(state.cooldown_until - now)
                             continue
-                    elif state.probe_required or state.cooldown_until > now:
+                        if state.in_flight >= state.config.max_in_flight:
+                            continue
+                        probes.append(state)
+                        continue
+                    if state.probe_required:
+                        if not state.probe_in_flight:
+                            if state.cooldown_until > now:
+                                timed.append(state.cooldown_until - now)
+                            elif state.in_flight < state.config.max_in_flight:
+                                probes.append(state)
+                        continue
+                    if state.cooldown_until > now:
+                        timed.append(state.cooldown_until - now)
                         continue
                     if state.in_flight >= state.config.max_in_flight:
                         continue
-                    eligible.append(state)
+                    healthy.append(state)
 
-                if eligible:
-                    selected, weighted = self._choose(eligible, route_affinity)
-                    due = max(
-                        selected.next_request_at,
-                        selected.next_send_at if kind is RequestKind.SEND else now,
-                    )
-                    if due <= now:
+                if kind is RequestKind.PROBE:
+                    candidates = probes
+                    effective_kind = RequestKind.PROBE
+                else:
+                    # A probe is an escape hatch only when no healthy matching
+                    # endpoint can admit this request now. In particular, do
+                    # not let a cooled node steal traffic from a due healthy node.
+                    due_healthy = [
+                        state
+                        for state in healthy
+                        if self._rate_due(state, kind) <= now
+                    ]
+                    if due_healthy:
+                        candidates = due_healthy
+                        effective_kind = kind
+                    elif not healthy:
+                        candidates = [
+                            state
+                            for state in probes
+                            if state.in_flight < state.config.max_in_flight
+                        ]
+                        effective_kind = RequestKind.PROBE
+                    else:
+                        candidates = []
+                        effective_kind = kind
+                    for state in healthy:
+                        due = self._rate_due(state, kind)
+                        if due > now:
+                            timed.append(due - now)
+
+                for state in candidates:
+                    due = self._rate_due(state, effective_kind)
+                    if due > now:
+                        timed.append(due - now)
+                if candidates:
+                    ready = [
+                        state
+                        for state in candidates
+                        if self._rate_due(state, effective_kind) <= now
+                    ]
+                    if ready:
+                        selected, weighted = self._choose(ready, route_affinity)
                         if weighted:
-                            self._commit_weighted_choice(eligible, selected)
+                            self._commit_weighted_choice(ready, selected)
                         selected.in_flight += 1
-                        if kind is RequestKind.SEND:
+                        if effective_kind is RequestKind.SEND:
                             selected.next_send_at = max(now, selected.next_send_at) + 1.0 / selected.config.sends_per_second
                         selected.next_request_at = max(now, selected.next_request_at) + 1.0 / selected.config.requests_per_second
-                        if kind is RequestKind.PROBE:
+                        if effective_kind is RequestKind.PROBE:
                             selected.probe_in_flight = True
-                        return EndpointLease(self, selected, kind, route_affinity)
-                    timed.append(due - now)
+                        return EndpointLease(self, selected, effective_kind, route_affinity)
 
-                timeout = min(timed) if timed else None
+                remaining = expires_at - now
+                if remaining <= 0:
+                    raise EndpointPoolExhausted(
+                        "endpoint pool exhausted before the acquisition deadline"
+                    )
+                timeout = min(timed + [remaining]) if timed else remaining
+                waiting_on = matching
+                for state in waiting_on:
+                    state.waiters += 1
                 try:
-                    if timeout is None:
-                        await self._condition.wait()
-                    else:
-                        await asyncio.wait_for(self._condition.wait(), timeout=max(timeout, 0.0001))
+                    await asyncio.wait_for(self._condition.wait(), timeout=max(timeout, 0.0001))
                 except TimeoutError:
                     pass
+                finally:
+                    for state in waiting_on:
+                        state.waiters -= 1
 
     @asynccontextmanager
     async def request(
@@ -342,6 +446,7 @@ class EndpointPool:
         route_group: str | None = None,
         endpoint_id: str | None = None,
         route_affinity: str | None = None,
+        deadline: float | None = None,
     ) -> AsyncIterator[EndpointLease]:
         """Context-managed form of :meth:`acquire`."""
 
@@ -350,6 +455,7 @@ class EndpointPool:
             route_group=route_group,
             endpoint_id=endpoint_id,
             route_affinity=route_affinity,
+            deadline=deadline,
         )
         async with lease:
             yield lease
@@ -362,6 +468,9 @@ class EndpointPool:
         if endpoint_id not in self._nodes:
             raise ValueError(f"unknown RPC endpoint {endpoint_id!r}")
         self._affinity[route_affinity] = endpoint_id
+        self._affinity.move_to_end(route_affinity)
+        while len(self._affinity) > self._max_affinity_entries:
+            self._affinity.popitem(last=False)
 
     def forget_affinity(self, route_affinity: str) -> None:
         self._affinity.pop(route_affinity, None)
@@ -392,6 +501,7 @@ class EndpointPool:
                         cooldown_until=state.cooldown_until,
                         probe_required=state.probe_required,
                         probe_in_flight=state.probe_in_flight,
+                        waiter_count=state.waiters,
                     )
                 )
             return tuple(result)
@@ -403,6 +513,7 @@ class EndpointPool:
             preferred_id = self._affinity.get(route_affinity)
             preferred = next((state for state in eligible if state.config.endpoint_id == preferred_id), None)
             if preferred is not None:
+                self._affinity.move_to_end(route_affinity)
                 return preferred, False
         # Peek at smooth weighted round-robin state. Commit the counters only
         # when the selected node can actually admit this request, so a delayed
@@ -413,6 +524,13 @@ class EndpointPool:
             key=lambda state: state.smooth_weight + state.config.weight,
         )
         return selected, True
+
+    @staticmethod
+    def _rate_due(state: _NodeState, kind: RequestKind) -> float:
+        due = state.next_request_at
+        if kind is RequestKind.SEND:
+            due = max(due, state.next_send_at)
+        return due
 
     @staticmethod
     def _commit_weighted_choice(eligible: Sequence[_NodeState], selected: _NodeState) -> None:
@@ -474,10 +592,12 @@ class EndpointPool:
             self._condition.notify_all()
 
     def _cool(self, state: _NodeState, now: float, retry_after_seconds: float | None) -> None:
-        state.cooldown_count += 1
+        already_cooling = state.cooldown_until > now
+        if not already_cooling:
+            state.cooldown_count += 1
         backoff = min(
             self.health_policy.max_cooldown_seconds,
-            self.health_policy.cooldown_seconds * (2 ** min(state.cooldown_count - 1, 30)),
+            self.health_policy.cooldown_seconds * (2 ** min(max(state.cooldown_count - 1, 0), 30)),
         )
         requested = retry_after_seconds or 0.0
         state.cooldown_until = max(state.cooldown_until, now + backoff, now + requested)

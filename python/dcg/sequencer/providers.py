@@ -2,30 +2,39 @@
 
 Integration contract
 --------------------
-Package C selects an :class:`EndpointRoute` from ``pool.py`` after signing and
-durably journaling a packet, then calls ``provider.send_raw(packet.raw_bytes,
-packet.signature, route)``. The provider receives no signer, message builder,
-blockhash policy, or authority to create a new transaction. On a retry, Package
-C must pass the exact bytes retained by its journal. An ambiguous helper death
-is returned to the sequencer; it does not cause this module to replay the
-packet. A later caller retry will lazily start a fresh helper and submit only
-the bytes it supplies. TPU ``ERR`` records arrive asynchronously, so Package C
-must consume ``drain_failures`` or install ``failure_handler`` and reconcile
-those signatures through its journal. Before using TPU, Package C also checks
-the configured RPC observer's genesis and binds the helper URL to that checked
-cluster identity.
+Package C selects an :class:`EndpointRoute` under ``pool.request(RequestKind.SEND)``
+after signing and durably journaling a packet, then calls
+``provider.send_raw(packet.raw_bytes, packet.signature, route)``. This applies
+to both RPC and TPU sends. ``route.endpoint_id`` identifies the selected,
+genesis-checked RPC observer and is retained in the provider receipt even when
+the shared TPU helper is the transport. The pool is the authoritative
+admission limiter; configure ``SolanaRpcEndpoint``'s internal limiter not to
+impose a lower competing rate. The provider receives no signer, message
+builder, blockhash policy, or authority to create a new transaction. On a
+retry, Package C must pass the exact bytes retained by its journal. An
+ambiguous helper death is returned to the sequencer; it does not cause this
+module to replay the packet. A later caller retry will lazily start a fresh
+helper and submit only the bytes it supplies. TPU ``ERR`` records arrive
+asynchronously, so Package C must consume ``drain_failures`` or install
+``failure_handler`` and reconcile those signatures through its journal. Before
+using TPU, Package C must verify the RPC observer's genesis and bind the helper
+URL to that same checked cluster identity.
 
 The TPU sidecar is an explicit runtime dependency. Build the checked-in
 ``rust/tpu-sender`` crate with Cargo and pass its executable path in
 :class:`TpuQuicConfig`. The helper accepts little-endian length-prefixed signed
-wire packets on stdin and is send-only; RPC still owns signature/account
-observation. Tests inject an in-memory helper factory and never start a process.
+wire packets on stdin, prints ``READY`` after successful startup, and is
+send-only; RPC still owns signature/account observation. Process exits are
+recorded as failures, retire the helper, and include its stderr tail in
+``TpuHelperDied``. Tests use fake Python child processes for subprocess
+protocol behavior and an in-memory helper for provider retry behavior.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import os
 import struct
 import time
@@ -43,7 +52,6 @@ from .types import (
     FailureClass,
     RpcEndpoint,
     RpcError,
-    RpcUnavailable,
     SendReceipt,
     SequencerError,
 )
@@ -80,15 +88,28 @@ class ProviderProtocolError(SequencerError):
     """A provider response does not match the signed packet it was given."""
 
 
-class TpuHelperDied(RpcUnavailable):
+class TpuHelperDied(SequencerError):
     """The sidecar died during handoff; the signed packet's fate is ambiguous."""
 
     failure_class = FailureClass.AMBIGUOUS
 
-    def __init__(self, message: str, *, returncode: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        returncode: int | None = None,
+        stderr_tail: Sequence[str] = (),
+    ):
         self.returncode = returncode
+        self.stderr_tail = tuple(stderr_tail)
         suffix = f" (exit code {returncode})" if returncode is not None else ""
+        if self.stderr_tail:
+            suffix += "\nhelper stderr tail:\n" + "\n".join(self.stderr_tail)
         super().__init__(message + suffix)
+
+
+class TpuHelperConfigurationError(SequencerError):
+    """The configured TPU helper cannot be started."""
 
 
 @dataclass(frozen=True)
@@ -111,6 +132,8 @@ class TpuQuicConfig:
     rate: float | None = None
     send_timeout_ms: int | None = None
     reconnect_min_interval_seconds: int | None = None
+    startup_timeout_seconds: float = 95.0
+    pipe_drain_timeout_seconds: float = 5.0
     extra_args: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -128,6 +151,10 @@ class TpuQuicConfig:
             raise ValueError("send_timeout_ms must be positive")
         if self.reconnect_min_interval_seconds is not None and self.reconnect_min_interval_seconds < 0:
             raise ValueError("reconnect_min_interval_seconds cannot be negative")
+        if not math.isfinite(self.startup_timeout_seconds) or self.startup_timeout_seconds <= 0:
+            raise ValueError("startup_timeout_seconds must be finite and positive")
+        if not math.isfinite(self.pipe_drain_timeout_seconds) or self.pipe_drain_timeout_seconds <= 0:
+            raise ValueError("pipe_drain_timeout_seconds must be finite and positive")
 
 
 class TpuSendHelper(Protocol):
@@ -188,7 +215,12 @@ class RpcSendProvider:
 
 
 class TpuQuicSendProvider:
-    """Persistent Rust TPU helper wrapper with journal-authorized restart retries."""
+    """Persistent Rust TPU helper wrapper with journal-authorized restart retries.
+
+    ``drain_failures`` retains at most ``max_retained_failures`` records
+    (256 by default); older undrained records are discarded when the queue is
+    full. Install ``failure_handler`` when every failure must be consumed.
+    """
 
     def __init__(
         self,
@@ -275,8 +307,18 @@ class TpuQuicSendProvider:
             if inspect.isawaitable(helper):
                 helper = await helper
             return helper
-        helper = _SubprocessTpuHelper(self._command(), self._on_helper_failure)
-        await helper.start()
+        helper = _SubprocessTpuHelper(
+            self._command(),
+            self._on_helper_failure,
+            self._on_helper_exit,
+            startup_timeout_seconds=self.config.startup_timeout_seconds,
+            pipe_drain_timeout_seconds=self.config.pipe_drain_timeout_seconds,
+        )
+        try:
+            await helper.start()
+        except BaseException:
+            await helper.close()
+            raise
         return helper
 
     async def _retire_helper(self, helper: TpuSendHelper) -> None:
@@ -292,12 +334,12 @@ class TpuQuicSendProvider:
     def _command(self) -> tuple[str, ...]:
         binary = Path(self.config.helper_binary).expanduser()
         if not binary.is_file():
-            raise FileNotFoundError(
+            raise TpuHelperConfigurationError(
                 f"DCG TPU helper not found at {binary}; build rust/tpu-sender with Cargo "
                 "and configure helper_binary to the resulting executable"
             )
         if not os.access(binary, os.X_OK):
-            raise PermissionError(f"DCG TPU helper is not executable: {binary}")
+            raise TpuHelperConfigurationError(f"DCG TPU helper is not executable: {binary}")
         command = [str(binary), "--rpc", self.config.rpc_url]
         if self.config.ws_url is not None:
             command += ["--ws", self.config.ws_url]
@@ -317,6 +359,11 @@ class TpuQuicSendProvider:
         command.extend(self.config.extra_args)
         return tuple(command)
 
+    async def _on_helper_exit(self, helper: _SubprocessTpuHelper) -> None:
+        async with self._helper_lock:
+            if self._helper is helper:
+                self._helper = None
+
     async def _on_helper_failure(self, signature: str | None, reason: str) -> None:
         failure = TpuSendFailure(signature, reason, self.provider_id)
         self._failures.append(failure)
@@ -333,29 +380,64 @@ class _SubprocessTpuHelper:
         self,
         command: Sequence[str],
         on_failure: Callable[[str | None, str], Awaitable[None]],
+        on_exit: Callable[[_SubprocessTpuHelper], Awaitable[None]],
+        *,
+        startup_timeout_seconds: float,
+        pipe_drain_timeout_seconds: float,
     ):
         self._command = tuple(command)
         self._on_failure = on_failure
+        self._on_exit = on_exit
+        self._startup_timeout_seconds = startup_timeout_seconds
+        self._pipe_drain_timeout_seconds = pipe_drain_timeout_seconds
         self._process: asyncio.subprocess.Process | None = None
         self._write_lock = asyncio.Lock()
         self._reader_tasks: tuple[asyncio.Task[None], ...] = ()
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._ready: asyncio.Future[None] | None = None
         self._stderr_tail: deque[str] = deque(maxlen=20)
+        self._closing = False
+        self._death_recorded = False
 
     async def start(self) -> None:
         if self._process is not None:
             return
-        self._process = await asyncio.create_subprocess_exec(
-            *self._command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        self._ready = asyncio.get_running_loop().create_future()
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                *self._command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise TpuHelperConfigurationError(
+                f"could not execute DCG TPU helper {self._command[0]!r}: {exc}"
+            ) from exc
         assert self._process.stdout is not None
         assert self._process.stderr is not None
+        self._stderr_task = asyncio.create_task(self._read_stderr(self._process.stderr))
         self._reader_tasks = (
             asyncio.create_task(self._read_stdout(self._process.stdout)),
-            asyncio.create_task(self._read_stderr(self._process.stderr)),
+            self._stderr_task,
         )
+        try:
+            await asyncio.wait_for(self._ready, timeout=self._startup_timeout_seconds)
+        except TimeoutError as exc:
+            try:
+                await self._on_failure(None, "helper-startup-timeout")
+            except Exception:
+                pass
+            error = self._death(
+                f"TPU helper did not become ready within {self._startup_timeout_seconds:g}s"
+            )
+            await self.close()
+            raise error from exc
+        except TpuHelperDied:
+            await self.close()
+            raise
+        if self._process.returncode is not None:
+            raise self._death("TPU helper exited immediately after startup")
 
     async def send_raw(self, raw_bytes: bytes, expected_signature: str) -> None:
         process = self._process
@@ -367,14 +449,20 @@ class _SubprocessTpuHelper:
                 raise self._death("TPU helper stdin is closed")
             try:
                 process.stdin.write(frame)
-                await process.stdin.drain()
-            except (BrokenPipeError, ConnectionError, OSError, RuntimeError) as exc:
+                await asyncio.wait_for(
+                    process.stdin.drain(), timeout=self._pipe_drain_timeout_seconds
+                )
+                if process.returncode is not None:
+                    raise self._death("TPU helper exited during send")
+            except (BrokenPipeError, ConnectionError, OSError, RuntimeError, TimeoutError) as exc:
                 raise self._death(f"TPU helper pipe failed: {exc}") from exc
 
     async def close(self) -> None:
         process = self._process
         if process is None:
             return
+        if process.returncode is None:
+            self._closing = True
         if process.stdin is not None and not process.stdin.is_closing():
             process.stdin.close()
         try:
@@ -387,6 +475,15 @@ class _SubprocessTpuHelper:
                 process.kill()
                 await process.wait()
         if self._reader_tasks:
+            if process.returncode is not None and not self._closing:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*self._reader_tasks, return_exceptions=True),
+                        timeout=1.0,
+                    )
+                    return
+                except TimeoutError:
+                    pass
             for task in self._reader_tasks:
                 if not task.done():
                     task.cancel()
@@ -395,6 +492,10 @@ class _SubprocessTpuHelper:
     async def _read_stdout(self, stream: asyncio.StreamReader) -> None:
         while line := await stream.readline():
             text = line.decode("utf-8", "replace").strip()
+            if text == "READY":
+                if self._ready is not None and not self._ready.done():
+                    self._ready.set_result(None)
+                continue
             if not text.startswith("ERR "):
                 continue
             _, _, rest = text.partition(" ")
@@ -411,6 +512,38 @@ class _SubprocessTpuHelper:
                 # caller hook; a bad diagnostics hook must not stop pipe drains.
                 continue
 
+        process = self._process
+        if process is None or self._closing:
+            return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=1.0)
+        except TimeoutError:
+            # An EOF is a protocol death even if the child leaves the process
+            # itself alive. Retire it so no later frame can disappear silently.
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+        if self._stderr_task is not None and not self._stderr_task.done():
+            await asyncio.gather(self._stderr_task, return_exceptions=True)
+        returncode = process.returncode
+        if not self._death_recorded:
+            self._death_recorded = True
+            reason = f"helper-exited rc={returncode}"
+            try:
+                await self._on_failure(None, reason)
+            except Exception:
+                pass
+        error = self._death(f"TPU helper exited unexpectedly (rc={returncode})")
+        if self._ready is not None and not self._ready.done():
+            self._ready.set_exception(error)
+        try:
+            await self._on_exit(self)
+        except Exception:
+            pass
+
     async def _read_stderr(self, stream: asyncio.StreamReader) -> None:
         while line := await stream.readline():
             text = line.decode("utf-8", "replace").rstrip()
@@ -422,6 +555,7 @@ class _SubprocessTpuHelper:
         return TpuHelperDied(
             message,
             returncode=None if process is None else process.returncode,
+            stderr_tail=tuple(self._stderr_tail),
         )
 
 
