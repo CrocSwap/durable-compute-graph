@@ -108,11 +108,10 @@ run, and the example does not define a new kernel.
    is a shared testnet image with a few versioned general kernels and an
    explicit app/kernel allowlist. **Owner: program/product design.**
 
-11. **Hello, Dispute is not ready to add here.** The optimistic replay seam is
-    being changed by the separate `dcg-seam-fix-2` work. This example does not
-    build around an in-flight interface. The next step is to pin that seam,
-    then add a false executor output and an on-chain challenger path against
-    the same app kernel. **Owner: program/client.**
+11. **Hello, Dispute now has a mechanics example.** The revision-8 app-bound
+    replay seam is merged. The example reuses its ByteSum ProgramTest cases;
+    see [`examples/hello-dispute`](../hello-dispute/README.md). The remaining
+    onboarding friction is recorded below. **Owner: program/client.**
 
 ## Newcomer path measurement
 
@@ -161,3 +160,33 @@ useful input. An estimated 218 lines cover instruction bodies, PDAs, account
 metas, signers, ProgramTest setup and account reads; the example-specific
 behavior is parsing the increment, submitting it, and checking the two output
 values. This is a line-count estimate, not a semantic code-size metric.
+
+## Hello Dispute
+
+The new [Hello Dispute example](../hello-dispute/README.md) reuses the merged
+revision-8 app-bound replay tests. These are the next friction points for making
+it a fresh-checkout developer example:
+
+1. **The fixture is external to this repository.** Both ProgramTest cases need
+   a retained PT2P bundle produced by the Basanos compiler. A clean DCG clone
+   cannot run the example until that artifact is supplied. The smallest fix is
+   a compact, reproducible template fixture or a supported tiny-template
+   builder. **Owner: compiler/example tooling.**
+
+2. **The typed Python session does not speak the dispute lifecycle.** It builds
+   the stateful session instruction family, while this example uses revision-8
+   document and challenge instructions. ProgramTest also runs in-process and
+   has no RPC endpoint for the current Python transport. The example therefore
+   delegates execution to the existing Rust ProgramTest cases. A Python client
+   needs typed document, challenge, response and settlement operations before
+   it can drive this path. **Owner: client/sequencer.**
+
+3. **The app is still compiled into a test-only feature.** The example reuses
+   the core's ByteSum test manifest rather than defining an app-owned kernel.
+   Developers still need a supported app crate and manifest builder to adapt
+   this path to their own kernel. **Owner: program/tooling.**
+
+4. **The demonstration is native-only.** It exercises ProgramTest's native
+   processor; it does not build an SBF image or use a validator. An SBF or
+   validator path remains a separate setup and verification step. **Owner:
+   program/tooling.**
