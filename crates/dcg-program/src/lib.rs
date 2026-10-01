@@ -24,6 +24,7 @@ pub mod compatibility;
 pub mod desc_upload;
 pub mod descriptor;
 pub mod envelope_seal;
+pub mod graph_v2;
 pub mod hash;
 pub mod kernel;
 pub mod kernel_svm;
@@ -143,6 +144,7 @@ pub fn process_instruction_with_manifest(
                 &application,
             )
         }
+        209..=219 => graph_v2::process(program_id, accounts, data),
         140 => pt1_onchain::init_fresh(program_id, accounts, data),
         141 => pt1_onchain::upload(program_id, accounts, data),
         142 => pt1_onchain::seal(program_id, accounts, data),

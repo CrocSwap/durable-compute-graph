@@ -1651,7 +1651,17 @@ class SequencerStream:
     async def append(self, intent: StreamIntent):
         if self._closed:
             raise JournalError("stream scheduler is closed")
-        receipt = await self.plan.append(intent)
+        if self._failures:
+            raise next(iter(self._failures.values()))
+        # H2: a failed step never frees its pending slot, so a full pending
+        # window must surface the failure instead of waiting forever.
+        append_task = asyncio.ensure_future(self.plan.append(intent))
+        while not append_task.done():
+            await asyncio.wait({append_task}, timeout=0.25)
+            if self._failures and not append_task.done():
+                append_task.cancel()
+                raise next(iter(self._failures.values()))
+        receipt = append_task.result()
         self._intents[intent.step_id] = (receipt.sequence, intent)
         self._register(receipt.sequence, intent)
         if not receipt.already_present or intent.step_id not in self._tasks:
