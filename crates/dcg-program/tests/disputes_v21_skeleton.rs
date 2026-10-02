@@ -423,3 +423,78 @@ async fn earliest_opened_winner_takes_the_pot_and_later_disputes_are_moot() {
     assert_eq!(ch.ctx.banks_client.get_balance(kp(0xC1).pubkey()).await.unwrap(), challenger_before + share);
     assert!(send(&mut ch.ctx, pot(d0, ch.run, ch.template), &[&caller]).await.is_err(), "paid once");
 }
+
+impl Chain {
+    fn buffer(&self, d: Pubkey, role: u8) -> Pubkey {
+        Pubkey::find_program_address(&[b"dcg21stg", d.as_ref(), &[role]], &PROGRAM).0
+    }
+
+    async fn stage(&mut self, d: Pubkey, role: u8, size: u32, bytes: &[u8], chunk: usize) {
+        let c = kp(0xC1);
+        let buf = self.buffer(d, role);
+        let mut data = vec![role];
+        data.extend_from_slice(&size.to_le_bytes());
+        let i = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new_readonly(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+        send(&mut self.ctx, i, &[&c]).await.unwrap();
+        let writer = if role == V::ROLE_EXECUTOR { kp(0xE1) } else { kp(0xC1) };
+        for (k, part) in bytes.chunks(chunk).enumerate() {
+            let mut w = ((k * chunk) as u32).to_le_bytes().to_vec();
+            w.extend_from_slice(part);
+            let i = ix(V::SUB_STAGE_WRITE, &w, vec![AccountMeta::new_readonly(writer.pubkey(), true), AccountMeta::new_readonly(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false)]);
+            send(&mut self.ctx, i, &[&writer]).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn openings_and_witnesses_can_come_from_staging_buffers() {
+    let mut ch = Chain::new(1_000).await;
+    let h = ch.honest();
+    let mut l = h.leaves[1].clone().unwrap();
+    let n = l.len();
+    l[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
+    let c = commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(l.clone())], h.outs.clone());
+    ch.commit(&c).await;
+    let d = ch.open(20, V::KIND_STEP_DESCEND).await;
+    // Descend to leaf 1.
+    let e = kp(0xE1);
+    let mut nodes = Vec::new();
+    nodes.extend_from_slice(&c.step[0][0]);
+    nodes.extend_from_slice(&c.step[0][1]);
+    let i = ix(V::SUB_REVEAL_NODES, &nodes, ch.party(0xE1, d));
+    send(&mut ch.ctx, i, &[&e]).await.unwrap();
+    let i = ix(V::SUB_PICK, &[1], ch.party(0xC1, d));
+    send(&mut ch.ctx, i, &[&kp(0xC1)]).await.unwrap();
+    // E stages its leaf (in 100-byte writes) and reveals from staging.
+    let mut leaf = vec![1u8];
+    leaf.extend_from_slice(&l);
+    ch.stage(d, V::ROLE_EXECUTOR, 2_000, &leaf, 100).await;
+    let mut accounts = ch.party(0xE1, d);
+    accounts.push(AccountMeta::new_readonly(ch.buffer(d, V::ROLE_EXECUTOR), false));
+    let i = ix(V::SUB_REVEAL_LEAF, &[V::FROM_STAGING], accounts);
+    send(&mut ch.ctx, i, &[&e]).await.unwrap();
+    // C stages its STEP claim and submits from staging.
+    let mut body = vec![V::CLAIM_STEP, 0];
+    body.extend(ch.spec_opening(STEP_BASE as usize + 1));
+    body.push(1);
+    body.extend_from_slice(&4u16.to_le_bytes());
+    body.extend_from_slice(&42i32.to_le_bytes());
+    ch.stage(d, V::ROLE_CHALLENGER, 4_000, &body, 300).await;
+    let cl = kp(0xC1);
+    let base = vec![AccountMeta::new_readonly(cl.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false), AccountMeta::new(kp(0xE1).pubkey(), false), AccountMeta::new(cl.pubkey(), false)];
+    // E's buffer is not C's: refused.
+    let mut wrong = base.clone();
+    wrong.push(AccountMeta::new_readonly(ch.buffer(d, V::ROLE_EXECUTOR), false));
+    let i = ix(V::SUB_CLAIM, &[V::FROM_STAGING], wrong);
+    assert!(send(&mut ch.ctx, i, &[&cl]).await.is_err());
+    // C cannot write E's buffer.
+    let mut w = 0u32.to_le_bytes().to_vec();
+    w.push(9);
+    let i = ix(V::SUB_STAGE_WRITE, &w, vec![AccountMeta::new_readonly(cl.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(ch.buffer(d, V::ROLE_EXECUTOR), false)]);
+    assert!(send(&mut ch.ctx, i, &[&cl]).await.is_err());
+    let mut right = base;
+    right.push(AccountMeta::new_readonly(ch.buffer(d, V::ROLE_CHALLENGER), false));
+    let i = ix(V::SUB_CLAIM, &[V::FROM_STAGING], right);
+    send(&mut ch.ctx, i, &[&cl]).await.unwrap();
+    assert_eq!(ch.ruling(d).await, V::RULING_CHALLENGER);
+}

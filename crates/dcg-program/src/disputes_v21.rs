@@ -17,8 +17,10 @@
 //!   executor bond to the earliest-opened winner (slasher share) and the
 //!   payer (remainder); later disputes on a refuted run are moot (§10.1).
 //!
-//! Not yet: staging buffers (every opening must fit one transaction), the
-//! reveal cache, the load extension, receipts, closes, and the full v2.1
+//! - per-party staging buffers (§8.2), created and funded by C, written any
+//!   time by their owner; a reveal or claim may read its bytes from them.
+//!
+//! Not yet: staging growth past one CPI creation (10 KiB), the reveal cache, the load extension, receipts, closes, and the full v2.1
 //! template identity.
 
 use dcg_disputes as D;
@@ -50,6 +52,20 @@ pub const SUB_FINALIZE: u8 = 10;
 pub const SUB_ADVANCE: u8 = 11;
 pub const SUB_MOOT: u8 = 12;
 pub const SUB_PAY_POT: u8 = 13;
+pub const SUB_STAGE_CREATE: u8 = 14;
+pub const SUB_STAGE_WRITE: u8 = 15;
+
+/// Staging buffer "D21S" (design §8.2): magic(4) role(1) pad(3) dispute(32)
+/// len:u32 pad(4) then the staged bytes. PDA ["dcg21stg", dispute, role].
+/// Role 1 is E's buffer, role 2 is C's; C funds both at creation. A reveal or
+/// claim whose data is the single byte `FROM_STAGING` reads its bytes from
+/// the party's buffer instead of the instruction. Skeleton: one CPI
+/// creation, so at most `MAX_STAGE` bytes (growth comes later).
+pub const ROLE_EXECUTOR: u8 = 1;
+pub const ROLE_CHALLENGER: u8 = 2;
+pub const STAGE_HEADER: usize = 48;
+pub const MAX_STAGE: usize = 10_240 - STAGE_HEADER;
+pub const FROM_STAGING: u8 = 0xFF;
 
 pub const RULING_OPEN: u8 = 0;
 pub const RULING_EXECUTOR: u8 = 1;
@@ -263,6 +279,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         SUB_ADVANCE => advance(program_id, accounts),
         SUB_MOOT => moot(program_id, accounts),
         SUB_PAY_POT => pay_pot(program_id, accounts),
+        SUB_STAGE_CREATE => stage_create(program_id, accounts, &data[2..]),
+        SUB_STAGE_WRITE => stage_write(program_id, accounts, &data[2..]),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -535,11 +553,78 @@ fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     next_phase(&mut d, if new_level == 0 { PH_LEAF } else { PH_NODES }, c.t.phase_window)
 }
 
+// 14: [challenger(s,w), run, template, dispute, buffer(w), system] role:u8 size:u32
+fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [challenger, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    {
+        let d = c.dispute.try_borrow_data()?;
+        challenger_signed(&d, challenger)?;
+    }
+    let role = *data.first().ok_or(err(1))?;
+    let size = u32_at(data, 1)? as usize;
+    if !(role == ROLE_EXECUTOR || role == ROLE_CHALLENGER) || size == 0 || size > MAX_STAGE || data.len() != 5 {
+        return Err(err(29));
+    }
+    create_pda(program_id, challenger, buffer, system, &[b"dcg21stg", c.dispute.key.as_ref(), &[role]], STAGE_HEADER + size)?;
+    let mut b = buffer.try_borrow_mut_data()?;
+    b[0..4].copy_from_slice(b"D21S");
+    b[4] = role;
+    b[8..40].copy_from_slice(c.dispute.key.as_ref());
+    Ok(())
+}
+
+// 15: [writer(s), run, template, dispute, buffer(w)] offset:u32 bytes. Any
+// time, by the buffer's owner (E for role 1, C for role 2).
+fn stage_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [writer, run, tmpl, dispute, buffer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    let role = staging_role(program_id, c.dispute, buffer)?;
+    if role == ROLE_EXECUTOR {
+        executor_signed(c.run, writer)?;
+    } else {
+        challenger_signed(&c.dispute.try_borrow_data()?, writer)?;
+    }
+    let offset = u32_at(data, 0)? as usize;
+    let bytes = &data[4..];
+    let mut b = buffer.try_borrow_mut_data()?;
+    let end = offset.checked_add(bytes.len()).ok_or(err(8))?;
+    if STAGE_HEADER + end > b.len() {
+        return Err(err(29));
+    }
+    b[STAGE_HEADER + offset..STAGE_HEADER + end].copy_from_slice(bytes);
+    let len = (u32_at(&b, 40)? as usize).max(end);
+    b[40..44].copy_from_slice(&(len as u32).to_le_bytes());
+    Ok(())
+}
+
+fn staging_role(program_id: &Pubkey, dispute: &AccountInfo, buffer: &AccountInfo) -> Result<u8, ProgramError> {
+    let b = buffer.try_borrow_data()?;
+    if b.len() < STAGE_HEADER || &b[0..4] != b"D21S" || b[8..40] != dispute.key.to_bytes() {
+        return Err(err(29));
+    }
+    let role = b[4];
+    derived(program_id, buffer, &[b"dcg21stg", dispute.key.as_ref(), &[role]])?;
+    Ok(role)
+}
+
 // 7: [executor(s), run, template, dispute(w)] present:u8 preimage
 fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [executor, run, tmpl, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     executor_signed(c.run, executor)?;
+    let staged;
+    let data: &[u8] = if data == [FROM_STAGING] {
+        let buffer = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        if staging_role(program_id, c.dispute, buffer)? != ROLE_EXECUTOR {
+            return Err(err(29));
+        }
+        staged = buffer.try_borrow_data()?;
+        let len = u32_at(&staged, 40)? as usize;
+        &staged[STAGE_HEADER..STAGE_HEADER + len]
+    } else {
+        data
+    };
     let mut d = c.dispute.try_borrow_mut_data()?;
     expect_phase(&d, PH_LEAF)?;
     let present = *data.first().ok_or(err(1))?;
@@ -606,8 +691,20 @@ fn step_opening<'a>(root: &[u8], data: &'a [u8], at: &mut usize, ordinal: u64) -
 // 8: [challenger(s), run(w), template, dispute(w), executor(w), challenger_account(w)]
 // claim:u8 index:u8 spec_opening [producer_opening] [witness: n:u8 (len:u16 bytes)*]
 fn claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [challenger, run, tmpl, dispute, executor_acct, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let [challenger, run, tmpl, dispute, executor_acct, _challenger_acct, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    let staged;
+    let data: &[u8] = if data == [FROM_STAGING] {
+        let buffer = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        if staging_role(program_id, c.dispute, buffer)? != ROLE_CHALLENGER {
+            return Err(err(29));
+        }
+        staged = buffer.try_borrow_data()?;
+        let len = u32_at(&staged, 40)? as usize;
+        &staged[STAGE_HEADER..STAGE_HEADER + len]
+    } else {
+        data
+    };
     let (kind, position, present, leaf_buf, chal) = {
         let d = c.dispute.try_borrow_data()?;
         challenger_signed(&d, challenger)?;
