@@ -20,6 +20,23 @@ overflow refuses the instruction without changing program-owned state.
 
 ## 1. Opening order and authenticated facts
 
+> **Amendment (2026-10-02), for v2.1 graph runs.** The 1 to 1,024
+> `challenge_limit`, and the DPA1 outcome table that "full challenge table
+> refuses" depends on, let an executor fill every slot with its own
+> challengers. See review R1-B1 in Basanos
+> `out/runs/review-dcg-disputes-v2.1-design-2026-10-02.md`.
+>
+> Graph runs under `docs/design/optimistic-descent-v2.1.md` therefore work
+> differently:
+> - there is no cap;
+> - each dispute is its own PDA;
+> - a permissionless `ruled_prefix` cursor and `best_win` replace the table;
+> - the pot rule of §2 (the lowest-sequence challenger win) is unchanged.
+>
+> Revision 9 Basanos documents should adopt the same change before §1 is
+> implemented. This section is kept below as written, for the record.
+
+
 Each document starts with `next_challenge_sequence = 0`. At a successful
 challenge open, DCG reads that value from the validated DCM2, checks it equals
 the DPA1 policy-facts record's next value, checks the committed per-run

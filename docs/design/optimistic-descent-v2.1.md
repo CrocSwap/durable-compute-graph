@@ -1,255 +1,302 @@
-# Optimistic disputes v2.1: first-divergence disputes for graph runs (draft, revision 2)
+# Optimistic disputes v2.1: first-divergence disputes for graph runs (draft, revision 3)
 
-Status: **draft design, 2026-10-02, revision 2.** Nothing here is implemented.
+Status: **draft design, 2026-10-02, revision 3.** Nothing here is
+implemented. It replaces the root-committed descent of v2.0 (tags 220–226).
 
-It replaces the root-committed descent of v2.0 (tags 220–226). Two reviews
-shaped it, both in `out/runs/` of the Basanos repository:
-- `review-dcg-graph-v2-2026-10-02.md` found v2.0 unsound. Its items are cited
-  here as v2.0-B*n* and v2.0-S*n*.
-- `review-dcg-disputes-v2.1-design-2026-10-02.md` reviewed revision 1 of this
-  design. Its items are cited as R1-B*n*, R1-S*n*, R1-M*n* and R1-N*n*.
+Review history (reports in Basanos `out/runs/`):
+- `review-dcg-graph-v2-2026-10-02.md` found v2.0 unsound. Cited here as
+  v2.0-B*n* and v2.0-S*n*.
+- `review-dcg-disputes-v2.1-design-2026-10-02.md` reviewed revision 1. Cited
+  as R1-*.
+- `review-dcg-disputes-v2.1-rev2-2026-10-02.md` reviewed revision 2. Cited as
+  R2-*.
 
-Section 17 maps every reviewed item to the section that handles it. Numbers
-are *estimated* unless marked *measured*.
+Section 18 maps every item to its section. Numbers are *estimated* unless
+marked *measured*.
 
-The owner decided on 2026-10-02 to design this now, before more code relies on
-the v2.0 formats. The same decision folds in what Basanos needs to move onto
-it: large and variable-length runs, state, template constants and late
-outputs.
+The owner decided on 2026-10-02 to design this before more code relies on
+the v2.0 formats, and to fold in what Basanos needs: large and
+variable-length runs, state, template constants and late outputs.
 
 ## 1. Goal and properties
 
-One general mechanism by which DCG settles a disagreement about a run of any
-size. The executor commits one root. A challenger who knows the honest
-execution forces, in a logarithmic number of rounds, a ruling on one small
-fact that the program checks locally. Applications supply kernels, constants
-and economics hooks rather than building their own dispute game.
+A general mechanism by which DCG settles a disagreement about a run of any
+size:
+- The executor commits one root.
+- A challenger who knows the honest execution H forces, in a logarithmic
+  number of rounds, a ruling on one small fact that the program checks
+  locally.
 
-**Properties** (each is tested; see section 15):
+Applications supply kernels, constants and economics hooks. They do not
+build their own dispute game.
 
-- **P-sound.** Suppose the committed root differs in any byte from the root
-  of the honest execution H. Then an honest challenger who opens before the
-  challenge deadline and submits in time wins, whatever the executor does.
-  The challenger needs the run's external input bytes, which section 4.4
-  makes available.
+**Properties** (each tested; see section 16):
+
+- **P-sound.** If the committed run root differs in any byte from H's, an
+  honest challenger wins whatever the executor does. The challenger must
+  open before the challenge deadline and submit in time. It relies on the
+  availability conditions of section 4.4.
 - **P-complete.** An honest executor who submits in time never loses a
-  dispute, whatever challengers do.
+  dispute, whatever challengers do. Section 10.2 makes "in time" bounded per
+  open: every extra concurrent open extends the executor's deadlines (R2-B5).
 - **P-local.** Every check reads a bounded number of fixed-size records and
   logarithmic paths. Nothing decodes a whole graph or plan. Every witness
-  fits a staging buffer of a size declared at admission, and every check fits
-  a declared compute budget.
+  fits a staging buffer of a size declared at admission. Every check fits a
+  declared compute budget.
 - **P-rounds.** For a step tree of height `h` and reveal depth `d`, a dispute
   takes at most `ceil(h/d) + 3` submissions by each party.
-- **P-live.**
-  - Nobody can stop another challenger from opening or from finishing.
-  - Every record reaches a terminal state, and all rent and bonds are
-    released, within a bounded time after the challenge deadline.
-- **P-bound.**
-  - A final run's outputs are bound to the committed root: anyone may post
-    an output value with its proof, at any time.
-  - A *refuted* run has no result. That is not the honest result: an
-    executor can always choose to be refuted. The payer needs a re-run path,
-    which section 10 gives.
+- **P-live.** No one can stop another challenger from opening or finishing.
+  Every record reaches a terminal state, and all rent and bonds are released.
+  Finality comes within `challenge_window + D(N)` slots of the commit, where
+  `N` is the number of disputes opened. `D` is linear in `N` and fixed at
+  admission. Every open is paid for by a bond.
+- **P-bound.** A final run's outputs are bound to its root. Anyone may post
+  an output with its proof once the run is final. A refuted run has no
+  result. It does not have the honest result either, because an executor can
+  always choose to be refuted. The payer has a re-run path (section 10.2).
 
-## 2. What changes, in brief
+## 2. Changes in brief
 
-- **First-divergence.**
-  - The executor commits one ordered step tree, in topological order, of
-    fixed shape.
-  - The challenger descends to the leftmost child whose hash differs from
-    H's. That lands on the first divergent leaf, and every earlier leaf is
-    then honest.
-  - That leaf is refuted locally, by one of the claims in section 7: SHAPE,
-    EDGE, GATE, STATE or STEP.
-  - Regions carry no soundness weight. v2.0 failed because it relied on them
-    (v2.0-B2, B4 and B7).
+- **First divergence.**
+  - The executor commits one step tree in topological order. Its shape is
+    fixed by the template.
+  - The challenger descends to the leftmost pickable child whose hash
+    differs from H's. It lands on the first divergent leaf, and every earlier
+    leaf is then honest.
+  - That leaf is refuted by one local claim: SHAPE, EDGE, GATE, STATE or
+    STEP.
+  - Regions carry no soundness weight.
 - **Generated structure.**
-  - A plan is a sequence of *segments*. Each segment is either enumerated
-    (an explicit step list, for traced graphs) or repeated (a body of steps
-    unrolled up to a template bound `K`).
-  - Each iteration of a repeated segment is gated by a value computed
-    earlier, and an absent iteration is a constant empty subtree. Size is
-    therefore fixed by the template and never depends on data.
-  - The dispute spec of a repeated segment is generated from its body at
-    dispute time. It is never enumerated (R1-M1, R1-M2, R1-S7).
-- **State.**
-  - Steps may carry state along explicit state chains, and a STATE claim
-    checks each link (R1-B5).
-  - Large state is chunked. An append-only log covers key and value caches
-    and family accumulators (R1-M5).
-- **Template constants.** Large immutable inputs, such as model weights,
-  are bound in the template identity. They are not chosen per run (R1-M3).
-- **Outputs.** The output tree's root is committed at `COMMIT`. Values are
-  posted later with proofs, and `OUT_DESCEND` finds a divergent output
-  (R1-M4).
+  - A plan is a list of *blocks*. Each block is either enumerated (an
+    explicit step list) or repeated (a body unrolled up to a bound `K` and
+    gated per iteration).
+  - Absent iterations are empty subtrees. The address map is fixed by the
+    template.
+  - Specs for repeated blocks are generated at dispute time. They are never
+    enumerated.
+- **State.** Explicit state chains, with a STATE claim. There are three
+  schemes: SMALL, LOG and CHUNKED. LOG and CHUNKED are fixed-capacity trees,
+  so no MMR is needed. A step may export its state as a value for other
+  steps to read.
+- **Constants.** Large immutable inputs are bound in the template ID. They
+  may be resident on chain, or committed and held off chain (R2-B6).
+- **Outputs.** The output tree root is committed at `COMMIT`. Values are
+  posted with proofs after finality. `OUT_DESCEND` refutes a divergent
+  output.
 
-The frozen v2.0 bytes that do not change are listed in section 12.
+Unchanged frozen bytes are listed in section 12.
 
-## 3. Structure: plans of segments
+## 3. Structure: plans of blocks
+
+DCPL already uses "segment" for a per-region step run, and the leaf
+coordinate's `segment_id` keeps that meaning. This design calls its
+top-level units **blocks** (R2-S11.7).
 
 ### 3.1 Steps, values and producers
 
 A **step** runs one kernel invocation:
-- inputs: at most 8 *values*;
-- parameters: one node parameter block;
-- state: optionally, one prior state;
-- results: its output values and, if stateful, a next state.
+- on at most 8 input *values*;
+- with one node parameter block;
+- optionally with one prior state;
+- producing at most 8 output values and, if stateful, a next state.
 
-Each value has exactly one **producer**:
+Each value has exactly one producer:
 
 | Kind | Producer | Bound by |
 |---|---|---|
-| 1 | an output port of an earlier step | the step tree |
-| 2 | an external input of the run | the run ID (section 12) |
-| 3 | a template constant | the template ID (section 12) |
+| 1 | an output port of an earlier step (absolute ordinal) | the step tree |
+| 2 | an external input of the run | the run ID |
+| 3 | a template constant | the template ID |
+| 4 | an output port of a body entry at a relative iteration (repeated blocks) | the step tree |
+| 5 | one chunk of a chunked external input or constant, indexed by the iteration | the run or template ID |
+| 6 | an output port of a body entry in the **last running iteration** of an earlier repeated block | the step tree and gates |
+| 7 | the iteration index `i`, as a `u32` value (repeated blocks; R2-N5) | the spec |
 
-A step with state names its **state predecessor**: the earlier step whose
-next state is its prior state. Alternatively, it names a state *initial
-value*, which is a producer of kind 2 or 3.
+A stateful step names a **state predecessor**. That is either a kind 1 or
+kind 4 producer whose next state is its prior state, or an **initial value**
+of kind 2 or kind 3.
 
-### 3.2 Enumerated segments
+### 3.2 Enumerated blocks
 
-An enumerated segment lists its steps explicitly. A traced graph lowers to
-one enumerated segment, from its canonical DCGG and DCPL. The frozen profile
-limits it to 16,384 steps, and its spec is derived at admission (section
-5.3).
+An enumerated block is an explicit list of at most 16,384 steps, the frozen
+profile ceiling. A traced graph lowers to one enumerated block, taken from
+its canonical DCGG and DCPL.
 
-### 3.3 Repeated segments
+### 3.3 Repeated blocks
 
-A repeated segment has three parts:
-- a **body**, a list of at most 16,384 step templates;
-- a **bound** `K`, the number of iterations, at most 2^32 − 1;
-- a **gate**, which decides whether each iteration runs.
+A repeated block has:
+- a **body** of at most 16,384 step templates;
+- a **bound** `K`, from 1 to 2^32 − 1;
+- a **gate**: body entry `g`, output port `q`.
 
-**Step templates.** A step template is a step spec in which producers may be
-*relative*:
-- `(kind 4, body entry e, port b, lag l)` means "output port `b` of body
-  entry `e` in iteration `i − l`", with `l ≥ 1`, or `l = 0` when `e` is
-  earlier in the body;
-- `(kind 5, external or constant id, chunk = i × stride + offset)` means "a
-  chunk of a chunked input, indexed by the iteration". It covers inputs such
-  as prompt tokens by position.
+The gate port must be a scalar `i32` (scalar code 5), rank 0 and
+`byte_length = 4` (R2-S1).
 
-State predecessors may be relative in the same way. "The key and value cache
-of the previous iteration" is the state at lag 1.
+**Iterations.**
+- Iteration 0 always runs.
+- Iteration `i ≥ 1` runs only if iteration `i − 1` runs and its gate value
+  (the little-endian `i32` of entry `g`, port `q`) is nonzero.
+- Gating is therefore monotone: once an iteration is off, every later one is
+  off.
+- In a running iteration every step runs. In an off iteration every step's
+  leaf is `EMPTY_LEAF`.
 
-**Gate.** Iteration `i ≥ 1` runs if and only if the gate value is nonzero.
-The gate value is one designated i32 output of a designated body entry in
-iteration `i − 1`. Iteration 0 always runs.
-- Once an iteration is gated off, every later iteration is off.
-- In an iteration that runs, every step runs.
-- In an iteration that is off, every step leaf is the constant `EMPTY_LEAF`.
+The unrolled DAG has fixed size `K × body_len`. Gating only masks it, so D9
+("no graph loops") holds.
 
-A stop rule is a body kernel whose output is "continue". The run's
-effective length is data, not structure, so D9's "no graph loops" holds: the
-unrolled DAG has a fixed size `K × |body|`, and gating only masks it.
+**Relative producers.**
+- **Kind 4** `(e', port, lag l)` reads entry `e'`'s port in iteration
+  `i − l`, where `l ≥ 1`, or `l = 0` when `e' < e`.
+- When `i < l`, the input takes its **initial** producer instead (5.1). That
+  is kind 2, 3 or 7, or kind 1 with an ordinal before the block (R2-S2).
 
-**Admission checks.** Admission checks a repeated segment's body once:
-- every relative producer points backwards in the order (iteration, body
-  index);
-- every chunk index fits its declared chunked value for every `i < K`;
-- the per-iteration subtree has a fixed shape.
+**Admission checks** (R2-S3). All are linear in the body, so none needs
+enumeration:
+- Every relative producer points backwards in `(iteration, body index)`.
+- Every kind 1 producer named inside a body has `ordinal < block base`.
+- **No absolute reference into a repeated block from outside it** (R2-B4).
+  A kind 1 producer or predecessor naming an ordinal inside repeated block
+  `B` is refused unless the consumer is in `B`'s own body. Reads of a
+  repeated block from later blocks use kind 6.
+- Every kind 5 chunk index `i × stride + offset`, at `i = K − 1`, computed
+  in `u64`, stays inside the chunked value. It must also avoid the short
+  last chunk unless the consumer header is the short length (R2-S4).
+- **Headers agree.** For every producer, the consumer's expected 23-byte
+  header agrees with the producer's header in bytes 7..23.
+- **No forks.** Each `(e', state output)` is named as a state predecessor by
+  at most one body entry, with one lag.
+- **Capacity.** `Σ blocks capacity ≤ 2^40`, checked in `u64`. At most 64
+  blocks.
 
-These checks make the unrolled order topological without enumerating it.
+### 3.4 Kind 6: last running iteration
 
-**Ceilings.** A template's total step capacity `Σ segments` is at most
-2^40. The frozen 16,384 limit applies to each enumerated segment and to each
-body. Raising a ceiling this way is a profile change (section 12).
+Kind 6 `(block B, entry e', port b)` names entry `e'`'s port in the last
+iteration `t` of `B` that runs. The consumer must come after `B`. Its honest
+value is always defined, because iteration 0 always runs. Section 7.3 gives
+its claim rule.
 
 ## 4. Values, state and availability
 
 ### 4.1 Plain values
 
-A plain value's digest is the frozen value digest:
-`SHA256("dcg.value.v2\0" || bytes)`. Its `ValueRefV1` header gives its
-layout, scheme, versions and length.
+The digest is the frozen `SHA256("dcg.value.v2\0" || bytes)`.
 
-### 4.2 Chunked values (required)
+### 4.2 Chunked values (R2-S4, R2-S5)
 
-A value whose layout declares `chunked(chunk_bytes)` has a different digest.
-It is the root of a tree over its chunks:
-- each chunk leaf is `SHA256("dcg.chunk.leaf.v2.1\0" || index:u64 || chunk)`;
-- the tree has the shape of section 6.2, so it is padded with
-  `EMPTY_CHUNK`;
-- the last chunk may be short, and the declared `byte_length` fixes its
-  length.
+**Registration.**
+- A new registered layout, `layout_id = 3` (chunked), is a profile change.
+- `layout_version = v` fixes `chunk_bytes = 2^v`, for `6 ≤ v ≤ 16`.
+- The port header's `byte_length` is the whole value's length.
+- The last chunk is short when `byte_length` is not a multiple of
+  `chunk_bytes`.
 
-A kernel that reads a chunked value receives *chunk openings*: the chunk
-with its path. A STEP witness carries only the chunks the honest kernel
-reads. Replay refuses if it reaches a chunk the witness lacks. This holds
-for data-dependent reads too, such as embedding rows chosen by token: the
-honest challenger knows H, so it knows which chunks are read.
+**Digest.** The value digest is the root of a v2.1 tree (section 6) over
+`ceil(byte_length / chunk_bytes)` chunk leaves, each
+`SHA256("dcg.chunk.leaf.v2.1\0" || index:u64 || chunk bytes)`. The empty
+leaf is `EMPTY_CHUNK`.
 
-### 4.3 State
+**Kind 5 inputs.** A kind 5 input is one chunk read as a plain value. Its
+input digest is the plain value digest of the chunk bytes. Its header
+`byte_length` is the chunk length.
 
-A state scheme is declared per node and committed in the spec:
+**Chunk openings.** A kernel reading a chunked input receives chunk
+openings, each a chunk plus its path. The STEP witness carries exactly the
+chunks the honest kernel reads, including data-dependent reads (C knows H).
+Replay refuses on a missing chunk.
 
-| Scheme | State digest | Prior state supplied to replay |
-|---|---|---|
-| `SMALL` (at most 4 KiB) | value digest of the state bytes | the bytes |
-| `LOG(entry_bytes)`, append-only | `SHA256("dcg.log.v2.1\0" || length:u64 || mmr_root)` over entries | the chunk openings it reads, plus the log's peaks for appending |
-| `CHUNKED(chunk_bytes)`, random access | chunked-value digest of the state image | the chunk openings it reads and writes |
+### 4.3 State (R2-S6)
 
-Replay computes the next state digest from the prior digest, the openings
-and the kernel's writes:
-- a `LOG` appends;
-- a `CHUNKED` state recomputes the root along each written path.
+| Scheme | Declared in `StepSpec` | Digest | Replay is given |
+|---|---|---|---|
+| SMALL | `state_bytes ≤ 4,096` | plain value digest of the bytes | the bytes |
+| LOG | `entry_bytes`, `capacity` (entries) | `SHA256("dcg.log.v2.1\0" || length:u64 || root)`, where `root` is the v2.1 tree over `capacity` entry leaves `SHA256("dcg.log.entry.v2.1\0" || index:u64 || entry)` with empty slots `EMPTY_LOG` | the entries it reads with their paths, and for each appended slot its (empty) path |
+| CHUNKED | `chunk_bytes`, `state_bytes` (fixed image length) | the chunked-value digest of the image | the chunks it reads or writes, with their paths |
 
-Basanos's key and value cache, and its family summaries, are `LOG` state
-(R1-M5). Range reads are chunk openings against the prior log.
+- **Fixed capacity.** LOG and CHUNKED trees have fixed capacity. An append
+  or a write recomputes the root along each touched path, so no peaks and no
+  MMR are needed (R2-N6).
+- **Empty initial state.** Each scheme's empty state is defined:
+  - SMALL: `state_bytes` zero bytes;
+  - LOG: length 0, all slots `EMPTY_LOG`;
+  - CHUNKED: an all-zero image.
 
-### 4.4 Availability
+  `EMPTY_STATE(spec)` is its digest. An initial value of kind 2 or 3 must
+  have the scheme's layout and size, which admission checks.
+- **Chains.** Every stateful step has nonzero prior and next digests. The
+  first step of a chain takes its prior from the initial producer, or from
+  `EMPTY_STATE`. A decomposition's sub-steps form one chain in the same way.
+  The last sub-step's next state may be exported (below) or simply end.
+- **State export** (non-chain reads). A stateful step may declare one output
+  port as its *state export*. It has the state's layout:
+  - layout 3 for CHUNKED;
+  - layout 4 (registered, "log") for LOG;
+  - the SMALL layout for SMALL.
 
-P-sound requires the challenger to compute H. It therefore needs:
-- the run's external input bytes;
-- the template constants;
-- the published plan.
+  Its digest must equal `next_state_digest`, and SHAPE checks this. Other
+  steps then read the state as an ordinary chunked input with chunk
+  openings. This is how Basanos family consumers read family logs.
 
-Admission requires each template constant to be stored on chain in sealed
-blobs. `init_run` requires each external input either to be posted to the
-run's input account in full, or, for a chunked input, its chunks to be
-posted to a run-owned chunk account before the challenge window opens. A
-run whose inputs are not fully posted cannot be committed (R1-S3). The
-executor's commitment needs no publication: the game reveals it on demand.
+### 4.4 Availability (R2-B6, R2-S10)
+
+P-sound requires C to compute H inside the challenge window. Admission and
+init enforce these preconditions:
+
+1. **External inputs.**
+   - The run does not count as `INPUTS_COMPLETE` until every external input
+     has been posted on chain and verified against its digest:
+     - a plain input is posted in full;
+     - a chunked input is posted chunk by chunk, with a cursor that
+       recomputes the root.
+   - The commit deadline starts at `INPUTS_COMPLETE`, not at `init_run`.
+2. **Constants.** Each constant is one of two kinds:
+   - **resident**: stored in sealed blobs, checked against its digest at
+     admission;
+   - **committed**: only its digest is in `constants_root`, and the
+     template names a content-addressed availability source. The source is a
+     `source_kind:u8` plus a 32-byte locator.
+
+   For a committed constant, P-sound rests on that source. Section 1 states
+   that, and Basanos 27B weights are of this kind.
+3. **Time.** The template declares `honest_compute_slots`, an upper bound on
+   the time to compute H. Admission requires `challenge_window ≥
+   honest_compute_slots + phase_window`.
+
+The executor's own commitment needs no publication. The game reveals it on
+demand.
 
 ## 5. Dispute spec (`DCDS`)
 
 ### 5.1 Records
 
-All integers are little-endian. All reserved bytes are zero.
+All integers are little-endian, and all reserved bytes are zero. Each record
+below gives its byte length.
 
-**Port header.** The expected `ValueRefV1` header, minus the digest, is 23
-bytes: `node_id:u32 direction:u8 port_id:u16 layout_id:u32
-layout_version:u16 scheme_id:u32 scheme_version:u16 byte_length:u32`.
-- A port's `scheme_id` and `scheme_version` are those of the **producer's**
-  region.
-- An external input's scheme is the root region's.
-- A constant's scheme is declared with the constant.
+**Port header (23 bytes).**
+`node_id:u32 direction:u8 port_id:u16 layout_id:u32 layout_version:u16
+scheme_id:u32 scheme_version:u16 byte_length:u32`.
+- `scheme` is the producer's region scheme. For external inputs it is the
+  root region's. For constants it is declared with the constant.
 
-The spec fixes the header exactly, so SHAPE, EDGE and OUT compare all 23
-bytes (R1-B4).
+**Producer (24 bytes).**
+`kind:u8 reserved:u8[3] a:u64 b:u32 c:u32 d:u32`:
 
-**Producer.** A producer is 24 bytes:
+| Kind | a | b | c | d |
+|---|---|---|---|---|
+| 1 | ordinal | port | 0 | 0 |
+| 2 | external id | 0 | 0 | 0 |
+| 3 | constant id | 0 | 0 | 0 |
+| 4 | body entry | port | lag | 0 |
+| 5 | input or constant id | 2 or 3 | stride | offset |
+| 6 | block index | port | body entry | 0 |
+| 7 | 0 | 0 | 0 | 0 |
 
-```
-kind:u8 reserved:u8[3] a:u64 b:u32 lag_or_stride:u32 offset:u32
-```
-
-- Kind 1: `a` = ordinal, `b` = port.
-- Kind 2: `a` = external id.
-- Kind 3: `a` = constant id.
-- Kind 4: `a` = body entry, `b` = port, `lag_or_stride` = lag.
-- Kind 5: `a` = chunked input id, `b` = 2 (external) or 3 (constant),
-  `lag_or_stride` = stride, `offset` = offset.
-- Unused fields are zero.
-
-**`StepSpec`.** At most 8 inputs and 8 outputs:
+**`StepSpec` (at most 1,024 bytes).**
 
 | Bytes | Field |
 |---|---|
 | `0..4` | magic `DSS1` |
 | `4..8` | region_id:u32 |
-| `8..12` | segment_id:u32 |
+| `8..12` | dcpl_segment_id:u32 |
 | `12..16` | node_id:u32 |
 | `16..20` | kernel_step:u32 |
 | `20..36` | kernel_id:[16] |
@@ -259,499 +306,535 @@ kind:u8 reserved:u8[3] a:u64 b:u32 lag_or_stride:u32 offset:u32
 | `44..46` | decomposition_version:u16 |
 | `46..48` | reserved |
 | `48..56` | max_cu:u64 |
-| `56..88` | parameter_digest:[32] (`SHA256("dcg.params.v2.1\0" || layout_id:u32 || layout_version:u16 || length:u32 || bytes)`; zero for an empty block) |
-| `88..120` | port_shapes_digest:[32] (SHA-256 of the node's canonical DCGG port records, so replay knows scalar type, rank and dimensions) |
-| `120` | state_scheme:u8 (0 none, 1 SMALL, 2 LOG, 3 CHUNKED) |
-| `121..124` | reserved |
-| `124..128` | state_parameter:u32 (entry or chunk bytes) |
-| `128..152` | state_predecessor: producer (kind 1 or 4 for a previous step; kind 2 or 3 for an initial value) |
-| `152` | input_count:u8 |
-| `153` | output_count:u8 |
-| `154..160` | reserved |
-| `160..` | inputs: `input_count` × (port header 23 + producer 24 + reserved 1) |
-| then | outputs: `output_count` × (port header 23 + reserved 1) |
+| `56..88` | parameter_digest:[32] = `SHA256("dcg.params.v2.1\0" || layout_id:u32 || layout_version:u16 || length:u32 || bytes)`, or all zero for an empty block |
+| `88..120` | port_shapes_digest:[32] (below) |
+| `120` | state_scheme:u8: 0 none, 1 SMALL, 2 LOG, 3 CHUNKED |
+| `121` | state_export_port:u8 (`0xFF` for none) |
+| `122..124` | reserved |
+| `124..128` | state_unit:u32 (`entry_bytes` or `chunk_bytes`; 0 for SMALL) |
+| `128..136` | state_size:u64 (`state_bytes`, or `capacity` for LOG) |
+| `136..160` | state_predecessor: producer |
+| `160..184` | state_initial: producer (kind 2, 3, or 0 for `EMPTY_STATE`) |
+| `184` | input_count:u8 |
+| `185` | output_count:u8 |
+| `186..192` | reserved |
+| `192..` | inputs: `input_count` × 72 bytes = port header 23 + producer 24 + initial producer 24 + reserved 1 |
+| then | outputs: `output_count` × 24 bytes = port header 23 + reserved 1 |
 
-**Other records.**
-- **`OutSpec(j)`.** `j` is the rank in `external_id` order (R1-N8). The
-  record is a port header plus a producer of kind 1 or 4, plus, in a
-  repeated segment, the iteration it reads.
-- **`InSpec(id)` and `ConstSpec(id)`.** A port header plus a chunk size
-  (zero for a plain value). `ConstSpec` adds the constant's digest.
-- **`SegmentSpec`.**
-  - Its kind: enumerated or repeated.
-  - The ordinal base, the step count (for a repeated segment, `K ×
-    body_len`) and `K`.
-  - The gate's body entry and port.
-  - The digest of its body table or enumerated records.
-- **`RegionSpec`.** Region id, parent, mode, and scheme and layout ids and
-  versions.
+The largest record (8 in, 8 out) is 192 + 576 + 192 = 960 bytes.
 
-### 5.2 Spec root
+`port_shapes_digest` is `SHA256("dcg.ports.v2.1\0" || records)`. `records`
+are the node's DCGG port records, each without its `u32` length prefix,
+ordered by `(direction, port_id)`. The source graph is:
+- for enumerated blocks, the template's DCGG;
+- for repeated blocks, the block's body DCGG (R2-S11.4).
 
-The spec is a tree over its records in this order:
+**Body entry.** A body entry is a `StepSpec` with magic `DSB1`, in which
+producers may be of kinds 4, 5, 6 and 7. Its `ordinal` is implicit.
+
+**`BlockSpec` (96 bytes).**
+`magic "DBK1" kind:u8 (1 enumerated, 2 repeated) reserved:u8[3]
+base_ordinal:u64 step_count:u64 K:u32 body_len:u32 gate_entry:u32
+gate_port:u16 reserved:u16 first_record:u64 record_count:u64
+address_base:u64 address_height:u8 reserved:u8[7] body_graph_id:[32]`.
+- For an enumerated block, `step_count = record_count` and
+  `K = body_len = 0`.
+- For a repeated block, `step_count = K × body_len` and
+  `record_count = body_len`.
+- `first_record` is the spec-tree leaf index of the block's first `StepSpec`
+  or body entry (R2-S11.3).
+- `address_base` and `address_height` place the block in the address map
+  (6.2).
+
+**`InSpec` (40 bytes).**
+`magic "DIN1" external_id:u32 header:[23] reserved:u8 chunk_log2:u8
+reserved:u8[7]`.
+
+**`ConstSpec` (112 bytes).**
+`magic "DCN1" constant_id:u32 header:[23] residency:u8 (1 resident,
+2 committed) source_kind:u8 reserved:u8[7] digest:[32] locator:[32]`.
+
+**`OutSpec` (56 bytes).**
+`magic "DOU1" reserved:u32 header:[23] reserved:u8 producer:[24]`.
+- The producer is kind 1 or kind 6.
+- `j` is the rank in DCGG `external_id` order.
+
+**`OutBlockSpec` (64 bytes)** (R2-S11.8, S11.9). This is for outputs
+produced in every iteration of a repeated block.
+`magic "DOB1" block:u32 entry:u32 port:u16 reserved:u16 header:[23]
+reserved:u8 first_out_index:u64 reserved:u8[8]`.
+- It generates `K` out entries `first_out_index + i`, each with kind 1
+  producer `base + i × body_len + entry`.
+- When iteration `i` is off, its out entry is `EMPTY_OUT`.
+
+**`RegionSpec` (32 bytes).**
+`magic "DRG1" region_id:u32 parent:u32 mode_id:u32 mode_version:u16
+scheme_id:u32 scheme_version:u16 layout_id:u32 layout_version:u16
+reserved:u16`.
+
+**Spec header (48 bytes).**
+`magic "DCS1" version:u16 reserved:u16 block_count:u32 const_count:u32
+in_count:u32 out_count:u32 out_block_count:u32 region_count:u32
+total_steps:u64 total_outputs:u64`.
+- `total_outputs` counts generated outputs too.
+- The counts are of stored records only.
+
+### 5.2 Spec tree and generation
+
+The spec tree's leaves, in order:
 1. the header;
-2. the `SegmentSpec` records;
-3. the `ConstSpec`, `InSpec`, `OutSpec` and `RegionSpec` records;
-4. per segment, its body table (repeated) or its `StepSpec` records
-   (enumerated).
+2. `BlockSpec` × `block_count`;
+3. `ConstSpec`, `InSpec`, `OutSpec`, `OutBlockSpec` and `RegionSpec`, each
+   by id or index;
+4. then per block, in order, its `StepSpec` records (enumerated) or body
+   entries (repeated).
 
-It has the shape of section 6.2. The header holds the count of each record
-type, so every record's position can be computed. Its layout:
+Body tables live only here (R2-S11.2). Each leaf is
+`SHA256("dcg.spec.leaf.v2.1\0" || type:u8 || record)`, with these type codes:
 
-```
-magic "DCS1"
-version:u16
-reserved:u16
-segment, const, in, out and region counts: u32 each
-total_steps:u64
-tree_shape:u8 (section 6.2)
-reveal_depth:u8
-reserved:u16
-```
+| Code | Record |
+|---|---|
+| 1 | header |
+| 2 | `BlockSpec` |
+| 3 | `ConstSpec` |
+| 4 | `InSpec` |
+| 5 | `OutSpec` |
+| 6 | `OutBlockSpec` |
+| 7 | `RegionSpec` |
+| 8 | `StepSpec` |
+| 9 | body entry |
 
-Each leaf is `SHA256("dcg.spec.leaf.v2.1\0" || type:u8 || record)`.
-`spec_root` is the tree's root.
+The tree has the shape of section 6. Its root is `spec_root`.
 
-**Repeated segments.** `StepSpec(k)` for ordinal `k` in a repeated segment
-is computed at dispute time:
+**Generating `StepSpec(k)`.** For ordinal `k` in repeated block `B`:
 1. Write `k = base + i × body_len + e`.
-2. Open body entry `e` of the segment's body table.
-3. Resolve its relative producers for iteration `i`:
-   - kind 4 with lag `l` becomes kind 1 at ordinal `base + (i − l) ×
-     body_len + e'`, or, when `i < l`, the declared initial producer;
-   - kind 5 becomes a chunk index.
-
-The spec for 10^6 Basanos op entries is therefore its body table plus a few
-records, not 10^6 records.
+2. Open body entry `e` at leaf `first_record + e`.
+3. Resolve each producer:
+   - kind 4 with lag `l` becomes kind 1 at `base + (i − l) × body_len + e'`
+     if `i ≥ l`. Otherwise it becomes the entry's initial producer;
+   - kind 5 becomes the chunk at `i × stride + offset`;
+   - kind 7 becomes the value `i`;
+   - kind 6 is unchanged; 7.3 handles it.
+4. Resolve state predecessors in the same way.
 
 ### 5.3 Derivation and admission
 
-The derivation is a pure function. Its inputs are:
-- for enumerated segments, the canonical DCGG and DCPL;
-- for repeated segments, a canonical *body plan* (a DCPL whose steps are the
-  body, plus the relative-producer table).
+The derivation is a pure function of:
+- the canonical DCGG and DCPL (enumerated blocks);
+- the canonical body plans and their DCGGs (repeated blocks);
+- the constant and input declarations.
 
-It refuses each of the following:
+It refuses:
 - a non-topological order;
-- an output port listed by more than one step;
+- an output port produced by more than one step;
 - more than 8 inputs or outputs on a step;
-- a relative producer that points forward;
-- a chunk index out of range;
+- any failure of the 3.3 checks;
 - a state chain that forks;
-- a node with `kernel_step > 1` unless its decomposition is declared and the
-  state chain links its sub-steps.
+- `kernel_step > 1` without a declared decomposition chain;
+- a `max_cu` above the program's replay budget (O2).
 
-**Admission.** An admission cursor computes `spec_root` over several
-transactions. It keeps a scratch account holding:
-- the producer index for enumerated segments, mapping
-  `(node, port) → ordinal`;
-- a streaming Merkle frontier.
+An admission cursor computes `spec_root` over several transactions. It keeps
+a scratch producer index and a streaming tree frontier. Enumerated blocks
+cost at most 16,384 steps each (*estimated*: under 30 transactions). Repeated
+blocks cost their body.
 
-Enumerated segments are bounded by 16,384 steps, so the work is bounded
-(*estimated*: under 30 transactions at 16,384 steps). A Basanos template's
-cost is its body.
+R1-S7's alternative was to derive the spec at dispute time from indexed DCGG
+and DCPL. It is rejected: repeated blocks need a committed body table anyway,
+and the frozen DCPL cannot express repetition.
 
-The alternative R1-S7 proposed was to index the sealed DCGG and DCPL and
-derive specs at dispute time. That is rejected. Repeated segments need a
-committed body table anyway, and the frozen DCPL cannot express repetition.
-A single derived root also keeps the referee independent of shard layout.
+## 6. Tree shape and addressing (replaces duplicate-last for v2.1)
 
-## 6. Commitments
+### 6.1 Trees
 
-### 6.1 Step leaf
+Every v2.1 tree has the same shape: the step tree, out tree, chunk trees,
+LOG and CHUNKED trees, and the spec tree.
 
-The frozen v2.0 step-leaf preimage (graph-plan-v2 §5) is unchanged:
-- plan id and run id;
-- region and coordinate, with `ordinal:u64`, so 2^40 fits;
-- input and output `ValueRefV1` lists, sorted by port key;
-- `prior_state_digest` and `next_state_digest`.
+- A tree of **capacity** `2^H` has leaf positions `0..2^H`.
+- A node at level `l` (leaves are level 0) is
+  `SHA256(domain || l:u16 || left || right)`.
+- An empty subtree at level `l` has the constant `EMPTY_t[l]`:
+  - `EMPTY_t[0]` is the tree type's empty leaf;
+  - `EMPTY_t[l+1] = node(l, EMPTY_t[l], EMPTY_t[l])`.
+- A tree of capacity 1 has its root equal to its single leaf.
+- A tree over `n` leaves uses `H = ceil(log2 max(n, 1))`, with positions
+  `≥ n` empty.
 
-For a stateless step, both state digests are zero. A leaf with 8 inputs and
-8 outputs is 1,040 bytes (*estimated* from the encoding).
+The domains and empty leaves, all `SHA256` of the ASCII string with a
+trailing zero byte (R2-S1, R2-S11.5):
 
-`EMPTY_LEAF = SHA256("dcg.leaf.empty.v2.1\0")` is the leaf of a gated-off
-step.
+| Tree | Node domain | Empty leaf |
+|---|---|---|
+| step | `dcg.trace.node.v2.1` | `EMPTY_LEAF = SHA256("dcg.leaf.empty.v2.1\0")` |
+| out | `dcg.out.node.v2.1` | `EMPTY_OUT = SHA256("dcg.out.empty.v2.1\0")` |
+| chunk | `dcg.chunk.node.v2.1` | `EMPTY_CHUNK = SHA256("dcg.chunk.empty.v2.1\0")` |
+| log | `dcg.log.node.v2.1` | `EMPTY_LOG = SHA256("dcg.log.empty.v2.1\0")` |
+| spec | `dcg.spec.node.v2.1` | `EMPTY_SPEC = SHA256("dcg.spec.empty.v2.1\0")` |
 
-### 6.2 Tree shape (replaces duplicate-last for v2.1 trees)
+An out-tree leaf is `SHA256("dcg.out.leaf.v2.1\0" || index:u64 ||
+ValueRefV1[55])`.
 
-Every v2.1 tree has the same shape: the step tree, the out tree, the chunk
-trees, log MMR peaks bagged into a fixed tree, and the spec tree. Its rules:
+### 6.2 The step tree's address map (R2-B2)
 
-- **Leaves.** A tree over `n` leaves has `2^ceil(log2 n)` leaf positions.
-  Positions `≥ n` hold the empty constant of that tree type. There is no
-  duplication rule, so R1-B8 does not arise.
-- **Nodes.** A node is `SHA256(domain || level:u16 || left || right)`, with
-  a per-tree domain:
-  - `dcg.trace.node.v2.1\0` for the step tree;
-  - `dcg.out.node.v2.1\0` for the out tree (R1-N4);
-  - `dcg.chunk.node.v2.1\0` for chunk trees;
-  - `dcg.spec.node.v2.1\0` for the spec tree.
-- **Empty subtrees.** An all-empty subtree at level `l` has the constant
-  `EMPTY[l]`, defined by `EMPTY[l+1] = node(l, EMPTY[l], EMPTY[l])`.
-- **Two-level shape** (`tree_shape = 1`). The step tree is a top tree whose
-  leaves are per-segment subtrees, and each segment's subtree is in turn:
-  - enumerated: a tree over its steps;
-  - repeated: a top tree over `K` iteration subtrees, each a tree over
-    `body_len` leaves.
+Each block occupies an aligned range of leaf positions:
 
-  An executor can land iteration roots as it goes, as Basanos lands
-  position roots, and seal the top at `COMMIT`.
-- **Off iterations.** An iteration that is gated off has the subtree
-  `EMPTY[h_body]`. An executor who stops at iteration `s` commits empties
-  for every later iteration without hashing them.
+- **Enumerated block.** It occupies `2^a` positions, `a =
+  ceil(log2 step_count)`. Ordinal `base + r` sits at position
+  `address_base + r`.
+- **Repeated block.** It occupies `2^(hk + hb)` positions, `hb =
+  ceil(log2 body_len)` and `hk = ceil(log2 K)`. Ordinal `base + i ×
+  body_len + e` sits at position `address_base + (i << hb) + e`.
+- **Placement.** Blocks are placed in block order. Each block's
+  `address_base` is the smallest multiple of its own size at or after the
+  previous block's end. Its size is `2^address_height`.
+- **The whole tree.** It has capacity `2^H`, the smallest power of two
+  covering the last block's end. Levels count from the global leaf layer.
+- **Step positions.** A leaf position is a *step position* if it is the
+  address of some ordinal `< total_steps`. Every other position is
+  *padding*, which is always `EMPTY_LEAF`.
 
-The shape is a pure function of the spec header and segment records. The
-tree's height `h` is fixed per template.
+The map is a pure function of the `BlockSpec` records. Two blocks never
+share an internal node below their alignment level. An iteration of a
+repeated block is an aligned subtree of height `hb`.
 
-### 6.3 Run root
+**Landing.** The executor may land iteration roots as it goes, using
+`LAND_SUBTREE`. Landed roots are **informational only** (R2-S7):
+- they are write-once per `(block, iteration)`;
+- they are never used by the descent;
+- they are never inserted into the reveal cache.
+
+`COMMIT` posts only the root.
+
+### 6.3 Run root (R2-B3)
 
 ```
-RunRootV21 =                                   ; 180 bytes
+RunRootV21 =                                   ; 172 bytes
   plan_id[32] run_id[32] spec_root[32]
   total_steps:u64
   step_tree_root[32]
-  out_count:u32
+  total_outputs:u32
   out_tree_root[32]
-  effective_iterations:u32                     ; repeated segments: last running iteration + 1, else 0
-  reserved:u32
 run_root = SHA256("dcg.run.root.v2.1\0" || RunRootV21)
 ```
 
-The run root fixes `effective_iterations`. The gate claim (7.3) refutes a
-wrong value.
+`effective_iterations` is removed. The stop position, if wanted, is a graph
+output, written by the stop kernel as an output of the body and read by
+kind 6. OUT and `OUT_DESCEND` then cover it.
 
-### 6.4 `COMMIT` checks (R1-S1)
+### 6.4 `COMMIT` checks
 
-`COMMIT` refuses unless all of the following hold:
-- `plan_id`, `run_id` and `spec_root` equal the run's and the template's;
-- `total_steps` and `out_count` equal the spec's, and the descent uses the
-  spec's counts, never the posted ones;
-- `effective_iterations` is at most `K`;
-- the run's inputs are fully posted (4.4).
+`COMMIT` requires all of:
+- `now <= commit_deadline`, where the deadline starts at `INPUTS_COMPLETE`
+  (R2-N2);
+- the ids equal the run's and the template's;
+- `total_steps` and `total_outputs` equal the spec's.
 
-Output values are **not** required at commit. Anyone may post output `j`
-with its out-tree path and value bytes at any time, even after the run is
-final. The program checks:
+The descent uses the spec's address map, never posted counts.
+
+**Posting outputs** (R2-S9). `POST_OUTPUT(j, path, value)` is allowed only
+once the run is `FINAL`. It checks:
 - the path against `out_tree_root`;
-- the entry's header against `OutSpec(j)`;
+- the entry's header against the generated or stored `OutSpec(j)`;
 - the value against its digest.
 
-Consumers read outputs only through such posts, so they are bound (P-bound).
-An out-tree position of a gated-off output holds `EMPTY_OUT`.
+When the run closes, it leaves a **run receipt** PDA,
+`["dcg2rcpt", run_id]`. The receipt holds the run root, the final status,
+`out_tree_root`, and the template. Outputs can still be posted against it
+after the run closes.
 
-## 7. Why first-divergence works
+## 7. Why first divergence works
 
-Let H be the honest execution. Its step tree, out tree and
-`effective_iterations` are all computable from the plan, the constants and
-the inputs (4.4).
+### 7.1 Descent (R2-B2)
 
-### 7.1 Descent
+The dispute holds a current node, starting at the root, and the node's level
+`l`.
 
-The dispute keeps a current node of the executor's tree, starting at the
-root.
+1. **Reveal.** E reveals the hashes of the current node's descendants `d'`
+   levels down, `d' = min(d, l)`, `d ≤ 5`, listed in position order. It
+   lists only **pickable** positions. A position is pickable if and only if
+   its subtree contains at least one step position (6.2). That depends only
+   on the address map, never on a hash. The program:
+   - fills every non-pickable position with `EMPTY_LEAF[level]`;
+   - folds level by level;
+   - checks the result against the current node.
+2. **Pick.** C picks one pickable position. A non-pickable pick is refused.
+3. **Leaf.** At level 0, E reveals the leaf. The reveal is either
+   `present:u8 = 1` followed by the leaf preimage, or `present = 0` for
+   `EMPTY_LEAF`. The program checks the reveal against the leaf hash and
+   stores it.
 
-1. **Reveal.** Each round, the executor reveals the hashes `d'` levels below
-   the current node, where `d' = min(d, remaining height)` and `d ≤ 5`
-   (R1-N7). It lists only positions whose leaf range intersects `[0, n)`.
-   The program fills every all-empty position with `EMPTY[l]`, folds level
-   by level, and checks the result against the current node.
-2. **Pick.** The challenger picks one revealed position. The pick is refused
-   if the position is all-empty (R1-B8), so the descent never reaches an
-   index `≥ n`.
-3. **Leaf.** At the leaf level, the executor reveals the leaf bytes, or the
-   empty marker for an `EMPTY_LEAF`. The program checks them against the
-   leaf hash and stores them.
+**Invariant.** C always picks the leftmost pickable position whose hash
+differs from H's.
+- Every step position left of the current node then holds H's leaf.
+- A skipped pickable node equals H's, so every leaf under it is H's, by
+  collision resistance.
+- A non-pickable node holds only padding. Padding is a constant in every
+  commitment, because the program fills it.
 
-**Invariant.** The challenger always picks the leftmost position whose hash
-differs from H's. Every leaf to the left of the current node is then equal
-to H's. A position is skipped only when its hash equals H's, and by
-collision resistance every leaf under it then equals H's. Empty positions
-equal H's empties by construction.
+Gated-off iterations are step positions, so they are always pickable. An
+early stop (E commits `EMPTY_LEAF` where H runs) is therefore always
+reachable. R2's model of the actual empty-constant, two-level shape showed
+the structural rule landing on the first divergence in 1,500 of 1,500
+trials. A hash-based rule missed it in 472 (*measured*, offline model only).
 
-The scratch model of R1 confirmed this on 3,000 random trees (*measured*,
-offline model, not DCG code).
+**Existence.** The root differs from H's exactly when some step position
+differs. In that case, a differing pickable child exists at every level.
 
-**Existence.** The root differs from H's exactly when some leaf differs, and
-then the leftmost differing child exists at every level.
+### 7.2 Base case
 
-### 7.2 Base case: leaf k is the first divergent leaf
+Every step position before `k` holds H's leaf. Leaf `k` differs.
 
-Every leaf before `k` equals H's. Leaf `k`, as revealed, differs from H's
-leaf `k`. The challenger claims one of the following (7.3), each a local
-check:
-
-| Divergence in leaf `k` | Claim | Why the check wins |
+| What differs in leaf `k` | Claim | Why it wins |
 |---|---|---|
-| bytes that do not parse, wrong plan or run id, wrong coordinate, a header byte, a count, nonzero state digests on a stateless step, or empty versus present on a non-gated step | SHAPE | compared against `StepSpec(k)` and the run |
-| leaf present or empty, but the gate says otherwise | GATE | the gate value comes from an earlier leaf, which is honest |
-| an input digest | EDGE(i) | the producer is an earlier leaf (honest), an external input (run) or a constant (template) |
-| the prior state digest | STATE | the predecessor is an earlier leaf (honest), or an initial value |
-| outputs or the next state digest | STEP | every input, the prior state and the parameters equal H's, so the challenger can witness them, and replay produces H's outputs |
+| does not parse; ids, coordinate, a header's bytes 0..23, counts, state digests zero or nonzero against the scheme, a state export that does not match; empty in iteration 0 or in an enumerated block | SHAPE | compared with `StepSpec(k)` and the run |
+| present or empty against the gate | GATE | the gate producer (iteration `i − 1`) is earlier, so it is honest |
+| an input's bytes 7..55 | EDGE(i) | the producer is earlier (honest), or is the run or the template |
+| prior state digest | STATE | the predecessor is earlier (honest), or is the initial value |
+| outputs or next state | STEP | inputs, prior state and parameters equal H's, so C can witness them |
 
-The rows are exhaustive. A leaf is fully determined by the spec, the run,
-its producers' outputs, its predecessor's state and the kernel.
+The rows are exhaustive: a present leaf is fully determined by its spec,
+its run, its producers, its predecessor and its kernel.
 
-**Outputs.**
-- If the step tree equals H's but the out tree differs, the challenger
-  descends the out tree the same way (`OUT_DESCEND`). It lands on the first
-  differing entry `j`, whose producer leaf is honest.
-- If the step tree equals H's but `effective_iterations` differs, a GATE
-  claim on the first iteration where the commitment and H disagree wins.
-  That iteration's gate producer is honest.
-
-The challenger should start with `OUT_DESCEND` only when `step_tree_root`
-equals H's (R1-N5).
+**Outputs.** If the step tree equals H's but the out tree differs,
+`OUT_DESCEND` descends the out tree (capacity `total_outputs`, every position
+pickable). It lands on the first differing entry `j`. Its producer leaf is
+in the honest step tree.
 
 ### 7.3 Claims
 
-| Claim | Opened (by whom) | Rules for C when |
+| Claim | Opened | Rules for C when |
 |---|---|---|
-| SHAPE | `StepSpec(k)` (either party; for a repeated segment, the body entry and segment record) | the leaf's bytes fail to parse, or any byte differs from the expected leaf except digests: ids, coordinate, every 23-byte port header, counts, the zero state of a stateless step, and the empty marker of a step that is not gated |
-| EDGE(i) | `StepSpec(k)`; for kind 1 or 4, producer leaf `p` with its path (E, or C from the cached descent, R1-N6) | the 55-byte input ref differs in any field from the producer's output ref, the external ref (52 bytes plus node fields) or the constant's digest; or the producer leaf lacks the port; or it is empty |
-| GATE | `SegmentSpec`; the gate producer leaf for iteration `i − 1` | leaf `k` is present but the gate value is zero, or leaf `k` is empty but the gate value is nonzero; for `effective_iterations`, the posted value disagrees with the gates |
-| STATE | `StepSpec(k)`; the predecessor leaf, or the initial value's ref | `prior_state_digest` differs from the predecessor's `next_state_digest`, or from the initial digest |
-| STEP | `StepSpec(k)`; C's witness: input values or chunk openings, parameter bytes, port records, prior state material | the witness verifies against leaf `k`'s digests, `parameter_digest` and `port_shapes_digest`, and the replayed outputs or next state differ from leaf `k`'s |
-| OUT(j) | `OutSpec(j)`; the producer leaf | the full out entry differs from the producer's output ref, or the producer lacks the port |
+| SHAPE | `StepSpec(k)`, generated or stored | parse failure; any byte other than digests differs from the expected leaf; state digest presence wrong for the scheme; a state export digest differs from `next_state_digest`; empty where the step is not gated |
+| EDGE(i), kind 1 or 4 | `StepSpec(k)`; producer leaf `p` with its path (E opens it, or C opens it from the cached descent) | input bytes 7..55 differ from `p`'s output bytes 7..55 at the named port; `p` lacks the port; `p` is empty (R2-B1) |
+| EDGE(i), kind 2 | `StepSpec(k)` | input bytes 7..55 differ from the run's external ref bytes 4..52 |
+| EDGE(i), kind 3 | `StepSpec(k)`, `ConstSpec` | input bytes 7..23 differ from the `ConstSpec` header bytes 7..23, or the digest differs from the constant's |
+| EDGE(i), kind 5 | `StepSpec(k)`; the chunk at its index, with its path against the input's or constant's chunk root | the input digest differs from the chunk's plain value digest, or the header differs |
+| EDGE(i), kind 7 | `StepSpec(k)` | the input digest differs from the value digest of `i` as a `u32` |
+| EDGE(i), kind 6 (`B, e', b`) | C names `t`. Opened: leaf `(B, t, e')`, and the gate leaf `(B, t, g)` unless `t = K − 1`, and the leaf at `(B, t+1, 0)` | rules for C if leaf `(B, t, e')` is present, the gate value at `t` is zero (or `t = K − 1`), and the input bytes 7..55 differ from that leaf's port. It rules for E if the opened facts do not establish `t` as the last running iteration |
+| GATE | `BlockSpec`; gate leaf `(B, i−1, g)` | leaf `k` is present and the gate leaf is empty or its value is zero; or leaf `k` is empty and the gate leaf is present with a nonzero value (R2-S1) |
+| STATE | `StepSpec(k)`; the predecessor leaf, or the initial value's ref | `prior_state_digest` differs from the predecessor's `next_state_digest`, the initial digest, or `EMPTY_STATE`; or the predecessor is empty |
+| STEP | `StepSpec(k)`; C's witness (inputs or chunk openings, parameter bytes, port records, state material) | the witness verifies against leaf `k`'s digests, `parameter_digest` and `port_shapes_digest`, and the replay's outputs or next state differ |
+| OUT(j) | `OutSpec(j)` or `OutBlockSpec`; the producer leaf | the entry is not `EMPTY_OUT` and the producer is empty or lacks the port; or the entry is `EMPTY_OUT` and the producer is present; or the entry's 55 bytes differ from the producer's output ref at bytes 7..55 together with the expected header |
 
-**Normative rule for malformed data (R1-B3).** Bytes that hash to the
-executor's own commitment are accepted as they are and stored. If they are
-malformed, missing a port or the wrong length, the claim rules for the
-challenger. A party's own fresh submission that fails verification (a
-witness, a reveal that does not fold, a pick of an all-empty position) is
-refused, and that party may retry until its deadline.
+**Why kind 6 is sound.** The honest `t` exists. Leaf `(B, t, e')` is before
+`k`, so it is honest. Its gate leaf is honest. Leaf `(B, t+1, 0)` is honest
+and empty, because H stops at `t`. So C can always establish the honest last
+iteration with honest leaves, and E cannot establish a different one.
 
-**Completeness.** If the commitment is H's:
+**Malformed-data rule (R1-B3).** Bytes that hash to E's own commitment are
+stored as they are. If they are malformed, missing a port or empty where
+present is required, the claim rules for C. A party's own fresh submission
+that fails verification is refused, and that party may retry until its
+deadline.
+
+**Completeness.** If E's commitment is H's:
 - every reveal and opening verifies;
-- every comparison is between equal fields;
-- every replay reproduces the committed digests;
-- `OUT_DESCEND` and GATE find nothing that differs.
+- every compared field is equal, including bytes 7..55 of every edge (R2-B1);
+- gates agree;
+- kind 6 establishes only H's `t`;
+- every replay reproduces the committed digests.
 
-Every claim rules for the executor.
+Every claim therefore rules for E. Admission's header-agreement and
+no-outside-reference checks (3.3) rule out spec-level contradictions
+(R2-B4, R2-S3).
 
 ## 8. The game
 
 ### 8.1 Phases
 
 ```
-OPEN(kind = STEP_DESCEND | OUT_DESCEND), C posts bond and pre-funds its staging
-  AWAIT_NODES   E reveals (8.3 run cache may answer at once)
-  AWAIT_PICK    C picks                                   repeat to leaf level
-  AWAIT_LEAF    E reveals leaf k (or entry j)
-  AWAIT_CLAIM   C names SHAPE | EDGE(i) | GATE | STATE | STEP | OUT
-  AWAIT_OPENING E opens what the claim needs (skipped when public or cached)
-  AWAIT_WITNESS C submits its pre-staged witness (STEP only)
+OPEN(kind = STEP_DESCEND | OUT_DESCEND); C posts its bond and pre-funds both staging buffers
+  AWAIT_NODES → AWAIT_PICK   (repeat to level 0; cached nodes skip AWAIT_NODES)
+  AWAIT_LEAF                  E reveals the leaf (present flag + preimage) or out entry
+  AWAIT_CLAIM                 C names SHAPE | EDGE(i[, t]) | GATE | STATE | STEP | OUT
+  AWAIT_OPENING               E opens what the claim needs (skipped if public or cached)
+  AWAIT_WITNESS               C submits its pre-staged witness (STEP only)
   RULED
 ```
 
-- Every action checks `now <= phase_deadline`, and every timeout checks
-  `now > phase_deadline`.
+- Actions check `now <= deadline`, and timeouts check `now > deadline`.
 - A silent party loses.
-- Spec records are public. Either party may supply them.
+- Spec records are public, so either party may supply them.
 
-### 8.2 Staging (R1-B7, R1-S5)
+### 8.2 Staging (R2-B5)
 
-Each party owns its own staging buffers. For each one:
-- the party funds its rent and gets it back when the dispute closes;
-- the party may write to it at any time, not only during its own phase;
-- the buffer is written in 900-byte writes and grows in 10,240-byte
-  increments (DRU1-style).
+- Each party has its own staging buffer for each dispute.
+- **Both buffers are pre-funded by the challenger at open.** Their rent is
+  refunded to C when the dispute closes. So griefing locks C's capital, not
+  E's.
+- Either party may write to its buffer at any time, in 900-byte writes,
+  growing it 10,240 bytes at a time. Only the submit is timed.
+- Admission sets `max_opening` to the largest of:
+  - one leaf (up to 1,040 bytes) plus a path;
+  - one spec record (up to 1,024 bytes) plus a path;
+  - one reveal (up to 1,024 bytes at `d = 5`);
+  - the largest witness.
 
-Only the final submit is timed.
-- C can stage a witness as soon as the leaf is revealed.
-- E can stage a leaf opening as soon as a pick is made.
+  It refuses anything over 1 MiB.
+- Leaves and `d = 5` reveals exceed a legacy packet, so they are staged
+  (R2-N1).
 
-Admission sets `max_opening` to the largest of:
-- one leaf plus its path;
-- one spec record plus its path;
-- the largest witness: inputs or openings, parameters, port records and
-  state material.
+**Measured staging throughput (O1, 2026-10-02, testnet).** 1 MiB written
+into one account as 900-byte writes:
 
-Admission refuses a template whose `max_opening` is over 1 MiB, the DRU1 cap.
-For reference, a measured Basanos form-30 body is about 582 KB.
+| From | Unordered | Ordered (128 per window) |
+|---|---|---|
+| Mac | 170–211 writes/s | 65 writes/s |
+| Tokyo box | 722–771 writes/s | 312 writes/s |
 
-### 8.3 Windows and load (R1-B7)
+### 8.3 Windows and load (R2-B5)
 
-**Phase windows.**
-- A phase's window is `phase_window + ceil(bytes_due / write_rate) ×
-  write_slots`, where `bytes_due` is the most that phase may require
-  staging.
-- `write_rate` and `write_slots` are template parameters. They must be at
-  least the floors measured on testnet before the constants are fixed (open
-  item O1).
+**Phase windows.** A phase's window is `phase_window + ceil(bytes_due /
+write_rate) × write_slots`.
+- Admission requires `write_rate × (1 / write_slots)` to be at most the
+  floor measured from an ordinary host: **100 writes/s** (O1).
+- `phase_window` is at least 750 slots, about 30 s.
 
-**Run-level reveal cache.** The run keeps a cache of revealed tree nodes.
-- When E reveals the hashes under a node once, every dispute reaches that
-  node with its answer already present.
-- So an honest executor answers at most one reveal per distinct node,
-  however many disputes share a path.
-- Leaves and openings are cached the same way.
+**Reveal cache.**
+- An entry is inserted only from a reveal or opening that verified against
+  an already authenticated parent. It is keyed by that parent's position and
+  hash.
+- A cached answer satisfies every dispute at that node.
+- With collision resistance, a node has one fold-valid child set, so one
+  dispute cannot poison another (R2-S7).
 
-**Load extension.** When more than `c` disputes (a template parameter) are
-waiting on E at once, each additional waiting dispute extends E's deadlines
-in all of them by `extend_slots`. The extension is capped by the bounded
-finalization delay (section 10).
-
-### 8.4 Sizes (*estimated*)
-
-| Case | Size |
-|---|---|
-| Node reveal at `d = 4` | 512 bytes |
-| Tree height, Basanos-size template (K = 10,240, about 64 entries per iteration) | about 20 levels |
-| Descent rounds at `d = 4` (or 4 at `d = 5`) | 5 |
-| Leaf, at most | 1,040 bytes |
-| EDGE opening (leaf plus a 20-level path) | 1.7 KB |
-| STEP witness for a Basanos A16 op | up to the 582 KB already measured for form 30 |
+**Load extension, uncapped.**
+- `waiting_E` is the number of disputes waiting on E.
+- When `waiting_E > c`, each further dispute that starts waiting extends
+  every pending E deadline, and the run's finality bound, by
+  `extend_slots`.
+- Every open costs a bond and pre-funds staging. So E's required answer rate
+  never exceeds `c / phase_window` plus what the extensions buy, and the
+  delay is bounded by the number of opens.
+- Admission requires `c × answer_cost ≤` the measured executor throughput
+  (O1). With that, P-complete holds as stated in section 1.
 
 ## 9. Instructions
 
 | Instruction | Who |
 |---|---|
-| `COMMIT(run root)`; `LAND_SUBTREE(segment, iteration, root)` for incremental landing | the run's named executor |
-| `POST_OUTPUT(j, path, value)` | anyone, any time after commit |
-| `OPEN_DISPUTE(nonce, kind)`, with bond and staging pre-fund | anyone, while `now <= challenge_deadline` and the run is not `REFUTED` |
-| `STAGE_CREATE`, `STAGE_WRITE(offset, bytes)` | either party, own buffer |
+| `POST_INPUT(chunk…)`, `INPUTS_COMPLETE` | the payer, or anyone, before commit |
+| `COMMIT(run root)` | the named executor, while `now <= commit_deadline` |
+| `LAND_SUBTREE(block, iteration, root)` (informational) | the named executor |
+| `POST_OUTPUT(j, path, value)` | anyone, after `FINAL`, also against the receipt |
+| `OPEN_DISPUTE(nonce, kind)`, with bond and both staging pre-funds | anyone, while `now <= challenge_deadline` and the run is not `REFUTED` |
+| `STAGE_CREATE`, `STAGE_WRITE` | each party, on its own buffer |
 | `REVEAL_NODES`, `PICK`, `REVEAL_LEAF`, `CLAIM`, `SUBMIT_OPENING`, `SUBMIT_WITNESS` | E, C, E, C, E, C |
-| `TIMEOUT`, `ADVANCE_RULED_PREFIX`, `SETTLE`, `FINALIZE_RUN`, `CANCEL_RUN` | anyone (`CANCEL_RUN`: the payer, after the commit deadline with no commit) |
-| `CLOSE_DISPUTE`, `CLOSE_STAGING`, `CLOSE_RUN`, `CLOSE_CACHE` | anyone; rent goes to the recorded payers |
+| `TIMEOUT`, `ADVANCE_RULED_PREFIX`, `SETTLE`, `FINALIZE_RUN` | anyone |
+| `CANCEL_RUN` | the payer, while `now > commit_deadline` with no commit |
+| `CLOSE_DISPUTE` (only after `ruled_prefix > sequence`, R2-S8), `CLOSE_STAGING`, `CLOSE_RUN` (leaves the receipt), `CLOSE_CACHE` | anyone; rent goes to the recorded payers |
 
-These are new tags. Tags 220–226 are not reused. The v2.0 handlers stay
-under `graph-v2-experimental` until they are removed. The trace-committed
-path (209–218) stays for small graphs, and a template's `commitment_kind`
-fixes which path its runs use (v2.0-B7, v2.0-S6).
+- These are new tags. Tags 220–226 are not reused, and the v2.0 handlers
+  stay under `graph-v2-experimental` until they are removed.
+- The trace-committed path (209–218) remains for small graphs. A template's
+  `commitment_kind` chooses the path.
+- Every record is accepted only at its derived PDA. Blob PDAs are seeded by
+  their writer.
 
-Every record is accepted only at its derived PDA:
-- run, template and blob, as already fixed in `b78e742`;
-- dispute, staging and cache records, newly.
+## 10. Concurrency, finality and economics
 
-Blob PDAs are seeded with their writer, so an unsealed blob cannot squat an
-id (v2.0-S2, R1-S6).
+### 10.1 Order
 
-## 10. Concurrency, records, finality and economics
+**No cap on disputes.** Each dispute is its own PDA,
+`["dcg2dsp", run, challenger, nonce]`, paid for by its challenger. The run
+keeps:
+- `next_sequence:u64`;
+- `open_disputes:u32`;
+- `waiting_E:u32`;
+- `ruled_prefix:u64`;
+- `best_win:u64`.
 
-### 10.1 Disputes and their order
+**Ruled prefix.** `ADVANCE_RULED_PREFIX` moves `ruled_prefix` over ruled
+disputes in sequence order. A dispute cannot close before the prefix passes
+it (R2-S8).
 
-**No cap (R1-B1).**
-- Each dispute is its own PDA, `["dcg2dsp", run, challenger, nonce]`, paid
-  for by its challenger.
-- The run keeps `next_sequence:u64` and `open_disputes:u32`. Each open takes
-  the next sequence.
-- No table means no slot can be filled.
+**Refutation.**
+- The first challenger ruling sets the run to `REFUTED`.
+- Disputes with a lower sequence than `best_win` continue.
+- Disputes with a higher sequence become moot. Their bonds are refunded,
+  and a ruling made before mootness still stands for its own bond (R2-N3).
+- No new opens are allowed on a refuted run.
+- The pot is paid to `best_win` once `ruled_prefix > best_win`.
 
-**Ruled prefix (R1-B2).**
-- The run keeps `ruled_prefix:u64`, the smallest sequence not yet ruled.
-- It also keeps `best_win:u64`, the lowest-sequence challenger win.
-- `ADVANCE_RULED_PREFIX` moves the prefix over ruled disputes in sequence
-  order. It is permissionless.
+### 10.2 Bounds and liveness
 
-**Refutation.** The first challenger ruling sets the run to `REFUTED`.
-- Disputes with a *lower* sequence than `best_win` continue to their
-  ruling.
-- Disputes with a *higher* sequence become moot (NEUTRAL), and their bonds
-  are refunded.
-- No dispute may open on a refuted run.
-- The pot goes to `best_win` once `ruled_prefix > best_win`, as in
-  dispute-economics-v2 §2.
+**Bounded delay.** Every open happens before the challenge deadline. A
+dispute has at most `2 × (ceil(h/d) + 3)` phases. Finality is at most
+`challenge_window + D(N)`, where:
+- `D(N) = (2 × (ceil(h/d) + 3)) × max_phase_slots + max(0, N − c) ×
+  extend_slots`;
+- `N` is the number of opens.
 
-### 10.2 Bounds, finality and liveness
+**Windows.** Each window has a minimum and a maximum at admission.
 
-**Bounded delay.**
-- Every open happens before the challenge deadline.
-- Each dispute lasts at most `(ceil(h/d) + 3) × 2` phases.
-- With the load extension capped, finality is at most `challenge_window +
-  D_max` after commit, where `D_max` is computed at admission from the
-  windows and the cap.
+**Finalization.** A run finalizes when `now > challenge_deadline`,
+`open_disputes == 0`, and the run is not refuted.
 
-**Windows.** `challenge_window` and `phase_window` have a minimum and a
-maximum at admission (v2.0-S3, R1-S6), and every `u64` addition is checked.
+**Executor.** `init_run` names the executor. With the zero key (anyone may
+commit), the bond and the rent follow whoever commits.
 
-**Finalization.** A run finalizes when:
-- `now > challenge_deadline`;
-- `open_disputes == 0`;
-- and the run is not refuted.
+**Re-run.** A refuted run has no result. The payer may start a new run with
+the same inputs and a different executor. The application's hook decides the
+requester's disposition (for Basanos, the document's).
 
-**Liveness.**
-- `init_run` names the executor key (v2.0-S6).
-- With the zero key ("anyone"), the bond and the rent follow the actual
-  committer (R1-S9).
-- The payer may `CANCEL_RUN` a run with no commit after its commit deadline
-  (R1-S6).
+### 10.3 Economics (hooks; DCG enforces conservation)
 
-**Re-run (R1-S10).**
-- A refuted run has no result.
-- The payer may open a new run with the same inputs and a different
-  executor.
-- The application decides what happens to its requester, through a hook.
-  For Basanos, that is the document's disposition.
-
-**Records close.**
-- A dispute closes after settlement. Its rent goes to its challenger, and
-  each staging buffer's rent goes to its owner.
-- The run and its reveal cache close after every dispute has closed
-  (v2.0-S4).
-
-### 10.3 Economics
-
-These are application hooks, with DCG enforcing conservation.
-
-**Bonds.** E posts `executor_bond` at commit, and C posts `challenger_bond`
-at open.
+**Bonds.** E bonds at commit. C bonds at open, and also pre-funds both
+staging buffers.
 
 **Standard policy.**
-- A challenger win returns C's bond.
-- `best_win` receives `bond_slasher_bps` of the executor bond.
-- The remainder goes to the template's committed destination: the payer or
-  the incinerator.
-- An executor win takes C's bond.
-- A moot dispute is refunded.
+- C's own bond:
+  - returned to C on a challenger win;
+  - taken by E on an executor win;
+  - refunded on a moot dispute.
+- The executor bond:
+  - `best_win` receives `bond_slasher_bps` of it;
+  - the remainder goes to the committed destination, the payer or the
+    incinerator.
 
-**Admission rules.** Admission requires:
+**Admission requires:**
 - `bond_slasher_bps < 10,000`;
 - a nonzero remainder;
 - a remainder destination that is not the executor.
 
-**What deters a cheating executor.**
-- The deterrent is the remainder. A cheating executor can always front-run
-  with its own challenger and recover the slasher share (R1-S4).
-- The payer is the guaranteed watcher: it loses the result if it does not
-  watch.
-- An application that wants third-party watchers sets the slasher share,
-  and the bonds, high enough to pay them.
+**Deterrence.** The remainder is the deterrent. The payer is the guaranteed
+watcher.
 
-## 11. Composition and finality across regions (R1-S8)
+**dispute-economics-v2 §1.** It is amended to match (R2-S12). v2.1 runs
+replace its `challenge_limit` and outcome table with the ruled prefix.
 
-**Finality across regions.** graph-plan-v2 §3 makes cross-region imports
-wait for source-region finality. In a v2.1 run, all regions finalize
-together with the run, so every import is final exactly when its source is.
-This is a recorded change to the frozen profile under its §9 change control.
-It is not silent.
+## 11. Regions, modes and cross-region finality
 
-**Regions and modes.** Regions remain in leaf coordinates and in the spec.
-v2.1 admits one mode per template. Later composition can come per region,
-on the same tree:
-- a consensus region's steps executed on chain at commit;
+A v2.1 run finalizes as one unit. Cross-region imports (graph-plan-v2 §3)
+are therefore final exactly when their source is. This is a recorded profile
+change.
+
+Regions stay in leaf coordinates and the spec, for later per-region modes:
+- consensus regions run at commit;
 - sampled regions;
-- ZK regions with proof leaves.
+- ZK proof leaves.
 
 ## 12. Identities, versions and what changes
 
 **Template ID v2.1.**
-- It is `SHA256("dcg.template.id.v2.1\0" || …)` over every one of these
-  fields, all mandatory, with no optional trailing bytes (v2.0-S10):
-  - `graph_id` and `plan_id` (zero when the template has only repeated
-    segments);
-  - `body_plan_ids_root`, `app_image_id`, `kernel_manifest_root`,
-    `spec_root` and `constants_root`;
-  - `commitment_kind:u8`, `reveal_depth:u8` and `tree_shape:u8`;
-  - `challenge_window`, `phase_window`, `write_rate`, `write_slots`, `c`
-    and `extend_slots`;
-  - `commit_deadline_slots`;
-  - `bond_policy_digest` and `max_opening`.
-- `constants_root` is the tree root over `ConstSpec` digests.
+- It is `SHA256("dcg.template.id.v2.1\0" || …)` over these fields, in this
+  order:
+  - `graph_id` and `plan_id` (zero if no enumerated block);
+  - `body_plans_root`, `app_image_id`, `kernel_manifest_root`, `spec_root`
+    and `constants_root`;
+  - `commitment_kind:u8`, `reveal_depth:u8`;
+  - `challenge_window`, `phase_window` (minimum and maximum),
+    `max_phase_slots`, `write_rate`, `write_slots`, `c`, `extend_slots`,
+    `commit_deadline_slots` and `honest_compute_slots`;
+  - `bond_policy_digest`;
+  - `max_opening`.
+- Every field is mandatory.
 
 **Run ID v2.1.** It is `SHA256("dcg.run.id.v2.1\0" || template_id ||
-nonce || count:u32 || external refs (52 bytes each, sorted) || executor[32])`
-(R1-S9). `init_run` checks the refs against `InSpec`: exact ids, headers
-and lengths (R1-S3).
+nonce || count:u32 || external refs (52 bytes each, sorted) ||
+executor[32])`. `init_run` checks the refs against `InSpec`.
+
+A variable-length prompt is a fixed-length input of `K` padded tokens plus a
+separate length input (R2-S4).
 
 **Unchanged frozen bytes:**
 - DCGG and DCPL;
@@ -761,162 +844,183 @@ and lengths (R1-S3).
 - the 52-byte external ref.
 
 **New:**
-- `DCDS` and its records;
-- body plans with relative producers;
+- `DCDS` records and the spec tree;
+- body plans and producer kinds 4–7;
 - `RunRootV21`;
-- the v2.1 tree shape with empty constants;
-- chunked values and state schemes;
-- the template and run identities.
+- the v2.1 tree and address map;
+- chunked layout 3 and log layout 4;
+- state schemes and state export;
+- template and run identities;
+- the run receipt.
 
 **Retired from disputes:** `RegionRootV1`, `ChildRootV1`, and duplicate-last
-padding for v2.1 trees.
+padding.
 
-**Profile changes, recorded under graph-plan-v2 §9:**
-- repeated segments: a total capacity of 2^40, with 16,384 per body;
-- one replay opening raised from 4 KiB to staged openings of up to 1 MiB;
-- cross-region finality (section 11);
-- stateful nodes admitted under the declared schemes.
+**Profile changes (graph-plan-v2 §9):**
+- capacity 2^40, with 16,384 per body and per enumerated block;
+- staged openings up to 1 MiB (was 4 KiB);
+- layouts 3 and 4;
+- stateful nodes;
+- cross-region finality.
 
 ## 13. Basanos revision 8 on v2.1
 
-Sources:
-- the scout read of `dcg-unified-v8.md`, `dcg-unified-v1.md` and the closure
-  notes;
-- R1's checks of v8 §1.x and §8.3.7.
-
-Revision 8's dispute path has not run on testnet. The 10-01 run measured
+Revision 8's dispute path has never run on testnet. The 10-01 run measured
 the happy path only.
 
 | Revision 8 | v2.1 |
 |---|---|
-| One K = 10,240 template for every document; prompt length variable; stop rule | One repeated segment with `K = 10,240`. The body is one position's op entries. Prompt tokens come from a chunked external input (kind 5, stride 1). The body's stop kernel is the gate. Variable length is data, not structure (R1-M2). |
-| Op entries by (position, segment, local) | Ordinal = `base + position × body_len + entry`, which is topological. Revision 8 segments become sub-blocks of the body. |
-| Per-position roots landed in DPR2, with an MMR prefix | `LAND_SUBTREE` per iteration into the fixed two-level shape. The MMR is replaced, which closes R1-M5's shape problem. |
-| Tags 166, 167, 163, 164, 168 and 169 (direct open, segment reveal, 16-wide descent) | First-divergence descent with `d = 4`, the same width. The leaf choice is now forced to the first divergence. |
-| Tags 120 and 121 (target leaf; reads proved to the producer leaf) | SHAPE and EDGE, with producers from `StepSpec`. |
-| Prior-state and key/value cache reads | `LOG` state carried along the iteration (lag 1). Reads are chunk openings, and STATE checks the links. |
-| Tags 122, 123 and 127 (model descriptor, weight rows, artifact blocks) | The weights are template constants (kind 3, chunked) inside `constants_root`, sealed with the template as revision 8 seals them (R1-M3). The STEP witness carries the rows read. |
-| Tags 128 and 124 (output stream, chunked replay) | STEP with chunk openings. A form over one transaction's compute (16, 17, 19) is split by its declared decomposition into sub-step leaves linked by a `SMALL` or `CHUNKED` state chain. |
-| DRU1 (115–118, 125), 1 MiB | Per-party staging (8.2), with the same cap and write size. |
-| Family summaries (170, 171, 179–181) | Ordinary body steps over `LOG` state, placed after the ops they read (the derivation checks this; §8.3.7 interleaving). |
-| Output attestation (177) after finalize | `POST_OUTPUT` at any time against the committed `out_tree_root` (R1-M4). |
-| DCR1 per (descriptor, challenger, nonce), first-settled winner | Ruled prefix and `best_win` (10.1). |
-| Self-challenge through a second key | The remainder deterrent (10.3). |
-| Custom settlement retry (187) | dispute-economics-v2's finite fallback, unchanged. |
+| One K = 10,240 template; variable prompt; stop rule | One repeated block, `K = 10,240`, whose body is one position. Prompt: a `K`-token padded input read by kind 5, plus a length input. The stop kernel is the gate. The stop position, if needed, is an output. |
+| Op entries `(position, segment, local)` | Ordinal `base + position × body_len + entry`; address `(position << hb) + entry`. |
+| DPR2 position roots with an MMR prefix | `LAND_SUBTREE` (informational) into the fixed address map. The DPR2 MMR is gone. |
+| Tags 166–169 (direct open, segment reveal, 16-wide descent) | First-divergence descent, `d = 4`. |
+| Tags 120/121 (target leaf, reads by producer proof) | SHAPE and EDGE, with producers from the spec. |
+| KV cache and prior-state reads | LOG state carried at lag 1. Attention reads are LOG entry openings. |
+| Tags 122/123/127 (weights by proof) | Committed constants with a named availability source, for 27B (R2-B6). Resident constants for small models. The STEP witness carries the rows read. |
+| Tags 128/124 (output stream, chunked replay) | STEP over a declared decomposition chain. |
+| DRU1 staging | Per-party staging, with the same cap. |
+| Family summaries | Body steps over LOG state. Consumers read the state export. |
+| Output attestation (177) | `POST_OUTPUT` after finality, against the run or its receipt. |
+| First-settled winner; self-challenge | Ruled prefix and `best_win`; the remainder deterrent. |
+| Custom settlement retry (187) | dispute-economics-v2's finite fallback. |
 
-**Application-supplied, through existing hooks:**
-- A16 kernels and the form catalog, as STEP replay via
-  `ApplicationDisputeHooks`;
-- the weight layout and the meaning of the model root, as the chunk
-  verifier via `ArtifactWitnessVerifier`.
+**Still needed before Basanos can migrate:**
+1. **Attention witness growth.** The body is fixed, so every step must fit
+   `max_opening` and `max_cu` at the worst position, `i = K − 1`. An
+   attention op reading the whole KV log grows with `i`. R2 estimates about
+   40 MB per layer at position 10,240 for a 4B-class model, not checked
+   against revision 8's attention forms.
 
-**What a Basanos migration still needs (implementation, not design):**
-1. A body plan for one position.
-2. Each form's decomposition and state scheme.
-3. Measured `write_rate` (O1).
-4. The CU of each form's replay plus hashing within `max_cu` (O2).
+   The fix is a fixed decomposition into sub-steps, sized for the worst
+   position: each sub-step reads a bounded window of the log, accumulates
+   into SMALL state, and early positions run zero-length windows. That
+   multiplies `body_len` and CU. Revision 8's own attention forms must be
+   checked for how they bound a single op's read, before choosing the
+   decomposition.
+2. **Typed decisions.** A decision document (`L = 1 + option_count`, with
+   options carried by the document) is a different template: an enumerated
+   or short repeated block, whose options are an external input.
+3. **Per-form work.** Decompositions and state schemes for each form, and
+   CU measurements (O2).
+4. **Admission cursor.** It must be measured on the Basanos body.
 
 ## 14. Implementation order
 
-1. **Core.** Python reference for:
-   - the v2.1 tree shape;
-   - `DCDS`, for enumerated segments;
+1. **Core.** Pin the record bytes first: header, `BlockSpec`, `StepSpec`,
+   `OutSpec`, `InSpec`, the trees and empty constants. Then build the Python
+   reference, scoped to **one enumerated block**, with these stateless
+   pieces:
+   - the address map;
+   - the step tree and out tree;
+   - `DCDS`;
    - `RunRootV21`;
-   - the descent;
-   - SHAPE, EDGE, STEP and OUT, stateless.
+   - descent with structural picks and the honest-challenger strategy;
+   - SHAPE, EDGE (kinds 1, 2, 3), STEP and OUT;
+   - a random-lie fuzzer;
+   - goldens.
+2. **Native program:**
+   - commit;
+   - dispute records;
+   - per-party staging pre-funded by C;
+   - reveal cache;
+   - ruled prefix;
+   - uncapped extension;
+   - economics;
+   - receipts;
+   - ProgramTest against the Python oracle.
+3. **Repeated blocks:** gates, kinds 4, 5, 6 and 7, generated specs, and the
+   multi-block address map.
+4. **State:** SMALL, LOG and CHUNKED, STATE, and state export.
+5. **Chunked values:** constants, residency and the availability source.
+6. **Testnet:** Hello, fan-out, long chain, a gated block, and concurrent
+   disputes.
+7. **Basanos:** a body plan for one position, on a K = 35 document.
 
-   Goldens for all of them.
-2. **Native program.** Commit, dispute records, staging, cache, ruled
-   prefix, economics. Property tests (section 15).
-3. **Repeated segments and gates.** GATE and generated specs.
-4. **State.** The three schemes and STATE.
-5. **Chunked values and constants.**
-6. **Testnet:**
-   - write-rate measurement (O1);
-   - Hello, fan-out and long-chain runs;
-   - a gated repeated segment.
-7. **Basanos body plan,** on a K = 35 document first.
+## 15. Open items
 
-## 15. Test plan
+- **O1. Staged writes** (*measured* 2026-10-02, 8.2). The 100 writes/s floor
+  is set from the slower host. `answer_cost` for the load-extension check
+  still needs measuring, once handlers exist.
+- **O2. Replay and witness-hashing compute per kernel.** SHA-256 over 1 MiB
+  is roughly 0.5M CU (*estimated*). `max_cu` is a DCKC property backed by
+  test vectors (R2-N4). Admission refuses oversize steps.
+- **O3. Sampling on top of STEP.** A fixed-slot draw can still be ground by
+  the leader of that slot.
+- **O4.** `d` up to 5. The default is 4.
+- **O5.** Hierarchical, multi-executor commitments, as a later additive
+  version.
+- **O6. Availability sources for committed constants.** Which
+  `source_kind`s to support (for example a content-addressed HTTP mirror, or
+  Arweave). An owner decision.
 
-- **Goldens** (Python and Rust must agree):
-  - tree shape for `n = 1, 2, 3, 5, 6, 7, 2^k ± 1`, including `EMPTY[l]`;
-  - every `DCDS` record and the spec header;
-  - generated `StepSpec` for repeated segments;
-  - `RunRootV21`;
-  - chunked values, `LOG` and `CHUNKED` state digests.
-- **Property tests** (native ProgramTest, with Python as the oracle):
-  - **Random lies.** Random graphs and segments each get one lie in any field
-    of any leaf: header bytes, a digest, a count, state, the gate, the empty
-    marker, an out entry, `effective_iterations`, an internal node, or an
-    unparseable leaf. The first-divergence challenger wins every time.
-  - **Honest commitments.** No challenger move wins.
-  - **Rounds.** The round count matches `ceil(h/d) + 3`.
-- **Adversarial:**
-  - each R1 blocker:
-    - B1: puppets cannot block an open;
-    - B2: an earlier honest dispute is paid despite a faster puppet;
-    - B3: malformed executor bytes rule for C;
-    - B4: each header field is caught;
-    - B5: state lies are caught;
-    - B6: a STEP witness with wrong parameters is refused;
-    - B7: concurrent disputes and the extension;
-    - B8: padding picks are refused;
-  - each v2.0 blocker that still applies;
-  - deadlines at `==` and `+1`;
-  - pre-funded PDAs;
-  - conservation across every ruling and moot path.
-- **Testnet:** section 14, step 6.
+## 16. Test plan
 
-## 16. Open items
+**Goldens** (Python and Rust must agree):
+- trees of capacity 1, 2, 4, 8 and 16, with `n = 0, 1, 2, 3, 5, 6, 7` and
+  `2^k ± 1`;
+- every `EMPTY_t[l]`;
+- the address map for one enumerated block, one repeated block (`K` not a
+  power of two, `body_len` not a power of two), and mixed blocks;
+- every record type;
+- generated `StepSpec`;
+- `RunRootV21`;
+- chunked, LOG and CHUNKED digests;
+- the state export.
 
-- **O1.** `write_rate`, `write_slots` and staged-write landing throughput on
-  Fogo.
+**Property tests** (ProgramTest, with Python as the oracle):
+- **Random lies.** One lie per run, in any field: header bytes, a digest, a
+  count, state, the gate, an early stop, a late stop, empty against present,
+  an out entry, `EMPTY_OUT` misuse, a kind 6 value, an internal node, or an
+  unparseable leaf. The first-divergence challenger wins.
+- **Honest runs.** No challenger move wins. Every EDGE against every input
+  of an honest leaf rules for E (R2-B1).
+- **Rounds.** The round count matches the formula.
 
-  **Measured on testnet, 2026-10-02.** The script is
-  `scripts/measure_write_rate.py`. It writes 1,165 × 900-byte chunks (1 MiB)
-  into one 10,164-byte graph-v2 blob, which models one staging account.
+**Adversarial:**
+- every R1 and R2 blocker;
+- deadlines at `==` and `+1`;
+- pre-funded PDAs;
+- conservation on every path;
+- a closed-dispute prefix stall (S8);
+- posts before `FINAL` and after `CLOSE_RUN`.
 
-  | Sender | Sequential (wait each) | Ordered lane, 128 per window | Unordered batch (`run_batch`) |
-  |---|---|---|---|
-  | Mac, direct node `.172` | 0.95 writes/s | 65 writes/s (18 s) | 170–211 writes/s (5.5–6.9 s per MiB, all on the first send, 3 runs) |
-  | Tokyo box, 1.6 ms from node `.173` | 7.7 writes/s | 312 writes/s (3.7 s) | 722–771 writes/s (1.5–1.6 s per MiB, 2 runs) |
+**Testnet:** section 14, step 6.
 
-  - Staging writes are independent, so they go unordered.
-  - A 1 MiB witness therefore lands in under 10 s from an ordinary host.
-  - The floor for the window formula should come from the slower host. So
-    `write_rate × write_slots` should allow about 100 writes/s, which gives a
-    20 s margin for 1 MiB, with `phase_window` sized from the 30 s minimum.
-  - Each write requested 20,000 CU. Every write in a batch targets the same
-    account, so all of them count against that account's 2.5M CU block cap;
-    20,000 CU allows up to 125 writes per block.
-  - Raw data: `out/write-rate-2026-10-02*.jsonl` (ignored path).
-- **O2.** CU for replay plus witness hashing per kernel. SHA-256 over 1 MiB
-  is roughly 0.5M CU (*estimated*, R1-S11). Admission refuses a step whose
-  declared `max_cu` exceeds the budget, and such steps must be decomposed.
-- **O3.** The sampling mode on top of STEP. The fixed-slot draw is still
-  open to grinding by that slot's leader, and Fogo's validator set is small
-  (R1-N10).
-- **O4.** Reveal depth `d`, up to 5. `d = 4` is the default.
-- **O5.** Hierarchical (multi-executor) commitments. They would be an
-  additive version over the same leaves and spec.
+## 17. Concerns not yet resolved
 
-## 17. Review traceability
+- The "honest executor never loses" bound (8.3) depends on a measured
+  `answer_cost`. Until the handlers exist, `c` is a placeholder.
+- Committed, non-resident constants make P-sound conditional on an off-chain
+  source (O6). This is inherent at 27B scale. Revision 8 has the same
+  dependency.
+
+## 18. Review traceability
 
 | Item | Where |
 |---|---|
-| v2.0-B1 forged records; v2.0-S2 squatting | 9 (derived PDAs; writer-seeded blobs) |
-| v2.0-B2 unbound outputs and positions | 6.2–6.4, 7 |
-| v2.0-B3 preimage before consistency | 7.3 (digest comparisons; malformed-data rule) |
-| v2.0-B4 any-child authentication | removed; producers come from the spec (5) |
-| v2.0-B5 one slot, deadlines | 8.1, 10.1 |
-| v2.0-B6 sampling grind | O3 |
-| v2.0-B7 size, decode, siblings | 5.2, 5.3, 8.2; there are no region waypoints |
-| v2.0-B8 unverified templates | 9 (`commitment_kind`; spec root required) |
-| v2.0-S1 dust; S3 windows; S4 records; S5 stranded | 9, 10.2 |
-| v2.0-S6 executor; S7 self-challenge; S8 result binding | 10.2, 10.3, 6.4 |
-| v2.0-S9 replay checks; S10 identities; S11 capacity | 5.1 (`StepSpec`), 12, 3.3 and 8.2 |
-| R1-B1 to R1-B8 | 10.1, 10.1, 7.3, 5.1, 4.3 and 7.3, 5.1, 8.2 and 8.3, 6.2 and 7.1 |
-| R1-M1 to R1-M5 | 3.3 and 5.2, 3.3, 3.1 and 13, 6.4, 4.3 and 6.2 |
-| R1-S1 to R1-S11 | 6.4, 5.1 and 5.2, 4.4 and 12, 10.3, 8.2, 9 and 10.2, 5.3, 11, 12, 10.2, O2 |
-| R1-N1 to R1-N10 | 6.3 (180 bytes, recounted with the new fields), 3.3, 7.3, 6.2, 7.2, 7.3, 7.1, 5.1, 1 and 10.2, O3 |
+| v2.0-B1 forged records; S2 squatting | 9 |
+| v2.0-B2 to B5, B7, B8 | 6, 7, 8.1, 10.1, 5, 9 |
+| v2.0-B6 sampling | O3 |
+| v2.0-S1 to S11 | 9, 10.2, 8.2, 6.4, 5.1, 12, 3.3 |
+| R1-B1 to R1-B8 | 10.1, 10.1, 7.3, 5.1 and 7.3, 4.3 and 7.3, 5.1, 8.2 and 8.3, 6 and 7.1 |
+| R1-M1 to R1-M5 | 3.3 and 5.2, 3.3, 3.1 and 4.4, 6.4, 4.3 and 6.2 |
+| R1-S1 to R1-S11; R1-N1 to R1-N10 | as in revision 2, superseded where R2 below applies |
+| R2-B1 EDGE bytes | 7.3 |
+| R2-B2 structural picks, address map | 6.2, 7.1 |
+| R2-B3 `effective_iterations` | 6.3 (removed) |
+| R2-B4 outside reads of off iterations | 3.3 (refused), 3.4 and 7.3 (kind 6) |
+| R2-B5 load and P-complete | 1, 8.2, 8.3, 10.2 |
+| R2-B6 constant residency | 4.4, 13, O6 |
+| R2-S1 gate and empty rules, constants | 3.3, 6.1, 7.3 |
+| R2-S2 initial producers | 5.1 (`StepSpec` inputs and state_initial) |
+| R2-S3 admission checks | 3.3 |
+| R2-S4 kind 5 | 4.2, 7.3, 12 |
+| R2-S5 chunked layout | 4.2 |
+| R2-S6 state boundaries and export | 4.3 |
+| R2-S7 landing and cache | 6.2, 8.3 |
+| R2-S8 prefix stall | 9, 10.1 |
+| R2-S9 output posting | 6.4 |
+| R2-S10 availability | 4.4 |
+| R2-S11 byte layouts | 5.1, 5.2, 6.1 |
+| R2-S12 economics-v2 §1 | 10.3, plus the amendment in that file |
+| R2-N1 to R2-N6 | 8.2, 6.4 and 9, 10.1, O2, 3.1 (kind 7), 4.3 |
