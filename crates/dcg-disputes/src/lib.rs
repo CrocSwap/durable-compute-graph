@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Optimistic disputes v2.1 consensus bytes (design
-//! `docs/design/optimistic-descent-v2.1.md`), step-1 scope: v2.1 trees with
+//! `docs/design/optimistic-descent-v2.1.md`): v2.1 trees with
 //! empty constants (§6.1), structural reveal folding (§7.1), the frozen step
 //! leaf, out leaves, `RunRootV21` (§6.3), spec leaves and `StepSpec` fields
-//! (§5.1). Mirrors `python/dcg/disputes_v21`; `tests/goldens.rs` pins it to
-//! `tests/golden/dcg/disputes_v21/vectors.json`.
+//! (§5.1); multi-block address maps and generated specs (`blocks`), and the
+//! generic chunked reductions (`reductions`). Mirrors
+//! `python/dcg/disputes_v21`; `tests/goldens.rs` pins it to
+//! `tests/golden/dcg/disputes_v21/vectors.json` and `chunked.json`.
 //!
 //! Hashing is supplied by the caller (`Sha256`), so the program can use the
 //! SBF syscall and the host a software SHA-256.
 #![no_std]
+
+pub mod blocks;
+pub mod reductions;
 
 pub type Hash = [u8; 32];
 
@@ -102,6 +107,20 @@ pub fn fold_reveal<H: Sha256>(
     depth: u32,
     revealed: &[Option<Hash>],
 ) -> Option<Hash> {
+    fold_reveal_by(h, tree, |l, p| pickable(steps, l, p), level, position, depth, revealed)
+}
+
+/// `fold_reveal` with a caller's structural pickability (multi-block step
+/// trees use `blocks::pickable`).
+pub fn fold_reveal_by<H: Sha256>(
+    h: &H,
+    tree: Tree,
+    pick: impl Fn(u32, u64) -> bool,
+    level: u32,
+    position: u64,
+    depth: u32,
+    revealed: &[Option<Hash>],
+) -> Option<Hash> {
     if depth == 0 || depth > MAX_DEPTH || depth > level || revealed.len() != 1usize << depth {
         return None;
     }
@@ -110,7 +129,7 @@ pub fn fold_reveal<H: Sha256>(
     let fill = empty(h, tree, base as u16);
     let mut row = [[0u8; 32]; 1 << MAX_DEPTH];
     for (i, slot) in revealed.iter().enumerate() {
-        let want = pickable(steps, base, first + i as u64);
+        let want = pick(base, first + i as u64);
         match (want, slot) {
             (true, Some(v)) => row[i] = *v,
             (false, None) => row[i] = fill,
@@ -219,8 +238,30 @@ impl<'a> Leaf<'a> {
     }
 }
 
-fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+pub(crate) fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     b.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+}
+
+pub(crate) fn u64_at(b: &[u8], at: usize) -> Option<u64> {
+    b.get(at..at + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+}
+
+pub const CHUNK_LEAF_DOMAIN: &[u8] = b"dcg.chunk.leaf.v2.1\x00";
+
+/// A chunk-tree leaf (§4.2).
+pub fn chunk_leaf<H: Sha256>(h: &H, index: u64, chunk: &[u8]) -> Hash {
+    h.hash(&[CHUNK_LEAF_DOMAIN, &index.to_le_bytes(), chunk])
+}
+
+/// The 24-byte producer record.
+pub fn encode_producer(kind: u8, a: u64, b: u32, c: u32, d: u32) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    out[0] = kind;
+    out[4..12].copy_from_slice(&a.to_le_bytes());
+    out[12..16].copy_from_slice(&b.to_le_bytes());
+    out[16..20].copy_from_slice(&c.to_le_bytes());
+    out[20..24].copy_from_slice(&d.to_le_bytes());
+    out
 }
 
 /// Strict parse; None for anything malformed (the malformed-data rule).
@@ -286,6 +327,16 @@ impl<'a> StepSpec<'a> {
     pub fn state_scheme(&self) -> u8 {
         self.0[120]
     }
+    /// The state export port, or `0xFF` for none.
+    pub fn state_export(&self) -> u8 {
+        self.0[121]
+    }
+    pub fn state_size(&self) -> u64 {
+        u64_at(self.0, 128).unwrap()
+    }
+    pub fn state_predecessor(&self) -> (u8, u64, u32, u32, u32) {
+        producer(&self.0[136..160])
+    }
     pub fn input_count(&self) -> usize {
         self.0[184] as usize
     }
@@ -316,10 +367,13 @@ pub fn producer(raw: &[u8]) -> (u8, u64, u32, u32, u32) {
     )
 }
 
-/// SHAPE (§7.3) for a stateless step in an enumerated block: true when the
-/// leaf differs from the spec in anything but digests.
+/// SHAPE (§7.3): true when the leaf differs from the spec in anything but
+/// digests, when its state digests are present or absent against the
+/// scheme, or when a state export's digest is not the next state's.
 pub fn shape_wrong(leaf: &Leaf<'_>, spec: &StepSpec<'_>, plan_id: &[u8], run_id: &[u8], ordinal: u64) -> bool {
-    leaf.plan_id != plan_id
+    let stateful = spec.state_scheme() != 0;
+    let zero = [0u8; 32];
+    let wrong = leaf.plan_id != plan_id
         || leaf.run_id != run_id
         || leaf.region != spec.region()
         || leaf.coord_region != spec.region()
@@ -331,6 +385,13 @@ pub fn shape_wrong(leaf: &Leaf<'_>, spec: &StepSpec<'_>, plan_id: &[u8], run_id:
         || leaf.output_count() != spec.output_count()
         || (0..spec.input_count()).any(|i| leaf.input(i)[..PORT_HEADER_BYTES] != *spec.input_header(i))
         || (0..spec.output_count()).any(|i| leaf.output(i)[..PORT_HEADER_BYTES] != *spec.output_header(i))
-        || leaf.prior != [0u8; 32]
-        || leaf.next != [0u8; 32]
+        || (leaf.prior == zero) == stateful
+        || (leaf.next == zero) == stateful;
+    if wrong || !stateful || spec.state_export() == 0xFF {
+        return wrong;
+    }
+    match leaf.output_port(spec.state_export() as u16) {
+        Some(export) => export[23..55] != *leaf.next,
+        None => true,
+    }
 }
