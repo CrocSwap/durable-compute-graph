@@ -251,7 +251,8 @@ class TransactionPlan:
 class EndpointLimits:
     sends_per_second: float = 10.0
     max_in_flight: int = 8
-    requests_per_second: float = 100.0
+    # M3: v1 callers had no implicit read-rate limit; configure one explicitly.
+    requests_per_second: float = 1_000_000.0
     weight: float = 1.0
     route_group: str | None = None
 

@@ -410,7 +410,9 @@ class Sequencer:
                 endpoint=endpoint,
                 sends_per_second=config.endpoint_limits[endpoint_id].sends_per_second,
                 requests_per_second=config.endpoint_limits[endpoint_id].requests_per_second,
-                max_in_flight=config.endpoint_limits[endpoint_id].max_in_flight,
+                # M3: v1 max_in_flight caps concurrent steps (enforced in
+                # _select_batch); the pool gets headroom for each step's reads.
+                max_in_flight=config.endpoint_limits[endpoint_id].max_in_flight * 4,
                 weight=config.endpoint_limits[endpoint_id].weight,
                 route_group=config.endpoint_limits[endpoint_id].route_group or endpoint_id,
             )
@@ -952,15 +954,16 @@ class Sequencer:
         finally:
             await lease.close()
 
-    async def _send_packet(self, step: TransactionStep, packet: _PacketState):
+    async def _send_packet(self, step: TransactionStep, packet: _PacketState, lease=None):
         provider_id = step.provider_id or ("rpc" if "rpc" in self.providers else next(iter(self.providers)))
         provider = self.providers[provider_id]
         route_group = self._route_group(step)
-        lease = await self._acquire_lease(
-            RequestKind.SEND,
-            route_group=route_group,
-            route_affinity=step.route_affinity or step.step_id,
-        )
+        if lease is None:
+            lease = await self._acquire_lease(
+                RequestKind.SEND,
+                route_group=route_group,
+                route_affinity=step.route_affinity or step.step_id,
+            )
         started = self.config.monotonic_clock()
         try:
             receipt = await provider.send_raw(packet.raw_bytes, packet.signature, lease.route)
@@ -1019,8 +1022,12 @@ class Sequencer:
     def _select_batch(self, ready: Sequence[TransactionStep]) -> list[TransactionStep]:
         batch: list[TransactionStep] = []
         locks: set[str] = set()
+        step_cap = min(
+            self.config.max_batch_size,
+            sum(limits.max_in_flight for limits in self.config.endpoint_limits.values()) or self.config.max_batch_size,
+        )
         for step in ready:
-            if len(batch) >= self.config.max_batch_size:
+            if len(batch) >= step_cap:
                 break
             if locks.intersection(step.write_locks):
                 continue
@@ -1206,6 +1213,18 @@ class Sequencer:
                     backoff_delay = self._next_backoff(backoff_delay)
                 elif packet.attempts > 0:
                     await asyncio.sleep(self.config.confirmation_poll_seconds)
+                # M3: the pool lease comes before the attempt row, so a pool
+                # timeout is never counted as a send attempt.
+                try:
+                    send_lease = await self._acquire_lease(
+                        RequestKind.SEND,
+                        route_group=self._route_group(step),
+                        route_affinity=step.route_affinity or step.step_id,
+                    )
+                except EndpointPoolExhausted:
+                    await self._sleep_backoff(backoff_delay)
+                    backoff_delay = self._next_backoff(backoff_delay)
+                    continue
                 attempt = packet.attempts + 1
                 await self._append(
                     journal,
@@ -1218,7 +1237,7 @@ class Sequencer:
                     # The intent, signature, and attempt row are durable before
                     # acquiring the final send lease. The lease then crosses
                     # directly into the selected provider, for RPC and TPU alike.
-                    receipt = await self._send_packet(step, packet)
+                    receipt = await self._send_packet(step, packet, send_lease)
                 except BlockhashExpired as exc:
                     await self._append(
                         journal,
@@ -1390,7 +1409,9 @@ class Sequencer:
                     route_affinity=step.route_affinity or step.step_id,
                 )
             except Exception as exc:
-                if not self._is_transport_exception(exc):
+                # M3: pool exhaustion while fetching the build blockhash is a
+                # wait, not a run abort.
+                if not (isinstance(exc, EndpointPoolExhausted) or self._is_transport_exception(exc)):
                     raise
                 await self._sleep_backoff(backoff_delay, getattr(exc, "retry_after", None))
                 backoff_delay = self._next_backoff(backoff_delay)
@@ -1677,6 +1698,46 @@ class SequencerStream:
     async def checkpoint(self, through_sequence: int | None = None):
         return await self.plan.checkpoint(through_sequence)
 
+    async def decide(
+        self,
+        step_id: str,
+        decision: str,
+        evidence_digest: str,
+    ) -> None:
+        """H2: act on the application's reconciliation choice for a dropped parent.
+
+        ``continue`` keeps the original signed bytes authoritative and resumes
+        polling them; ``rebuild`` authorizes a fresh generation; ``abandon``
+        leaves the branch failed. The choice is journaled before any state
+        changes, then the dropped parent and its invalidated descendants are
+        cleared and rescheduled.
+        """
+
+        if decision not in ("abandon", "continue", "rebuild"):
+            raise ValueError("decision must be abandon, continue, or rebuild")
+        if step_id not in self._dropped:
+            raise JournalError(f"step {step_id} is not a dropped stream parent")
+        packets = [packet for packet in await self.plan.unresolved_packets() if packet.step_id == step_id]
+        generation = max((packet.generation for packet in packets), default=0)
+        await self.plan.record_reconciliation_decision(
+            step_id, generation, decision=decision, evidence_digest=evidence_digest
+        )
+        if decision == "abandon":
+            return
+        if decision == "rebuild" and packets:
+            await self.plan.authorize_rebuild(step_id, generation, evidence_digest)
+        affected = {step_id, *self._invalidated}
+        self._dropped.discard(step_id)
+        self._rebuild_invalidated()
+        for affected_id in affected:
+            self._failures.pop(affected_id, None)
+            self._reconciliation_recorded.discard(affected_id)
+            entry = self._intents.get(affected_id)
+            if entry is not None and affected_id not in self.plan.terminal_summaries:
+                self._schedule(entry[0], entry[1])
+        async with self._conditions:
+            self._conditions.notify_all()
+
     async def close_input(self, *, wait_for_pending: bool = False) -> None:
         await self.plan.close_input(wait_for_pending=wait_for_pending)
 
@@ -1914,8 +1975,15 @@ class SequencerStream:
                         )
                         await step.reconcile_dropped(endpoint, packet.signature, postcondition)
                 raise ReconciliationRequired(f"step {step.step_id} requires application reconciliation")
-            async with asyncio.timeout(self.sequencer.config.per_step_time_cap_seconds):
-                await self._drive_stream_step(sequence, intent, step, dependencies)
+            try:
+                async with asyncio.timeout(self.sequencer.config.per_step_time_cap_seconds):
+                    await self._drive_stream_step(sequence, intent, step, dependencies)
+            except TimeoutError as exc:
+                # H3: the cap surfaces as a journaled reconciliation, never a bare TimeoutError.
+                await self._record_reconciliation_required(
+                    step, intent, f"step exceeded its {self.sequencer.config.per_step_time_cap_seconds}s time cap"
+                )
+                raise StepTimeCapExceeded(f"stream step {step.step_id} exceeded its time cap") from exc
             self._forget(intent.step_id)
         except asyncio.CancelledError:
             raise
@@ -2181,39 +2249,43 @@ class SequencerStream:
     async def _send_stream_packet(self, step: TransactionStep, intent: StreamIntent, packet):
         provider_id = step.provider_id or ("rpc" if "rpc" in self.sequencer.providers else next(iter(self.sequencer.providers)))
         provider = self.sequencer.providers[provider_id]
-        # Package B's stable attempt API records the observer before the pool
-        # lease is acquired. Pinning to the adapter-selected endpoint makes the
-        # durable route reservation and final lease identical.
-        attempt = await self.plan.record_send_attempt(
-            step.step_id,
-            packet.generation,
-            provider_id=provider_id,
-            endpoint_id=step.endpoint_id,
-            route_group=intent.route_group,
-            route_affinity=intent.route_affinity,
-        )
+        # M5: take the pool lease before journaling the attempt, so pool
+        # exhaustion never consumes attempt budget, and fail over within the
+        # route group when the pinned endpoint cannot admit the send. The
+        # attempt row is still durable before the packet crosses to the provider.
         try:
-            lease = await self.sequencer._acquire_lease(
-                RequestKind.SEND,
-                endpoint_id=step.endpoint_id,
-                route_group=intent.route_group,
-                route_affinity=intent.route_affinity,
-            )
-        except EndpointPoolExhausted as exc:
-            await self.plan.record_send_result(
-                step.step_id,
-                packet.generation,
-                attempt.number,
-                acknowledged=False,
-                provider_id=provider_id,
-                endpoint_id=step.endpoint_id,
-                route_group=intent.route_group,
-                route_affinity=intent.route_affinity,
-                detail=str(exc)[:512],
-            )
+            try:
+                lease = await self.sequencer._acquire_lease(
+                    RequestKind.SEND,
+                    endpoint_id=step.endpoint_id,
+                    route_group=intent.route_group,
+                    route_affinity=intent.route_affinity,
+                )
+            except EndpointPoolExhausted:
+                if intent.route_group is None:
+                    raise
+                lease = await self.sequencer._acquire_lease(
+                    RequestKind.SEND,
+                    endpoint_id=None,
+                    route_group=intent.route_group,
+                    route_affinity=intent.route_affinity,
+                )
+        except EndpointPoolExhausted:
             await self.sequencer._sleep_backoff(self._backoff)
             self._backoff = self.sequencer._next_backoff(self._backoff)
             return None
+        try:
+            attempt = await self.plan.record_send_attempt(
+                step.step_id,
+                packet.generation,
+                provider_id=provider_id,
+                endpoint_id=lease.endpoint_id,
+                route_group=intent.route_group,
+                route_affinity=intent.route_affinity,
+            )
+        except BaseException:
+            await lease.close()
+            raise
         provider_attempt = _StreamProviderAttempt(
             self.plan,
             step.step_id,
@@ -2247,7 +2319,9 @@ class SequencerStream:
             if provider_attempt.failure is not None:
                 self.sequencer.unmatched_provider_failures.append(provider_attempt.failure)
             self.sequencer._forget_stream_provider_attempt(provider_attempt)
-            if isinstance(exc, (RateLimited, RpcUnavailable, EndpointPoolExhausted)):
+            # M2: BlockhashExpired is a hint (a lagging node may not know the
+            # blockhash yet); the lease clock and status reconciliation decide.
+            if isinstance(exc, (RateLimited, RpcUnavailable, EndpointPoolExhausted, BlockhashExpired)):
                 await self.sequencer._sleep_backoff(self._backoff, getattr(exc, "retry_after", None))
                 self._backoff = self.sequencer._next_backoff(self._backoff)
                 return None

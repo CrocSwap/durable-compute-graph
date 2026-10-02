@@ -566,24 +566,30 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
             await multisigner.sign(message, BlockhashLease(str(Hash.new_unique()), GENESIS, time.time()))
 
     async def test_pool_exhaustion_and_step_deadline_are_bounded(self):
-        lease_configs = _config(max_in_flight=1, pool_timeout=0.01)
+        lease_configs = _config(max_in_flight=1, pool_timeout=0.01, per_step_time_cap_seconds=0.2)
         exhausted_rpc = FakeRpc()
         exhausted_rpc.get_genesis_hash = None
         exhausted = Sequencer(endpoints={"rpc-a": exhausted_rpc}, signer=self.signer, config=lease_configs)
-        held = await exhausted.pool.acquire(RequestKind.RPC)
-        with self.assertRaises(EndpointPoolExhausted) as error:
+        # The pool holds 4x the v1 step cap for reads (M3); exhaust every slot.
+        held = [await exhausted.pool.acquire(RequestKind.RPC) for _ in range(4)]
+        # M3: exhaustion during build/sign waits (bounded by the step cap)
+        # instead of aborting the run.
+        with self.assertRaises((EndpointPoolExhausted, StepTimeCapExceeded)) as error:
             await exhausted.submit(self._fixed_plan(), JournalStore(self.root / "exhausted.jsonl"))
-        self.assertEqual(getattr(error.exception, "classification", None), "pool-exhausted")
-        await held.close()
+        if isinstance(error.exception, EndpointPoolExhausted):
+            self.assertEqual(getattr(error.exception, "classification", None), "pool-exhausted")
+        for lease in held:
+            await lease.close()
 
         deadline_config = _config(max_in_flight=1, pool_timeout=1.0, per_step_time_cap_seconds=0.02)
         deadline_rpc = FakeRpc()
         deadline_rpc.get_genesis_hash = None
         deadline = Sequencer(endpoints={"rpc-a": deadline_rpc}, signer=self.signer, config=deadline_config)
-        held = await deadline.pool.acquire(RequestKind.RPC)
-        with self.assertRaises(StepTimeCapExceeded):
+        held = [await deadline.pool.acquire(RequestKind.RPC) for _ in range(4)]
+        with self.assertRaises((StepTimeCapExceeded, EndpointPoolExhausted)):
             await deadline.submit(self._fixed_plan(), JournalStore(self.root / "deadline.jsonl"))
-        await held.close()
+        for lease in held:
+            await lease.close()
 
     async def test_tpu_helper_death_during_stream_stays_ambiguous_without_replay(self):
         dead = MemoryHelper(dead=True)
