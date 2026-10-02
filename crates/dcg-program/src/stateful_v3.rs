@@ -3270,7 +3270,14 @@ fn run_view_phase(
     data: &[u8],
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
-    exact_data(data, 11)?;
+    // Optional trailing `phases: u8` (1..=64): run that many consecutive view
+    // phases in one instruction so the accounts are deserialized once. The
+    // 11-byte form is one phase, as before.
+    let phases = match data.len() {
+        11 => 1u32,
+        12 if (1..=64).contains(&data[11]) => data[11] as u32,
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
     if accounts.len() < 3 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
@@ -3328,7 +3335,7 @@ fn run_view_phase(
     if left == 0 {
         return Err(refusal(REFUSAL_PHASE_CURSOR));
     }
-    let count = left.min(kernel.max_view_phase_bytes()) as usize;
+    let _ = left;
     let resource_guards = parsed
         .resource_index
         .map(|index| accounts[index].try_borrow_data())
@@ -3356,6 +3363,12 @@ fn run_view_phase(
         }
         let scratch = &accounts[parsed.scratch_index];
         let mut scratch_raw = scratch.try_borrow_mut_data()?;
+        for _ in 0..phases {
+        let left = session.phase_total - session.phase_cursor;
+        if left == 0 {
+            break;
+        }
+        let count = left.min(kernel.max_view_phase_bytes()) as usize;
         let stage_start = CHILD_HEADER_BYTES + session.phase_cursor as usize;
         let stage_end = stage_start + count;
         let mut workspace_header = None;
@@ -3382,8 +3395,9 @@ fn run_view_phase(
             kernel,
         )?;
         put_u32(&mut scratch_raw, 112, session.phase_state_cursor);
+        session.phase_cursor += count as u32;
+        }
     }
-    session.phase_cursor += count as u32;
     store_session(session_account, &session)
 }
 
