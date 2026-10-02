@@ -136,6 +136,13 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         217 => challenge(program_id, accounts, data),
         218 => finalize(program_id, accounts),
         219 => sample_audit(program_id, accounts),
+        220 => commit_root(program_id, accounts, data),
+        221 => open_dispute(program_id, accounts),
+        222 => reveal_region(program_id, accounts, data),
+        223 => choose(program_id, accounts, data),
+        224 => reveal_leaf(program_id, accounts, data),
+        225 => replay_leaf(program_id, accounts, data),
+        226 => settle_descent(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -568,7 +575,8 @@ fn challenge(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
     let len = u32_at(&t, 8)? as usize;
     let parsed = Table::parse(&t[BLOB_HEADER..BLOB_HEADER + len])?;
     let mut d = run.try_borrow_mut_data()?;
-    if d[4] != STATUS_COMMITTED {
+    // A root-committed run is disputed only by descent (221..226).
+    if d[4] != STATUS_COMMITTED || d[RUN_ROOT_MODE] == 1 {
         return Err(err(19));
     }
     if Clock::get()?.slot > u64_at(&d, 24)? {
@@ -595,7 +603,7 @@ fn finalize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let view = template_view(program_id, template)?;
     run_checked(program_id, run, template)?;
     let mut d = run.try_borrow_mut_data()?;
-    if d[4] != STATUS_COMMITTED {
+    if d[4] != STATUS_COMMITTED || d[RUN_ROOT_MODE] == 1 {
         return Err(err(19));
     }
     if Clock::get()?.slot <= u64_at(&d, 24)? {
@@ -700,4 +708,554 @@ fn raw_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
     }
     d[offset..end].copy_from_slice(bytes);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Root-committed optimistic runs and the root → region → step descent
+// (v2.0 §5 commitments; fast path, see docs/hello-graph.md).
+//
+// The executor commits only the root region digest (RegionRootV1, §5). A
+// challenger opens a dispute; the executor reveals the target region's
+// RegionRootV1; the challenger descends into a child region or picks a leaf of
+// the region's step tree; the executor reveals that leaf with its Merkle path;
+// then anyone replays the leaf. Each input is authenticated against its
+// source: an external input against the run's own cell, a producer in the
+// same region by its leaf and path under the same step-tree root, a producer
+// in a child region by that child's revealed RegionRootV1 outputs. A silent
+// party loses at its deadline.
+//
+// PROVISIONAL (not frozen by the spec): a value digest is
+// SHA256("dcg.value.v2.provisional\0" || value bytes).
+
+pub const VALUE_DOMAIN: &[u8] = b"dcg.value.v2.provisional\x00";
+pub const LEAF_DOMAIN: &[u8] = b"dcg.region.leaf.v2\x00";
+pub const NODE_DOMAIN: &[u8] = b"dcg.region.node.v2\x00";
+pub const ROOT_DOMAIN: &[u8] = b"dcg.region.root.v2\x00";
+
+// Dispute record "DCD2", PDA ["dcg2disp", run].
+const D_PHASE: usize = 4;
+const D_WINNER: usize = 5;
+const D_CHILDREN: usize = 6; // u16
+const D_DEADLINE: usize = 8;
+const D_ROOT: usize = 16;
+const D_TARGET: usize = 48;
+const D_REGION: usize = 80;
+const D_LEAF_INDEX: usize = 84;
+const D_CHALLENGER: usize = 88;
+const D_STEP_ROOT: usize = 120;
+const D_LEAF: usize = 152;
+const D_CHILD_TABLE: usize = 192; // 8 × (region u32, root[32])
+const D_MAX_CHILDREN: usize = 8;
+const DISPUTE_BYTES: usize = D_CHILD_TABLE + D_MAX_CHILDREN * 36;
+
+const PHASE_IDLE: u8 = 1;
+const PHASE_AWAIT_REGION: u8 = 2;
+const PHASE_AWAIT_CHOICE: u8 = 3;
+const PHASE_AWAIT_LEAF: u8 = 4;
+const PHASE_AWAIT_REPLAY: u8 = 5;
+const PHASE_RULED: u8 = 6;
+
+const RUN_ROOT_MODE: usize = 12; // run byte: 1 = root-committed
+const VALUE_REF: usize = 55;
+const CHILD_REF: usize = 54;
+
+fn value_digest(bytes: &[u8]) -> [u8; 32] {
+    sha256(&[VALUE_DOMAIN, bytes])
+}
+
+fn dispute_checked<'a>(program_id: &Pubkey, run: &AccountInfo, dispute: &'a AccountInfo) -> ProgramResult {
+    owned(program_id, dispute)?;
+    let (expected, _) = Pubkey::find_program_address(&[b"dcg2disp", run.key.as_ref()], program_id);
+    if expected != *dispute.key || &dispute.try_borrow_data()?[0..4] != b"DCD2" {
+        return Err(err(40));
+    }
+    Ok(())
+}
+
+fn root_mode_run(run: &AccountInfo) -> Result<bool, ProgramError> {
+    Ok(run.try_borrow_data()?[RUN_ROOT_MODE] == 1)
+}
+
+fn now() -> Result<u64, ProgramError> {
+    Ok(Clock::get()?.slot)
+}
+
+/// A RegionRootV1 view (§5): the parts the descent uses.
+struct RegionView<'a> {
+    plan_id: &'a [u8],
+    run_id: &'a [u8],
+    region_id: u32,
+    step_root: &'a [u8],
+    children: Vec<(u32, [u8; 32])>,
+    outputs: &'a [u8],
+    output_count: usize,
+}
+
+fn parse_region(b: &[u8]) -> Result<RegionView<'_>, ProgramError> {
+    let bad = || err(41);
+    let mut at = 64;
+    let region_id = u32_at(b, at)?;
+    at += 4 + 4 + 2 + 4 + 2 + 4 + 2;
+    let n_in = u16_at(b, at)? as usize;
+    at += 2 + n_in * VALUE_REF;
+    let step_root = b.get(at..at + 32).ok_or(bad())?;
+    at += 32;
+    let n_child = u16_at(b, at)? as usize;
+    at += 2;
+    let mut children = Vec::new();
+    for i in 0..n_child {
+        let c = b.get(at + i * CHILD_REF..at + (i + 1) * CHILD_REF).ok_or(bad())?;
+        children.push((u32::from_le_bytes(c[0..4].try_into().unwrap()), c[22..54].try_into().unwrap()));
+    }
+    at += n_child * CHILD_REF;
+    let n_out = u16_at(b, at)? as usize;
+    at += 2;
+    let outputs = b.get(at..at + n_out * VALUE_REF).ok_or(bad())?;
+    at += n_out * VALUE_REF;
+    if b.len() != at + 32 {
+        return Err(bad());
+    }
+    Ok(RegionView { plan_id: &b[0..32], run_id: &b[32..64], region_id, step_root, children, outputs, output_count: n_out })
+}
+
+/// The digest of the value ref `(node, direction, port)` in a ref list, if present.
+fn ref_digest(refs: &[u8], count: usize, node: u32, direction: u8, port: u16) -> Option<[u8; 32]> {
+    (0..count).find_map(|i| {
+        let r = &refs[i * VALUE_REF..(i + 1) * VALUE_REF];
+        (u32::from_le_bytes(r[0..4].try_into().unwrap()) == node
+            && r[4] == direction
+            && u16::from_le_bytes([r[5], r[6]]) == port)
+            .then(|| r[23..55].try_into().unwrap())
+    })
+}
+
+/// Fold a leaf up its Merkle path (§5: level-tagged nodes, odd layers duplicate).
+fn merkle_fold(leaf: [u8; 32], mut index: u32, path: &[u8]) -> Result<[u8; 32], ProgramError> {
+    if path.len() % 32 != 0 {
+        return Err(err(42));
+    }
+    let mut node = leaf;
+    for (level, sibling) in path.chunks(32).enumerate() {
+        let level = (level as u16).to_le_bytes();
+        node = if index & 1 == 0 {
+            sha256(&[NODE_DOMAIN, &level, &node, sibling])
+        } else {
+            sha256(&[NODE_DOMAIN, &level, sibling, &node])
+        };
+        index >>= 1;
+    }
+    Ok(node)
+}
+
+struct Cursor<'a> {
+    d: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ProgramError> {
+        let s = self.d.get(self.at..self.at + n).ok_or(err(43))?;
+        self.at += n;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8, ProgramError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, ProgramError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u32(&mut self) -> Result<u32, ProgramError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn blob16(&mut self) -> Result<&'a [u8], ProgramError> {
+        let n = self.u16()? as usize;
+        self.take(n)
+    }
+}
+
+/// Rule the dispute for the challenger: the run is refuted and the executor's
+/// bond goes to the challenger.
+fn rule_challenger(run: &AccountInfo, dispute: &AccountInfo, challenger: &AccountInfo, step: u16) -> ProgramResult {
+    {
+        let mut dd = dispute.try_borrow_mut_data()?;
+        if dd[D_CHALLENGER..D_CHALLENGER + 32] != challenger.key.as_ref()[..] {
+            return Err(err(44));
+        }
+        dd[D_PHASE] = PHASE_RULED;
+        dd[D_WINNER] = 2;
+    }
+    {
+        let mut d = run.try_borrow_mut_data()?;
+        d[4] = STATUS_CHALLENGER_WON;
+        d[10..12].copy_from_slice(&step.to_le_bytes());
+    }
+    take_bond(run, challenger)
+}
+
+/// The executor answered every question: the dispute closes and the
+/// commitment stands (another challenger may open while the window lasts).
+fn rule_executor(dispute: &AccountInfo) -> ProgramResult {
+    let mut dd = dispute.try_borrow_mut_data()?;
+    dd[D_PHASE] = PHASE_IDLE;
+    dd[D_WINNER] = 1;
+    dd[D_CHALLENGER..D_CHALLENGER + 32].fill(0);
+    Ok(())
+}
+
+// 220: [executor(s,w), run(w), template, dispute(w), system] tag root[32] trace_copy
+fn commit_root(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [executor, run, template, dispute, system, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !executor.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let view = template_view(program_id, template)?;
+    run_checked(program_id, run, template)?;
+    if view.mode != MODE_OPTIMISTIC {
+        return Err(err(18));
+    }
+    let root = key32(data, 1)?;
+    {
+        let mut d = run.try_borrow_mut_data()?;
+        if d[4] != STATUS_OPEN {
+            return Err(err(19));
+        }
+        let n_in = u16_at(&d, 6)? as usize;
+        let n_steps = u16_at(&d, 8)? as usize;
+        // A convenience copy of the trace for readers; only the root is
+        // authoritative and only it is ever checked.
+        let copy = &data[33..];
+        if copy.len() != n_steps * CELL {
+            return Err(err(16));
+        }
+        let at = RUN_HEADER + n_in * CELL;
+        d[at..at + copy.len()].copy_from_slice(copy);
+        let slot = now()?;
+        d[4] = STATUS_COMMITTED;
+        d[RUN_ROOT_MODE] = 1;
+        d[16..24].copy_from_slice(&slot.to_le_bytes());
+        d[24..32].copy_from_slice(&(slot + view.window).to_le_bytes());
+        d[128..160].copy_from_slice(executor.key.as_ref());
+    }
+    create_pda(program_id, executor, dispute, system, &[b"dcg2disp", run.key.as_ref()], DISPUTE_BYTES)?;
+    {
+        let mut dd = dispute.try_borrow_mut_data()?;
+        dd[0..4].copy_from_slice(b"DCD2");
+        dd[D_PHASE] = PHASE_IDLE;
+        dd[D_ROOT..D_ROOT + 32].copy_from_slice(&root);
+    }
+    if view.bond > 0 {
+        invoke(&system_instruction::transfer(executor.key, run.key, view.bond), &[executor.clone(), run.clone(), system.clone()])?;
+    }
+    Ok(())
+}
+
+// 221: [challenger(s,w), run, template, dispute(w)] open a dispute on the root.
+fn open_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [challenger, run, template, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    if !challenger.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let view = template_view(program_id, template)?;
+    run_checked(program_id, run, template)?;
+    dispute_checked(program_id, run, dispute)?;
+    let d = run.try_borrow_data()?;
+    if d[4] != STATUS_COMMITTED || d[RUN_ROOT_MODE] != 1 {
+        return Err(err(19));
+    }
+    if now()? > u64_at(&d, 24)? {
+        return Err(err(20));
+    }
+    let mut dd = dispute.try_borrow_mut_data()?;
+    if dd[D_PHASE] != PHASE_IDLE {
+        return Err(err(45));
+    }
+    let root = key32(&dd, D_ROOT)?;
+    dd[D_PHASE] = PHASE_AWAIT_REGION;
+    dd[D_WINNER] = 0;
+    dd[D_TARGET..D_TARGET + 32].copy_from_slice(&root);
+    dd[D_REGION..D_REGION + 4].copy_from_slice(&0u32.to_le_bytes());
+    dd[D_CHALLENGER..D_CHALLENGER + 32].copy_from_slice(challenger.key.as_ref());
+    dd[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&(now()? + view.window).to_le_bytes());
+    Ok(())
+}
+
+// 222: [executor(s), run, template, dispute(w)] tag RegionRootV1 bytes
+fn reveal_region(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [executor, run, template, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let view = template_view(program_id, template)?;
+    run_checked(program_id, run, template)?;
+    dispute_checked(program_id, run, dispute)?;
+    let d = run.try_borrow_data()?;
+    if !executor.is_signer || d[128..160] != executor.key.as_ref()[..] {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let bytes = &data[1..];
+    let mut dd = dispute.try_borrow_mut_data()?;
+    if dd[D_PHASE] != PHASE_AWAIT_REGION {
+        return Err(err(45));
+    }
+    if sha256(&[ROOT_DOMAIN, bytes]) != key32(&dd, D_TARGET)? {
+        return Err(err(46));
+    }
+    let r = parse_region(bytes)?;
+    let plan_id = key32(&template.try_borrow_data()?, 16 + 32 * 2)?;
+    if r.plan_id != plan_id || r.run_id != &d[32..64] || r.region_id != u32_at(&dd, D_REGION)? {
+        return Err(err(47));
+    }
+    if r.children.len() > D_MAX_CHILDREN {
+        return Err(err(48));
+    }
+    dd[D_STEP_ROOT..D_STEP_ROOT + 32].copy_from_slice(r.step_root);
+    dd[D_CHILDREN..D_CHILDREN + 2].copy_from_slice(&(r.children.len() as u16).to_le_bytes());
+    for (i, (id, root)) in r.children.iter().enumerate() {
+        let at = D_CHILD_TABLE + i * 36;
+        dd[at..at + 4].copy_from_slice(&id.to_le_bytes());
+        dd[at + 4..at + 36].copy_from_slice(root);
+    }
+    dd[D_PHASE] = PHASE_AWAIT_CHOICE;
+    dd[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&(now()? + view.window).to_le_bytes());
+    Ok(())
+}
+
+// 223: [challenger(s), run, template, dispute(w)] tag kind:u8 (0 child, 1 leaf) value:u32
+fn choose(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [challenger, run, template, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let view = template_view(program_id, template)?;
+    run_checked(program_id, run, template)?;
+    dispute_checked(program_id, run, dispute)?;
+    let mut dd = dispute.try_borrow_mut_data()?;
+    if !challenger.is_signer || dd[D_CHALLENGER..D_CHALLENGER + 32] != challenger.key.as_ref()[..] {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if dd[D_PHASE] != PHASE_AWAIT_CHOICE {
+        return Err(err(45));
+    }
+    let kind = *data.get(1).ok_or(err(43))?;
+    let value = u32_at(data, 2)?;
+    if kind == 0 {
+        let n = u16_at(&dd, D_CHILDREN)? as usize;
+        let child = (0..n).find(|i| u32_at(&dd, D_CHILD_TABLE + i * 36).ok() == Some(value)).ok_or(err(49))?;
+        let root = key32(&dd, D_CHILD_TABLE + child * 36 + 4)?;
+        dd[D_TARGET..D_TARGET + 32].copy_from_slice(&root);
+        dd[D_REGION..D_REGION + 4].copy_from_slice(&value.to_le_bytes());
+        dd[D_PHASE] = PHASE_AWAIT_REGION;
+    } else if kind == 1 {
+        dd[D_LEAF_INDEX..D_LEAF_INDEX + 4].copy_from_slice(&value.to_le_bytes());
+        dd[D_PHASE] = PHASE_AWAIT_LEAF;
+    } else {
+        return Err(err(43));
+    }
+    dd[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&(now()? + view.window).to_le_bytes());
+    Ok(())
+}
+
+// 224: [executor(s), run, template, dispute(w)] tag leaf:blob16 path:blob16
+fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [executor, run, template, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let view = template_view(program_id, template)?;
+    run_checked(program_id, run, template)?;
+    dispute_checked(program_id, run, dispute)?;
+    let d = run.try_borrow_data()?;
+    if !executor.is_signer || d[128..160] != executor.key.as_ref()[..] {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let mut c = Cursor { d: &data[1..], at: 0 };
+    let leaf = c.blob16()?;
+    let path = c.blob16()?;
+    let mut dd = dispute.try_borrow_mut_data()?;
+    if dd[D_PHASE] != PHASE_AWAIT_LEAF {
+        return Err(err(45));
+    }
+    let digest = sha256(&[LEAF_DOMAIN, leaf]);
+    if merkle_fold(digest, u32_at(&dd, D_LEAF_INDEX)?, path)? != key32(&dd, D_STEP_ROOT)? {
+        return Err(err(46));
+    }
+    dd[D_LEAF..D_LEAF + 32].copy_from_slice(&digest);
+    dd[D_PHASE] = PHASE_AWAIT_REPLAY;
+    dd[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&(now()? + view.window).to_le_bytes());
+    Ok(())
+}
+
+// 225: [challenger(s,w), run(w), template, dispute(w), graph, plan]
+// tag leaf:blob16 then per input: value:blob16 auth:u8 [1: leaf:blob16 index:u32 path:blob16 | 2: region:blob16]
+fn replay_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [challenger, run, template, dispute, graph, plan, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let _view = template_view(program_id, template)?;
+    run_checked(program_id, run, template)?;
+    dispute_checked(program_id, run, dispute)?;
+    {
+        let dd = dispute.try_borrow_data()?;
+        if dd[D_PHASE] != PHASE_AWAIT_REPLAY {
+            return Err(err(45));
+        }
+        if !challenger.is_signer || dd[D_CHALLENGER..D_CHALLENGER + 32] != challenger.key.as_ref()[..] {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+    }
+    let (graph_id, plan_id) = {
+        let t = template.try_borrow_data()?;
+        (key32(&t, 16 + 32)?, key32(&t, 16 + 64)?)
+    };
+    if sealed_blob(program_id, graph, KIND_GRAPH)? != graph_id || sealed_blob(program_id, plan, KIND_PLAN)? != plan_id {
+        return Err(err(50));
+    }
+    let gb = graph.try_borrow_data()?;
+    let gb = &gb[BLOB_HEADER..BLOB_HEADER + u32_at(&gb, 8)? as usize];
+    let pb = plan.try_borrow_data()?;
+    let pb = &pb[BLOB_HEADER..BLOB_HEADER + u32_at(&pb, 8)? as usize];
+    let wire = |c: dcg_wire::Code| ProgramError::Custom(0x6400 + c as u32);
+    let g = dcg_wire::decode_graph(gb).map_err(wire)?;
+    let p = dcg_wire::decode_plan(pb).map_err(wire)?;
+
+    let mut c = Cursor { d: &data[1..], at: 0 };
+    let leaf = c.blob16()?;
+    let (step_root, leaf_digest, children) = {
+        let dd = dispute.try_borrow_data()?;
+        let n = u16_at(&dd, D_CHILDREN)? as usize;
+        let ch: Vec<[u8; 32]> = (0..n).map(|i| key32(&dd, D_CHILD_TABLE + i * 36 + 4)).collect::<Result<_, _>>()?;
+        (key32(&dd, D_STEP_ROOT)?, key32(&dd, D_LEAF)?, ch)
+    };
+    if sha256(&[LEAF_DOMAIN, leaf]) != leaf_digest {
+        return Err(err(46));
+    }
+    // Leaf: plan_id run_id region coordinate(region segment ordinal node kernel_step) inputs outputs states.
+    let run_id = key32(&run.try_borrow_data()?, 32)?;
+    let mut l = Cursor { d: leaf, at: 0 };
+    if l.take(32)? != plan_id || l.take(32)? != run_id {
+        return Err(err(47));
+    }
+    let _region = l.u32()?;
+    let (coord_region, segment) = (l.u32()?, l.u32()?);
+    let ordinal = u64::from_le_bytes(l.take(8)?.try_into().unwrap());
+    let (node_id, kernel_step) = (l.u32()?, l.u32()?);
+    let n_in = l.u16()? as usize;
+    let inputs = l.take(n_in * VALUE_REF)?;
+    let n_out = l.u16()? as usize;
+    let outputs = l.take(n_out * VALUE_REF)?;
+    let step = p.steps.get(ordinal as usize).ok_or(err(51))?;
+    if (step.region_id, step.segment_id, step.node_id, step.kernel_step) != (coord_region, segment, node_id, kernel_step)
+        || step.inputs.len() != n_in
+        || step.outputs.len() != 1
+        || n_out != 1
+    {
+        return Err(err(51));
+    }
+    let mut values: Vec<&[u8]> = Vec::new();
+    for (i, port_ref) in step.inputs.iter().enumerate() {
+        let r = &inputs[i * VALUE_REF..(i + 1) * VALUE_REF];
+        if u32::from_le_bytes(r[0..4].try_into().unwrap()) != port_ref.node_id || r[4] != 0
+            || u16::from_le_bytes([r[5], r[6]]) != port_ref.port_id
+        {
+            return Err(err(51));
+        }
+        let claimed: [u8; 32] = r[23..55].try_into().unwrap();
+        let value = c.blob16()?;
+        if value_digest(value) != claimed {
+            // The caller must supply the bytes the leaf names.
+            return Err(err(52));
+        }
+        let auth = c.u8()?;
+        let external = g.inputs.iter().position(|e| (e.node_id, e.port_id) == (port_ref.node_id, port_ref.port_id));
+        let consistent = match (auth, external) {
+            (0, Some(index)) => {
+                let d = run.try_borrow_data()?;
+                d.get(RUN_HEADER + index * CELL..RUN_HEADER + (index + 1) * CELL) == Some(value)
+            }
+            (1, None) => {
+                let producer = c.blob16()?;
+                let index = c.u32()?;
+                let path = c.blob16()?;
+                if merkle_fold(sha256(&[LEAF_DOMAIN, producer]), index, path)? != step_root {
+                    return Err(err(53));
+                }
+                let edge = g.edges.iter().find(|e| (e.destination_node, e.destination_port) == (port_ref.node_id, port_ref.port_id)).ok_or(err(53))?;
+                producer_output(producer, edge.source_node, edge.source_port)? == claimed
+            }
+            (2, None) => {
+                let region = c.blob16()?;
+                if !children.contains(&sha256(&[ROOT_DOMAIN, region])) {
+                    return Err(err(53));
+                }
+                let edge = g.edges.iter().find(|e| (e.destination_node, e.destination_port) == (port_ref.node_id, port_ref.port_id)).ok_or(err(53))?;
+                let rv = parse_region(region)?;
+                ref_digest(rv.outputs, rv.output_count, edge.source_node, 1, edge.source_port) == Some(claimed)
+            }
+            _ => return Err(err(53)),
+        };
+        if !consistent {
+            // The leaf's input disagrees with its authenticated source.
+            drop(g);
+            return rule_challenger(run, dispute, challenger, ordinal as u16);
+        }
+        values.push(value);
+    }
+    let node = g.nodes.iter().find(|n| n.node_id == node_id).ok_or(err(51))?;
+    let code = dcg_kernels::REGISTRY
+        .iter()
+        .find(|k| {
+            let name = k.name.as_bytes();
+            node.kernel_id[..name.len()] == *name && node.kernel_id[name.len()..].iter().all(|b| *b == 0)
+        })
+        .map(|k| k.code)
+        .ok_or(err(12))?;
+    let mut out = [0u8; CELL];
+    let claimed_out: [u8; 32] = outputs[23..55].try_into().unwrap();
+    let wrong = match dcg_kernels::execute(code, &values, &mut out) {
+        Ok(n) => value_digest(&out[..n]) != claimed_out,
+        Err(_) => true,
+    };
+    drop(g);
+    if wrong {
+        rule_challenger(run, dispute, challenger, ordinal as u16)
+    } else {
+        rule_executor(dispute)
+    }
+}
+
+fn producer_output(leaf: &[u8], node: u32, port: u16) -> Result<[u8; 32], ProgramError> {
+    let mut l = Cursor { d: leaf, at: 64 + 4 + 4 + 4 + 8 + 4 + 4 };
+    let n_in = l.u16()? as usize;
+    l.take(n_in * VALUE_REF)?;
+    let n_out = l.u16()? as usize;
+    let outs = l.take(n_out * VALUE_REF)?;
+    ref_digest(outs, n_out, node, 1, port).ok_or(err(53))
+}
+
+// 226: [caller(s), run(w), template, dispute(w), executor(w), challenger(w)]
+// Deadlines: a silent executor loses, a silent challenger loses, and an idle
+// run past its window finalizes (bond back to the executor).
+fn settle_descent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [_caller, run, template, dispute, executor, challenger, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let view = template_view(program_id, template)?;
+    let _ = view;
+    run_checked(program_id, run, template)?;
+    dispute_checked(program_id, run, dispute)?;
+    let slot = now()?;
+    let (phase, deadline, run_deadline, status, exec_key) = {
+        let dd = dispute.try_borrow_data()?;
+        let d = run.try_borrow_data()?;
+        (dd[D_PHASE], u64_at(&dd, D_DEADLINE)?, u64_at(&d, 24)?, d[4], key32(&d, 128)?)
+    };
+    if status != STATUS_COMMITTED {
+        return Err(err(19));
+    }
+    match phase {
+        PHASE_AWAIT_REGION | PHASE_AWAIT_LEAF if slot > deadline => rule_challenger(run, dispute, challenger, u16::MAX),
+        PHASE_AWAIT_CHOICE | PHASE_AWAIT_REPLAY if slot > deadline => rule_executor(dispute),
+        PHASE_IDLE if slot > run_deadline => {
+            if executor.key.to_bytes() != exec_key {
+                return Err(err(28));
+            }
+            run.try_borrow_mut_data()?[4] = STATUS_FINAL;
+            take_bond(run, executor)
+        }
+        _ => Err(err(23)),
+    }
 }
