@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import tempfile
 import time
@@ -498,6 +499,48 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
         signatures = {str(Signature.from_bytes(raw[1:65])) for raw in self.rpc.send_packets}
         self.assertEqual(signatures, {original}, "only the original packet was ever sent")
         self.assertEqual(resumed.plan.terminal_summaries["only"].signature, original)
+
+    async def test_multisigner_stream_sends_fully_signed_packets(self):
+        # A stream whose steps need a second signer (e.g. a fresh account):
+        # every sent packet carries both signatures and verifies.
+        authority, extra = Keypair(), Keypair()
+        multisigner = MultiSigner((KeypairFileSigner(authority), KeypairFileSigner(extra)))
+        config = _config()
+        sequencer = Sequencer(endpoints={"rpc-a": self.rpc}, signer=multisigner, config=config)
+        identity = StreamIdentity(
+            run_id="run-multisigner",
+            genesis_hash=GENESIS,
+            program_id=str(PROGRAM),
+            # Every account the program instruction touches is bound by identity.
+            destination_accounts=tuple(sorted((str(DESTINATION), str(extra.pubkey())))),
+            signer_public_keys=(str(authority.pubkey()), str(extra.pubkey())),
+            route_policy_digest=sequencer.route_policy_digest,
+            commitment_policy="confirmed",
+        )
+        base = _step_factory(self.rpc, KeypairFileSigner(authority))
+
+        def build(intent):
+            step = base(intent)
+
+            def message(lease):
+                instruction = Instruction(PROGRAM, f"dcg-step:{intent.intent_data['tag']}".encode(),
+                                          [AccountMeta(DESTINATION, False, True), AccountMeta(extra.pubkey(), True, True)])
+                return bytes(Message.new_with_blockhash([instruction], authority.pubkey(), Hash.from_string(lease.blockhash)))
+
+            return dataclasses.replace(step, build_message=message)
+
+        stream = await sequencer.open_stream(identity, str(self.root / "multisigner"), build,
+                                             limits=StreamLimits(max_journal_bytes=config.stream_journal_quota_bytes))
+        self.streams.append(stream)
+        await stream.append(_intent("a", write_locks=("lane",)))
+        await stream.append(_intent("b", dependencies=("a",), write_locks=("lane",)))
+        result = await asyncio.wait_for(stream.wait(), timeout=3)
+        self.assertEqual(set(result.outcomes), {"a", "b"})
+        self.assertEqual(len(self.rpc.send_packets), 2)
+        for raw in self.rpc.send_packets:
+            tx = VersionedTransaction.from_bytes(raw)
+            self.assertEqual(len(tx.signatures), 2)
+            tx.verify_and_hash_message()
 
     async def test_invalidated_unsigned_descendant_is_journaled_and_can_be_abandoned(self):
         def status(signature, packet, count):
