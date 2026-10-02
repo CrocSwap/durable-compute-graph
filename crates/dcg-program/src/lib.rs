@@ -104,6 +104,7 @@ fn application_program_manifest() -> &'static app_api::ApplicationProgramManifes
         optimistic_replays: &EMPTY_REPLAYS,
         legacy_forms: &EMPTY_FORMS,
         require_legacy_form_binding: false,
+        admission_scan: kernel::AdmissionScan::Full,
         hooks: &compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &compatibility::REVISION8_COMPATIBILITY,
     };
@@ -203,6 +204,7 @@ pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
         optimistic_replays: &EMPTY_REPLAYS,
         legacy_forms: &EMPTY_FORMS,
         require_legacy_form_binding: false,
+        admission_scan: kernel::AdmissionScan::Full,
         hooks: &compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &compatibility::REVISION8_COMPATIBILITY,
     };

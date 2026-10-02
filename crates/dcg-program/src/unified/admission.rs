@@ -2,6 +2,7 @@
 //!
 //! ```text
 //!   0 "DEA2" | 4 version:u16 = 2 (revision 7), 3 (revision 8) | 6 flags:u16
+//!     (bit 0 complete, bit 1 app-bound, bit 2 attested)
 //!   8 registry[32] | 40 table_root[32] | 72 PT2S[32] | 104 PT2S_sha256[32]
 //! 136 position_count:u32 | 140 base_classes:u32 | 144 generated_classes:u32
 //! 148 admitted:u32 | 152 n_max:u32 | 156 rs1_height:u8 | 157 zero[3]
@@ -16,7 +17,7 @@ use super::registry::{self, find_row, HEADER as DRP2_HEADER};
 use super::{no, plan, u16_at, u32_at, ADMISSION_STATE, PLAN_BINDING, REGISTRY_ROOT};
 use crate::account_provenance::{expect_derived, expect_derived_with_bump, AccountKind, RoleFlags};
 use crate::hash;
-use crate::kernel::{ApplicationManifest, CommittedReplayWitness, LegacyFormBinding};
+use crate::kernel::{AdmissionScan, ApplicationManifest, CommittedReplayWitness, LegacyFormBinding};
 use crate::pt2p::Pt2p;
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
@@ -274,6 +275,9 @@ pub const VERSION: u16 = 3;
 pub const MAX_STEP: u16 = 256;
 const FLAG_COMPLETE: u16 = 1;
 const FLAG_APP_BOUND: u16 = 2;
+/// At least one app-bound class was admitted without the per-position scan
+/// (`AdmissionScan::Attested`).
+const FLAG_ATTESTED: u16 = 4;
 
 pub fn bytes(classes: u32) -> usize {
     HEADER + (classes as usize).div_ceil(8)
@@ -293,6 +297,7 @@ pub struct View {
     pub rs1_height: u8,
     pub complete: bool,
     pub app_bound: bool,
+    pub attested: bool,
     pub payer: [u8; 32],
 }
 
@@ -328,7 +333,7 @@ fn view_inner(
     if raw.len() < HEADER
         || raw[..4] != *b"DEA2"
         || u16_at(&raw, 4, ADMISSION_STATE)? != VERSION
-        || u16_at(&raw, 6, ADMISSION_STATE)? & !(FLAG_COMPLETE | FLAG_APP_BOUND) != 0
+        || u16_at(&raw, 6, ADMISSION_STATE)? & !(FLAG_COMPLETE | FLAG_APP_BOUND | FLAG_ATTESTED) != 0
         || raw[157..160] != [0; 3]
         || (VERSION == 2 && raw[160..192] != [0; 32])
         || (VERSION == 3 && raw[160..192] == [0; 32])
@@ -349,6 +354,7 @@ fn view_inner(
         rs1_height: raw[156],
         complete: u16_at(&raw, 6, ADMISSION_STATE)? & FLAG_COMPLETE != 0,
         app_bound: u16_at(&raw, 6, ADMISSION_STATE)? & FLAG_APP_BOUND != 0,
+        attested: u16_at(&raw, 6, ADMISSION_STATE)? & FLAG_ATTESTED != 0,
         payer: if VERSION == 3 {
             raw[160..192].try_into().unwrap()
         } else {
@@ -517,6 +523,7 @@ pub fn step_with_manifest(
     plan::bind_pt2s(program, &accounts[2], &accounts[4], &accounts[5], None)?;
     let mut set: Vec<u32> = Vec::with_capacity(count as usize);
     let mut app_bound = false;
+    let mut attested = false;
     {
         let s = accounts[2].try_borrow_data()?;
         if hash::sha256(&[&s]) != v.pt2s_sha256 {
@@ -546,10 +553,13 @@ pub fn step_with_manifest(
                     check_app_binding(manifest, machine_selector, shape.form)?;
                     if let Some(machine) = machine_selector {
                         if let Some(binding) = manifest.resolve_legacy_form(machine, shape.form) {
-                            validate_app_bound_class(
-                                &x, key, shape.form, machine, binding, manifest,
-                            )
-                            .map_err(no)?;
+                            match manifest.admission_scan {
+                                AdmissionScan::Full => validate_app_bound_class(
+                                    &x, key, shape.form, machine, binding, manifest,
+                                )
+                                .map_err(no)?,
+                                AdmissionScan::Attested => attested = true,
+                            }
                             app_bound = true;
                         }
                     }
@@ -576,6 +586,9 @@ pub fn step_with_manifest(
     let mut flags = u16_at(&raw, 6, ADMISSION_STATE)?;
     if app_bound {
         flags |= FLAG_APP_BOUND;
+    }
+    if attested {
+        flags |= FLAG_ATTESTED;
     }
     if admitted == v.base_classes + v.generated_classes {
         flags |= FLAG_COMPLETE;

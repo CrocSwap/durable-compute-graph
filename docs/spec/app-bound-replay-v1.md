@@ -24,8 +24,9 @@ opt-in means replay accepts no opened plan input at that coordinate; the
 application is responsible for ensuring its result does not depend on those
 unbound reads. The default `replay_input_spans` adapter calls `replay(&[], …)`
 when the opt-in is present. Every route length MUST be a multiple of the bound
-kernel's input alignment. Every class whose form is
-bound by the manifest MUST be checked against the sealed plan at tag 160.
+kernel's input alignment. Under a full-scan manifest
+(`AdmissionScan::Full`, §1.1), every class whose form is bound by the manifest
+MUST be checked against the sealed plan at tag 160.
 Admission rejects with code 799 if any instance cannot be opened by the tag-184
 adapter, including when:
 
@@ -63,9 +64,36 @@ fixture and image are recorded in `docs/experiments/dcg-seam-fix-2026-09-30.md`.
 These numbers constrain the manifest; they do not prove every app kernel's
 actual worst-case runtime.
 
+### 1.1 Full and attested admission
+
+The manifest's `admission_scan` selects how tag 160 treats a class whose form
+it binds:
+
+- `Full`: the per-instance check above. Its cost grows with positions times
+  bound classes. Measured on the K=10,240 fixture: about 271,000 tag-160
+  transactions covered roughly 1,600 of an estimated 3,300 bound classes, so a
+  single transaction cannot finish it and the parked DEA2 v4 cursor
+  (`fast/admission-cursor`) is the only on-chain route.
+- `Attested`: a bound class is admitted on its binding and registry checks
+  alone. The sealed template is trusted to be openable, and parties who rely
+  on it verify that off chain by running the same per-instance check.
+  Measured: the K=10,240 fixture admits in about 1,800 tag-160 transactions.
+
+A DEA2 that admitted at least one bound class without the scan sets flag
+bit 2 (`attested`). An attested manifest's identity digest also commits the
+choice (`dcg/application-admission-attested/1`), so documents record which
+admission they relied on; a full-scan manifest's digest is unchanged.
+
+**What attestation gives up.** If an attested template does contain a
+coordinate the adapter cannot open, a challenge at that coordinate is ruled
+neutrally (as for a changed identity, §2): the challenger's bond is refunded
+and the executor is not convicted. A lie at such a coordinate therefore
+stands. This is the risk accepted by trusting the template.
+
 ## 2. App identity
 
-Admission state DEA2 v3 uses flag bit 0 for complete and bit 1 for app-bound.
+Admission state DEA2 v3 uses flag bit 0 for complete, bit 1 for app-bound and
+bit 2 for attested (§1.1).
 If any admitted class uses an app form, UnifiedInit writes a 64-byte DCM2 v7
 extension after the option table:
 

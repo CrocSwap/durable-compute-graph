@@ -640,6 +640,20 @@ pub struct OptimisticReplayBinding {
     pub replay: &'static dyn OptimisticReplay,
 }
 
+/// How tag 160 admits a class whose form this manifest binds to an app kernel
+/// (`docs/spec/app-bound-replay-v1.md` §1.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionScan {
+    /// Every instance of the class is checked on chain for an opening the
+    /// tag-184 adapter accepts. Cost grows with positions × bound classes.
+    Full,
+    /// The class is admitted on its registry checks alone; the sealed
+    /// template is trusted to be openable and is verified off chain. A
+    /// coordinate that cannot be opened rules a challenge neutral, so a lie
+    /// there is not convicted. DEA2 records this with flag bit 2.
+    Attested,
+}
+
 pub struct ApplicationManifest {
     pub application_id: &'static [u8],
     pub version: u16,
@@ -652,6 +666,8 @@ pub struct ApplicationManifest {
     /// than handled by the historical profile adapter. Admission checks this
     /// before a document can rely on the mapping.
     pub require_legacy_form_binding: bool,
+    /// Whether tag 160 scans app-bound classes position by position.
+    pub admission_scan: AdmissionScan,
     /// App-selected revision-8 policy hooks.
     pub hooks: &'static dyn crate::compatibility::ApplicationHooks,
     /// App-selected typed-decision route producer. Kept as a separate trait
@@ -891,6 +907,11 @@ impl ApplicationManifest {
                     &route.length.to_le_bytes(),
                 ]);
             }
+        }
+        // A full-scan manifest keeps its historical digest; an attested one
+        // commits that choice, so a document records which admission it had.
+        if self.admission_scan == AdmissionScan::Attested {
+            digest = hash::sha256(&[b"dcg/application-admission-attested/1", &digest]);
         }
         digest
     }
@@ -1585,6 +1606,10 @@ pub mod test_kernel {
         legacy_forms: &BYTE_SUM_LEGACY_FORMS,
         require_legacy_form_binding: !cfg!(feature = "sbf-real-lifecycle-test")
             || cfg!(feature = "sbf-unbound-form-test"),
+        #[cfg(not(feature = "sbf-attested-admission-test"))]
+        admission_scan: AdmissionScan::Full,
+        #[cfg(feature = "sbf-attested-admission-test")]
+        admission_scan: AdmissionScan::Attested,
         hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
@@ -1830,9 +1855,40 @@ mod tests {
         optimistic_replays: &ALIGNMENT_PROBE_REPLAYS,
         legacy_forms: &ZERO_INPUT_BINDING,
         require_legacy_form_binding: true,
+        admission_scan: AdmissionScan::Full,
         hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
+
+    #[cfg(feature = "test-kernel")]
+    static ZERO_INPUT_APP_ATTESTED: ApplicationManifest = ApplicationManifest {
+        admission_scan: AdmissionScan::Attested,
+        ..ZERO_INPUT_APP_FIELDS
+    };
+    #[cfg(feature = "test-kernel")]
+    const ZERO_INPUT_APP_FIELDS: ApplicationManifest = ApplicationManifest {
+        application_id: b"dcg-zero-span-test/1",
+        version: 1,
+        kernels: &ALIGNMENT_PROBE_KERNELS,
+        optimistic_replays: &ALIGNMENT_PROBE_REPLAYS,
+        legacy_forms: &ZERO_INPUT_BINDING,
+        require_legacy_form_binding: true,
+        admission_scan: AdmissionScan::Full,
+        hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
+    };
+
+    /// A full-scan manifest keeps the identity digest it had before
+    /// `AdmissionScan` existed (pinned), and attested admission changes it.
+    #[cfg(feature = "test-kernel")]
+    #[test]
+    fn attested_admission_is_part_of_the_identity() {
+        let full = ZERO_INPUT_APP.admission_identity_digest();
+        let hex: String = full.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "8ab3b659b49a5d1502c5f32010d47288fdb3a08ca3ca5df44813d53f93fb50cc");
+        assert_eq!(full, ZERO_INPUT_APP_FIELDS.admission_identity_digest());
+        assert_ne!(full, ZERO_INPUT_APP_ATTESTED.admission_identity_digest());
+    }
 
     #[cfg(feature = "test-kernel")]
     static MISALIGNED_INPUT_SPANS: [ReplayInputLayout; 1] = [ReplayInputLayout {
@@ -1865,6 +1921,7 @@ mod tests {
         optimistic_replays: &ALIGNMENT_PROBE_REPLAYS,
         legacy_forms: &MISALIGNED_INPUT_BINDING,
         require_legacy_form_binding: true,
+        admission_scan: AdmissionScan::Full,
         hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
@@ -1913,6 +1970,7 @@ mod tests {
         optimistic_replays: &[],
         legacy_forms: &[],
         require_legacy_form_binding: false,
+        admission_scan: AdmissionScan::Full,
         hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
@@ -1969,6 +2027,7 @@ mod tests {
             optimistic_replays: &[],
             legacy_forms: &[],
             require_legacy_form_binding: false,
+            admission_scan: AdmissionScan::Full,
             hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
             decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
         };
@@ -2006,6 +2065,7 @@ mod tests {
             optimistic_replays: &test_kernel::REPLAY_BINDINGS,
             legacy_forms: &INVALID_FORMS,
             require_legacy_form_binding: true,
+            admission_scan: AdmissionScan::Full,
             hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
             decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
         };
@@ -2059,6 +2119,7 @@ mod tests {
             optimistic_replays: &test_kernel::REPLAY_BINDINGS,
             legacy_forms: &MULTI_ROUTE_FORMS,
             require_legacy_form_binding: true,
+            admission_scan: AdmissionScan::Full,
             hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
             decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
         };

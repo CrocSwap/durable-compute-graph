@@ -127,6 +127,7 @@ static PREVIOUS_APP_MANIFEST: dcg_program::kernel::ApplicationManifest =
         optimistic_replays: &dcg_program::kernel::test_kernel::REPLAY_BINDINGS,
         legacy_forms: &dcg_program::kernel::test_kernel::BYTE_SUM_REAL_LIFECYCLE_FORMS,
         require_legacy_form_binding: true,
+        admission_scan: dcg_program::kernel::AdmissionScan::Full,
         hooks: &dcg_program::compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &dcg_program::compatibility::REVISION8_COMPATIBILITY,
     };
@@ -2514,6 +2515,19 @@ async fn build_with_pre_fix_seal_processor(
             .await
             .expect("admission step checks compiler-v1 classes");
             first += count as u32;
+        }
+        // An attested app image admits its bound classes without the
+        // position scan and says so in DEA2 (complete | app-bound | attested).
+        #[cfg(feature = "sbf-attested-admission-test")]
+        if !admit_form48_only {
+            let record = ctx
+                .banks_client
+                .get_account(dea2)
+                .await
+                .unwrap()
+                .expect("tag 160 completed admission")
+                .data;
+            assert_eq!(u16_at(&record, 6), 1 | 2 | 4, "attested app-bound admission is complete");
         }
     } else {
         ctx.set_account(&dea2, &shared(owned(&program, adm)));
