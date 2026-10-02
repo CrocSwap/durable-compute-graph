@@ -193,6 +193,10 @@ pub const CORE_INSTRUCTION_TAGS_REVISION_8: &[u8] = &[
     115, 116, 117, 118, 125, 131, 132, 140, 141, 142, 143, 144, 145, 146, 156, 157, 158, 159, 160,
     161, 162, 163, 164, 165, 166, 167, 168, 169, 172, 173, 174, 175, 176, 177, 178, 183, 184, 185,
     186, 187, 193, 197, 198, 199, 200,
+    // The graph lifecycle (208-227) is routed only under its features but is
+    // reserved for DCG in every image, so no application can claim it.
+    208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225,
+    226, 227,
 ];
 
 /// Whether `tag` belongs to the DCG revision-8 core dispatcher.
