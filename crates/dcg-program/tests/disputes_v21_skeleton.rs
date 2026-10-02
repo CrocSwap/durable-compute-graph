@@ -498,3 +498,38 @@ async fn openings_and_witnesses_can_come_from_staging_buffers() {
     send(&mut ch.ctx, i, &[&cl]).await.unwrap();
     assert_eq!(ch.ruling(d).await, V::RULING_CHALLENGER);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_reveal_answers_a_second_dispute_without_the_executor() {
+    let mut ch = Chain::new(1_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let a = ch.open(30, V::KIND_STEP_DESCEND).await;
+    let b = ch.open(31, V::KIND_STEP_DESCEND).await;
+    let e = kp(0xE1);
+    let cache = Pubkey::find_program_address(&[b"dcg21rc", ch.run.as_ref(), &[V::KIND_STEP_DESCEND], &1u32.to_le_bytes(), &0u64.to_le_bytes()], &PROGRAM).0;
+    let mut nodes = Vec::new();
+    nodes.extend_from_slice(&c.step[0][0]);
+    nodes.extend_from_slice(&c.step[0][1]);
+    // The executor's signer pays the cache rent, so it is writable here.
+    let mut accounts = vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(a, false)];
+    accounts.push(AccountMeta::new(cache, false));
+    accounts.push(AccountMeta::new_readonly(SYSTEM, false));
+    let i = ix(V::SUB_REVEAL_NODES, &nodes, accounts);
+    send(&mut ch.ctx, i, &[&e]).await.unwrap();
+    // Dispute B is answered from the cache by its own challenger.
+    let cl = kp(0xC1);
+    let answer = |d: Pubkey, run: Pubkey, template: Pubkey, k: Pubkey| ix(V::SUB_CACHE_ANSWER, &[], vec![AccountMeta::new_readonly(cl.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(d, false), AccountMeta::new_readonly(k, false)]);
+    send(&mut ch.ctx, answer(b, ch.run, ch.template, cache), &[&cl]).await.unwrap();
+    assert_eq!(ch.ctx.banks_client.get_account(b).await.unwrap().unwrap().data[4], 2, "B awaits a pick");
+    // A forged cache (any program-owned account with the bytes) is refused.
+    let mut forged = ch.ctx.banks_client.get_account(cache).await.unwrap().unwrap();
+    forged.data[24] ^= 1;
+    let fake = Pubkey::new_unique();
+    ch.ctx.set_account(&fake, &forged.into());
+    let d3 = ch.open(32, V::KIND_STEP_DESCEND).await;
+    assert!(send(&mut ch.ctx, answer(d3, ch.run, ch.template, fake), &[&cl]).await.is_err());
+    // A then B play on: picking the honest leaf and losing EDGE, as usual.
+    let i = ix(V::SUB_PICK, &[1], ch.party(0xC1, b));
+    send(&mut ch.ctx, i, &[&cl]).await.unwrap();
+}

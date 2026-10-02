@@ -20,7 +20,10 @@
 //! - per-party staging buffers (§8.2), created and funded by C, written any
 //!   time by their owner; a reveal or claim may read its bytes from them.
 //!
-//! Not yet: staging growth past one CPI creation (10 KiB), the reveal cache, the load extension, receipts, closes, and the full v2.1
+//! - a run-level reveal cache: a verified reveal may be recorded, and any
+//!   other dispute at the same node is answered from it by anyone (§8.3).
+//!
+//! Not yet: staging growth past one CPI creation (10 KiB), the leaf cache, the load extension, receipts, closes, and the full v2.1
 //! template identity.
 
 use dcg_disputes as D;
@@ -66,6 +69,14 @@ pub const ROLE_CHALLENGER: u8 = 2;
 pub const STAGE_HEADER: usize = 48;
 pub const MAX_STAGE: usize = 10_240 - STAGE_HEADER;
 pub const FROM_STAGING: u8 = 0xFF;
+pub const SUB_CACHE_ANSWER: u8 = 16;
+
+/// Reveal cache entry "D21C" (design §8.3): magic(4) kind(1) depth(1) pad(2)
+/// level:u32 pad(4) position:u64 node[32] revealed[32 x 32]. PDA
+/// ["dcg21rc", run, kind, level, position]. Written only by a verified
+/// reveal, keyed by the node it answers; any dispute at that node can then
+/// be answered from it by anyone.
+pub const CACHE_BYTES: usize = 56 + 32 * 32;
 
 pub const RULING_OPEN: u8 = 0;
 pub const RULING_EXECUTOR: u8 = 1;
@@ -127,7 +138,7 @@ fn create_pda<'a>(
         return Err(err(3));
     }
     let bump_seed = [bump];
-    let mut signer: [&[u8]; 5] = [&[]; 5];
+    let mut signer: [&[u8]; 6] = [&[]; 6];
     signer[..seeds.len()].copy_from_slice(seeds);
     signer[seeds.len()] = &bump_seed;
     let signer = &signer[..seeds.len() + 1];
@@ -281,6 +292,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         SUB_PAY_POT => pay_pot(program_id, accounts),
         SUB_STAGE_CREATE => stage_create(program_id, accounts, &data[2..]),
         SUB_STAGE_WRITE => stage_write(program_id, accounts, &data[2..]),
+        SUB_CACHE_ANSWER => cache_answer(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -495,7 +507,7 @@ fn tree_of(kind: u8) -> D::Tree {
 
 // 5: [executor(s), run, template, dispute(w)] the pickable hashes, in position order.
 fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [executor, run, tmpl, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     executor_signed(c.run, executor)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
@@ -527,6 +539,51 @@ fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
         let h = slot.unwrap_or([0; 32]);
         d[D_REVEALED + 32 * i..D_REVEALED + 32 * (i + 1)].copy_from_slice(&h);
     }
+    d[D_REVEALED_N..D_REVEALED_N + 2].copy_from_slice(&(n as u16).to_le_bytes());
+    if let [cache, system, ..] = rest {
+        // Optional: record this verified answer for every other dispute at
+        // the same node. The executor pays its rent.
+        let level_b = level.to_le_bytes();
+        let pos_b = position.to_le_bytes();
+        let seeds: [&[u8]; 5] = [b"dcg21rc", c.run.key.as_ref(), &[kind], &level_b, &pos_b];
+        if cache.data_is_empty() {
+            create_pda(program_id, executor, cache, system, &seeds, CACHE_BYTES)?;
+            let mut k = cache.try_borrow_mut_data()?;
+            k[0..4].copy_from_slice(b"D21C");
+            k[4] = kind;
+            k[5] = depth as u8;
+            k[8..12].copy_from_slice(&level_b);
+            k[16..24].copy_from_slice(&pos_b);
+            k[24..56].copy_from_slice(&d[D_CURRENT..D_CURRENT + 32]);
+            k[56..].copy_from_slice(&d[D_REVEALED..D_REVEALED + 32 * 32]);
+        }
+    }
+    next_phase(&mut d, PH_PICK, c.t.phase_window)
+}
+
+// 16: [anyone, run, template, dispute(w), cache] answer AWAIT_NODES from a
+// cached, verified reveal of the same node.
+fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [_caller, run, tmpl, dispute, cache, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    let mut d = c.dispute.try_borrow_mut_data()?;
+    expect_phase(&d, PH_NODES)?;
+    let k = cache.try_borrow_data()?;
+    let level = u32_at(&d, D_LEVEL)?;
+    let position = u64_at(&d, D_POSITION)?;
+    let kind = d[D_KIND];
+    if k.len() != CACHE_BYTES || &k[0..4] != b"D21C" {
+        return Err(err(30));
+    }
+    derived(program_id, cache, &[b"dcg21rc", c.run.key.as_ref(), &[kind], &level.to_le_bytes(), &position.to_le_bytes()])?;
+    // The node hash must match too: the cache answers this node only.
+    if k[4] != kind || k[5] != d[D_DEPTH].min(level as u8) || k[24..56] != d[D_CURRENT..D_CURRENT + 32] {
+        return Err(err(30));
+    }
+    let depth = k[5] as u32;
+    let first = position << depth;
+    let n = (0..1u64 << depth).filter(|i| D::pickable(limit(&c.t, kind), level - depth, first + i)).count();
+    d[D_REVEALED..D_REVEALED + 32 * 32].copy_from_slice(&k[56..]);
     d[D_REVEALED_N..D_REVEALED_N + 2].copy_from_slice(&(n as u16).to_le_bytes());
     next_phase(&mut d, PH_PICK, c.t.phase_window)
 }
