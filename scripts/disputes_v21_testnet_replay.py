@@ -47,11 +47,15 @@ def sample(scenarios: list[dict], per: int) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--per", type=int, default=2)
+    ap.add_argument("--match", default="", help="only scenarios whose name contains one of these (comma-separated)")
     args = ap.parse_args()
     gc = GraphClient.from_environment()
     cl = CL.DisputeClient(gc)
     executor, challenger = Keypair.from_seed(bytes([0xE1]) * 32), Keypair()
-    chosen = sample(json.loads(SCENARIOS.read_text()), args.per)
+    pool = json.loads(SCENARIOS.read_text())
+    if args.match:
+        pool = [s for s in pool if any(m in s["name"] for m in args.match.split(","))]
+    chosen = sample(pool, args.per)
     cl.fund(executor.pubkey(), 50_000_000 * len(chosen))
     cl.fund(challenger.pubkey(), 50_000_000 * len(chosen))
     agree = skipped = 0
@@ -72,8 +76,17 @@ def main() -> int:
             continue
         run = cl.init_run(template, template_id, bytes.fromhex(s["nonce"]), executor.pubkey(), refs, gc.payer)
         cl.commit(run, template, bytes.fromhex(s["root_bytes"]), executor)
-        out = cl.play(run, template, s, executor, challenger)
-        ok = out["ruling"] == s["ruling"]
+        if s["ruling"] == "refused":
+            # A forged claim must be refused and leave the dispute open.
+            try:
+                out = cl.play(run, template, s, executor, challenger)
+                ok = False
+            except Exception as exc:  # the claim's preflight refusal
+                out = {"ruling": "refused", "error": str(exc)[-120:]}
+                ok = True
+        else:
+            out = cl.play(run, template, s, executor, challenger)
+            ok = out["ruling"] == s["ruling"]
         agree += ok
         print(json.dumps({"name": s["name"], "claim": s["claim_name"], "oracle": s["ruling"], **out,
                           "rounds": len(s["rounds"]), "claim_bytes": len(s["claim"]) // 2, "agree": ok}), flush=True)
