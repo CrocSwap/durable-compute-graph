@@ -403,6 +403,19 @@ class EndpointPool:
                     due = self._rate_due(state, effective_kind)
                     if due > now:
                         timed.append(due - now)
+                if (
+                    not candidates
+                    and not healthy
+                    and route_group is not None
+                    and endpoint_id is None
+                    and kind is not RequestKind.PROBE
+                    and len(matching) < len(self._nodes)
+                    and all(state.probe_required or state.cooldown_until > now for state in matching)
+                ):
+                    # M5: every node in the requested route group is cooling;
+                    # fail over to the whole pool instead of waiting it out.
+                    matching = tuple(self._nodes.values())
+                    continue
                 if candidates:
                     ready = [
                         state

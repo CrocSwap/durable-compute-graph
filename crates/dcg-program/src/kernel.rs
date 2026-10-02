@@ -1521,6 +1521,145 @@ pub mod test_kernel {
         hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
+
+    /// Test-only adapter used by the generic-dispute SBF suite. The engine
+    /// sees only the hook contract; this application authenticates a tiny
+    /// synthetic weight witness and replays with the existing ByteSum kernel.
+    #[cfg(feature = "test-kernel")]
+    pub struct DisputeHooks;
+
+    #[cfg(feature = "test-kernel")]
+    pub static DISPUTE_HOOKS: DisputeHooks = DisputeHooks;
+
+    #[cfg(feature = "test-kernel")]
+    impl crate::app_api::ApplicationDisputeHooks for DisputeHooks {
+        fn supports_form(&self, machine: u8, form: u16) -> bool {
+            matches!(machine, 0..=2)
+                && matches!(
+                    form,
+                    1 | 4 | 5 | 10 | 13 | 16 | 18 | 19 | 21 | 22 | 28 | 30 | 40..=48 | 256
+                )
+        }
+
+        fn requires_weight_rows(&self, form: u16, _operation: u16) -> bool {
+            matches!(form, 1 | 4 | 22 | 47)
+        }
+
+        fn requires_artifact_block(&self, form: u16, _operation: u16) -> bool {
+            matches!(form, 2 | 10 | 13 | 16 | 18 | 19 | 21 | 28 | 30)
+        }
+
+        fn replay_pt1(
+            &self,
+            request: crate::app_api::ApplicationReplayRequest<'_>,
+            output: &mut [u8],
+        ) -> Result<usize, u32> {
+            if request.instruction_data.len() != 1
+                || request.artifact_operands.first().copied() != Some(b"DCGTEST-ROWS/1")
+            {
+                return Err(740);
+            }
+            if request.form == 22 && request.reads.len() == 1 {
+                return BYTE_SUM.execute(request.reads[0], output).map_err(|_| 734);
+            }
+            if request.form == 47 && request.reads.len() == 2 && output.len() >= 1024 {
+                let input = request
+                    .reads
+                    .iter()
+                    .map(|read| *read)
+                    .find(|read| read.len() >= 64)
+                    .and_then(|read| read.get(..64))
+                    .ok_or(734u32)?;
+                let mut sum = [0u8; 256];
+                BYTE_SUM.execute(input, &mut sum).map_err(|_| 734u32)?;
+                for lane in output[..1024].chunks_exact_mut(4) {
+                    lane.copy_from_slice(&sum[..4]);
+                }
+                return Ok(1024);
+            }
+            Err(740)
+        }
+    }
+
+    #[cfg(feature = "test-kernel")]
+    impl crate::app_api::ArtifactWitnessVerifier for DisputeHooks {
+        fn supplied_read_hash(
+            &self,
+            _machine: u8,
+            _form: u16,
+            _region: u16,
+            _byte_length: u32,
+        ) -> Result<[u8; 32], u32> {
+            Err(734)
+        }
+
+        fn verify_descriptor_row_anchor(
+            &self,
+            descriptor_core: &[u8],
+            model_root: &[u8; 32],
+        ) -> Result<crate::app_api::ArtifactRowAnchor, u32> {
+            if descriptor_core != b"DCGTEST-DESCRIPTOR/1" {
+                return Err(734);
+            }
+            Ok(crate::app_api::ArtifactRowAnchor {
+                root: crate::hash::sha256(&[
+                    b"dcg/test-artifact-row-anchor/1",
+                    descriptor_core,
+                    model_root,
+                ]),
+                leaf_count: 1,
+            })
+        }
+
+        fn verify_weight_rows(
+            &self,
+            _witness: &[u8],
+            _anchor: crate::app_api::ArtifactRowAnchor,
+            _tensor_name: &[u8],
+            _first_row: u32,
+            _row_count: u16,
+            _width: u32,
+        ) -> Result<(), u32> {
+            Err(734)
+        }
+
+        fn verify_weight_rows_for_entry(
+            &self,
+            witness: &[u8],
+            anchor: crate::app_api::ArtifactRowAnchor,
+            _machine: u8,
+            form: u16,
+            _operation: u16,
+            _payload: &[u8],
+            _read_operands: &[&[u8]],
+        ) -> Result<(), u32> {
+            if matches!(form, 22 | 47)
+                && witness == b"DCGTEST-ROWS/1"
+                && anchor.leaf_count == 1
+                && anchor.root != [0; 32]
+            {
+                Ok(())
+            } else {
+                Err(734)
+            }
+        }
+
+        fn verify_artifact_block(
+            &self,
+            _form: u16,
+            _operation: u16,
+            _position: u32,
+            witness: &[u8],
+            descriptor_core: &[u8],
+            _model_root: &[u8; 32],
+        ) -> Result<(), u32> {
+            if descriptor_core == b"DCGTEST-DESCRIPTOR/1" && witness == b"DCGTEST-ARTIFACT/1" {
+                Ok(())
+            } else {
+                Err(734)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

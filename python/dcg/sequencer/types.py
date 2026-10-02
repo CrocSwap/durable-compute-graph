@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable, Protocol, Sequence
@@ -61,6 +63,10 @@ class AmbiguousFate(SequencerError):
     failure_class = FailureClass.AMBIGUOUS
 
 
+class ReconciliationRequired(AmbiguousFate):
+    """A stream branch needs application state reconciliation before continuing."""
+
+
 class StepTimeCapExceeded(SequencerError):
     """The configured per-step time cap expired; journal state is resumable."""
 
@@ -81,6 +87,11 @@ class Commitment(str, Enum):
     PROCESSED = "processed"
     CONFIRMED = "confirmed"
     FINALIZED = "finalized"
+
+
+class LatencyMode(str, Enum):
+    CONFIRMED = "confirmed"
+    PROCESSED = "processed"
 
 
 @dataclass(frozen=True)
@@ -165,6 +176,15 @@ class Signer(Protocol):
     async def sign(self, message: bytes, lease: BlockhashLease) -> SignedTransaction: ...
 
 
+class MessageSigner(Protocol):
+    """Injected signer for one required account in a multi-signer message."""
+
+    @property
+    def public_key(self) -> str: ...
+
+    async def sign_message(self, message: bytes) -> bytes: ...
+
+
 class RpcEndpoint(Protocol):
     """RPC boundary. Network-specific wire encoding stays in this adapter."""
 
@@ -211,6 +231,10 @@ class TransactionStep:
     write_locks: tuple[str, ...] = ()
     retry_policy: RetryPolicy = RetryPolicy.SAME_BYTES
     authorize_rebuild: RebuildAuthorizer | None = None
+    route_group: str | None = None
+    route_affinity: str | None = None
+    provider_id: str | None = None
+    reconcile_dropped: Callable[[RpcEndpoint, str, PostconditionResult], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -220,12 +244,17 @@ class TransactionPlan:
     destination_accounts: tuple[str, ...]
     signer_public_key: str
     steps: tuple[TransactionStep, ...]
+    signer_public_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class EndpointLimits:
     sends_per_second: float = 10.0
     max_in_flight: int = 8
+    # M3: v1 callers had no implicit read-rate limit; configure one explicitly.
+    requests_per_second: float = 1_000_000.0
+    weight: float = 1.0
+    route_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -244,3 +273,20 @@ class SequencerConfig:
     per_step_time_cap_seconds: float = 90.0
     confirmation_poll_seconds: float = 0.25
     backoff: Backoff = Backoff()
+    pool_acquire_timeout_seconds: float = 30.0
+    health_score_threshold: float = 6.0
+    health_cooldown_seconds: float = 1.0
+    health_max_cooldown_seconds: float = 60.0
+    health_rate_limit_points: float = 6.0
+    health_transport_error_points: float = 2.0
+    status_batch_window_seconds: float = 0.002
+    status_batch_size: int = 256
+    latency_mode: LatencyMode = LatencyMode.CONFIRMED
+    optimistic_max_depth: int = 2
+    optimistic_max_seconds: float = 2.0
+    optimistic_drop_status_misses: int = 2
+    optimistic_drop_window_seconds: float = 0.0
+    stream_journal_quota_bytes: int = 1_000_000_000
+    stream_checkpoint_retention: int = 2
+    monotonic_clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep

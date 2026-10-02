@@ -1074,11 +1074,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
+name = "dcg-kernels"
+version = "0.1.0"
+
+[[package]]
 name = "dcg-program"
 version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "dcg-kernels",
  "ed25519-dalek",
  "indexmap",
  "proc-macro-crate 3.3.0",

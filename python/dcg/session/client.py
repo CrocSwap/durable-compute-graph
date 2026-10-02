@@ -181,6 +181,7 @@ class SequencedInstructionTransport:
             program_id=str(program_id),
             destination_accounts=tuple(sorted({str(meta.pubkey) for _role, meta in built.account_roles})),
             signer_public_key=operation_signers.public_key,
+            signer_public_keys=operation_signers.public_keys,
             steps=(step,),
         )
         try:

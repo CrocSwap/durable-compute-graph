@@ -40,6 +40,9 @@ class RpcConfig:
     outage_cooldown_seconds: float = 0.25
     max_cooldown_seconds: float = 8.0
     commitment: Commitment = Commitment.CONFIRMED
+    # Skip RPC preflight simulation. Program errors then surface through the
+    # signature status instead of the send call; saves a full simulation per send.
+    skip_preflight: bool = False
 
 
 class SolanaRpcEndpoint:
@@ -155,7 +158,7 @@ class SolanaRpcEndpoint:
                 encoded,
                 {
                     "encoding": "base64",
-                    "skipPreflight": False,
+                    "skipPreflight": self.config.skip_preflight,
                     "preflightCommitment": self.config.commitment.value,
                     "maxRetries": 0,
                 },
@@ -474,7 +477,7 @@ class SolanaRpcEndpoint:
             raise BlockhashExpired(safe_message)
         if "too many requests" in lowered or "rate limit" in lowered:
             raise RateLimited(safe_message)
-        if "instructionerror" in lowered or "custom program error" in lowered:
+        if "instructionerror" in lowered or "custom program error" in lowered or "error processing instruction" in lowered:
             raise ProgramRefused(safe_message)
         if code in {-32005, -32004} or "node is unhealthy" in lowered or "node unhealthy" in lowered:
             raise RpcUnavailable(safe_message)
