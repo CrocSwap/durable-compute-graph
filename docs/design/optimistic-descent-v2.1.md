@@ -947,6 +947,24 @@ the happy path only.
 
 ## 14. Implementation order
 
+**Status, 2026-10-02.** Step 1 is done offline, in `python/dcg/disputes_v21/`:
+- the trees, `DCDS` for one enumerated block, `RunRootV21`, the referee and the
+  honest challenger;
+- `python/tests/test_disputes_v21.py`, with these results (*measured*):
+  - 400 random lies across 10 kinds were all refuted;
+  - every claim against every leaf of 40 honest random graphs ruled for E;
+  - two reintroduced bugs (the R2-B1 EDGE bytes, and SHAPE ignoring state
+    digests) were each caught;
+- goldens in `tests/golden/dcg/disputes_v21/vectors.json`, from
+  `scripts/disputes_v21_goldens.py`.
+
+Not in step 1:
+- producer kinds 3 to 7;
+- parameters, so STEP does not check `parameter_digest` or
+  `port_shapes_digest` (the traced kernels have none);
+- state;
+- repeated blocks.
+
 1. **Core.** Pin the record bytes first: header, `BlockSpec`, `StepSpec`,
    `OutSpec`, `InSpec`, the trees and empty constants. Then build the Python
    reference, scoped to **one enumerated block**, with these stateless
