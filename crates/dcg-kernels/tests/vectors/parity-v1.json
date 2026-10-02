@@ -1,0 +1,10 @@
+[
+  {"name": "ordinary", "inputs": [20, 22], "host": {"trace": [42, 42]}},
+  {"name": "negative", "inputs": [-7, 3], "host": {"trace": [-4, -4]}},
+  {"name": "zero-sum", "inputs": [-2147483647, 2147483647], "host": {"trace": [0, 0]}},
+  {"name": "max-edge", "inputs": [2147483646, 1], "host": {"trace": [2147483647, 2147483647]}},
+  {"name": "min-edge", "inputs": [-2147483647, -1], "host": {"trace": [-2147483648, -2147483648]}},
+  {"name": "min-plus-max", "inputs": [-2147483648, 2147483647], "host": {"trace": [-1, -1]}},
+  {"name": "overflow-up", "inputs": [2147483647, 1], "host": {"refusal": 1, "step": 0}},
+  {"name": "overflow-down", "inputs": [-2147483648, -1], "host": {"refusal": 1, "step": 0}}
+]
