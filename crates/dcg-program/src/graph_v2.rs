@@ -28,7 +28,7 @@ use solana_program::{
     account_info::AccountInfo,
     clock::Clock,
     entrypoint::ProgramResult,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     pubkey::Pubkey,
     rent::Rent,
@@ -63,7 +63,9 @@ const CELL: usize = 4;
 const BLOB_HEADER: usize = 76;
 // Template: magic(4) mode(1) samples(1) pad(2) window(8) template_id(32)
 // graph_id(32) plan_id(32) table_id(32) manifest_root(32) image_id(32) table_key(32).
-const TEMPLATE_BYTES: usize = 16 + 32 * 7;
+/// Header, seven identities, then the executor bond (u64 lamports).
+const TEMPLATE_BYTES: usize = 16 + 32 * 7 + 8;
+const TEMPLATE_BOND: usize = 16 + 32 * 7;
 // Run: magic(4) status(1) audited(1) n_in(2) n_steps(2) bad_step(2) pad(4)
 // commit_slot(8) deadline(8) run_id(32) template(32) payer(32) executor(32)
 // then inputs (n_in cells) then trace (n_steps cells).
@@ -297,7 +299,12 @@ fn admit_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         }
     }
     let image_id = sha256(&[b"dcg.app.image.v2\x00", program_id.as_ref()]);
-    let template_id = sha256(&[TEMPLATE_DOMAIN, &graph_id, &plan_id, &image_id, &manifest_root, &table_id, &data[1..11]]);
+    // Optional executor bond (lamports) after the manifest root; bound into
+    // the template identity when present.
+    let bond = data.get(43..51).map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let bond_bytes = if data.len() >= 51 { &data[43..51] } else { &[][..] };
+    let template_id =
+        sha256(&[TEMPLATE_DOMAIN, &graph_id, &plan_id, &image_id, &manifest_root, &table_id, &data[1..11], bond_bytes]);
     create_pda(program_id, admitter, template, system, &[b"dcg2tmpl", &template_id], TEMPLATE_BYTES)?;
     let mut d = template.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"DCT2");
@@ -311,6 +318,7 @@ fn admit_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     {
         d[16 + 32 * i..48 + 32 * i].copy_from_slice(part);
     }
+    d[TEMPLATE_BOND..TEMPLATE_BOND + 8].copy_from_slice(&bond.to_le_bytes());
     Ok(())
 }
 
@@ -342,7 +350,7 @@ fn verify_canonical_lowering(
         return Err(wire(dcg_wire::Code::LowerGraphId));
     }
     if decoded_plan.kernel_manifest_root != manifest_root.as_slice() {
-        return Err(err(20));
+        return Err(err(29));
     }
     let lowered = dcg_wire::lower(&decoded, &decoded_plan, |id, semantic, abi| {
         dcg_kernels::REGISTRY
@@ -361,7 +369,7 @@ fn verify_canonical_lowering(
     let t = table.try_borrow_data()?;
     let t = &t[BLOB_HEADER..BLOB_HEADER + u32_at(&t, 8)? as usize];
     if t.len() < lowered.len() || t[..lowered.len()] != lowered[..] {
-        return Err(err(21));
+        return Err(err(30));
     }
     Ok(true)
 }
@@ -372,6 +380,7 @@ struct TemplateView {
     window: u64,
     template_id: [u8; 32],
     table_key: [u8; 32],
+    bond: u64,
 }
 
 fn template_view(program_id: &Pubkey, template: &AccountInfo) -> Result<TemplateView, ProgramError> {
@@ -386,6 +395,8 @@ fn template_view(program_id: &Pubkey, template: &AccountInfo) -> Result<Template
         window: u64_at(&d, 8)?,
         template_id: key32(&d, 16)?,
         table_key: key32(&d, 16 + 32 * 6)?,
+        // Templates admitted before bonds are 240 bytes and carry none.
+        bond: if d.len() >= TEMPLATE_BYTES { u64_at(&d, TEMPLATE_BOND)? } else { 0 },
     })
 }
 
@@ -482,9 +493,10 @@ fn execute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     Ok(())
 }
 
-// 216: [executor(s), run(w), template] tag trace(n_steps cells) optimistic commit.
+// 216: [executor(s,w), run(w), template, system] tag trace(n_steps cells) optimistic commit.
+// The executor posts the template's bond into the run account.
 fn commit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [executor, run, template, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let [executor, run, template, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     if !executor.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -507,9 +519,29 @@ fn commit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     d[at..at + trace.len()].copy_from_slice(trace);
     let slot = Clock::get()?.slot;
     d[4] = STATUS_COMMITTED;
+    if view.bond > 0 {
+        let system = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        drop(d);
+        invoke(&system_instruction::transfer(executor.key, run.key, view.bond), &[executor.clone(), run.clone(), system.clone()])?;
+        d = run.try_borrow_mut_data()?;
+    }
     d[16..24].copy_from_slice(&slot.to_le_bytes());
     d[24..32].copy_from_slice(&(slot + view.window).to_le_bytes());
     d[128..160].copy_from_slice(executor.key.as_ref());
+    Ok(())
+}
+
+/// The run's bond: its lamports above the rent-exempt minimum for its size.
+fn take_bond(run: &AccountInfo, to: &AccountInfo) -> ProgramResult {
+    let floor = Rent::get()?.minimum_balance(run.data_len());
+    let bond = run.lamports().saturating_sub(floor);
+    if bond > 0 {
+        if !to.is_writable {
+            return Err(err(27));
+        }
+        **run.try_borrow_mut_lamports()? -= bond;
+        **to.try_borrow_mut_lamports()? += bond;
+    }
     Ok(())
 }
 
@@ -551,12 +583,15 @@ fn challenge(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
     }
     d[4] = STATUS_CHALLENGER_WON;
     d[10..12].copy_from_slice(&(step as u16).to_le_bytes());
-    Ok(())
+    drop(d);
+    // The executor's bond goes to the challenger who proved the step wrong.
+    take_bond(run, challenger)
 }
 
-// 218: [caller, run(w), template] after the deadline with no winning challenge.
+// 218: [caller, run(w), template, executor(w)?] after the deadline with no
+// winning challenge; the bond, if any, returns to the committing executor.
 fn finalize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    let [_caller, run, template, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let [_caller, run, template, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let view = template_view(program_id, template)?;
     run_checked(program_id, run, template)?;
     let mut d = run.try_borrow_mut_data()?;
@@ -570,12 +605,21 @@ fn finalize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(err(24));
     }
     d[4] = STATUS_FINAL;
+    let executor_key = key32(&d, 128)?;
+    drop(d);
+    if view.bond > 0 {
+        let executor = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        if executor.key.to_bytes() != executor_key {
+            return Err(err(28));
+        }
+        take_bond(run, executor)?;
+    }
     Ok(())
 }
 
 // 219: [caller, run(w), template, table, slot_hashes] sampling audit.
 fn sample_audit(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    let [_caller, run, template, table, slot_hashes, ..] = accounts else {
+    let [caller, run, template, table, slot_hashes, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     if *slot_hashes.key != sysvar::slot_hashes::id() {
@@ -609,7 +653,9 @@ fn sample_audit(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
             d[4] = STATUS_CHALLENGER_WON;
             d[10..12].copy_from_slice(&(step as u16).to_le_bytes());
             d[5] = 1;
-            return Ok(());
+            drop(d);
+            // An audit that catches a wrong step pays the bond to the auditor.
+            return take_bond(run, caller);
         }
     }
     d[5] = 1;

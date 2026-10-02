@@ -6,6 +6,7 @@ Environment: DCG_PAYER_KEYPAIR, DCG_PROGRAM_ID, DCG_RPC_URL.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 
@@ -20,6 +21,12 @@ def hello(a, b):
     return identity_i32(total)
 
 
+def held(client, run) -> int:
+    value = client.rpc("getAccountInfo", [str(run), {"encoding": "base64", "commitment": "confirmed"}])["value"]
+    rent = client.rpc("getMinimumBalanceForRentExemption", [value["space"]])
+    return value["lamports"] - rent
+
+
 def main(scenario: str) -> int:
     graph = tracing.trace(hello)
     client = GraphClient.from_environment()
@@ -31,7 +38,8 @@ def main(scenario: str) -> int:
         mode = "sampling" if name.startswith("sampling") else ("consensus" if name == "consensus" else "optimistic")
         print(f"== {name}")
         print(graph.explain(mode, samples=2))
-        admitted = client.admit(graph, mode, window_slots=150, samples=2)
+        bond = int(os.environ["DCG_BOND"]) if os.environ.get("DCG_BOND") else None
+        admitted = client.admit(graph, mode, window_slots=150, samples=2, bond=bond)
         run = client.init_run(admitted, inputs)
         if mode == "consensus":
             client.execute(admitted, run)
@@ -41,6 +49,8 @@ def main(scenario: str) -> int:
                 trace = [trace[0] + 1, trace[1] + 1]  # wrong add, consistent identity
             client.commit(admitted, run, trace)
             state = client.read_run(run)
+            if bond:
+                print(f"  bond held after commit: {held(client, run)} lamports")
             if name == "dishonest":
                 client.challenge(admitted, run, 0)
             elif mode == "sampling":
@@ -55,6 +65,8 @@ def main(scenario: str) -> int:
                 client.wait_past(state["deadline"])
                 client.finalize(admitted, run)
         state = client.read_run(run)
+        if bond and mode != "consensus":
+            print(f"  bond held at the end: {held(client, run)} lamports")
         outputs = graph.outputs_of(state["trace"])
         print(f"  run {run} status={state['status']} trace={state['trace']} outputs={outputs} "
               f"bad_step={state['bad_step']} audited={state['audited']} wall={time.monotonic() - started:.1f}s")

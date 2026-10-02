@@ -117,7 +117,10 @@ class GraphClient:
         return blob
 
     def admit(self, graph: Graph, mode: str, window_slots: int = 150, samples: int = 0,
-              manifest_root: bytes | None = None) -> dict:
+              manifest_root: bytes | None = None, bond: int | None = None) -> dict:
+        """``bond``: executor bond in lamports, posted at commit, paid to a
+        winning challenger or auditor and refunded at finalize. ``None`` admits
+        a template without a bond field (the pre-bond identity)."""
         if manifest_root is None:
             # A canonical DCPL binds its kernel-manifest root (bytes 104..136),
             # and admission checks the declared root against it.
@@ -135,14 +138,16 @@ class GraphClient:
         ids = {**graph.ids(), "table": hashlib.sha256(TABLE_DOMAIN + table).digest()}
         image_id = hashlib.sha256(b"dcg.app.image.v2\x00" + bytes(self.program_id)).digest()
         template_id = hashlib.sha256(TEMPLATE_DOMAIN + ids["graph"] + ids["plan"] + image_id + manifest_root
-                                     + ids["table"] + policy[3:]).digest()
+                                     + ids["table"] + policy[3:]
+                                     + (b"" if bond is None else struct.pack("<Q", bond))).digest()
         template = self.pda(b"dcg2tmpl", template_id)
         if self.account(template) is None:
-            self.send(bytes([213, MODES[mode], samples]) + struct.pack("<Q", window_slots) + manifest_root,
+            self.send(bytes([213, MODES[mode], samples]) + struct.pack("<Q", window_slots) + manifest_root
+                      + (b"" if bond is None else struct.pack("<Q", bond)),
                       [AccountMeta(self.payer.pubkey(), True, True), AccountMeta(template, False, True),
                        AccountMeta(blobs["graph"], False, False), AccountMeta(blobs["plan"], False, False),
                        AccountMeta(blobs["table"], False, False), AccountMeta(SYSTEM, False, False)])
-        return {"template": template, "template_id": template_id, "table": blobs["table"], **blobs}
+        return {"template": template, "template_id": template_id, "table": blobs["table"], "bond": bond or 0, **blobs}
 
     def init_run(self, admitted: dict, inputs: list[int]) -> Pubkey:
         nonce = secrets.token_bytes(32)
@@ -157,7 +162,8 @@ class GraphClient:
 
     def _run_metas(self, admitted: dict, run: Pubkey, signer: Keypair | None = None, table: bool = True):
         who = (signer or self.payer).pubkey()
-        metas = [AccountMeta(who, True, False), AccountMeta(run, False, True),
+        # The signer is writable: it posts or receives a bond.
+        metas = [AccountMeta(who, True, True), AccountMeta(run, False, True),
                  AccountMeta(admitted["template"], False, False)]
         if table:
             metas.append(AccountMeta(admitted["table"], False, False))
@@ -168,14 +174,19 @@ class GraphClient:
 
     def commit(self, admitted, run, trace_values: list[int], executor: Keypair | None = None):
         return self.send(bytes([216]) + b"".join(struct.pack("<i", v) for v in trace_values),
-                         self._run_metas(admitted, run, executor, table=False), [executor] if executor else None)
+                         self._run_metas(admitted, run, executor, table=False) + [AccountMeta(SYSTEM, False, False)],
+                         [executor] if executor else None)
 
     def challenge(self, admitted, run, step: int, challenger: Keypair | None = None):
         return self.send(bytes([217]) + struct.pack("<H", step), self._run_metas(admitted, run, challenger),
                          [challenger] if challenger else None)
 
     def finalize(self, admitted, run):
-        return self.send(bytes([218]), self._run_metas(admitted, run, table=False))
+        metas = self._run_metas(admitted, run, table=False)
+        if admitted.get("bond"):
+            d = self.account(run)
+            metas.append(AccountMeta(Pubkey.from_bytes(d[128:160]), False, True))
+        return self.send(bytes([218]), metas)
 
     def audit(self, admitted, run):
         return self.send(bytes([219]), self._run_metas(admitted, run) + [AccountMeta(SLOT_HASHES, False, False)])
