@@ -145,7 +145,9 @@ class Dispute:
             got = leaf.inputs[index]
             kind, a, b, _c, _d = S.decode_producer(d["inputs"][index][1])
             if kind == 2:
-                ref = self.record.external_refs[a]
+                ref = self.record.external_refs.get(a)
+                if ref is None:  # the run never posted that input
+                    return self._rule("C")
                 return self._rule("C" if got[7:55] != ref[4:52] else "E")
             if kind == 1:
                 if producer_opening is None:

@@ -95,6 +95,11 @@ pub const TEMPLATE_DOMAIN: &[u8] = b"dcg.template.id.v2.1-skeleton\x00";
 pub const MIN_WINDOW: u64 = 1;
 pub const MAX_WINDOW: u64 = 10_000_000;
 pub const MAX_LEAF: usize = 1_100;
+/// A depth-5 reveal (1,024 bytes of hashes) does not fit one transaction and
+/// reveals are not staged yet, so depth is capped at 4 (review B3).
+pub const MAX_REVEAL_DEPTH: u8 = 4;
+/// The design's wall-time floor for a phase (§8.3): about 30 s at 40 ms.
+pub const MIN_PHASE_WINDOW: u64 = 750;
 
 struct Syscall;
 impl D::Sha256 for Syscall {
@@ -175,11 +180,11 @@ fn now() -> Result<u64, ProgramError> {
 // Template "D21T": magic(4) depth(1) pad(3) total_steps(8) total_outputs(8)
 // challenge_window(8) phase_window(8) executor_bond(8) challenger_bond(8)
 // out_spec_base(4) step_spec_base(4) spec_root(32) template_id(32)
-// slasher_bps(2) pad(6) = 136 bytes;
+// slasher_bps(2) pad(6) plan_id(32) = 168 bytes;
 // PDA ["dcg21tmpl", template_id]. The bases are the spec-tree leaf indices of
 // OutSpec(0) and StepSpec(0) (2 + in_count, and BlockSpec.first_record).
 
-const T_BYTES: usize = 136;
+const T_BYTES: usize = 168;
 
 struct Template {
     depth: u32,
@@ -193,6 +198,7 @@ struct Template {
     step_spec_base: u64,
     spec_root: [u8; 32],
     slasher_bps: u64,
+    plan_id: [u8; 32],
 }
 
 fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, ProgramError> {
@@ -213,6 +219,7 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
         step_spec_base: u32_at(&d, 60)? as u64,
         spec_root: key32(&d, 64)?,
         slasher_bps: u16_at(&d, 128)? as u64,
+        plan_id: key32(&d, 136)?,
     })
 }
 
@@ -267,7 +274,8 @@ const D_REVEALED: usize = 144;
 const D_LEAF_LEN: usize = D_REVEALED + 32 * 32;
 const D_LEAF_PRESENT: usize = D_LEAF_LEN + 2;
 const D_LEAF: usize = D_LEAF_LEN + 8;
-const D_BYTES: usize = D_LEAF + MAX_LEAF;
+const D_NONCE: usize = D_LEAF + MAX_LEAF;
+const D_BYTES: usize = D_NONCE + 32;
 
 const PH_NODES: u8 = 1; // E reveals
 const PH_PICK: u8 = 2; // C picks
@@ -300,18 +308,18 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 // 1: [admitter(s,w), template(w), system] depth:u8 total_steps:u64
 // total_outputs:u64 challenge_window:u64 phase_window:u64 executor_bond:u64
 // challenger_bond:u64 out_spec_base:u32 step_spec_base:u32 spec_root[32]
-// slasher_bps:u16 (< 10,000: the remainder deterrent, design §10.3)
+// slasher_bps:u16 (< 10,000: the remainder deterrent, design §10.3) plan_id[32]
 fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [admitter, tmpl, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
-    if !admitter.is_signer || data.len() != 1 + 6 * 8 + 8 + 32 + 2 {
+    if !admitter.is_signer || data.len() != 1 + 6 * 8 + 8 + 32 + 2 + 32 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let depth = data[0];
     let (cw, pw) = (u64_at(data, 17)?, u64_at(data, 25)?);
     let total_steps = u64_at(data, 1)?;
-    if !(1..=D::MAX_DEPTH as u8).contains(&depth)
+    if !(1..=MAX_REVEAL_DEPTH).contains(&depth)
         || !(MIN_WINDOW..=MAX_WINDOW).contains(&cw)
-        || !(MIN_WINDOW..=MAX_WINDOW).contains(&pw)
+        || !(MIN_PHASE_WINDOW..=MAX_WINDOW).contains(&pw)
         || total_steps == 0
         || total_steps > 1 << 40
         || u16_at(data, 89)? >= 10_000
@@ -326,6 +334,7 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     d[8..64].copy_from_slice(&data[1..57]);
     d[64..96].copy_from_slice(&data[57..89]);
     d[128..130].copy_from_slice(&data[89..91]);
+    d[136..168].copy_from_slice(&data[91..123]);
     d[96..128].copy_from_slice(&template_id);
     Ok(())
 }
@@ -342,6 +351,18 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     let refs = data.get(68..68 + n * 52).ok_or(err(1))?;
     if data.len() != 68 + n * 52 {
         return Err(err(1));
+    }
+    // External refs are sorted by strictly increasing external id (design
+    // §12); EDGE kind 2 looks a ref up by id, never by position (review B2).
+    for i in 1..n {
+        if u32_at(refs, 52 * i)? <= u32_at(refs, 52 * (i - 1))? {
+            return Err(err(31));
+        }
+    }
+    if payer.key.as_ref() == &data[32..64] {
+        // The payer receives the remainder; an executor paying itself
+        // removes the deterrent (design §10.3).
+        return Err(err(31));
     }
     let template_id = key32(&tmpl.try_borrow_data()?, 96)?;
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &data[0..32], &(n as u32).to_le_bytes(), refs, &data[32..64]]);
@@ -372,6 +393,7 @@ fn commit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
         }
         if d[R_STATUS] != RUN_OPEN
             || rr.run_id() != &d[R_RUN_ID..R_RUN_ID + 32]
+            || rr.plan_id() != t.plan_id
             || rr.spec_root() != t.spec_root
             || rr.total_steps() != t.total_steps
             || rr.total_outputs() != t.total_outputs
@@ -443,6 +465,7 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     d[D_RUN..D_RUN + 32].copy_from_slice(run.key.as_ref());
     d[D_CURRENT..D_CURRENT + 32].copy_from_slice(&current);
     d[D_SEQ..D_SEQ + 8].copy_from_slice(&sequence.to_le_bytes());
+    d[D_NONCE..D_NONCE + 32].copy_from_slice(&data[..32]);
     Ok(())
 }
 
@@ -459,9 +482,9 @@ fn dispute_ctx<'a, 'b>(program_id: &Pubkey, run: &'a AccountInfo<'b>, tmpl: &Acc
     if d.len() != D_BYTES || &d[0..4] != b"D21D" || d[D_RUN..D_RUN + 32] != run.key.to_bytes() {
         return Err(err(11));
     }
-    if dispute.owner != program_id {
-        return Err(err(2));
-    }
+    // A dispute is accepted only at its derived address (review B1): a
+    // program-owned account holding D21D bytes is not a dispute.
+    derived(program_id, dispute, &[b"dcg21dsp", run.key.as_ref(), &d[D_CHALLENGER..D_CHALLENGER + 32], &d[D_NONCE..D_NONCE + 32]])?;
     drop(d);
     Ok(Ctx { t, run, dispute })
 }
@@ -614,12 +637,13 @@ fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
 fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [challenger, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
-    {
-        let d = c.dispute.try_borrow_data()?;
-        challenger_signed(&d, challenger)?;
-    }
     let role = *data.first().ok_or(err(1))?;
-    let size = u32_at(data, 1)? as usize;
+    // C funds both buffers; E may create its own if C has not (review).
+    let by_challenger = challenger_signed(&c.dispute.try_borrow_data()?, challenger).is_ok();
+    if !by_challenger && !(role == ROLE_EXECUTOR && executor_signed(c.run, challenger).is_ok()) {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let size = if role == ROLE_EXECUTOR { MAX_STAGE } else { u32_at(data, 1)? as usize };
     if !(role == ROLE_EXECUTOR || role == ROLE_CHALLENGER) || size == 0 || size > MAX_STAGE || data.len() != 5 {
         return Err(err(29));
     }
@@ -821,8 +845,13 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
                     match pk {
                         2 => {
                             let refs = &c.run.try_borrow_data()?[R_REFS..];
-                            let r = refs.get(a as usize * 52..a as usize * 52 + 52).ok_or(err(19))?;
-                            got[7..55] != r[4..52]
+                            match refs.chunks_exact(52).find(|r| u32::from_le_bytes(r[0..4].try_into().unwrap()) as u64 == a) {
+                                Some(r) => got[7..55] != r[4..52],
+                                // The spec names an input the run never posted:
+                                // the run's inputs are incomplete, and the
+                                // executor should not have committed it.
+                                None => true,
+                            }
                         }
                         1 => match step_opening(&root, data, &mut at, a)?.and_then(D::parse_leaf) {
                             None => true,
@@ -850,9 +879,10 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
                         }
                         *slot = v;
                     }
-                    let code = kernel_code(spec.kernel_id()).ok_or(err(21))?;
                     let mut out = [0u8; 4];
-                    match dcg_kernels::execute(code, &ins[..n], &mut out) {
+                    // An unknown kernel cannot replay any output (as in the
+                    // Python referee): it rules for C.
+                    match kernel_code(spec.kernel_id()).ok_or(0u16).and_then(|code| dcg_kernels::execute(code, &ins[..n], &mut out)) {
                         Err(_) => true,
                         Ok(_) => leaf.output_count() != 1 || D::value_digest(&H, &out) != leaf.output(0)[23..55],
                     }
@@ -897,6 +927,9 @@ fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, challenger_wi
         let mut r = c.run.try_borrow_mut_data()?;
         if executor.key.to_bytes() != r[R_EXECUTOR..R_EXECUTOR + 32] {
             return Err(err(22));
+        }
+        if r[R_STATUS] != RUN_COMMITTED && r[R_STATUS] != RUN_REFUTED {
+            return Err(err(25));
         }
         let open = u32_at(&r, R_OPEN)?.checked_sub(1).ok_or(err(8))?;
         r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());

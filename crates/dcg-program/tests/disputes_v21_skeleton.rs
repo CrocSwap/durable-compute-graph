@@ -147,13 +147,14 @@ impl Chain {
         assert_eq!(spec_levels.last().unwrap()[0], g.spec_root);
         // Template.
         let mut data = vec![4u8];
-        for x in [2u64, 1, challenge_window, 20, EXECUTOR_BOND, CHALLENGER_BOND] {
+        for x in [2u64, 1, challenge_window, 750, EXECUTOR_BOND, CHALLENGER_BOND] {
             data.extend_from_slice(&x.to_le_bytes());
         }
         data.extend_from_slice(&OUT_BASE.to_le_bytes());
         data.extend_from_slice(&STEP_BASE.to_le_bytes());
         data.extend_from_slice(&g.spec_root);
         data.extend_from_slice(&SLASHER_BPS.to_le_bytes());
+        data.extend_from_slice(&g.plan_id);
         let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
         let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
         let admitter = kp(0xA1);
@@ -363,7 +364,7 @@ async fn a_silent_executor_loses_at_its_deadline() {
     let caller = kp(0xA1);
     let accounts = vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false), AccountMeta::new(kp(0xE1).pubkey(), false), AccountMeta::new(kp(0xC1).pubkey(), false)];
     assert!(send(&mut ch.ctx, ix(V::SUB_TIMEOUT, &[], accounts.clone()), &[&caller]).await.is_err(), "not before the deadline");
-    ch.ctx.warp_to_slot(100).unwrap();
+    ch.ctx.warp_to_slot(2_000).unwrap();
     send(&mut ch.ctx, ix(V::SUB_TIMEOUT, &[], accounts), &[&caller]).await.unwrap();
     assert_eq!(ch.ruling(d).await, 2);
     assert_eq!(ch.run_status().await, V::RUN_REFUTED);
@@ -532,4 +533,69 @@ async fn a_cached_reveal_answers_a_second_dispute_without_the_executor() {
     // A then B play on: picking the honest leaf and losing EDGE, as usual.
     let i = ix(V::SUB_PICK, &[1], ch.party(0xC1, b));
     send(&mut ch.ctx, i, &[&cl]).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_dispute_record_is_refused() {
+    // Review B1: a program-owned account holding a copy of a real dispute
+    // (same run, challenger, phase) is not a dispute.
+    let mut ch = Chain::new(1_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let real = ch.open(40, V::KIND_STEP_DESCEND).await;
+    let copy = ch.ctx.banks_client.get_account(real).await.unwrap().unwrap();
+    ch.ctx.warp_to_slot(2_000).unwrap();
+    let fake = Pubkey::new_unique();
+    ch.ctx.set_account(&fake, &copy.into());
+    let caller = kp(0xA1);
+    let accounts = |d: Pubkey, run: Pubkey, template: Pubkey| vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(d, false), AccountMeta::new(kp(0xE1).pubkey(), false), AccountMeta::new(kp(0xC1).pubkey(), false)];
+    assert!(send(&mut ch.ctx, ix(V::SUB_TIMEOUT, &[], accounts(fake, ch.run, ch.template)), &[&caller]).await.is_err());
+    assert_eq!(ch.run_status().await, V::RUN_COMMITTED, "the forged timeout changed nothing");
+    // The real dispute still times out normally.
+    send(&mut ch.ctx, ix(V::SUB_TIMEOUT, &[], accounts(real, ch.run, ch.template)), &[&caller]).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_refuses_bad_templates_and_runs() {
+    let mut ch = Chain::new(1_000).await;
+    let admitter = kp(0xA1);
+    // Depth 5 (review B3) and a phase window under the 750-slot floor.
+    for (depth, phase) in [(5u8, 750u64), (4, 749)] {
+        let mut data = vec![depth];
+        for x in [2u64, 1, 1_000, phase, EXECUTOR_BOND, CHALLENGER_BOND] {
+            data.extend_from_slice(&x.to_le_bytes());
+        }
+        data.extend_from_slice(&OUT_BASE.to_le_bytes());
+        data.extend_from_slice(&STEP_BASE.to_le_bytes());
+        data.extend_from_slice(&ch.g.spec_root);
+        data.extend_from_slice(&SLASHER_BPS.to_le_bytes());
+        data.extend_from_slice(&ch.g.plan_id);
+        let id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
+        let t = Pubkey::find_program_address(&[b"dcg21tmpl", &id], &PROGRAM).0;
+        let i = ix(V::SUB_CREATE_TEMPLATE, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(t, false), AccountMeta::new_readonly(SYSTEM, false)]);
+        assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err(), "depth {depth} phase {phase}");
+    }
+    // Unsorted external refs (review B2), and a payer naming itself executor.
+    let init = |executor: &Pubkey, refs: &[&Vec<u8>]| {
+        let mut d = vec![9u8; 32];
+        d.extend_from_slice(executor.as_ref());
+        d.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+        for r in refs {
+            d.extend_from_slice(r);
+        }
+        d
+    };
+    let unsorted = init(&kp(0xE1).pubkey(), &[&ch.g.refs[1], &ch.g.refs[0]]);
+    let selfpaid = init(&admitter.pubkey(), &[&ch.g.refs[0], &ch.g.refs[1]]);
+    for data in [unsorted, selfpaid] {
+        let run = Pubkey::new_unique();
+        let i = ix(V::SUB_INIT_RUN, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+        assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err());
+    }
+    // A commit under another plan id is refused.
+    let mut c = ch.honest();
+    c.root_bytes[0] ^= 1;
+    let e = kp(0xE1);
+    let i = ix(V::SUB_COMMIT, &c.root_bytes, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert!(send(&mut ch.ctx, i, &[&e]).await.is_err());
 }
