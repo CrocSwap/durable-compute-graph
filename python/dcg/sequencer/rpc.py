@@ -40,6 +40,9 @@ class RpcConfig:
     outage_cooldown_seconds: float = 0.25
     max_cooldown_seconds: float = 8.0
     commitment: Commitment = Commitment.CONFIRMED
+    # Skip RPC preflight simulation. Program errors then surface through the
+    # signature status instead of the send call; saves a full simulation per send.
+    skip_preflight: bool = False
 
 
 class SolanaRpcEndpoint:
@@ -155,7 +158,7 @@ class SolanaRpcEndpoint:
                 encoded,
                 {
                     "encoding": "base64",
-                    "skipPreflight": False,
+                    "skipPreflight": self.config.skip_preflight,
                     "preflightCommitment": self.config.commitment.value,
                     "maxRetries": 0,
                 },

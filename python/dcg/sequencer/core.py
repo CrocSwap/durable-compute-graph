@@ -1095,7 +1095,12 @@ class Sequencer:
                     {"step_id": step.step_id, "generation": packet.generation, "status": _status_to_json(status)},
                     step.step_id,
                 )
-                if status.error is None and status.commitment in {Commitment.CONFIRMED, Commitment.FINALIZED}:
+                landed = {Commitment.CONFIRMED, Commitment.FINALIZED}
+                if self.config.latency_mode is LatencyMode.PROCESSED:
+                    # Latency mode: a clean processed status completes the step
+                    # and releases its dependents (rollback risk accepted).
+                    landed = landed | {Commitment.PROCESSED}
+                if status.error is None and status.commitment in landed:
                     await self._confirm(
                         step,
                         packet,
