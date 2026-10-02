@@ -1,0 +1,12 @@
+[package]
+name = "dcg-disputes"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Optimistic disputes v2.1 consensus bytes: trees, leaves, run roots, spec records (no_std)"
+
+[dependencies]
+
+[dev-dependencies]
+sha2 = { version = "=0.10.9", default-features = false }
+serde_json = "=1.0.151"
