@@ -45,9 +45,24 @@ PYTHONPATH=python python/.venv/bin/python examples/hello-graph/hello_graph.py al
 | sampling honest | audited, final | 13.0 s |
 | sampling dishonest | audit caught step 0 → challenger_won | 3.7 s |
 
+After the 10-02 conformance upgrades, all five pass again with verified admission and a 1,000,000-lamport executor bond (`DCG_BOND=1000000`).
+
+**Root-committed descent** (`examples/hello-graph/hello_descent.py`, 10-02):
+
+| case | path | ruling | wall |
+|---|---|---|---|
+| dishonest-add | root → child region 1 → leaf 0, external inputs | challenger | 9.3 s |
+| dishonest-identity | root leaf 0, input authenticated by child region root | challenger | 7.1 s |
+| forged-input | root leaf 0, input contradicts child output | challenger (authentication) | 7.0 s |
+| honest | root → child → leaf 0 | executor; final after window | 13.9 s |
+| honest-root-leaf | root leaf 0 | executor; final after window | 14.1 s |
+| silent | executor never reveals | challenger at deadline | 15.3 s |
+
+**Kernel parity:** `scripts/kernel_parity.py` runs `crates/dcg-kernels/tests/vectors/parity-v1.json` through tag 215. All 8 cases match the host, including both overflow refusals.
+
 ## On-chain surface
 
-The instructions live in `crates/dcg-program/src/graph_v2.rs` and use tags 208–219:
+The instructions live in `crates/dcg-program/src/graph_v2.rs` and use tags 208–226:
 - 208: raw write;
 - 209: close run;
 - 210–212: blob create, write and seal;
@@ -57,15 +72,24 @@ The instructions live in `crates/dcg-program/src/graph_v2.rs` and use tags 208�
 - 216: commit;
 - 217: challenge;
 - 218: finalize;
-- 219: sampling audit.
+- 219: sampling audit;
+- 220: commit a root region digest (root-committed runs);
+- 221: open a dispute;
+- 222: reveal a region (`RegionRootV1`);
+- 223: choose a child region or a leaf;
+- 224: reveal a leaf and its Merkle path;
+- 225: replay a leaf with authenticated inputs;
+- 226: settle at a deadline, or finalize an idle run.
+
+Canonical DCGG/DCPL blobs are decoded at admission by `crates/dcg-wire`, a `no_std` port of the reference refusal rules checked against the golden corpus. A wire refusal is `0x6400 + code`.
 
 Kernels come from `crates/dcg-kernels`, which is `no_std`. The same source is used on the host and in SBF.
 
 ## Shortcuts against the v2.0 spec
 
-- **No DCPL decoding on chain.** The program trusts the template admitter's lowered step table. The graph and plan blobs are bound by hash only.
+- **DCPL is decoded on chain only for canonical blobs.** Admission verifies that the executed table equals the plan's lowering. Fast-path `DCGGF1` shapes still use a trusted table (template byte 6 = 0). The template's mode is not bound to the plan's region modes.
 - **Fixed 4-byte cells** and at most 8 inputs per step.
-- **Direct step replay.** A challenge replays one step directly over the on-chain trace, instead of descending root → region → step.
-- **No bonds, fees or slashing.** A ruling only sets the run status.
+- **Two dispute paths.** Trace-committed runs (216/217) keep direct one-step replay. Root-committed runs (220–226) descend root → region → step. The **value digest is provisional**: `SHA256("dcg.value.v2.provisional\0" || bytes)`, because the frozen spec leaves it open. Producers in a *parent* region are not authenticated yet; only external inputs, same-region producers and child-region producers are.
+- **Executor bond only.** The bond is posted at commit, paid to a winning challenger or auditor, and refunded at finalize. There is no challenger bond and no protocol fee.
 - **Image identity** is a hash of the program ID, not of the ELF.
 - **Encodings.** The tracer emits the golden DCGG/DCPL bytes only for the exact two-level add/identity shape. Other shapes get a fast `DCGGF1`/`DCPLF1` encoding.
