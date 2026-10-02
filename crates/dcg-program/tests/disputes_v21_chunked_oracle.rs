@@ -169,9 +169,12 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
 
 #[tokio::test(flavor = "multi_thread")]
 async fn chunked_kernels_rule_as_the_python_oracle() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/dcg/disputes_v21/chunked_scenarios.json");
-    let scenarios: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    assert!(scenarios.len() >= 400);
+    // CHUNKED_SCENARIOS names another recorded set (for example Basanos
+    // captures); by default, the checked-in goldens.
+    let golden = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/dcg/disputes_v21/chunked_scenarios.json");
+    let path = std::env::var("CHUNKED_SCENARIOS").unwrap_or_else(|_| golden.to_string());
+    let scenarios: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(path != golden || scenarios.len() >= 400);
     // V21_SBF=1 (with BPF_OUT_DIR naming a graph-v21 image) runs the SBF
     // program, which also checks stack frames and compute; otherwise native.
     let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
