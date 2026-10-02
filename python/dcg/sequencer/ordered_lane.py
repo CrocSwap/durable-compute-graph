@@ -5,10 +5,12 @@ Measured on Fogo testnet (2026-10-01, Doom on DCG, 29 dependent transactions
 per frame): per-step confirm waits gave 0.025 frames/s; this lane gave about
 0.44 frames/s with every frame landing in order. Four levers:
 
-1. **Tight compute requests.** The leader's cost tracker charges each
-   transaction's *requested* limit against a per-writable-account block cap
-   (2.5M cost units on Fogo). Blanket 1.4M requests allow one step per block
-   and let a small later step jump ahead of a large earlier one.
+1. **Tight, non-decreasing compute requests.** The leader's cost tracker
+   charges each transaction's *requested* limit against a per-writable-account
+   block cap (2.5M cost units on Fogo). Blanket 1.4M requests allow one step
+   per block; a later step requesting less than an earlier one can fit a block
+   the earlier one could not and land first, so requests are raised to the
+   running maximum along the lane.
 2. **Strictly decreasing priority.** When conflicting transactions sit in the
    leader's buffer together, higher priority runs first, so earlier steps win.
 3. **One ordered connection.** HTTP/1.1 pipelining writes every request in
@@ -76,6 +78,7 @@ class LaneResult:
     send_seconds: float
     landed_seconds: float
     slots: list[int | None]
+    first_error: object = None
 
 
 Sign = Callable[[bytes], Awaitable[tuple[str, bytes]]]
@@ -126,9 +129,19 @@ class OrderedLane:
             sock.close()
         return [body[:300].decode(errors="replace") for body in bodies if b'"error"' in body]
 
-    async def run(self, steps: Sequence[LaneStep], *, wait_seconds: float = 20.0, repair: bool = True) -> LaneResult:
+    async def run(self, steps: Sequence[LaneStep], *, wait_seconds: float = 20.0, repair: bool = True,
+                  monotonic_limits: bool = True) -> LaneResult:
         blockhash = self.blockhash()
         n = len(steps)
+        if monotonic_limits:
+            # A step requesting less compute than its predecessor can fit a
+            # block the predecessor could not and land first; non-decreasing
+            # requests along the lane rule that out (measured on Fogo 10-01).
+            ceiling, raised = 0, []
+            for step in steps:
+                ceiling = max(ceiling, step.compute_unit_limit)
+                raised.append(LaneStep(step.step_id, step.instructions, ceiling))
+            steps = raised
         built = [await self._build(step, blockhash, self.priority_step * (n - i)) for i, step in enumerate(steps)]
         t0 = time.monotonic()
         send_errors = self._send_ordered([raw for _sig, raw in built])
@@ -147,7 +160,8 @@ class OrderedLane:
         bad = [i for i, v in enumerate(statuses) if v is None or v.get("err")]
         base = min((v["slot"] for v in statuses if v), default=0)
         result = LaneResult(n - len(bad), bad[0] if bad else None, 0, 0, sent, landed_s,
-                            [v["slot"] - base if v else None for v in statuses])
+                            [v["slot"] - base if v else None for v in statuses],
+                            (statuses[bad[0]] or {}).get("err", "missing") if bad else None)
         if bad and repair:
             time.sleep(1.0)
             result.repaired, result.skipped = await self.repair(steps, bad[0])
