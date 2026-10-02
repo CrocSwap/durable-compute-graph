@@ -87,6 +87,8 @@ class LaneResult:
     landed_seconds: float
     slots: list[int | None]
     first_error: object = None
+    signatures: list[str] | None = None
+    statuses: list | None = None
 
 
 Sign = Callable[[bytes], Awaitable[tuple[str, bytes]]]
@@ -209,7 +211,8 @@ class OrderedLane:
         base = min((v["slot"] for v in statuses if v), default=0)
         result = LaneResult(n - len(bad), bad[0] if bad else None, 0, 0, handle.send_seconds, landed_s,
                             [v["slot"] - base if v else None for v in statuses],
-                            (statuses[bad[0]] or {}).get("err", "missing") if bad else None)
+                            (statuses[bad[0]] or {}).get("err", "missing") if bad else None,
+                            sigs, statuses)
         if bad and repair:
             time.sleep(1.0)
             # Walk from the start: a step's simulation also fails while an
