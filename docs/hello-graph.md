@@ -62,7 +62,7 @@ After the 10-02 conformance upgrades, all five pass again with verified admissio
 
 ## On-chain surface
 
-The instructions live in `crates/dcg-program/src/graph_v2.rs` and use tags 208–226:
+The instructions live in `crates/dcg-program/src/graph_v2.rs` and use tags 208–226, routed only in builds with the `graph-v2` feature (the shared testnet program: `--features "sbf-lifecycle-test sbf-real-lifecycle-test graph-v2"`):
 - 208: raw write;
 - 209: close run;
 - 210–212: blob create, write and seal;

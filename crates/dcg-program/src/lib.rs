@@ -144,6 +144,9 @@ pub fn process_instruction_with_manifest(
                 &application,
             )
         }
+        // The v2 graph lifecycle (tag 208 is a raw owner-signed write) is only
+        // for the shared testnet graph program; production images never route it.
+        #[cfg(feature = "graph-v2")]
         208..=226 => graph_v2::process(program_id, accounts, data),
         140 => pt1_onchain::init_fresh(program_id, accounts, data),
         141 => pt1_onchain::upload(program_id, accounts, data),

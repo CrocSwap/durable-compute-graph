@@ -9,6 +9,8 @@ license = "GPL-3.0-only"
 default = ["custom-heap", "revision-8"]
 revision-7 = []
 revision-8 = []
+# Routes the DCG v2 graph lifecycle (tags 208-226). Shared testnet graph program only.
+graph-v2 = []
 test-rev8-before-payer-alias-fix = []
 no-entrypoint = []
 custom-heap = []
