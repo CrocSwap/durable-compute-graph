@@ -20,6 +20,7 @@ const PROGRAM: Pubkey = Pubkey::new_from_array([0xD6; 32]);
 const SYSTEM: Pubkey = system_program::ID;
 const EXECUTOR_BOND: u64 = 2_000_000;
 const CHALLENGER_BOND: u64 = 1_000_000;
+const SLASHER_BPS: u16 = 5_000;
 const OUT_BASE: u32 = 4; // header, block, 2 InSpecs
 const STEP_BASE: u32 = 7; // + 1 OutSpec, 2 RegionSpecs
 
@@ -152,6 +153,7 @@ impl Chain {
         data.extend_from_slice(&OUT_BASE.to_le_bytes());
         data.extend_from_slice(&STEP_BASE.to_le_bytes());
         data.extend_from_slice(&g.spec_root);
+        data.extend_from_slice(&SLASHER_BPS.to_le_bytes());
         let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
         let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
         let admitter = kp(0xA1);
@@ -365,4 +367,59 @@ async fn a_silent_executor_loses_at_its_deadline() {
     send(&mut ch.ctx, ix(V::SUB_TIMEOUT, &[], accounts), &[&caller]).await.unwrap();
     assert_eq!(ch.ruling(d).await, 2);
     assert_eq!(ch.run_status().await, V::RUN_REFUTED);
+}
+
+impl Chain {
+    async fn win_by_step(&mut self, d: Pubkey, c: &Commit) {
+        self.step(d, c, 1).await;
+        let mut body = vec![V::CLAIM_STEP, 0];
+        body.extend(self.spec_opening(STEP_BASE as usize + 1));
+        body.push(1);
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&42i32.to_le_bytes());
+        self.claim(d, body).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn earliest_opened_winner_takes_the_pot_and_later_disputes_are_moot() {
+    let mut ch = Chain::new(1_000).await;
+    let h = ch.honest();
+    let mut l = h.leaves[1].clone().unwrap();
+    let n = l.len();
+    l[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
+    let c = commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(l)], h.outs.clone());
+    ch.commit(&c).await;
+    let d0 = ch.open(10, V::KIND_STEP_DESCEND).await; // sequence 0 (the honest challenger)
+    let d1 = ch.open(11, V::KIND_STEP_DESCEND).await; // sequence 1 (a faster puppet)
+    let d2 = ch.open(12, V::KIND_STEP_DESCEND).await; // sequence 2
+    ch.win_by_step(d1, &c).await;
+    assert_eq!(ch.run_status().await, V::RUN_REFUTED);
+    // No new opens on a refuted run.
+    let c1 = kp(0xC1);
+    let mut data = vec![13u8; 32];
+    data.push(V::KIND_STEP_DESCEND);
+    let late = ch.dispute(13);
+    let i = ix(V::SUB_OPEN, &data, vec![AccountMeta::new(c1.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(late, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert!(send(&mut ch.ctx, i, &[&c1]).await.is_err());
+    // Sequence 2 is after the best win: moot, bond refunded.
+    let caller = kp(0xA1);
+    let moot = |d: Pubkey, run: Pubkey, template: Pubkey| ix(V::SUB_MOOT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(d, false), AccountMeta::new(kp(0xC1).pubkey(), false)]);
+    send(&mut ch.ctx, moot(d2, ch.run, ch.template), &[&caller]).await.unwrap();
+    assert_eq!(ch.ruling(d2).await, V::RULING_MOOT);
+    // Sequence 0 is earlier than the best win: not moot; it plays on and wins.
+    assert!(send(&mut ch.ctx, moot(d0, ch.run, ch.template), &[&caller]).await.is_err());
+    ch.win_by_step(d0, &c).await;
+    // The pot waits for the ruled prefix to pass sequence 0.
+    let payer = kp(0xA1).pubkey();
+    let pot = |d: Pubkey, run: Pubkey, template: Pubkey| ix(V::SUB_PAY_POT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(kp(0xC1).pubkey(), false), AccountMeta::new(payer, false)]);
+    assert!(send(&mut ch.ctx, pot(d0, ch.run, ch.template), &[&caller]).await.is_err(), "prefix has not passed best_win");
+    let adv = ix(V::SUB_ADVANCE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d0, false)]);
+    send(&mut ch.ctx, adv, &[&caller]).await.unwrap();
+    assert!(send(&mut ch.ctx, pot(d1, ch.run, ch.template), &[&caller]).await.is_err(), "the puppet is not best_win");
+    let challenger_before = ch.ctx.banks_client.get_balance(kp(0xC1).pubkey()).await.unwrap();
+    send(&mut ch.ctx, pot(d0, ch.run, ch.template), &[&caller]).await.unwrap();
+    let share = EXECUTOR_BOND * SLASHER_BPS as u64 / 10_000;
+    assert_eq!(ch.ctx.banks_client.get_balance(kp(0xC1).pubkey()).await.unwrap(), challenger_before + share);
+    assert!(send(&mut ch.ctx, pot(d0, ch.run, ch.template), &[&caller]).await.is_err(), "paid once");
 }

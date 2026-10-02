@@ -13,11 +13,13 @@
 //! - one dispute record per (run, challenger, nonce); phase deadlines on
 //!   every action and timeout;
 //! - bonds: executor bond at commit, challenger bond at open; a challenger
-//!   ruling refutes the run.
+//!   ruling refutes the run; the ruled prefix and `best_win` pay the
+//!   executor bond to the earliest-opened winner (slasher share) and the
+//!   payer (remainder); later disputes on a refuted run are moot (§10.1).
 //!
 //! Not yet: staging buffers (every opening must fit one transaction), the
-//! reveal cache, the ruled prefix and `best_win` ordering, the load
-//! extension, receipts, closes, and the full v2.1 template identity.
+//! reveal cache, the load extension, receipts, closes, and the full v2.1
+//! template identity.
 
 use dcg_disputes as D;
 use solana_program::{
@@ -45,6 +47,14 @@ pub const SUB_REVEAL_LEAF: u8 = 7;
 pub const SUB_CLAIM: u8 = 8;
 pub const SUB_TIMEOUT: u8 = 9;
 pub const SUB_FINALIZE: u8 = 10;
+pub const SUB_ADVANCE: u8 = 11;
+pub const SUB_MOOT: u8 = 12;
+pub const SUB_PAY_POT: u8 = 13;
+
+pub const RULING_OPEN: u8 = 0;
+pub const RULING_EXECUTOR: u8 = 1;
+pub const RULING_CHALLENGER: u8 = 2;
+pub const RULING_MOOT: u8 = 3;
 
 pub const CLAIM_SHAPE: u8 = 1;
 pub const CLAIM_EDGE: u8 = 2;
@@ -137,11 +147,12 @@ fn now() -> Result<u64, ProgramError> {
 // ---------------------------------------------------------------------------
 // Template "D21T": magic(4) depth(1) pad(3) total_steps(8) total_outputs(8)
 // challenge_window(8) phase_window(8) executor_bond(8) challenger_bond(8)
-// out_spec_base(4) step_spec_base(4) spec_root(32) template_id(32) = 128 bytes;
+// out_spec_base(4) step_spec_base(4) spec_root(32) template_id(32)
+// slasher_bps(2) pad(6) = 136 bytes;
 // PDA ["dcg21tmpl", template_id]. The bases are the spec-tree leaf indices of
 // OutSpec(0) and StepSpec(0) (2 + in_count, and BlockSpec.first_record).
 
-const T_BYTES: usize = 128;
+const T_BYTES: usize = 136;
 
 struct Template {
     depth: u32,
@@ -154,6 +165,7 @@ struct Template {
     out_spec_base: u64,
     step_spec_base: u64,
     spec_root: [u8; 32],
+    slasher_bps: u64,
 }
 
 fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, ProgramError> {
@@ -173,6 +185,7 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
         out_spec_base: u32_at(&d, 56)? as u64,
         step_spec_base: u32_at(&d, 60)? as u64,
         spec_root: key32(&d, 64)?,
+        slasher_bps: u16_at(&d, 128)? as u64,
     })
 }
 
@@ -187,8 +200,12 @@ const R_RUN_ID: usize = 104;
 const R_COMMIT: usize = 136;
 const R_DEADLINE: usize = 144;
 const R_OPEN: usize = 152;
-const R_NEXT: usize = 156;
-const R_ROOT: usize = 160;
+const R_NEXT: usize = 156; // external ref count
+const R_SEQ: usize = 160; // next dispute sequence
+const R_PREFIX: usize = 168; // ruled prefix: smallest sequence not yet ruled
+const R_BEST: usize = 176; // lowest-sequence challenger win (u64::MAX: none)
+const R_PAID: usize = 184; // pot paid
+const R_ROOT: usize = 192;
 const R_REFS: usize = R_ROOT + D::RUN_ROOT_BYTES;
 
 pub const RUN_OPEN: u8 = 0;
@@ -218,7 +235,8 @@ const D_CHALLENGER: usize = 32;
 const D_RUN: usize = 64;
 const D_CURRENT: usize = 96;
 const D_REVEALED_N: usize = 128;
-const D_REVEALED: usize = 136;
+const D_SEQ: usize = 136;
+const D_REVEALED: usize = 144;
 const D_LEAF_LEN: usize = D_REVEALED + 32 * 32;
 const D_LEAF_PRESENT: usize = D_LEAF_LEN + 2;
 const D_LEAF: usize = D_LEAF_LEN + 8;
@@ -242,6 +260,9 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         SUB_CLAIM => claim(program_id, accounts, &data[2..]),
         SUB_TIMEOUT => timeout(program_id, accounts),
         SUB_FINALIZE => finalize(program_id, accounts),
+        SUB_ADVANCE => advance(program_id, accounts),
+        SUB_MOOT => moot(program_id, accounts),
+        SUB_PAY_POT => pay_pot(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -249,9 +270,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 // 1: [admitter(s,w), template(w), system] depth:u8 total_steps:u64
 // total_outputs:u64 challenge_window:u64 phase_window:u64 executor_bond:u64
 // challenger_bond:u64 out_spec_base:u32 step_spec_base:u32 spec_root[32]
+// slasher_bps:u16 (< 10,000: the remainder deterrent, design §10.3)
 fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [admitter, tmpl, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
-    if !admitter.is_signer || data.len() != 1 + 6 * 8 + 8 + 32 {
+    if !admitter.is_signer || data.len() != 1 + 6 * 8 + 8 + 32 + 2 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let depth = data[0];
@@ -262,6 +284,7 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         || !(MIN_WINDOW..=MAX_WINDOW).contains(&pw)
         || total_steps == 0
         || total_steps > 1 << 40
+        || u16_at(data, 89)? >= 10_000
     {
         return Err(err(6));
     }
@@ -272,6 +295,7 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     d[4] = depth;
     d[8..64].copy_from_slice(&data[1..57]);
     d[64..96].copy_from_slice(&data[57..89]);
+    d[128..130].copy_from_slice(&data[89..91]);
     d[96..128].copy_from_slice(&template_id);
     Ok(())
 }
@@ -299,6 +323,7 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     d[R_EXECUTOR..R_EXECUTOR + 32].copy_from_slice(&data[32..64]);
     d[R_RUN_ID..R_RUN_ID + 32].copy_from_slice(&run_id);
     d[R_NEXT..R_NEXT + 4].copy_from_slice(&(n as u32).to_le_bytes());
+    d[R_BEST..R_BEST + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     d[R_REFS..].copy_from_slice(refs);
     Ok(())
 }
@@ -368,11 +393,14 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     if t.challenger_bond > 0 {
         invoke(&system_instruction::transfer(challenger.key, dispute.key, t.challenger_bond), &[challenger.clone(), dispute.clone(), system.clone()])?;
     }
-    {
+    let sequence = {
         let mut r = run.try_borrow_mut_data()?;
         let open = u32_at(&r, R_OPEN)?.checked_add(1).ok_or(err(8))?;
         r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
-    }
+        let seq = u64_at(&r, R_SEQ)?;
+        r[R_SEQ..R_SEQ + 8].copy_from_slice(&seq.checked_add(1).ok_or(err(8))?.to_le_bytes());
+        seq
+    };
     let mut d = dispute.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"D21D");
     d[D_PHASE] = if level == 0 { PH_LEAF } else { PH_NODES };
@@ -384,6 +412,7 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     d[D_CHALLENGER..D_CHALLENGER + 32].copy_from_slice(challenger.key.as_ref());
     d[D_RUN..D_RUN + 32].copy_from_slice(run.key.as_ref());
     d[D_CURRENT..D_CURRENT + 32].copy_from_slice(&current);
+    d[D_SEQ..D_SEQ + 8].copy_from_slice(&sequence.to_le_bytes());
     Ok(())
 }
 
@@ -698,36 +727,40 @@ fn out_spec_leaf_index(t: &Template, j: u64) -> Result<u64, ProgramError> {
 }
 
 fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, challenger_wins: bool) -> ProgramResult {
-    {
+    let seq = {
         let mut d = c.dispute.try_borrow_mut_data()?;
+        if d[D_RULING] != RULING_OPEN {
+            return Err(err(25));
+        }
+        if challenger.key.to_bytes() != d[D_CHALLENGER..D_CHALLENGER + 32] {
+            return Err(err(22));
+        }
         d[D_PHASE] = PH_RULED;
-        d[D_RULING] = if challenger_wins { 2 } else { 1 };
+        d[D_RULING] = if challenger_wins { RULING_CHALLENGER } else { RULING_EXECUTOR };
+        u64_at(&d, D_SEQ)?
+    };
+    {
+        let mut r = c.run.try_borrow_mut_data()?;
+        if executor.key.to_bytes() != r[R_EXECUTOR..R_EXECUTOR + 32] {
+            return Err(err(22));
+        }
+        let open = u32_at(&r, R_OPEN)?.checked_sub(1).ok_or(err(8))?;
+        r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
+        if challenger_wins {
+            // Refuted at once for consumers. The executor bond waits for the
+            // ruled prefix to pass the lowest winning sequence (§10.1).
+            r[R_STATUS] = RUN_REFUTED;
+            if seq < u64_at(&r, R_BEST)? {
+                r[R_BEST..R_BEST + 8].copy_from_slice(&seq.to_le_bytes());
+            }
+        }
     }
-    let mut r = c.run.try_borrow_mut_data()?;
-    let open = u32_at(&r, R_OPEN)?.saturating_sub(1);
-    r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
+    // The challenger's bond: back to a winning challenger, to E otherwise.
     if challenger_wins {
-        if executor.key.to_bytes() != r[R_EXECUTOR..R_EXECUTOR + 32] || challenger.key.to_bytes() != c.dispute.try_borrow_data()?[D_CHALLENGER..D_CHALLENGER + 32] {
-            return Err(err(22));
-        }
-        let first_refutation = r[R_STATUS] == RUN_COMMITTED;
-        r[R_STATUS] = RUN_REFUTED;
-        drop(r);
-        // The challenger's bond back, and (on the first refutation) half the
-        // executor bond; the rest of the executor bond stays with the run
-        // for its payer (the remainder deterrent, design §10.3).
-        move_all(c.dispute, challenger)?;
-        if first_refutation && c.t.executor_bond > 0 {
-            move_lamports(c.run, challenger, c.t.executor_bond / 2)?;
-        }
+        move_all(c.dispute, challenger)
     } else {
-        drop(r);
-        if executor.key.to_bytes() != c.run.try_borrow_data()?[R_EXECUTOR..R_EXECUTOR + 32] {
-            return Err(err(22));
-        }
-        move_all(c.dispute, executor)?;
+        move_all(c.dispute, executor)
     }
-    Ok(())
 }
 
 fn move_lamports(from: &AccountInfo, to: &AccountInfo, amount: u64) -> ProgramResult {
@@ -760,6 +793,77 @@ fn timeout(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // E owes NODES and LEAF; C owes PICK and CLAIM.
     let challenger_wins = matches!(phase, PH_NODES | PH_LEAF);
     rule(&c, executor, challenger, challenger_wins)
+}
+
+// 11: [anyone, run(w), template, dispute] the dispute at `ruled_prefix` is ruled or moot.
+fn advance(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [_caller, run, tmpl, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    let (seq, ruling) = {
+        let d = c.dispute.try_borrow_data()?;
+        (u64_at(&d, D_SEQ)?, d[D_RULING])
+    };
+    let mut r = c.run.try_borrow_mut_data()?;
+    let prefix = u64_at(&r, R_PREFIX)?;
+    if seq != prefix || ruling == RULING_OPEN {
+        return Err(err(26));
+    }
+    r[R_PREFIX..R_PREFIX + 8].copy_from_slice(&prefix.checked_add(1).ok_or(err(8))?.to_le_bytes());
+    Ok(())
+}
+
+// 12: [anyone, run(w), template, dispute(w), challenger(w)] a dispute opened
+// after the lowest challenger win on a refuted run is moot; its bond returns.
+fn moot(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [_caller, run, tmpl, dispute, challenger, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    {
+        let mut d = c.dispute.try_borrow_mut_data()?;
+        let r = c.run.try_borrow_data()?;
+        if r[R_STATUS] != RUN_REFUTED
+            || d[D_RULING] != RULING_OPEN
+            || u64_at(&d, D_SEQ)? <= u64_at(&r, R_BEST)?
+            || challenger.key.to_bytes() != d[D_CHALLENGER..D_CHALLENGER + 32]
+        {
+            return Err(err(27));
+        }
+        d[D_PHASE] = PH_RULED;
+        d[D_RULING] = RULING_MOOT;
+    }
+    {
+        let mut r = c.run.try_borrow_mut_data()?;
+        let open = u32_at(&r, R_OPEN)?.checked_sub(1).ok_or(err(8))?;
+        r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
+    }
+    move_all(c.dispute, challenger)
+}
+
+// 13: [anyone, run(w), template, best dispute, challenger(w), payer(w)] once
+// the ruled prefix has passed `best_win`: the slasher share of the executor
+// bond to that challenger, the remainder to the run's payer.
+fn pay_pot(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [_caller, run, tmpl, dispute, challenger, payer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    {
+        let d = c.dispute.try_borrow_data()?;
+        let mut r = c.run.try_borrow_mut_data()?;
+        let best = u64_at(&r, R_BEST)?;
+        if r[R_STATUS] != RUN_REFUTED
+            || r[R_PAID] != 0
+            || u64_at(&r, R_PREFIX)? <= best
+            || u64_at(&d, D_SEQ)? != best
+            || d[D_RULING] != RULING_CHALLENGER
+            || challenger.key.to_bytes() != d[D_CHALLENGER..D_CHALLENGER + 32]
+            || payer.key.to_bytes() != r[R_PAYER..R_PAYER + 32]
+        {
+            return Err(err(28));
+        }
+        r[R_PAID] = 1;
+    }
+    let bond = c.t.executor_bond;
+    let share = bond.checked_mul(c.t.slasher_bps).ok_or(err(8))? / 10_000;
+    move_lamports(c.run, challenger, share)?;
+    move_lamports(c.run, payer, bond - share)
 }
 
 // 10: [anyone, run(w), template, executor(w)] after the challenge deadline with no open dispute.
