@@ -86,10 +86,14 @@ class OrderedLane:
             self.payer, Hash.from_string(blockhash))
         return await self.sign(bytes(message))
 
-    def _send_ordered(self, wires: Sequence[bytes]) -> None:
+    def _send_ordered(self, wires: Sequence[bytes]) -> list[str]:
         u = urlparse(self.url)
-        sock = socket.create_connection((u.hostname, u.port or 80), timeout=10)
+        secure = u.scheme == "https"
+        sock = socket.create_connection((u.hostname, u.port or (443 if secure else 80)), timeout=10)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if secure:
+            import ssl
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
         try:
             for i, raw in enumerate(wires):
                 body = json.dumps({"jsonrpc": "2.0", "id": i, "method": "sendTransaction",
@@ -105,14 +109,22 @@ class OrderedLane:
                 got += chunk
         finally:
             sock.close()
+        errors = []
+        for part in got.split(b"HTTP/1.1 ")[1:]:
+            body = part.split(b"\r\n\r\n", 1)[-1]
+            if b'"error"' in body:
+                errors.append(body[:300].decode(errors="replace"))
+        return errors
 
     async def run(self, steps: Sequence[LaneStep], *, wait_seconds: float = 20.0, repair: bool = True) -> LaneResult:
         blockhash = self.blockhash()
         n = len(steps)
         built = [await self._build(step, blockhash, self.priority_step * (n - i)) for i, step in enumerate(steps)]
         t0 = time.monotonic()
-        self._send_ordered([raw for _sig, raw in built])
+        send_errors = self._send_ordered([raw for _sig, raw in built])
         sent = time.monotonic() - t0
+        if send_errors and len(send_errors) == n:
+            raise RuntimeError(f"every lane send was rejected; first: {send_errors[0]}")
         sigs = [sig for sig, _raw in built]
         statuses: list = [None] * n
         deadline = time.monotonic() + wait_seconds
