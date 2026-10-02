@@ -70,6 +70,14 @@ class LaneStep:
 
 
 @dataclass
+class LaneHandle:
+    steps: list
+    built: list
+    started: float
+    send_seconds: float
+
+
+@dataclass
 class LaneResult:
     landed: int
     failed_first: int | None
@@ -129,16 +137,10 @@ class OrderedLane:
             sock.close()
         return [body[:300].decode(errors="replace") for body in bodies if b'"error"' in body]
 
-    async def run(self, steps: Sequence[LaneStep], *, wait_seconds: float = 20.0, repair: bool = True,
-                  monotonic_limits: bool = True, blockhash: str | None = None,
-                  watch_last: bool = False, poll_seconds: float = 0.1,
-                  resend_after_seconds: float = 0.5, max_resends: int = 3, salt: int = 0) -> LaneResult:
-        """Send ``steps`` in order and wait for them.
-
-        ``watch_last`` polls only the final step: valid when the application's
-        guards make the final step impossible unless every earlier step landed
-        (e.g. a commit that checks a cursor). Any failure or timeout falls back
-        to reading every status, then to repair."""
+    async def send(self, steps: Sequence[LaneStep], *, monotonic_limits: bool = True,
+                   blockhash: str | None = None, salt: int = 0, epoch: int | None = None,
+                   epoch_ceiling: int = 100_000) -> "LaneHandle":
+        """Build, sign and send ``steps`` in order without waiting."""
         blockhash = blockhash or self.blockhash()
         n = len(steps)
         if monotonic_limits:
@@ -152,12 +154,29 @@ class OrderedLane:
             steps = raised
         # ``salt`` makes repeated steps unique when a blockhash is reused: an
         # identical (message, blockhash) pair would dedupe as already processed.
-        built = [await self._build(step, blockhash, self.priority_step * (n - i) + salt) for i, step in enumerate(steps)]
+        # ``epoch`` (an increasing lane number) makes priority decrease across
+        # lanes too, so a later lane never outranks an earlier one still in
+        # flight; it also makes every transaction unique.
+        offset = salt if epoch is None else self.priority_step * n * (epoch_ceiling - epoch)
+        built = [await self._build(step, blockhash, self.priority_step * (n - i) + offset)
+                 for i, step in enumerate(steps)]
         t0 = time.monotonic()
         send_errors = self._send_ordered([raw for _sig, raw in built])
-        sent = time.monotonic() - t0
         if send_errors and len(send_errors) == n:
             raise RuntimeError(f"every lane send was rejected; first: {send_errors[0]}")
+        return LaneHandle(list(steps), built, t0, time.monotonic() - t0)
+
+    async def wait(self, handle: "LaneHandle", *, wait_seconds: float = 20.0, repair: bool = True,
+                   watch_last: bool = False, poll_seconds: float = 0.1,
+                   resend_after_seconds: float = 0.5, max_resends: int = 3) -> LaneResult:
+        """Wait for a sent lane.
+
+        ``watch_last`` polls only the final step: valid when the application's
+        guards make the final step impossible unless every earlier step landed
+        (e.g. a commit that checks a cursor). Any failure or timeout falls back
+        to reading every status, then to repair."""
+        steps, built, t0 = handle.steps, handle.built, handle.started
+        n = len(built)
         sigs = [sig for sig, _raw in built]
         statuses: list = [None] * n
         deadline = time.monotonic() + wait_seconds
@@ -188,7 +207,7 @@ class OrderedLane:
         landed_s = time.monotonic() - t0
         bad = [i for i, v in enumerate(statuses) if v is None or v.get("err")]
         base = min((v["slot"] for v in statuses if v), default=0)
-        result = LaneResult(n - len(bad), bad[0] if bad else None, 0, 0, sent, landed_s,
+        result = LaneResult(n - len(bad), bad[0] if bad else None, 0, 0, handle.send_seconds, landed_s,
                             [v["slot"] - base if v else None for v in statuses],
                             (statuses[bad[0]] or {}).get("err", "missing") if bad else None)
         if bad and repair:
@@ -198,6 +217,16 @@ class OrderedLane:
             # can skip work that never landed.
             result.repaired, result.skipped = await self.repair(steps, 0)
         return result
+
+    async def run(self, steps: Sequence[LaneStep], *, wait_seconds: float = 20.0, repair: bool = True,
+                  monotonic_limits: bool = True, blockhash: str | None = None,
+                  watch_last: bool = False, poll_seconds: float = 0.1,
+                  resend_after_seconds: float = 0.5, max_resends: int = 3, salt: int = 0) -> LaneResult:
+        """Send ``steps`` in order and wait for them (``send`` then ``wait``)."""
+        handle = await self.send(steps, monotonic_limits=monotonic_limits, blockhash=blockhash, salt=salt)
+        return await self.wait(handle, wait_seconds=wait_seconds, repair=repair, watch_last=watch_last,
+                               poll_seconds=poll_seconds, resend_after_seconds=resend_after_seconds,
+                               max_resends=max_resends)
 
     async def repair(self, steps: Sequence[LaneStep], start: int = 0) -> tuple[int, int]:
         sent = skipped = 0
