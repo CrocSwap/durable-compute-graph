@@ -38,10 +38,13 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import socket
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 from urllib.parse import urlparse
 
@@ -93,6 +96,7 @@ class LaneHandle:
     built: list
     started: float
     send_seconds: float
+    journal_lane: int | None = None
 
 
 @dataclass
@@ -132,10 +136,71 @@ def keypair_signer(*keypairs) -> Sign:
     return sign
 
 
+class LaneJournal:
+    """Append-only JSONL of signed lane packets, fsynced before they are sent.
+
+    A ``sent`` row holds one lane's step ids, signatures and exact signed
+    bytes; a ``closed`` row marks that lane's outcome as known. After a crash,
+    ``open_lane()`` returns the last lane with no ``closed`` row, so a new
+    process can poll the original signatures (and re-send the identical bytes)
+    instead of signing new ones."""
+
+    VERSION = 1
+
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def _append(self, row: dict) -> None:
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"v": self.VERSION, **row}, sort_keys=True) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+    def rows(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        out = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                break  # a torn final line from a crash mid-write
+        return out
+
+    def next_lane(self) -> int:
+        return 1 + max((row["lane"] for row in self.rows()), default=0)
+
+    def record_sent(self, lane: int, step_ids: Sequence[str], built: Sequence[tuple[str, bytes]]) -> None:
+        self._append({"event": "sent", "lane": lane, "steps": list(step_ids),
+                      "signatures": [sig for sig, _raw in built],
+                      "packets": [base64.b64encode(raw).decode() for _sig, raw in built]})
+
+    def record_closed(self, lane: int, landed: int, repaired: int) -> None:
+        self._append({"event": "closed", "lane": lane, "landed": landed, "repaired": repaired})
+
+    def open_lane(self) -> dict | None:
+        rows, closed = self.rows(), set()
+        for row in rows:
+            if row["event"] == "closed":
+                closed.add(row["lane"])
+        sent = [row for row in rows if row["event"] == "sent" and row["lane"] not in closed]
+        return sent[-1] if sent else None
+
+
 class OrderedLane:
     def __init__(self, url: str, payer: Pubkey, sign: Sign, *, priority_step: int = 1000,
-                 user_agent: str = "dcg-ordered-lane"):
+                 user_agent: str = "dcg-ordered-lane", extra_urls: Sequence[str] = (),
+                 journal: LaneJournal | None = None):
+        """``url`` is the primary node: reads, simulation and repair use it.
+        ``extra_urls`` receive the same ordered packets in parallel (each on
+        its own connection), so one slow or dropping node does not hold the
+        lane. ``journal`` records each lane's signed packets before sending."""
         self.url, self.payer, self.sign = url, payer, sign
+        self.extra_urls = tuple(extra_urls)
+        self.journal = journal
         self.priority_step = priority_step
         self.user_agent = user_agent
 
@@ -236,7 +301,29 @@ class OrderedLane:
         return BatchResult(landed, failed, pending, sends, rebuilds, time.monotonic() - t0)
 
     def _send_ordered(self, wires: Sequence[bytes]) -> list[str]:
-        u = urlparse(self.url)
+        """Pipeline ``wires`` in order to the primary node and, in parallel, to
+        every extra node. Returns the primary's send errors (an extra node's
+        failure is ignored: the primary's outcome decides)."""
+        threads = [threading.Thread(target=self._send_ordered_to, args=(url, wires), daemon=True)
+                   for url in self.extra_urls]
+        for t in threads:
+            t.start()
+        try:
+            return self._send_ordered_to(self.url, wires)
+        finally:
+            for t in threads:
+                t.join(timeout=10)
+
+    def _send_ordered_to(self, url: str, wires: Sequence[bytes]) -> list[str]:
+        try:
+            return self._pipeline(url, wires)
+        except OSError as exc:
+            if url == self.url:
+                raise
+            return [f"extra node {url}: {exc}"]
+
+    def _pipeline(self, url: str, wires: Sequence[bytes]) -> list[str]:
+        u = urlparse(url)
         secure = u.scheme == "https"
         sock = socket.create_connection((u.hostname, u.port or (443 if secure else 80)), timeout=10)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -278,11 +365,15 @@ class OrderedLane:
         offset = salt if epoch is None else self.priority_step * n * (epoch_ceiling - epoch)
         built = [await self._build(step, blockhash, self.priority_step * (n - i) + offset)
                  for i, step in enumerate(steps)]
+        lane_id = None
+        if self.journal is not None:
+            lane_id = self.journal.next_lane()
+            self.journal.record_sent(lane_id, [step.step_id for step in steps], built)
         t0 = time.monotonic()
         send_errors = self._send_ordered([raw for _sig, raw in built])
         if send_errors and len(send_errors) == n:
             raise RuntimeError(f"every lane send was rejected; first: {send_errors[0]}")
-        return LaneHandle(list(steps), built, t0, time.monotonic() - t0)
+        return LaneHandle(list(steps), built, t0, time.monotonic() - t0, lane_id)
 
     async def wait(self, handle: "LaneHandle", *, wait_seconds: float = 20.0, repair: bool = True,
                    watch_last: bool = False, poll_seconds: float = 0.1,
@@ -335,7 +426,32 @@ class OrderedLane:
             # earlier step is still missing, so starting at the first failure
             # can skip work that never landed.
             result.repaired, result.skipped = await self.repair(steps, 0)
+        if self.journal is not None and handle.journal_lane is not None and (not bad or repair):
+            # repair() raises unless every step is resolved, so reaching here
+            # with repair on means the lane's outcome is known.
+            self.journal.record_closed(handle.journal_lane, result.landed, result.repaired)
         return result
+
+    async def resume(self, steps: Sequence[LaneStep], *, wait_seconds: float = 10.0,
+                     repair: bool = True) -> LaneResult | None:
+        """Finish the journal's open lane after a crash, or return None if
+        there is none. ``steps`` must be the same logical steps, in the same
+        order, as the lane that was sent. The original signed packets are
+        re-sent verbatim (a landed one dedupes by signature) and their
+        signatures polled; only steps still missing are repaired from the
+        chain, which needs the application's cursor guards as usual."""
+        if self.journal is None:
+            raise ValueError("resume needs a journal")
+        row = self.journal.open_lane()
+        if row is None:
+            return None
+        if row["steps"] != [step.step_id for step in steps]:
+            raise ValueError(f"journal lane {row['lane']} has steps {row['steps'][:3]}…, not the given steps")
+        built = [(sig, base64.b64decode(packet)) for sig, packet in zip(row["signatures"], row["packets"])]
+        t0 = time.monotonic()
+        self._send_ordered([raw for _sig, raw in built])
+        handle = LaneHandle(list(steps), built, t0, time.monotonic() - t0, row["lane"])
+        return await self.wait(handle, wait_seconds=wait_seconds, repair=repair)
 
     async def run(self, steps: Sequence[LaneStep], *, wait_seconds: float = 20.0, repair: bool = True,
                   monotonic_limits: bool = True, blockhash: str | None = None,

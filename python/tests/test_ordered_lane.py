@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import socket
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,7 +19,7 @@ from solders.transaction import Transaction, VersionedTransaction
 from solders.address_lookup_table_account import AddressLookupTableAccount
 from solders.hash import Hash
 
-from dcg.sequencer.ordered_lane import LaneStep, OrderedLane, keypair_signer
+from dcg.sequencer import LaneJournal, LaneStep, OrderedLane, keypair_signer
 
 PROGRAM = Pubkey.from_string("FCzAE7H9q8Q4Ki5YQUikHQmCTbYJbjDjTupGj187BZox")
 BLOCKHASH = "4uQeVj5tqViQh7yWWGStvkEG1Zmhx6uasJtWCJziofM"
@@ -72,7 +74,7 @@ class Chain:
             return None
 
 
-def make_handler(chain: Chain):
+def make_handler(chain: Chain, seen: list | None = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -86,6 +88,8 @@ def make_handler(chain: Chain):
                 chain.blockhashes += 1
                 result = {"value": {"blockhash": str(Hash.new_unique()) if chain.independent else BLOCKHASH}}
             elif method == "sendTransaction":
+                if seen is not None:
+                    seen.append(Chain.step_of(base64.b64decode(params[0]))[1])
                 if chain.reject_sends:
                     body = json.dumps({"jsonrpc": "2.0", "id": req["id"],
                                        "error": {"code": -32002, "message": "rejected"}}).encode()
@@ -116,8 +120,8 @@ class OrderedLaneTests(unittest.TestCase):
     def setUp(self):
         self.payer = Keypair()
 
-    def serve(self, chain: Chain) -> str:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(chain))
+    def serve(self, chain: Chain, seen: list | None = None) -> str:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(chain, seen))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)
         return f"http://127.0.0.1:{server.server_address[1]}"
@@ -228,6 +232,68 @@ class OrderedLaneTests(unittest.TestCase):
         self.assertEqual(list(result.failed), ["s3"])
         self.assertEqual(sorted(result.landed), ["s0", "s1", "s2", "s4"])
         self.assertEqual(chain.arrivals.count(3), 1)
+
+
+    def test_extra_nodes_receive_the_same_ordered_packets(self):
+        chain, primary, extra = Chain(), [], []
+        lane = OrderedLane(self.serve(chain, primary), self.payer.pubkey(), keypair_signer(self.payer),
+                           extra_urls=(self.serve(chain, extra),))
+        result = asyncio.run(lane.run(self.steps(6)))
+        self.assertEqual((result.landed, chain.cursor), (6, 6))
+        self.assertEqual(primary, list(range(6)))
+        self.assertEqual(extra, list(range(6)))
+
+    def test_a_dead_extra_node_does_not_stop_the_lane(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            dead = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        chain = Chain()
+        lane = OrderedLane(self.serve(chain), self.payer.pubkey(), keypair_signer(self.payer), extra_urls=(dead,))
+        self.assertEqual(asyncio.run(lane.run(self.steps(4))).landed, 4)
+
+    def journal(self) -> LaneJournal:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return LaneJournal(f"{tmp.name}/lane.jsonl")
+
+    def test_journal_records_and_closes_each_lane(self):
+        chain, journal = Chain(), self.journal()
+        lane = OrderedLane(self.serve(chain), self.payer.pubkey(), keypair_signer(self.payer), journal=journal)
+        asyncio.run(lane.run(self.steps(3)))
+        asyncio.run(lane.run([LaneStep(f"t{k}", s.instructions, s.compute_unit_limit)
+                              for k, s in enumerate(self.steps(5)[3:], start=3)]))
+        self.assertEqual([(r["event"], r["lane"]) for r in journal.rows()],
+                         [("sent", 1), ("closed", 1), ("sent", 2), ("closed", 2)])
+        self.assertIsNone(journal.open_lane())
+        self.assertIsNone(asyncio.run(lane.resume(self.steps(3))))
+
+    def test_resume_after_a_crash_polls_the_original_packets(self):
+        chain, journal = Chain(), self.journal()
+        url = self.serve(chain)
+        steps = self.steps(5)
+        asyncio.run(OrderedLane(url, self.payer.pubkey(), keypair_signer(self.payer), journal=journal).send(steps))
+        # crash: the process never waited. A new process resumes from the journal.
+        original = journal.open_lane()["signatures"]
+        result = asyncio.run(OrderedLane(url, self.payer.pubkey(), keypair_signer(self.payer),
+                                         journal=journal).resume(steps))
+        self.assertEqual((result.landed, result.repaired, chain.cursor), (5, 0, 5))
+        self.assertEqual(result.signatures, original)
+        self.assertEqual(len(chain.status), 5, "no packet beyond the journaled ones was signed")
+        self.assertIsNone(journal.open_lane())
+
+    def test_resume_repairs_steps_lost_before_the_crash(self):
+        chain, journal = Chain(drop={2}), self.journal()
+        url = self.serve(chain)
+        steps = self.steps(6)
+        asyncio.run(OrderedLane(url, self.payer.pubkey(), keypair_signer(self.payer), journal=journal).send(steps))
+        result = asyncio.run(OrderedLane(url, self.payer.pubkey(), keypair_signer(self.payer),
+                                         journal=journal).resume(steps))
+        self.assertEqual(chain.cursor, 6)
+        self.assertIsNone(journal.open_lane())
+        with self.assertRaisesRegex(ValueError, "not the given steps"):
+            journal.record_sent(9, ["x"], [("sig", b"raw")])
+            asyncio.run(OrderedLane(url, self.payer.pubkey(), keypair_signer(self.payer),
+                                    journal=journal).resume(steps))
 
 
 if __name__ == "__main__":

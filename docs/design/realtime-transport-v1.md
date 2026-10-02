@@ -423,13 +423,32 @@ Used on Fogo testnet (*measured*, Basanos
 - DCG template admission for the K=35 Basanos template in about 12 minutes.
 
 v1.1 gaps (owner, 2026-10-02; these replace the earlier L1–L8 list, which is
-dropped):
-1. Move `OrderedLane` into the sequencer proper, with its journal and
-   multi-node sending.
-2. Version-0 transactions with address lookup tables (needed for
-   UnifiedInit at K=10,240).
-3. An unordered batch primitive for independent steps such as attestations.
-4. Compute-unit sizing per step (Fogo charges requested compute against the
-   per-account block cap).
-5. Blockhash refresh for long windows.
-6. A resume test for the H3 stream path.
+dropped). Status as of 2026-10-02, all **offline** against a local JSON-RPC
+stub; none has run on testnet yet:
+1. **`OrderedLane` in the sequencer package: done offline.** Exported from
+   `dcg.sequencer`. `extra_urls` pipelines the same ordered packets to more
+   nodes in parallel (the primary's outcome decides; a dead extra node is
+   ignored). `LaneJournal` fsyncs each lane's signed packets before sending
+   and a `closed` row after its outcome is known; `resume(steps)` re-sends
+   the journaled bytes verbatim, polls the original signatures, and repairs
+   only what is still missing. It does not merge lanes into the
+   `TransactionPlan`/stream journal; exactly-once still rests on the
+   application's on-chain cursor guards.
+2. **Version-0 transactions with lookup tables: done offline.**
+   `LaneStep.lookup_tables`; `keypair_signer` signs both message versions.
+3. **Unordered batches: done offline.** `OrderedLane.run_batch` for
+   independent steps (attestations), reporting landed, refused and missing
+   steps.
+4. **Compute sizing: done offline.** `OrderedLane.size_compute` sets a step's
+   request from `simulateTransaction` (`ceil(used × 1.15) + 2,000`).
+5. **Blockhash refresh: done offline for batches.** `run_batch` rebuilds
+   missing steps on a fresh blockhash once theirs is 4 s old (Fogo hashes
+   last about 6 s). Ordered lanes are short and their repair path fetches a
+   fresh hash per step, so they do not refresh mid-lane.
+6. **H3 resume test: done.** A packet resumed from the journal with no fate
+   becomes `AmbiguousFate` with one journaled reconciliation after one
+   blockhash lifetime, and no second generation is signed.
+
+Tests: `python/tests/test_ordered_lane.py`, `python/tests/test_sequencer_realtime.py`.
+Next: exercise 2–4 on testnet through the Basanos executor (UnifiedInit as a
+version-0 lane step, attestations through `run_batch`).

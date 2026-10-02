@@ -20,8 +20,8 @@ milestone follows.
 Next, in order: a review of the v2 graph lifecycle (the step before the
 `graph-v2` feature becomes default); input authentication for sibling and
 distant regions in descent (today `explain()` refuses those graphs under a
-root commitment); lanes implementation; the transport v1.1 gaps listed in
-`docs/design/realtime-transport-v1.md`.
+root commitment); lanes implementation; a testnet run of the transport v1.1 work (done offline,
+`docs/design/realtime-transport-v1.md`).
 
 ## Original sequence (kickoff estimates)
 

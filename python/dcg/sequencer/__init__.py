@@ -39,7 +39,15 @@ from .types import (
     TransactionStep,
 )
 
+from .ordered_lane import BatchResult, LaneJournal, LaneResult, LaneStep, OrderedLane, keypair_signer
+
 __all__ = [
+    "BatchResult",
+    "LaneJournal",
+    "LaneResult",
+    "LaneStep",
+    "OrderedLane",
+    "keypair_signer",
     "AmbiguousFate",
     "AccountInfo",
     "Backoff",
