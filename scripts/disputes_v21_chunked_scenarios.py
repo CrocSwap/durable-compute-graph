@@ -31,6 +31,7 @@ from solders.keypair import Keypair  # noqa: E402
 from dcg.disputes_v21 import game as G  # noqa: E402
 from dcg.disputes_v21 import run as R  # noqa: E402
 from dcg.disputes_v21 import spec as S  # noqa: E402
+from dcg.disputes_v21 import transcript as X  # noqa: E402
 from dcg.disputes_v21 import wire as W  # noqa: E402
 
 OUT = ROOT / "tests/golden/dcg/disputes_v21/chunked_scenarios.json"
@@ -59,76 +60,13 @@ def context(sp, values, nonce):
     return tdata, refs, run
 
 
-class Recorder:
-    """Captures a dispute's moves as instruction bodies."""
-
-    def __init__(self, dispute: G.Dispute):
-        self.d = dispute
-        self.rounds = []
-        self.leaf = None
-        self.claim = None
-
-
-def drive(record, executor, dispute: G.Dispute, target_position: int | None, honest, choose_claim):
-    """Descend (to the first divergence, or to `target_position`) and claim,
-    recording every body. Returns (rounds, leaf, claim, ruling)."""
-    sp = record.spec
-    rounds = []
-    htree = honest.step_tree if dispute.kind == "STEP_DESCEND" else honest.out_tree
-    while dispute.level > 0:
-        nodes = executor.nodes(dispute)
-        reveal = b"".join(nodes[i] for i in sorted(nodes))
-        dispute.reveal_nodes(nodes)
-        step = min(dispute.depth, dispute.level)
-        base, first = dispute.level - step, dispute.position << step
-        if target_position is None:
-            pick = next(i for i in sorted(dispute.revealed) if dispute.revealed[i] != htree.at(base, first + i))
-        else:
-            pick = (target_position >> (dispute.level - step)) & ((1 << step) - 1)
-        dispute.pick(pick)
-        rounds.append({"reveal": reveal.hex(), "pick": pick})
-    leaf = executor.leaf(dispute)
-    dispute.reveal_leaf(leaf)
-    name, kw = choose_claim(dispute)
-    body = W.claim_body(sp, dispute.kind, dispute.position, name, kw)
-    ruling = dispute.claim(name, **kw)
-    return rounds, W.leaf_body(leaf).hex(), body.hex(), ruling, name
-
-
-def honest_claim_capture(record, executor, honest):
-    """The honest challenger's claim, captured instead of made."""
-    captured = {}
-    orig = G.Dispute.claim
-
-    def spy(self, name, **kw):
-        captured["v"] = (name, kw)
-        return orig(self, name, **kw)
-
-    G.Dispute.claim = spy
-    try:
-        d = G.honest_challenge(record, executor, honest, DEPTH)
-    finally:
-        G.Dispute.claim = orig
-    return d, captured.get("v")
-
-
 def scenario_against(name, sp, values, nonce, committed, honest, target=None, claim=None, kind="STEP_DESCEND"):
     tdata, refs, run = context(sp, values, nonce)
     assert committed.run_id == run
     record = G.RunRecord(PLAN_ID, run, sp, committed.root_bytes, refs)
-    executor = G.Executor(committed)
-    if target is None:
-        # The honest challenger: find its claim first, then replay it recorded.
-        d, (cname, ckw) = honest_claim_capture(record, executor, honest)
-        kind = d.kind
-        chooser = lambda _d: (cname, ckw)  # noqa: E731
-    else:
-        chooser = lambda _d: claim  # noqa: E731
-    dispute = G.Dispute(record, kind, DEPTH)
-    rounds, leaf, body, ruling, cname = drive(record, executor, dispute, target, honest, chooser)
+    t = X.record(record, committed, honest, DEPTH, target=target, claim=claim, kind=kind)
     return {"name": name, "nonce": nonce.hex(), "template_data": tdata.hex(), "refs": [refs[e].hex() for e in sorted(refs)],
-            "root_bytes": committed.root_bytes.hex(), "kind": kind, "rounds": rounds, "leaf": leaf,
-            "claim": body, "claim_name": cname, "ruling": ruling}
+            "root_bytes": committed.root_bytes.hex(), **t}
 
 
 def execute(sp, values, nonce, **faults):

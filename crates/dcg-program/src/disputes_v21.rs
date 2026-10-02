@@ -218,15 +218,15 @@ struct Template {
     spec_root: [u8; 32],
     slasher_bps: u64,
     plan_id: [u8; 32],
-    blocks: [Block; MAX_BLOCKS],
-    block_count: usize,
+    /// On the heap: SBF stack frames are 4 KiB.
+    blocks: Vec<Block>,
     /// The step tree's height (§6.2).
     height: u32,
 }
 
 impl Template {
     fn blocks(&self) -> &[Block] {
-        &self.blocks[..self.block_count]
+        &self.blocks
     }
     fn block_of(&self, ordinal: u64) -> Result<(usize, Block), ProgramError> {
         self.blocks().iter().enumerate().find(|(_, b)| b.contains(ordinal)).map(|(i, b)| (i, *b)).ok_or(err(19))
@@ -275,15 +275,13 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
     if !(1..=MAX_BLOCKS).contains(&block_count) {
         return Err(err(4));
     }
-    let mut list = [Block::parse(&d[T_BLOCKS..T_BLOCKS + Block::BYTES]).ok_or(err(4))?; MAX_BLOCKS];
-    for (i, slot) in list.iter_mut().enumerate().take(block_count) {
-        let at = T_BLOCKS + Block::BYTES * i;
-        *slot = Block::parse(&d[at..at + Block::BYTES]).ok_or(err(4))?;
-    }
-    let height = check_blocks(&list[..block_count], u64_at(&d, 8)?)?;
+    let list = (0..block_count)
+        .map(|i| Block::parse(&d[T_BLOCKS + Block::BYTES * i..T_BLOCKS + Block::BYTES * (i + 1)]))
+        .collect::<Option<Vec<Block>>>()
+        .ok_or(err(4))?;
+    let height = check_blocks(&list, u64_at(&d, 8)?)?;
     Ok(Template {
         blocks: list,
-        block_count,
         height,
         depth: d[4] as u32,
         total_steps: u64_at(&d, 8)?,
@@ -405,19 +403,20 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         return Err(err(6));
     }
     // The blocks: given after the fixed fields, or the step-1 default.
-    let mut list = [Block::parse(&default_block(total_steps, u32_at(data, 53)? as u64)).ok_or(err(6))?; MAX_BLOCKS];
-    let mut count = 1usize;
-    if data.len() > FIXED {
-        count = data[FIXED] as usize;
+    let list: Vec<Block> = if data.len() > FIXED {
+        let count = data[FIXED] as usize;
         if !(1..=MAX_BLOCKS).contains(&count) || data.len() != FIXED + 1 + Block::BYTES * count {
             return Err(ProgramError::InvalidInstructionData);
         }
-        for (i, slot) in list.iter_mut().enumerate().take(count) {
-            let at = FIXED + 1 + Block::BYTES * i;
-            *slot = Block::parse(&data[at..at + Block::BYTES]).ok_or(err(6))?;
-        }
-    }
-    check_blocks(&list[..count], total_steps)?;
+        (0..count)
+            .map(|i| Block::parse(&data[FIXED + 1 + Block::BYTES * i..FIXED + 1 + Block::BYTES * (i + 1)]))
+            .collect::<Option<Vec<Block>>>()
+            .ok_or(err(6))?
+    } else {
+        vec![Block::parse(&default_block(total_steps, u32_at(data, 53)? as u64)).ok_or(err(6))?]
+    };
+    let count = list.len();
+    check_blocks(&list, total_steps)?;
     let template_id = sha256(&[TEMPLATE_DOMAIN, data]);
     create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id], T_BYTES)?;
     let mut d = tmpl.try_borrow_mut_data()?;
@@ -859,15 +858,12 @@ fn spec_record<'a>(t: &Template, data: &'a [u8], at: &mut usize, leaf_index: u64
     Ok((type_code, record))
 }
 
-fn read_path(data: &[u8], at: usize) -> Result<([D::Hash; 48], usize), ProgramError> {
+fn read_path(data: &[u8], at: usize) -> Result<(Vec<D::Hash>, usize), ProgramError> {
     let n = *data.get(at).ok_or(err(1))? as usize;
     if n > 48 {
         return Err(err(1));
     }
-    let mut out = [[0u8; 32]; 48];
-    for (i, slot) in out.iter_mut().enumerate().take(n) {
-        *slot = key32(data, at + 1 + 32 * i)?;
-    }
+    let out = (0..n).map(|i| key32(data, at + 1 + 32 * i)).collect::<Result<Vec<_>, _>>()?;
     Ok((out, n))
 }
 
@@ -921,11 +917,10 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         challenger_signed(&d, challenger)?;
         expect_phase(&d, PH_CLAIM)?;
         let len = u16_at(&d, D_LEAF_LEN)? as usize;
-        let mut buf = [0u8; MAX_LEAF];
-        buf[..len].copy_from_slice(&d[D_LEAF..D_LEAF + len]);
+        let buf = d[D_LEAF..D_LEAF + len].to_vec();
         (d[D_KIND], u64_at(&d, D_POSITION)?, d[D_LEAF_PRESENT] == 1, (buf, len))
     };
-    let leaf_bytes = &leaf_buf.0[..leaf_buf.1];
+    let leaf_bytes = &leaf_buf.0[..];
     let root: [u8; D::RUN_ROOT_BYTES] = c.run.try_borrow_data()?[R_ROOT..R_REFS].try_into().unwrap();
     let refs_buf = c.run.try_borrow_data()?;
     let refs = &refs_buf[R_REFS..];
@@ -964,15 +959,14 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         let (bi, block) = c.t.block_of(ordinal)?;
         let (it, entry) = block.split(ordinal);
         let (_t, stored) = spec_record(&c.t, data, &mut at, block.first_record + entry)?;
-        let mut generated = [0u8; 1_024];
+        let mut generated = vec![0u8; stored.len()];
         let record: &[u8] = if block.kind == 1 {
             stored
         } else {
-            let out = generated.get_mut(..stored.len()).ok_or(err(17))?;
-            if !blocks::generate(stored, &block, it, out) {
+            if !blocks::generate(stored, &block, it, &mut generated) {
                 return Err(err(17));
             }
-            &generated[..stored.len()]
+            &generated
         };
         let spec = D::StepSpec(record);
         if !spec.valid() {

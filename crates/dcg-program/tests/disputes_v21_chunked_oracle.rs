@@ -160,9 +160,16 @@ async fn chunked_kernels_rule_as_the_python_oracle() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/dcg/disputes_v21/chunked_scenarios.json");
     let scenarios: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     assert!(scenarios.len() >= 400);
+    // V21_SBF=1 (with BPF_OUT_DIR naming a graph-v21 image) runs the SBF
+    // program, which also checks stack frames and compute; otherwise native.
+    let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
     let mut test = ProgramTest::default();
-    test.prefer_bpf(false);
-    test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction));
+    test.prefer_bpf(sbf);
+    if sbf {
+        test.add_program("dcg_program", PROGRAM, None);
+    } else {
+        test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction));
+    }
     for b in [0xA1u8, 0xE1, 0xC1] {
         test.add_account(kp(b).pubkey(), Account { lamports: 1_000_000_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 });
     }
