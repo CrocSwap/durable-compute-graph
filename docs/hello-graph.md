@@ -16,7 +16,7 @@ def hello(a, b):
     return identity_i32(total)
 
 graph = tracing.trace(hello)      # static trace; refuses data-dependent control flow
-print(graph.explain("optimistic", commitment="root"))  # regions and modes, imports, kernels, guarantee, ceilings;
+print(graph.explain("optimistic")) # regions and modes, imports, kernels, guarantee, ceilings;
                                    # raises TraceError instead of stating a guarantee the program lacks
 graph.evaluate(20, 22)             # host execution: [42, 42]
 ```
@@ -90,7 +90,7 @@ Kernels come from `crates/dcg-kernels`, which is `no_std`. The same source is us
 
 - **DCPL is decoded on chain for canonical blobs.** Admission verifies that the executed table equals the plan's lowering. The tracer emits canonical DCGG/DCPL for every shape the format can express. Only inexpressible shapes (an external input used twice or never, a dead step, an output that is a raw input) fall back to `DCGGF1` with a trusted table (template byte 6 = 0). The template's mode is bound to the plan: every graph and plan region must resolve in the template's mode (sampling counts as optimistic), or admission refuses with `0x621f`. The golden Hello pair is the optimistic one; consensus Hello uses its own canonical consensus-mode pair.
 - **Fixed 4-byte cells** and at most 8 inputs per step.
-- **Two dispute paths.** Trace-committed runs (216/217) keep direct one-step replay. Root-committed runs (220–226) descend root → region → step. The value digest is `SHA256("dcg.value.v2\0" || bytes)` (spec §5, decided 2026-10-02). Inputs are authenticated when they come from an external input, a same-region producer, a child-region producer, or a producer in the parent region the descent came from (`parent_child_descent.py`). Producers in a sibling region, or two or more regions away, are not authenticated yet, so `explain(commitment="root")` refuses such graphs; the trace commitment (216/217) still covers them.
+- **Two dispute paths.** Trace-committed runs (216/217) keep direct one-step replay. Root-committed runs (220–226) descend root → region → step. The value digest is `SHA256("dcg.value.v2\0" || bytes)` (spec §5, decided 2026-10-02). Inputs are authenticated when they come from an external input, a same-region producer, a child-region producer, or a producer in the parent region the descent came from (`parent_child_descent.py`). Producers in a sibling region, or two or more regions away, are not authenticated yet. The 2026-10-02 review found the descent unsound in its current form (B2–B5, B7 in Basanos `out/runs/review-dcg-graph-v2-2026-10-02.md`), so `explain()` refuses root commitments and sampling until the redesign.
 - **Bonds.** The executor posts the template's bond at commit; it goes to a winning challenger or auditor and is refunded at finalize. In root-committed descent the challenger posts the same bond when it opens a dispute (221): a losing challenger's bond goes to the executor, and a winning challenger gets it back. There is no protocol fee.
 - **Image identity** is a hash of the program ID, not of the ELF.
 - **Encodings.** The tracer emits the golden DCGG/DCPL bytes only for the exact two-level add/identity shape. Other shapes get a fast `DCGGF1`/`DCPLF1` encoding.

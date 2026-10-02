@@ -37,7 +37,10 @@ def main(scenario: str) -> int:
         started = time.monotonic()
         mode = "sampling" if name.startswith("sampling") else ("consensus" if name == "consensus" else "optimistic")
         print(f"== {name}")
-        print(graph.explain(mode, samples=2))
+        try:
+            print(graph.explain(mode, samples=2))
+        except tracing.TraceError as refusal:  # no guarantee is stated for this mode yet
+            print(f"explain refused: {refusal}")
         bond = int(os.environ["DCG_BOND"]) if os.environ.get("DCG_BOND") else None
         admitted = client.admit(graph, mode, window_slots=150, samples=2, bond=bond)
         run = client.init_run(admitted, inputs)

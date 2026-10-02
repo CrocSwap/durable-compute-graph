@@ -394,6 +394,16 @@ class Graph:
         if commitment == "root" and not canonical:
             raise TraceError("COMMITMENT", "a root commitment needs canonical v2.0 bytes; this shape lowers to the "
                                            "fast-path encoding")
+        # Review 2026-10-02 (graph-v2 lifecycle): the program does not yet
+        # provide these guarantees, so no guarantee is stated for them.
+        if commitment == "root":
+            raise TraceError("UNSOUND", "root-committed descent (tags 220-226) is under redesign: region outputs "
+                                        "and leaf positions are not bound to their steps, child-region "
+                                        "authentication accepts any child, and one dispute slot can be held "
+                                        "past the window (review 2026-10-02, B2-B5, B7); use commitment='trace'")
+        if mode == "sampling":
+            raise TraceError("UNSOUND", "the sampling audit seeds from the newest slot hash, which an executor "
+                                        "can grind (review 2026-10-02, B6); no sampling guarantee is stated")
         for i, s in enumerate(t.steps):
             if kernels.REGISTRY.get(s.kernel.code) != s.kernel:
                 raise TraceError("CAPABILITY", f"step {i} uses {s.kernel.name}/v{s.kernel.semantic_version}, which "
@@ -451,6 +461,9 @@ class Graph:
                          "authenticated (external input, same region, parent region, or child region root)")
         elif mode != "consensus":
             lines.append("  dispute path: direct replay of one step against the posted trace")
+        lines.append("  status: the graph-v2 program has open review findings (2026-10-02: forgeable records "
+                     "via tag 208, dispute-account dust, unchecked deadline arithmetic, stranded runs); "
+                     "testnet mechanics only, not a production guarantee")
         lines.append("  ceilings (designed): 4-byte i32 cells, <=8 inputs per step, region depth <=8, "
                      "one step replay fits one transaction (1.4M CU, 4 KiB opening)")
         if measured:

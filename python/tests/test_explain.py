@@ -54,12 +54,20 @@ def _bind(kernel):
 
 class ExplainTests(unittest.TestCase):
     def test_hello_names_modes_imports_and_kernels(self):
-        text = tracing.trace(hello).explain("optimistic", commitment="root")
+        text = tracing.trace(hello).explain("optimistic")
         self.assertIn("region child [optimistic, parent root]: steps [0]", text)
         self.assertIn("imports: child step0 -> root step1 (child)", text)
         self.assertIn("add_i32/v1 abi 1 code 1", text)
-        self.assertIn("root -> region -> step descent", text)
+        self.assertIn("direct replay of one step", text)
         self.assertIn("composition: every region resolves in optimistic mode", text)
+        self.assertIn("not a production guarantee", text)
+
+    def test_root_commitment_and_sampling_are_refused_pending_the_redesign(self):
+        g = tracing.trace(hello)
+        for args, kw in ((("optimistic",), {"commitment": "root"}), (("sampling",), {"samples": 2})):
+            with self.assertRaises(TraceError) as ctx:
+                g.explain(*args, **kw)
+            self.assertEqual(ctx.exception.code, "UNSOUND")
 
     def test_relations(self):
         self.assertEqual([f[-1] for f in tracing.trace(parent_child).imports()], ["parent", "child"])
@@ -67,36 +75,25 @@ class ExplainTests(unittest.TestCase):
         self.assertEqual([f[-1] for f in tracing.trace(siblings).imports()], ["other"])
         self.assertEqual([f[-1] for f in tracing.trace(skip_level).imports()], ["other"])
 
-    def test_adjacent_imports_are_stated_under_a_root_commitment(self):
-        for fn in (hello, parent_child, grandchild):
-            self.assertIn("descent", tracing.trace(fn).explain("optimistic", commitment="root"))
-
-    def test_non_adjacent_imports_are_refused_under_a_root_commitment(self):
+    def test_non_adjacent_imports_still_explain_under_a_trace_commitment(self):
         for fn in (siblings, skip_level):
-            g = tracing.trace(fn)
-            with self.assertRaises(TraceError) as ctx:
-                g.explain("optimistic", commitment="root")
-            self.assertEqual(ctx.exception.code, "IMPORT_UNAUTHENTICATED")
-            # The trace commitment replays against posted outputs and still holds.
-            self.assertIn("direct replay", g.explain("optimistic"))
+            self.assertIn("direct replay", tracing.trace(fn).explain("optimistic"))
 
     def test_unsupported_modes_and_commitments_are_refused(self):
         g = tracing.trace(hello)
         cases = [(("zk",), {}, "MODE"), (("sampling",), {}, "MODE"), (("optimistic",), {"commitment": "x"}, "COMMITMENT"),
                  (("consensus",), {"commitment": "root"}, "COMMITMENT"),
                  (("sampling",), {"samples": 2, "commitment": "root"}, "COMMITMENT")]
+        # Order of checks: mode and commitment shape first, soundness after.
         for args, kw, code in cases:
             with self.assertRaises(TraceError) as ctx:
                 g.explain(*args, **kw)
             self.assertEqual(ctx.exception.code, code, (args, kw))
 
-    def test_root_commitment_needs_canonical_bytes(self):
+    def test_fast_path_bytes_are_reported_as_trusted(self):
         def reuse(a, b):
             return add_i32(a, a)
 
-        with self.assertRaises(TraceError) as ctx:
-            tracing.trace(reuse).explain("optimistic", commitment="root")
-        self.assertEqual(ctx.exception.code, "COMMITMENT")
         self.assertIn("admission trusts the step table", tracing.trace(reuse).explain("optimistic"))
 
     def test_an_unregistered_kernel_is_refused(self):
