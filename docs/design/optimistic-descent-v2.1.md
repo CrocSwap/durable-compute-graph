@@ -286,8 +286,28 @@ one transaction: its chunk (at most `2^16` bytes), its prior state (at most
 `max_cu`.
 
 The single-route app adapter of revision 8 (one input, an opening of at most
-900 bytes) cannot carry these operations. They are chunked kernels in v2.1.
-Probe: Basanos `out/runs/attested-admission-2026-10-02/route-rule-probe.md`.
+900 bytes) cannot carry these operations. Probe: Basanos
+`out/runs/attested-admission-2026-10-02/route-rule-probe.md`.
+
+**Correction (2026-10-02, later the same day).** That does not make them
+chunked kernels. Compiler v1 already sizes every operation instance to
+replay in one transaction. Revision 8's native dispute path measured 28 of
+its 29 forms through the full response path in one transaction each, the
+largest being form 40 at 1,195,036 CU (Basanos evidence M1364). Form 4,
+over 40 weight rows, executes in 1,093,802 CU (M1311).
+
+Their wide inputs are carried by staged witnesses, not by splitting the
+compute: form 4 took 439 transactions per dispute, mostly weight rows. Form
+22 is SHA-256 over up to 64 KB of reads (about 32k CU of hashing); its cost
+is the witness size alone.
+
+Under v2.1, a compiler-v1 instance is therefore an ordinary step. It needs:
+- an application kernel for STEP replay;
+- witnesses staged beyond 10 KiB;
+- committed constants with chunk openings, for weight rows (step 5).
+
+Chunked kernels are for operations whose *compute* exceeds one transaction:
+a larger model shape, a future compiler, or other applications.
 
 **Status.** There is a Python reference: `plans.py`, `reductions.py`, and `test_disputes_v21_chunked.py` (*measured*):
 - every consistent output, state, gate, input and prior fault in 72 chunked plans is convicted;
