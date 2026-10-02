@@ -173,7 +173,9 @@ class DescentClient:
                            [executor])
 
     def open(self, admitted, run, challenger: Keypair):
-        return self.c.send(bytes([221]), self._metas(admitted, run, challenger, True), [challenger])
+        # With a bonded template the challenger posts the same bond.
+        return self.c.send(bytes([221]), self._metas(admitted, run, challenger, True) + [AccountMeta(SYSTEM, False, False)],
+                           [challenger])
 
     def reveal_region(self, admitted, run, commitment: Commitment, region: int, executor: Keypair):
         return self.c.send(bytes([222]) + commitment.region_bytes[region], self._metas(admitted, run, executor),
@@ -217,8 +219,10 @@ class DescentClient:
                          + _blob16(b"".join(merkle_path(commitment.region_leaves[src.region_id], k))))
             else:
                 data += bytes([2]) + _blob16(commitment.region_bytes[src.region_id])
+        executor = Pubkey.from_bytes(self.c.account(run)[128:160])
         metas = self._metas(admitted, run, challenger, True) + [
-            AccountMeta(admitted["graph"], False, False), AccountMeta(admitted["plan"], False, False)]
+            AccountMeta(admitted["graph"], False, False), AccountMeta(admitted["plan"], False, False),
+            AccountMeta(executor, False, True)]
         return self.c.send(data, metas, [challenger], cu=1_400_000)
 
     def settle(self, admitted, run, executor: Pubkey, challenger: Pubkey):

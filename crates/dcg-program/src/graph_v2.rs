@@ -901,16 +901,29 @@ fn rule_challenger(run: &AccountInfo, dispute: &AccountInfo, challenger: &Accoun
         d[4] = STATUS_CHALLENGER_WON;
         d[10..12].copy_from_slice(&step.to_le_bytes());
     }
-    take_bond(run, challenger)
+    // The challenger takes the executor's bond and gets its own back.
+    take_bond(run, challenger)?;
+    take_bond(dispute, challenger)
 }
 
 /// The executor answered every question: the dispute closes and the
 /// commitment stands (another challenger may open while the window lasts).
-fn rule_executor(dispute: &AccountInfo) -> ProgramResult {
-    let mut dd = dispute.try_borrow_mut_data()?;
-    dd[D_PHASE] = PHASE_IDLE;
-    dd[D_WINNER] = 1;
-    dd[D_CHALLENGER..D_CHALLENGER + 32].fill(0);
+/// The losing challenger's bond goes to the executor it held up.
+fn rule_executor(run: &AccountInfo, dispute: &AccountInfo, executor: Option<&AccountInfo>) -> ProgramResult {
+    {
+        let mut dd = dispute.try_borrow_mut_data()?;
+        dd[D_PHASE] = PHASE_IDLE;
+        dd[D_WINNER] = 1;
+        dd[D_CHALLENGER..D_CHALLENGER + 32].fill(0);
+    }
+    let floor = Rent::get()?.minimum_balance(dispute.data_len());
+    if dispute.lamports() > floor {
+        let executor = executor.ok_or(ProgramError::NotEnoughAccountKeys)?;
+        if executor.key.as_ref() != &run.try_borrow_data()?[128..160] {
+            return Err(err(28));
+        }
+        take_bond(dispute, executor)?;
+    }
     Ok(())
 }
 
@@ -963,9 +976,10 @@ fn commit_root(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     Ok(())
 }
 
-// 221: [challenger(s,w), run, template, dispute(w)] open a dispute on the root.
+// 221: [challenger(s,w), run, template, dispute(w), system] open a dispute on
+// the root; the challenger posts the template's bond into the dispute record.
 fn open_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    let [challenger, run, template, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let [challenger, run, template, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     if !challenger.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -990,6 +1004,13 @@ fn open_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     dd[D_REGION..D_REGION + 4].copy_from_slice(&0u32.to_le_bytes());
     dd[D_CHALLENGER..D_CHALLENGER + 32].copy_from_slice(challenger.key.as_ref());
     dd[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&(now()? + view.window).to_le_bytes());
+    drop(dd);
+    drop(d);
+    if view.bond > 0 {
+        let system = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        invoke(&system_instruction::transfer(challenger.key, dispute.key, view.bond),
+               &[challenger.clone(), dispute.clone(), system.clone()])?;
+    }
     Ok(())
 }
 
@@ -1092,10 +1113,10 @@ fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     Ok(())
 }
 
-// 225: [challenger(s,w), run(w), template, dispute(w), graph, plan]
+// 225: [challenger(s,w), run(w), template, dispute(w), graph, plan, executor(w)]
 // tag leaf:blob16 then per input: value:blob16 auth:u8 [1: leaf:blob16 index:u32 path:blob16 | 2: region:blob16]
 fn replay_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [challenger, run, template, dispute, graph, plan, ..] = accounts else {
+    let [challenger, run, template, dispute, graph, plan, rest @ ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     let _view = template_view(program_id, template)?;
@@ -1229,7 +1250,7 @@ fn replay_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if wrong {
         rule_challenger(run, dispute, challenger, ordinal as u16)
     } else {
-        rule_executor(dispute)
+        rule_executor(run, dispute, rest.first())
     }
 }
 
@@ -1264,7 +1285,7 @@ fn settle_descent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
     }
     match phase {
         PHASE_AWAIT_REGION | PHASE_AWAIT_LEAF if slot > deadline => rule_challenger(run, dispute, challenger, u16::MAX),
-        PHASE_AWAIT_CHOICE | PHASE_AWAIT_REPLAY if slot > deadline => rule_executor(dispute),
+        PHASE_AWAIT_CHOICE | PHASE_AWAIT_REPLAY if slot > deadline => rule_executor(run, dispute, Some(executor)),
         PHASE_IDLE if slot > run_deadline => {
             if executor.key.to_bytes() != exec_key {
                 return Err(err(28));
