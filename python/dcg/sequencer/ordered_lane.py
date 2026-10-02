@@ -40,6 +40,26 @@ from solders.message import Message
 from solders.pubkey import Pubkey
 
 
+def _read_responses(sock, count: int) -> list[bytes]:
+    """Read ``count`` pipelined HTTP/1.1 responses, each body by Content-Length."""
+    buf, bodies = b"", []
+    while len(bodies) < count:
+        head_end = buf.find(b"\r\n\r\n")
+        if head_end >= 0:
+            head = buf[:head_end].decode("latin-1").lower()
+            length = next((int(line.split(":", 1)[1]) for line in head.split("\r\n")
+                           if line.startswith("content-length:")), 0)
+            if len(buf) >= head_end + 4 + length:
+                bodies.append(buf[head_end + 4:head_end + 4 + length])
+                buf = buf[head_end + 4 + length:]
+                continue
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    return bodies
+
+
 @dataclass(frozen=True)
 class LaneStep:
     step_id: str
@@ -101,20 +121,10 @@ class OrderedLane:
                                               {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}]}).encode()
                 sock.sendall((f"POST / HTTP/1.1\r\nHost: {u.hostname}\r\nContent-Type: application/json\r\n"
                               f"Content-Length: {len(body)}\r\nUser-Agent: {self.user_agent}\r\n\r\n").encode() + body)
-            got = b""
-            while got.count(b"HTTP/1.1 ") < len(wires):
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                got += chunk
+            bodies = _read_responses(sock, len(wires))
         finally:
             sock.close()
-        errors = []
-        for part in got.split(b"HTTP/1.1 ")[1:]:
-            body = part.split(b"\r\n\r\n", 1)[-1]
-            if b'"error"' in body:
-                errors.append(body[:300].decode(errors="replace"))
-        return errors
+        return [body[:300].decode(errors="replace") for body in bodies if b'"error"' in body]
 
     async def run(self, steps: Sequence[LaneStep], *, wait_seconds: float = 20.0, repair: bool = True) -> LaneResult:
         blockhash = self.blockhash()
