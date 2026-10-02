@@ -130,8 +130,16 @@ class OrderedLane:
         return [body[:300].decode(errors="replace") for body in bodies if b'"error"' in body]
 
     async def run(self, steps: Sequence[LaneStep], *, wait_seconds: float = 20.0, repair: bool = True,
-                  monotonic_limits: bool = True) -> LaneResult:
-        blockhash = self.blockhash()
+                  monotonic_limits: bool = True, blockhash: str | None = None,
+                  watch_last: bool = False, poll_seconds: float = 0.1,
+                  resend_after_seconds: float = 0.5, max_resends: int = 3, salt: int = 0) -> LaneResult:
+        """Send ``steps`` in order and wait for them.
+
+        ``watch_last`` polls only the final step: valid when the application's
+        guards make the final step impossible unless every earlier step landed
+        (e.g. a commit that checks a cursor). Any failure or timeout falls back
+        to reading every status, then to repair."""
+        blockhash = blockhash or self.blockhash()
         n = len(steps)
         if monotonic_limits:
             # A step requesting less compute than its predecessor can fit a
@@ -142,7 +150,9 @@ class OrderedLane:
                 ceiling = max(ceiling, step.compute_unit_limit)
                 raised.append(LaneStep(step.step_id, step.instructions, ceiling))
             steps = raised
-        built = [await self._build(step, blockhash, self.priority_step * (n - i)) for i, step in enumerate(steps)]
+        # ``salt`` makes repeated steps unique when a blockhash is reused: an
+        # identical (message, blockhash) pair would dedupe as already processed.
+        built = [await self._build(step, blockhash, self.priority_step * (n - i) + salt) for i, step in enumerate(steps)]
         t0 = time.monotonic()
         send_errors = self._send_ordered([raw for _sig, raw in built])
         sent = time.monotonic() - t0
@@ -151,11 +161,30 @@ class OrderedLane:
         sigs = [sig for sig, _raw in built]
         statuses: list = [None] * n
         deadline = time.monotonic() + wait_seconds
+        if watch_last:
+            # Leaders can drop transactions outright (maxRetries 0 means the RPC
+            # never re-sends). If the final step is not visible soon, re-send the
+            # identical bytes in order: landed steps dedupe by signature and the
+            # dropped ones get another chance, still in order.
+            resend_at = time.monotonic() + resend_after_seconds
+            resends = 0
+            while time.monotonic() < deadline:
+                last = self.rpc("getSignatureStatuses", [sigs[-1:]])["value"][0]
+                if last is not None:
+                    if not last.get("err"):
+                        statuses = [{"slot": last["slot"], "err": None}] * (n - 1) + [last]
+                        deadline = 0
+                    break
+                if resends < max_resends and time.monotonic() >= resend_at:
+                    self._send_ordered([raw for _sig, raw in built])
+                    resends += 1
+                    resend_at = time.monotonic() + resend_after_seconds
+                time.sleep(poll_seconds)
         while time.monotonic() < deadline:
             statuses = self.rpc("getSignatureStatuses", [sigs])["value"]
             if all(v is not None for v in statuses) or any(v and v.get("err") for v in statuses):
                 break
-            time.sleep(0.1)
+            time.sleep(poll_seconds)
         landed_s = time.monotonic() - t0
         bad = [i for i, v in enumerate(statuses) if v is None or v.get("err")]
         base = min((v["slot"] for v in statuses if v), default=0)
@@ -164,7 +193,10 @@ class OrderedLane:
                             (statuses[bad[0]] or {}).get("err", "missing") if bad else None)
         if bad and repair:
             time.sleep(1.0)
-            result.repaired, result.skipped = await self.repair(steps, bad[0])
+            # Walk from the start: a step's simulation also fails while an
+            # earlier step is still missing, so starting at the first failure
+            # can skip work that never landed.
+            result.repaired, result.skipped = await self.repair(steps, 0)
         return result
 
     async def repair(self, steps: Sequence[LaneStep], start: int = 0) -> tuple[int, int]:
