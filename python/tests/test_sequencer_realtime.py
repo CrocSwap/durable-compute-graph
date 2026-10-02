@@ -500,6 +500,43 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signatures, {original}, "only the original packet was ever sent")
         self.assertEqual(resumed.plan.terminal_summaries["only"].signature, original)
 
+    async def _crash_after_send(self, name: str) -> str:
+        # A process sends one packet, then dies before seeing its fate. The
+        # packet never becomes visible and its postcondition stays unmet.
+        self.rpc.status_resolver = lambda signature, packet, count: None
+        first = await self.open_stream(name=name)
+        await first.append(_intent("only", write_locks=("lane",)))
+        for _ in range(100):
+            if self.rpc.send_packets:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(self.rpc.send_packets), 1)
+        original = str(Signature.from_bytes(self.rpc.send_packets[0][1:65]))
+        await first.close()
+        self.streams.remove(first)
+        self.rpc.send_packets.clear()  # the fake postcondition reads sent packets
+        return original
+
+    async def test_h3_resumed_packet_expires_after_one_blockhash_lifetime(self):
+        # H3: a packet resumed from the journal has no in-memory lease. The
+        # resumed process must not wait on it forever (or resend it blindly):
+        # one blockhash lifetime after first sight it is ambiguous, journaled
+        # as a reconciliation, and no second generation is signed.
+        await self._crash_after_send("h3-expiry")
+        lifetime = 0.4
+        config = _config(blockhash_lifetime_seconds=lifetime, per_step_time_cap_seconds=5.0)
+        resumed = await self.open_stream(config=config, name="h3-expiry")
+        started = time.monotonic()
+        await resumed.append(_intent("only", write_locks=("lane",)))
+        with self.assertRaises(AmbiguousFate):
+            await asyncio.wait_for(resumed.wait(), timeout=4)
+        self.assertGreaterEqual(time.monotonic() - started, lifetime)
+        required = [event for event in resumed.plan.lifecycle_events
+                    if event.event == "reconciliation_required" and event.step_id == "only"]
+        self.assertEqual(len(required), 1)
+        self.assertIn("expired", str(required[0].data))
+        self.assertEqual(self.rpc.send_packets, [], "the resumed process signed no second generation")
+
     async def test_multisigner_stream_sends_fully_signed_packets(self):
         # A stream whose steps need a second signer (e.g. a fresh account):
         # every sent packet carries both signatures and verifies.
