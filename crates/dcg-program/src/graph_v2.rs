@@ -746,7 +746,9 @@ const D_STEP_ROOT: usize = 120;
 const D_LEAF: usize = 152;
 const D_CHILD_TABLE: usize = 192; // 8 × (region u32, root[32])
 const D_MAX_CHILDREN: usize = 8;
-const DISPUTE_BYTES: usize = D_CHILD_TABLE + D_MAX_CHILDREN * 36;
+/// The step-tree root of the region the descent came from (zero at the root).
+const D_PARENT_STEP_ROOT: usize = D_CHILD_TABLE + D_MAX_CHILDREN * 36;
+const DISPUTE_BYTES: usize = D_PARENT_STEP_ROOT + 32;
 
 const PHASE_IDLE: u8 = 1;
 const PHASE_AWAIT_REGION: u8 = 2;
@@ -1039,6 +1041,8 @@ fn choose(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
         let n = u16_at(&dd, D_CHILDREN)? as usize;
         let child = (0..n).find(|i| u32_at(&dd, D_CHILD_TABLE + i * 36).ok() == Some(value)).ok_or(err(49))?;
         let root = key32(&dd, D_CHILD_TABLE + child * 36 + 4)?;
+        let parent_step_root = key32(&dd, D_STEP_ROOT)?;
+        dd[D_PARENT_STEP_ROOT..D_PARENT_STEP_ROOT + 32].copy_from_slice(&parent_step_root);
         dd[D_TARGET..D_TARGET + 32].copy_from_slice(&root);
         dd[D_REGION..D_REGION + 4].copy_from_slice(&value.to_le_bytes());
         dd[D_PHASE] = PHASE_AWAIT_REGION;
@@ -1114,11 +1118,11 @@ fn replay_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 
     let mut c = Cursor { d: &data[1..], at: 0 };
     let leaf = c.blob16()?;
-    let (step_root, leaf_digest, children) = {
+    let (step_root, leaf_digest, children, parent_step_root) = {
         let dd = dispute.try_borrow_data()?;
         let n = u16_at(&dd, D_CHILDREN)? as usize;
         let ch: Vec<[u8; 32]> = (0..n).map(|i| key32(&dd, D_CHILD_TABLE + i * 36 + 4)).collect::<Result<_, _>>()?;
-        (key32(&dd, D_STEP_ROOT)?, key32(&dd, D_LEAF)?, ch)
+        (key32(&dd, D_STEP_ROOT)?, key32(&dd, D_LEAF)?, ch, key32(&dd, D_PARENT_STEP_ROOT).ok())
     };
     if sha256(&[LEAF_DOMAIN, leaf]) != leaf_digest {
         return Err(err(46));
@@ -1166,11 +1170,14 @@ fn replay_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
                 let d = run.try_borrow_data()?;
                 d.get(RUN_HEADER + index * CELL..RUN_HEADER + (index + 1) * CELL) == Some(value)
             }
-            (1, None) => {
+            (1 | 3, None) => {
+                // 1: the producer is a step of this region; 3: of the parent
+                // region the descent came from.
                 let producer = c.blob16()?;
                 let index = c.u32()?;
                 let path = c.blob16()?;
-                if merkle_fold(sha256(&[LEAF_DOMAIN, producer]), index, path)? != step_root {
+                let root = if auth == 1 { Some(step_root) } else { parent_step_root.filter(|r| *r != [0; 32]) };
+                if Some(merkle_fold(sha256(&[LEAF_DOMAIN, producer]), index, path)?) != root {
                     return Err(err(53));
                 }
                 let edge = g.edges.iter().find(|e| (e.destination_node, e.destination_port) == (port_ref.node_id, port_ref.port_id)).ok_or(err(53))?;

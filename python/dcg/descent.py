@@ -207,10 +207,14 @@ class DescentClient:
                 continue
             edge = next(e for e in g.edges if (e.destination_node, e.destination_port) == (r.node_id, r.port_id))
             src = producer_step[(edge.source_node, edge.source_port)]
-            if src.region_id == region:
-                k = commitment.region_ordinals[region].index(src.ordinal)
-                data += (bytes([1]) + _blob16(commitment.leaf_bytes[src.ordinal]) + struct.pack("<I", k)
-                         + _blob16(b"".join(merkle_path(commitment.region_leaves[region], k))))
+            parent = next(r.parent_region_id for r in p.regions if r.region_id == region)
+            if src.region_id in (region, parent):
+                # 1: a producer in this region; 3: in the parent region the
+                # descent came from (authenticated under its step root).
+                k = commitment.region_ordinals[src.region_id].index(src.ordinal)
+                data += (bytes([1 if src.region_id == region else 3]) + _blob16(commitment.leaf_bytes[src.ordinal])
+                         + struct.pack("<I", k)
+                         + _blob16(b"".join(merkle_path(commitment.region_leaves[src.region_id], k))))
             else:
                 data += bytes([2]) + _blob16(commitment.region_bytes[src.region_id])
         metas = self._metas(admitted, run, challenger, True) + [

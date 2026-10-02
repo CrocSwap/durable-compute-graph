@@ -6,10 +6,12 @@ control flow, ambient effects, and unknown operations are refused at trace
 time with the source location. The result lowers to the step table that the
 on-chain graph lifecycle executes, plus graph/plan blobs.
 
-Fast-path note: for the exact two-level add/identity shape the emitted graph
-and plan blobs are the frozen golden DCGG/DCPL bytes. Other shapes emit a
-``DCGGF1``/``DCPLF1`` fast encoding of the step table, which is not the frozen
-v2.0 canonical format.
+Encoding: the exact two-level add/identity shape emits the frozen golden
+DCGG/DCPL bytes; any other shape the canonical format can express is lowered
+to canonical v2.0 DCGG/DCPL with the reference encoder (``dcg.graph.v2``).
+Shapes it cannot express (an external input used twice or never, a step whose
+output is neither consumed nor returned, an output that is a raw input) fall
+back to the ``DCGGF1``/``DCPLF1`` fast encoding, whose table the chain trusts.
 """
 
 from __future__ import annotations
@@ -66,6 +68,7 @@ class Trace:
     steps: list[Step] = field(default_factory=list)
     outputs: tuple[int, ...] = ()
     region_stack: list[str] = field(default_factory=lambda: ["root"])
+    region_parents: dict[str, str] = field(default_factory=dict)
 
     @property
     def n_inputs(self) -> int:
@@ -118,6 +121,9 @@ def call(kernel: KernelSpec, *args) -> Value:
 @contextlib.contextmanager
 def region(name: str):
     trace = _ACTIVE[-1]
+    parent = trace.region_parents.setdefault(name, trace.region_stack[-1])
+    if parent != trace.region_stack[-1] or name == "root":
+        raise TraceError("REGION_NESTING", f"region {name!r} entered under two parents", _caller())
     trace.region_stack.append(name)
     try:
         yield
@@ -171,11 +177,122 @@ class Graph:
         return (self.trace.n_inputs == 2 and len(s) == 2 and s[0].kernel.name == "add_i32"
                 and s[0].refs == (0, 1) and s[1].kernel.name == "identity_i32" and s[1].refs == (2,))
 
+    def canonical(self) -> tuple[bytes, bytes] | None:
+        """Canonical v2.0 (DCGG, DCPL) for this trace, or None when the shape
+        is outside what the canonical format expresses (see module note)."""
+        if getattr(self, "_canonical", False) is not False:
+            return self._canonical
+        self._canonical = None
+        from dcg.graph import v2 as wire
+
+        t = self.trace
+        n_in = t.n_inputs
+        uses = [0] * n_in
+        consumed = [False] * len(t.steps)
+        for s in t.steps:
+            for r in s.refs:
+                if r < n_in:
+                    uses[r] += 1
+                else:
+                    consumed[r - n_in] = True
+        returned = {o - n_in for o in t.outputs if o >= n_in}
+        if (any(u != 1 for u in uses) or any(o < n_in for o in t.outputs)
+                or any(not c and i not in returned for i, c in enumerate(consumed))):
+            return None
+        names = ["root"]
+        for s in t.steps:
+            for name in self._region_path(s.region):
+                if name not in names:
+                    names.append(name)
+        rid = {name: i for i, name in enumerate(names)}
+        parent = {rid[n]: (wire.ROOT_PARENT if n == "root" else rid[t.region_parents[n]]) for n in names}
+
+        def kid(name: str, version: int) -> bytes:
+            return f"{name}/v{version}".encode().ljust(16, b"\x00")
+
+        nodes, ports, edges, ins, outs = [], [], [], [], []
+        for i, s in enumerate(t.steps):
+            node = i + 1
+            nodes.append(wire.NodeV1(node, kid(s.kernel.name, s.kernel.semantic_version), s.kernel.semantic_version,
+                                     s.kernel.abi_version, rid[s.region]))
+            for port, r in enumerate(s.refs):
+                ports.append(wire.PortV1(node, 0, port, 1, 1, 5, (), 4, 4, 4))
+                if r < n_in:
+                    ins.append(wire.GraphInputV1(r, node, port))
+                else:
+                    edges.append(wire.EdgeV1(r - n_in + 1, 0, node, port))
+            ports.append(wire.PortV1(node, 1, 0, 1, 1, 5, (), 4, 4, 4))
+        for external, o in enumerate(t.outputs):
+            outs.append(wire.GraphOutputV1(external, o - n_in + 1, 0))
+        regions = tuple(wire.RegionV1(r, parent[r], wire.MODE_OPTIMISTIC, 1, 2, 1, 1, 1) for r in sorted(parent))
+        graph = wire.GraphV2(tuple(nodes), tuple(sorted(ports, key=lambda p: (p.node_id, p.direction, p.port_id))),
+                             tuple(sorted(edges, key=lambda e: (e.destination_node, e.destination_port,
+                                                                 e.source_node, e.source_port))),
+                             regions, tuple(sorted(ins, key=lambda x: x.external_id)), tuple(outs))
+        try:
+            graph_bytes = wire.encode_graph(graph)
+        except (wire.GraphError, ValueError):
+            return None
+        # Steps keep trace order; a region's segment breaks wherever another
+        # region's step intervenes.
+        steps, segments, seg_of = [], [], {}
+        last: tuple[int, int] | None = None
+        for i, s in enumerate(t.steps):
+            r = rid[s.region]
+            if last is None or last[0] != r:
+                seg_of[r] = seg_of.get(r, -1) + 1
+                segments.append([r, seg_of[r], i, 0])
+            segments[-1][3] += 1
+            last = (r, seg_of[r])
+            node = i + 1
+            steps.append(wire.StepV1(i, r, seg_of[r], node, 0, 1, 1,
+                                     tuple(wire.PortRefV1(node, 0, p) for p in range(len(s.refs))),
+                                     (wire.PortRefV1(node, 1, 0),)))
+        region_plans = tuple(
+            wire.RegionPlanV1(r, parent[r], wire.MODE_OPTIMISTIC, 1, 2, 1, 1, 1,
+                              sum(1 for st in steps if st.region_id == r), seg_of.get(r, -1) + 1)
+            for r in sorted(parent))
+        node_region = {n.node_id: n.region_id for n in nodes}
+        boundaries = tuple(sorted(
+            (wire.BoundaryV1(node_region[e.source_node], node_region[e.destination_node],
+                             wire.PortRefV1(e.source_node, 1, e.source_port),
+                             wire.PortRefV1(e.destination_node, 0, e.destination_port), 1, 1, 2, 1)
+             for e in edges if node_region[e.source_node] != node_region[e.destination_node]),
+            key=lambda b: (b.source_region, b.destination_region,
+                           (b.source.node_id, b.source.direction, b.source.port_id),
+                           (b.destination.node_id, b.destination.direction, b.destination.port_id))))
+        costs = [wire.CostAdmissionV1(1, st.region_id, st.ordinal, 100_000, 2, 4 * len(st.inputs), 4, 4, 4096, 4096,
+                                      4 * len(st.inputs), 4, 0, 4096) for st in steps]
+        costs += [wire.CostAdmissionV1(2, r, 0, 100_000, 4, 64, 64, 64, 4096, 4096, 64, 64, 0, 4096)
+                  for r in sorted(parent)]
+        costs.append(wire.CostAdmissionV1(3, 0, 0, 1_400_000, 64, 4096, 4096, 4096, 32768, 4096, 4096, 4096, 0, 4096))
+        costs.sort(key=lambda c: (c.scope_kind, c.region_id, c.step_ordinal))
+        golden_plan = _golden("minimal_two_level_add_identity", "plans_v1.tsv")
+        manifest_root = golden_plan[104:136] if golden_plan else bytes(32)
+        plan = wire.PlanV2(wire.graph_id(graph_bytes), b"compiler-v2-id!!", 1, 1, 1, 1, 1, b"I" * 32, manifest_root,
+                           b"", region_plans, tuple(steps),
+                           tuple(sorted((wire.SegmentV1(r, sid, first, count, 2, 1)
+                                         for r, sid, first, count in segments), key=lambda x: (x.region_id, x.segment_id))),
+                           boundaries, (), tuple(costs))
+        try:
+            self._canonical = (graph_bytes, wire.encode_plan(plan))
+        except (wire.PlanError, ValueError):
+            self._canonical = None
+        return self._canonical
+
+    def _region_path(self, name: str) -> list[str]:
+        path = [name]
+        while path[-1] != "root":
+            path.append(self.trace.region_parents[path[-1]])
+        return list(reversed(path))
+
     def graph_bytes(self) -> bytes:
         if self._is_hello_shape():
             golden = _golden("minimal_two_level_add_identity", "graphs_v1.tsv")
             if golden:
                 return golden
+        if self.canonical():
+            return self.canonical()[0]
         return b"DCGGF1" + self.step_table() + struct.pack("<H", len(self.trace.outputs)) + b"".join(
             struct.pack("<H", o) for o in self.trace.outputs)
 
@@ -184,6 +301,8 @@ class Graph:
             golden = _golden("minimal_two_level_add_identity", "plans_v1.tsv")
             if golden:
                 return golden
+        if self.canonical():
+            return self.canonical()[1]
         regions = sorted({s.region for s in self.trace.steps})
         return b"DCPLF1" + self.step_table() + ",".join(regions).encode()
 
@@ -222,7 +341,7 @@ class Graph:
         t, ids = self.trace, self.ids()
         lines = [f"graph {t.name}: {t.n_inputs} i32 inputs ({', '.join(t.input_names)}), {len(t.steps)} kernel steps",
                  f"  graph id {ids['graph'].hex()[:16]}…  plan id {ids['plan'].hex()[:16]}…  table id {ids['table'].hex()[:16]}…",
-                 f"  encoding: {'frozen v2.0 golden DCGG/DCPL' if self._is_hello_shape() else 'fast-path DCGGF1/DCPLF1 (not canonical v2.0)'}"]
+                 f"  encoding: {'frozen v2.0 golden DCGG/DCPL' if self._is_hello_shape() else 'canonical v2.0 DCGG/DCPL' if self.canonical() else 'fast-path DCGGF1/DCPLF1 (not canonical v2.0)'}"]
         regions: dict[str, list[int]] = {}
         for i, s in enumerate(t.steps):
             regions.setdefault(s.region, []).append(i)

@@ -87,9 +87,9 @@ Kernels come from `crates/dcg-kernels`, which is `no_std`. The same source is us
 
 ## Shortcuts against the v2.0 spec
 
-- **DCPL is decoded on chain only for canonical blobs.** Admission verifies that the executed table equals the plan's lowering. Fast-path `DCGGF1` shapes still use a trusted table (template byte 6 = 0). The template's mode is not bound to the plan's region modes.
+- **DCPL is decoded on chain for canonical blobs.** Admission verifies that the executed table equals the plan's lowering. The tracer emits canonical DCGG/DCPL for every shape the format can express. Only inexpressible shapes (an external input used twice or never, a dead step, an output that is a raw input) fall back to `DCGGF1` with a trusted table (template byte 6 = 0). The template's mode is not bound to the plan's region modes.
 - **Fixed 4-byte cells** and at most 8 inputs per step.
-- **Two dispute paths.** Trace-committed runs (216/217) keep direct one-step replay. Root-committed runs (220–226) descend root → region → step. The **value digest is provisional**: `SHA256("dcg.value.v2.provisional\0" || bytes)`, because the frozen spec leaves it open. Producers in a *parent* region are not authenticated yet; only external inputs, same-region producers and child-region producers are.
+- **Two dispute paths.** Trace-committed runs (216/217) keep direct one-step replay. Root-committed runs (220–226) descend root → region → step. The **value digest is provisional**: `SHA256("dcg.value.v2.provisional\0" || bytes)`, because the frozen spec leaves it open. Inputs are authenticated when they come from an external input, a same-region producer, a child-region producer, or a producer in the parent region the descent came from (`parent_child_descent.py`). Producers two or more regions up are not authenticated yet.
 - **Executor bond only.** The bond is posted at commit, paid to a winning challenger or auditor, and refunded at finalize. There is no challenger bond and no protocol fee.
 - **Image identity** is a hash of the program ID, not of the ELF.
 - **Encodings.** The tracer emits the golden DCGG/DCPL bytes only for the exact two-level add/identity shape. Other shapes get a fast `DCGGF1`/`DCPLF1` encoding.
