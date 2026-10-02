@@ -1,6 +1,7 @@
 # Real-time transaction transport v1
 
-**Status: designed; implementation and live behavior are open.** This note is
+**Status (2026-10-02): partly implemented and used on testnet; see "Status
+and v1.1 gaps" at the end.** The original design note follows unchanged. It is
 based on DCG `main` at `057f088` (which already contains the Python
 `dcg.sequencer`) and the Basanos source snapshot at `8bfdfbb7e121`. The Doom
 adapter reference is Basanos branch `fadeno/doom-dcg-r7b`, commit `8f082eac6`.
@@ -403,3 +404,32 @@ parallel implementation estimate.
   RPC or TPU/QUIC is enabled in the first DCG testnet part 2 profile. All rates
   and caps must be recorded as configured or measured per run; no global
   throughput target is inferred here.
+
+## Status and v1.1 gaps (2026-10-02)
+
+Implemented in `dcg.sequencer`: the finite-plan sequencer with journal and
+resend of signed bytes, the stream and its journal, provider health, the
+leader pool, and `OrderedLane` (send a window of ordered steps, wait for
+visibility, repair from the chain record). Transport tests cover multi-signer
+packets, crash-after-send resume of the same signed packet, and the H3 stream
+time cap.
+
+Used on Fogo testnet (*measured*, Basanos
+`docs/experiments/fast-path-status-2026-10-01.md`):
+- Doom on DCG frames, 1.63–1.66 frames/s;
+- a full-size (K=10,240) Basanos document: all position roots landed in
+  45.7 s and 10,210 output attestations in about 11 minutes through
+  `OrderedLane` windows;
+- DCG template admission for the K=35 Basanos template in about 12 minutes.
+
+v1.1 gaps (owner, 2026-10-02; these replace the earlier L1–L8 list, which is
+dropped):
+1. Move `OrderedLane` into the sequencer proper, with its journal and
+   multi-node sending.
+2. Version-0 transactions with address lookup tables (needed for
+   UnifiedInit at K=10,240).
+3. An unordered batch primitive for independent steps such as attestations.
+4. Compute-unit sizing per step (Fogo charges requested compute against the
+   per-account block cap).
+5. Blockhash refresh for long windows.
+6. A resume test for the H3 stream path.

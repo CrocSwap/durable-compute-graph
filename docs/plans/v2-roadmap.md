@@ -1,10 +1,28 @@
 # DCG v2 milestone roadmap
 
-**Status: designed sequence.** Every duration below is an **estimate**, not a
-measurement. The kickoff produced offline specs and codec vectors only; no Rust
-or SBF build, ProgramTest lifecycle, shared-program deployment, or testnet
-transaction was run here. Estimates overlap across stage 2/3/4 and must not be
-summed as elapsed time.
+**Status: milestones 1–3 reached on Fogo testnet as fast-path mechanics
+demonstrations (2026-10-01/02); none of it is reviewed yet.** The table
+below is the original designed sequence. Its durations are **estimates**
+from the kickoff and must not be summed as elapsed time. The status by
+milestone follows.
+
+## Status (2026-10-02)
+
+| # | Milestone | Status |
+|---|---|---|
+| 1 | Hello Graph locally | **Done.** `dcg.tracing` lowers every expressible traced graph to canonical v2.0 graph and plan bytes. `crates/dcg-wire` decodes them against golden vectors, and admission checks the uploaded bytes against the canonical lowering (errors 29–31). |
+| 2 | Hello Graph on the shared program | **Done on testnet** (*measured* 2026-10-01, `docs/hello-graph.md`). Labeled a mechanics demonstration; its shortcuts against the frozen spec are listed in that note. |
+| 3 | Hello Dispute | **Done on testnet; unreviewed.** Root-committed descent, tags 220–226: root → region → step, replay of the disputed step on chain, parent and child region input authentication, executor and challenger bonds, mode binding (`0x621f`). 16 testnet cases (*measured*, `docs/hello-graph.md`). The value digest is final: `SHA256("dcg.value.v2\0" \|\| bytes)` (owner decision 2026-10-02). Tags 208–226 build only with the `graph-v2` feature, so default images do not expose them. |
+| 4 | `explain()` with a composed guarantee | **Partial.** `explain()` names kernels, regions, source lines, the per-mode guarantee and ceilings. It does not yet compose guarantees across regions or refuse an OPEN capability. |
+| 5 | Doom consumer | **Running on stateful v3, below target.** Doom runs on DCG stateful v3 sessions (not the v2 graph lifecycle) at 1.63–1.66 frames/s on testnet (*measured*, Basanos `docs/experiments/fast-path-status-2026-10-01.md`) against the 3.0/s goal. The limit is v3's single cursor, phase lock and write set; `docs/design/stateful-session-lanes-v1.md` is the designed fix (owner decisions recorded, not implemented). |
+| 6–8 | Sampling, Freivalds, ZK | Not started. |
+
+Next, in order: a review of the v2 graph lifecycle (the step before the
+`graph-v2` feature becomes default); the composed guarantee in `explain()`;
+lanes implementation; the transport v1.1 gaps listed in
+`docs/design/realtime-transport-v1.md`.
+
+## Original sequence (kickoff estimates)
 
 | Milestone | Dependencies | Acceptance | Estimate |
 |---|---|---|---|
