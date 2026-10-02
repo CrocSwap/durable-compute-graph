@@ -62,9 +62,26 @@ else
     failed=1
 fi
 
+is_attested() {
+    case " $ATTESTED_TESTS " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+image_for() {
+    if is_attested "$1"; then printf '%s' "$ATTESTED_IMAGE"; else printf '%s' "$APP_IMAGE"; fi
+}
+features_for() {
+    if is_attested "$1"; then printf 'sbf-attested-admission-test'; else printf 'sbf-real-lifecycle-test'; fi
+}
+
 DEFAULT_IMAGE="$RUN_ROOT/default"
 APP_IMAGE="$RUN_ROOT/sbf-real-lifecycle-test"
 UNBOUND_IMAGE="$RUN_ROOT/sbf-unbound-form-test"
+ATTESTED_IMAGE="$RUN_ROOT/sbf-attested-admission-test"
+# Full-size (K=10,240) app-bound admission is attested: a full per-position
+# scan does not fit (owner decision 2026-10-02; app-bound-replay-v1 §1.1).
+# These tests run on the attested app image and are skipped on the
+# full-scan one.
+ATTESTED_TESTS="rev8_pt1x_full_honest_path_reaches_challenge_ruling rev8_pt1x_registry_and_admission_sbf rev8_pt1x_real_admission_to_resolve_sbf"
 
 if run_logged default-image-build env \
     CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
@@ -102,7 +119,17 @@ if run_logged app-image-build env \
         BASANOS_DCG_F48_RECEIPT="$RUN_ROOT/form48-receipt-plain" \
         BPF_OUT_DIR="$APP_IMAGE" \
         cargo test --locked --offline --profile fasttest -p dcg-program \
-            --features sbf-real-lifecycle-test --test unified_v8_document -- --nocapture
+            --features sbf-real-lifecycle-test --test unified_v8_document -- --nocapture \
+            --skip rev8_pt1x_full_honest_path_reaches_challenge_ruling \
+            --skip rev8_pt1x_registry_and_admission_sbf \
+            --skip rev8_pt1x_real_admission_to_resolve_sbf
+
+    run_logged attested-app-image-build env \
+        CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+        DCG_SBF_SDK="$DCG_SBF_SDK" \
+        DCG_SBF_TOOLS_VERSION="$DCG_SBF_TOOLS_VERSION" \
+        DCG_SBF_STAGING_NAME=dcg-r8-test-hardening-attested \
+        "$BUILD_SCRIPT" --features sbf-attested-admission-test --sbf-out-dir "$ATTESTED_IMAGE"
 
     for test_name in \
         rev8_pt1x_full_honest_path_reaches_challenge_ruling \
@@ -118,9 +145,9 @@ if run_logged app-image-build env \
             BASANOS_PT2P_F47_ROOT="$F47_ROOT" \
             BASANOS_PT2P_K10240_ROOT="$K10240_PLAIN_ROOT" \
             BASANOS_PT2P_F47_POSITION="$F47_POSITION" \
-            BPF_OUT_DIR="$APP_IMAGE" \
+            BPF_OUT_DIR="$(image_for "$test_name")" \
             cargo test --locked --offline --profile fasttest -p dcg-program \
-                --features sbf-real-lifecycle-test --test unified_v8_document \
+                --features "$(features_for "$test_name")" --test unified_v8_document \
                 "$test_name" -- --exact --nocapture || true
     done
 
@@ -140,9 +167,9 @@ if run_logged app-image-build env \
                 BASANOS_PT2P_F47_ROOT="$K10240_DECISION_ROOT" \
                 BASANOS_PT2P_K10240_ROOT="$K10240_DECISION_ROOT" \
                 BASANOS_PT2P_F47_POSITION=10239 \
-                BPF_OUT_DIR="$APP_IMAGE" \
+                BPF_OUT_DIR="$(image_for "$test_name")" \
                 cargo test --locked --offline --profile fasttest -p dcg-program \
-                    --features sbf-real-lifecycle-test --test unified_v8_document \
+                    --features "$(features_for "$test_name")" --test unified_v8_document \
                     "$test_name" -- --exact --nocapture || true
         done
     fi
