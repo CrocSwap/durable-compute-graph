@@ -1,6 +1,6 @@
-# Optimistic disputes v2.1: first-divergence disputes for graph runs (draft, revision 3)
+# Optimistic disputes v2.1: first-divergence disputes for graph runs (draft, revision 3.1)
 
-Status: **draft design, 2026-10-02, revision 3.** Nothing here is
+Status: **draft design, 2026-10-02, revision 3.1** (revision 3 plus the focused check's fixes, `review-dcg-disputes-v2.1-rev3-focused-2026-10-02.md`, cited R3-*). Nothing here is
 implemented. It replaces the root-committed descent of v2.0 (tags 220–226).
 
 Review history (reports in Basanos `out/runs/`):
@@ -165,8 +165,20 @@ enumeration:
   header agrees with the producer's header in bytes 7..23.
 - **No forks.** Each `(e', state output)` is named as a state predecessor by
   at most one body entry, with one lag.
-- **Capacity.** `Σ blocks capacity ≤ 2^40`, checked in `u64`. At most 64
-  blocks.
+- **Capacity.** The bound is on leaf *positions*, not steps (R3-S6):
+  - the step tree's height `H` is at most 40;
+  - the sum of the blocks' aligned address ranges, alignment included, is at
+    most 2^40, computed in `u64`;
+  - there are at most 64 blocks, and no empty block (`step_count ≥ 1`);
+  - each `BlockSpec`'s stored `address_base` and `address_height` must equal
+    the derived ones, and the `base_ordinal`s must be contiguous.
+- **Chunk headers** (R3-B3). A kind 5 consumer is compared against a
+  *derived chunk header*, not against the whole value's header:
+  - layout 5 ("raw bytes", version 1, registered);
+  - the value's scheme;
+  - `byte_length = chunk_bytes`.
+
+  The chunk index range must avoid the short last chunk.
 
 ### 3.4 Kind 6: last running iteration
 
@@ -196,8 +208,8 @@ The digest is the frozen `SHA256("dcg.value.v2\0" || bytes)`.
 leaf is `EMPTY_CHUNK`.
 
 **Kind 5 inputs.** A kind 5 input is one chunk read as a plain value. Its
-input digest is the plain value digest of the chunk bytes. Its header
-`byte_length` is the chunk length.
+input digest is the plain value digest of the chunk bytes. Its header is the derived chunk header of 3.3: layout 5, the value's
+scheme, and `byte_length = chunk_bytes`.
 
 **Chunk openings.** A kernel reading a chunked input receives chunk
 openings, each a chunk plus its path. The STEP witness carries exactly the
@@ -332,7 +344,7 @@ ordered by `(direction, port_id)`. The source graph is:
 **Body entry.** A body entry is a `StepSpec` with magic `DSB1`, in which
 producers may be of kinds 4, 5, 6 and 7. Its `ordinal` is implicit.
 
-**`BlockSpec` (96 bytes).**
+**`BlockSpec` (104 bytes).**
 `magic "DBK1" kind:u8 (1 enumerated, 2 repeated) reserved:u8[3]
 base_ordinal:u64 step_count:u64 K:u32 body_len:u32 gate_entry:u32
 gate_port:u16 reserved:u16 first_record:u64 record_count:u64
@@ -348,9 +360,10 @@ address_base:u64 address_height:u8 reserved:u8[7] body_graph_id:[32]`.
 
 **`InSpec` (40 bytes).**
 `magic "DIN1" external_id:u32 header:[23] reserved:u8 chunk_log2:u8
-reserved:u8[7]`.
+reserved:u8[7]`. For a chunked input, `chunk_log2` must equal the header's
+`layout_version`; otherwise it is 0 (R3-S9).
 
-**`ConstSpec` (112 bytes).**
+**`ConstSpec` (104 bytes).**
 `magic "DCN1" constant_id:u32 header:[23] residency:u8 (1 resident,
 2 committed) source_kind:u8 reserved:u8[7] digest:[32] locator:[32]`.
 
@@ -359,13 +372,20 @@ reserved:u8[7]`.
 - The producer is kind 1 or kind 6.
 - `j` is the rank in DCGG `external_id` order.
 
-**`OutBlockSpec` (64 bytes)** (R2-S11.8, S11.9). This is for outputs
+**`OutBlockSpec` (56 bytes)** (R2-S11.8, S11.9). This is for outputs
 produced in every iteration of a repeated block.
 `magic "DOB1" block:u32 entry:u32 port:u16 reserved:u16 header:[23]
 reserved:u8 first_out_index:u64 reserved:u8[8]`.
 - It generates `K` out entries `first_out_index + i`, each with kind 1
   producer `base + i × body_len + entry`.
 - When iteration `i` is off, its out entry is `EMPTY_OUT`.
+
+**Out index space** (R3-S7):
+- The `OutSpec` records take indices `0..out_count`, by `external_id` rank.
+- The `OutBlockSpec` records follow in block order, each taking `K`
+  consecutive indices from its `first_out_index`.
+- Admission checks that the ranges are disjoint and tile
+  `[0, total_outputs)`.
 
 **`RegionSpec` (32 bytes).**
 `magic "DRG1" region_id:u32 parent:u32 mode_id:u32 mode_version:u16
@@ -507,11 +527,11 @@ repeated block is an aligned subtree of height `hb`.
 ### 6.3 Run root (R2-B3)
 
 ```
-RunRootV21 =                                   ; 172 bytes
+RunRootV21 =                                   ; 176 bytes
   plan_id[32] run_id[32] spec_root[32]
   total_steps:u64
   step_tree_root[32]
-  total_outputs:u32
+  total_outputs:u64
   out_tree_root[32]
 run_root = SHA256("dcg.run.root.v2.1\0" || RunRootV21)
 ```
@@ -586,7 +606,7 @@ Every step position before `k` holds H's leaf. Leaf `k` differs.
 | What differs in leaf `k` | Claim | Why it wins |
 |---|---|---|
 | does not parse; ids, coordinate, a header's bytes 0..23, counts, state digests zero or nonzero against the scheme, a state export that does not match; empty in iteration 0 or in an enumerated block | SHAPE | compared with `StepSpec(k)` and the run |
-| present or empty against the gate | GATE | the gate producer (iteration `i − 1`) is earlier, so it is honest |
+| present or empty against the gate | GATE | `BlockSpec`; gate leaf `(B, i−1, g)` with its 4-byte gate value | leaf `k` is present and the gate leaf is empty or its value is zero; or leaf `k` is empty and the gate leaf is present with a nonzero value |
 | an input's bytes 7..55 | EDGE(i) | the producer is earlier (honest), or is the run or the template |
 | prior state digest | STATE | the predecessor is earlier (honest), or is the initial value |
 | outputs or next state | STEP | inputs, prior state and parameters equal H's, so C can witness them |
@@ -595,8 +615,9 @@ The rows are exhaustive: a present leaf is fully determined by its spec,
 its run, its producers, its predecessor and its kernel.
 
 **Outputs.** If the step tree equals H's but the out tree differs,
-`OUT_DESCEND` descends the out tree (capacity `total_outputs`, every position
-pickable). It lands on the first differing entry `j`. Its producer leaf is
+`OUT_DESCEND` descends the out tree the same way. Its pickable positions are
+exactly those `< total_outputs`, and the program fills every other position
+with `EMPTY_OUT[level]` (R3-F2). It lands on the first differing entry `j`. Its producer leaf is
 in the honest step tree.
 
 ### 7.3 Claims
@@ -609,15 +630,21 @@ in the honest step tree.
 | EDGE(i), kind 3 | `StepSpec(k)`, `ConstSpec` | input bytes 7..23 differ from the `ConstSpec` header bytes 7..23, or the digest differs from the constant's |
 | EDGE(i), kind 5 | `StepSpec(k)`; the chunk at its index, with its path against the input's or constant's chunk root | the input digest differs from the chunk's plain value digest, or the header differs |
 | EDGE(i), kind 7 | `StepSpec(k)` | the input digest differs from the value digest of `i` as a `u32` |
-| EDGE(i), kind 6 (`B, e', b`) | C names `t`. Opened: leaf `(B, t, e')`, and the gate leaf `(B, t, g)` unless `t = K − 1`, and the leaf at `(B, t+1, 0)` | rules for C if leaf `(B, t, e')` is present, the gate value at `t` is zero (or `t = K − 1`), and the input bytes 7..55 differ from that leaf's port. It rules for E if the opened facts do not establish `t` as the last running iteration |
+| EDGE(i), kind 6 (`B, e', b`) | C names `t:u32`. Opened: leaf `(B, t, e')` and, unless `t = K − 1`, the gate leaf `(B, t, g)` with its 4-byte gate value | C wins if and only if `t < K`, leaf `(B, t, e')` is present, the gate at `t` is zero or `t = K − 1`, and the input bytes 7..55 differ from port `b`'s bytes 7..55. Otherwise E wins (R3-S1). |
 | GATE | `BlockSpec`; gate leaf `(B, i−1, g)` | leaf `k` is present and the gate leaf is empty or its value is zero; or leaf `k` is empty and the gate leaf is present with a nonzero value (R2-S1) |
 | STATE | `StepSpec(k)`; the predecessor leaf, or the initial value's ref | `prior_state_digest` differs from the predecessor's `next_state_digest`, the initial digest, or `EMPTY_STATE`; or the predecessor is empty |
 | STEP | `StepSpec(k)`; C's witness (inputs or chunk openings, parameter bytes, port records, state material) | the witness verifies against leaf `k`'s digests, `parameter_digest` and `port_shapes_digest`, and the replay's outputs or next state differ |
-| OUT(j) | `OutSpec(j)` or `OutBlockSpec`; the producer leaf | the entry is not `EMPTY_OUT` and the producer is empty or lacks the port; or the entry is `EMPTY_OUT` and the producer is present; or the entry's 55 bytes differ from the producer's output ref at bytes 7..55 together with the expected header |
+| OUT(j) | `OutSpec(j)` or `OutBlockSpec`; the producer leaf (for a kind 6 producer, as in EDGE kind 6, with C naming `t`) | the entry is not `EMPTY_OUT` and the producer is empty or lacks the port; or the entry is `EMPTY_OUT` and the producer is present; or entry bytes 0..23 differ from the spec header; or entry bytes 23..55 differ from the producer port's digest (R3-S8, R3-B2) |
+
+**Gate values** (R3-S2). A leaf holds the gate port's digest, not its value.
+Whoever supplies a gate opening also supplies the 4 bytes. The program checks
+`SHA256("dcg.value.v2\0" || bytes)` against the leaf's digest before reading
+the little-endian `i32`.
 
 **Why kind 6 is sound.** The honest `t` exists. Leaf `(B, t, e')` is before
-`k`, so it is honest. Its gate leaf is honest. Leaf `(B, t+1, 0)` is honest
-and empty, because H stops at `t`. So C can always establish the honest last
+`k`, so it is honest. Its gate leaf is honest. Every leaf of `B` is before `k`, so it is honest. "Present at `t`, and
+gate zero at `t`" therefore fixes the honest `t`, and no third opening is
+needed. So C can always establish the honest last
 iteration with honest leaves, and E cannot establish a different one.
 
 **Malformed-data rule (R1-B3).** Bytes that hash to E's own commitment are
@@ -658,9 +685,15 @@ OPEN(kind = STEP_DESCEND | OUT_DESCEND); C posts its bond and pre-funds both sta
 ### 8.2 Staging (R2-B5)
 
 - Each party has its own staging buffer for each dispute.
-- **Both buffers are pre-funded by the challenger at open.** Their rent is
-  refunded to C when the dispute closes. So griefing locks C's capital, not
-  E's.
+- **The challenger funds both buffers at open, at different sizes**
+  (R3-S4):
+  - E's buffer is funded to the rent of E's largest opening, a few KB, so
+    E never pays to grow it;
+  - C's buffer is sized for the largest witness, up to 1 MiB.
+
+  Both rents are refunded to C at close. So griefing locks C's capital, not
+  E's. In section 9, `STAGE_CREATE` for E's buffer happens inside
+  `OPEN_DISPUTE`.
 - Either party may write to its buffer at any time, in 900-byte writes,
   growing it 10,240 bytes at a time. Only the submit is timed.
 - Admission sets `max_opening` to the largest of:
@@ -697,16 +730,24 @@ write_rate) × write_slots`.
 - With collision resistance, a node has one fold-valid child set, so one
   dispute cannot poison another (R2-S7).
 
-**Load extension, uncapped.**
-- `waiting_E` is the number of disputes waiting on E.
-- When `waiting_E > c`, each further dispute that starts waiting extends
-  every pending E deadline, and the run's finality bound, by
-  `extend_slots`.
-- Every open costs a bond and pre-funds staging. So E's required answer rate
-  never exceeds `c / phase_window` plus what the extensions buy, and the
-  delay is bounded by the number of opens.
-- Admission requires `c × answer_cost ≤` the measured executor throughput
-  (O1). With that, P-complete holds as stated in section 1.
+**Load extension, uncapped** (R3-B1).
+- The run keeps `extension_total:u64`. E's effective deadline in any dispute
+  is the stored base deadline plus `extension_total`, so an extension writes
+  only the run account, not N dispute accounts.
+- Each time a dispute starts waiting on E while `waiting_E ≥ c`,
+  `extension_total` grows by `extend_slots`. Extensions are counted per
+  *wait*, not per open.
+- Admission requires `extend_slots ≥ answer_slots`, the measured time for
+  E to land its largest answer. A kind 6 opening is the largest: three
+  leaves, three paths and a gate value, about 3.2 KB plus `3 × 32 × h` bytes
+  (R3-S3). Each additional waiting dispute therefore buys E the time to
+  answer it.
+- Every open costs a bond and pre-funds E's buffer, so the delay is paid
+  for.
+- **Contention** (R3-S5). Picks and answers both write the run account.
+  `answer_slots` must be measured with an attacker spamming picks before the
+  constants are fixed. Otherwise `waiting_E` and `extension_total` move to a
+  per-run counter account that only E's answers and the extension write.
 
 ## 9. Instructions
 
@@ -760,9 +801,9 @@ it (R2-S8).
 **Bounded delay.** Every open happens before the challenge deadline. A
 dispute has at most `2 × (ceil(h/d) + 3)` phases. Finality is at most
 `challenge_window + D(N)`, where:
-- `D(N) = (2 × (ceil(h/d) + 3)) × max_phase_slots + max(0, N − c) ×
-  extend_slots`;
-- `N` is the number of opens.
+- `D(N) = (2 × (ceil(h/d) + 3)) × max_phase_slots + W × extend_slots`;
+- `W ≤ N × (ceil(h/d) + 3)` is the number of waits on E, with `N` the number
+  of opens (R3-B1).
 
 **Windows.** Each window has a minimum and a maximum at admission.
 
@@ -1024,3 +1065,6 @@ the happy path only.
 | R2-S11 byte layouts | 5.1, 5.2, 6.1 |
 | R2-S12 economics-v2 §1 | 10.3, plus the amendment in that file |
 | R2-N1 to R2-N6 | 8.2, 6.4 and 9, 10.1, O2, 3.1 (kind 7), 4.3 |
+| R3-F1 record lengths; R3-F2 out padding; R3-F3 `total_outputs` width | 5.1, 7.2, 6.3 |
+| R3-B1 extension arithmetic; R3-B2 OUT kind 6; R3-B3 chunk headers | 8.3 and 10.2; 7.3; 3.3 and 4.2 |
+| R3-S1 to R3-S9 | 7.3, 7.3, 8.3, 8.2, 8.3, 3.3, 5.1, 7.3, 5.1 |
