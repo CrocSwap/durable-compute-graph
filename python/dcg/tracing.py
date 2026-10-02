@@ -177,13 +177,21 @@ class Graph:
         return (self.trace.n_inputs == 2 and len(s) == 2 and s[0].kernel.name == "add_i32"
                 and s[0].refs == (0, 1) and s[1].kernel.name == "identity_i32" and s[1].refs == (2,))
 
-    def canonical(self) -> tuple[bytes, bytes] | None:
-        """Canonical v2.0 (DCGG, DCPL) for this trace, or None when the shape
-        is outside what the canonical format expresses (see module note)."""
-        if getattr(self, "_canonical", False) is not False:
-            return self._canonical
-        self._canonical = None
+    def canonical(self, mode: str = "optimistic") -> tuple[bytes, bytes] | None:
+        """Canonical v2.0 (DCGG, DCPL) for this trace with every region in the
+        resolution mode of ``mode`` (consensus, or optimistic for optimistic and
+        sampling templates), or None when the shape is outside what the
+        canonical format expresses (see module note)."""
+        cache = self.__dict__.setdefault("_canonical", {})
+        key = "consensus" if mode == "consensus" else "optimistic"
+        if key not in cache:
+            cache[key] = self._lower(key)
+        return cache[key]
+
+    def _lower(self, mode: str) -> tuple[bytes, bytes] | None:
         from dcg.graph import v2 as wire
+
+        mode_id = wire.MODE_CONSENSUS if mode == "consensus" else wire.MODE_OPTIMISTIC
 
         t = self.trace
         n_in = t.n_inputs
@@ -224,7 +232,7 @@ class Graph:
             ports.append(wire.PortV1(node, 1, 0, 1, 1, 5, (), 4, 4, 4))
         for external, o in enumerate(t.outputs):
             outs.append(wire.GraphOutputV1(external, o - n_in + 1, 0))
-        regions = tuple(wire.RegionV1(r, parent[r], wire.MODE_OPTIMISTIC, 1, 2, 1, 1, 1) for r in sorted(parent))
+        regions = tuple(wire.RegionV1(r, parent[r], mode_id, 1, 2, 1, 1, 1) for r in sorted(parent))
         graph = wire.GraphV2(tuple(nodes), tuple(sorted(ports, key=lambda p: (p.node_id, p.direction, p.port_id))),
                              tuple(sorted(edges, key=lambda e: (e.destination_node, e.destination_port,
                                                                  e.source_node, e.source_port))),
@@ -249,7 +257,7 @@ class Graph:
                                      tuple(wire.PortRefV1(node, 0, p) for p in range(len(s.refs))),
                                      (wire.PortRefV1(node, 1, 0),)))
         region_plans = tuple(
-            wire.RegionPlanV1(r, parent[r], wire.MODE_OPTIMISTIC, 1, 2, 1, 1, 1,
+            wire.RegionPlanV1(r, parent[r], mode_id, 1, 2, 1, 1, 1,
                               sum(1 for st in steps if st.region_id == r), seg_of.get(r, -1) + 1)
             for r in sorted(parent))
         node_region = {n.node_id: n.region_id for n in nodes}
@@ -275,10 +283,9 @@ class Graph:
                                          for r, sid, first, count in segments), key=lambda x: (x.region_id, x.segment_id))),
                            boundaries, (), tuple(costs))
         try:
-            self._canonical = (graph_bytes, wire.encode_plan(plan))
+            return graph_bytes, wire.encode_plan(plan)
         except (wire.PlanError, ValueError):
-            self._canonical = None
-        return self._canonical
+            return None
 
     def _region_path(self, name: str) -> list[str]:
         path = [name]
@@ -286,30 +293,31 @@ class Graph:
             path.append(self.trace.region_parents[path[-1]])
         return list(reversed(path))
 
-    def graph_bytes(self) -> bytes:
-        if self._is_hello_shape():
+    def graph_bytes(self, mode: str = "optimistic") -> bytes:
+        # The frozen golden Hello pair is the optimistic one.
+        if self._is_hello_shape() and mode != "consensus":
             golden = _golden("minimal_two_level_add_identity", "graphs_v1.tsv")
             if golden:
                 return golden
-        if self.canonical():
-            return self.canonical()[0]
+        if self.canonical(mode):
+            return self.canonical(mode)[0]
         return b"DCGGF1" + self.step_table() + struct.pack("<H", len(self.trace.outputs)) + b"".join(
             struct.pack("<H", o) for o in self.trace.outputs)
 
-    def plan_bytes(self) -> bytes:
-        if self._is_hello_shape():
+    def plan_bytes(self, mode: str = "optimistic") -> bytes:
+        if self._is_hello_shape() and mode != "consensus":
             golden = _golden("minimal_two_level_add_identity", "plans_v1.tsv")
             if golden:
                 return golden
-        if self.canonical():
-            return self.canonical()[1]
+        if self.canonical(mode):
+            return self.canonical(mode)[1]
         regions = sorted({s.region for s in self.trace.steps})
         return b"DCPLF1" + self.step_table() + ",".join(regions).encode()
 
-    def ids(self) -> dict[str, bytes]:
+    def ids(self, mode: str = "optimistic") -> dict[str, bytes]:
         return {
-            "graph": hashlib.sha256(GRAPH_DOMAIN + self.graph_bytes()).digest(),
-            "plan": hashlib.sha256(PLAN_DOMAIN + self.plan_bytes()).digest(),
+            "graph": hashlib.sha256(GRAPH_DOMAIN + self.graph_bytes(mode)).digest(),
+            "plan": hashlib.sha256(PLAN_DOMAIN + self.plan_bytes(mode)).digest(),
             "table": hashlib.sha256(TABLE_DOMAIN + self.step_table()).digest(),
         }
 

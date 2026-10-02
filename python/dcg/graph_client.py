@@ -124,18 +124,19 @@ class GraphClient:
         if manifest_root is None:
             # A canonical DCPL binds its kernel-manifest root (bytes 104..136),
             # and admission checks the declared root against it.
-            plan = graph.plan_bytes()
+            plan = graph.plan_bytes(mode)
             manifest_root = plan[104:136] if plan.startswith(b"DCPL") else b"\0" * 32
         policy = b"POL" + bytes([MODES[mode], samples]) + struct.pack("<Q", window_slots)
         blobs = {
-            "graph": self.upload_blob(1, graph.graph_bytes(), GRAPH_DOMAIN),
-            "plan": self.upload_blob(2, graph.plan_bytes(), PLAN_DOMAIN),
+            # Region modes in the canonical blobs match the template's mode.
+            "graph": self.upload_blob(1, graph.graph_bytes(mode), GRAPH_DOMAIN),
+            "plan": self.upload_blob(2, graph.plan_bytes(mode), PLAN_DOMAIN),
             # The template identity omits mode/window (fixed in the next image);
             # a trailing policy suffix, ignored by the on-chain parser, keeps
             # templates of different modes distinct.
             "table": self.upload_blob(3, table := graph.step_table() + policy, TABLE_DOMAIN),
         }
-        ids = {**graph.ids(), "table": hashlib.sha256(TABLE_DOMAIN + table).digest()}
+        ids = {**graph.ids(mode), "table": hashlib.sha256(TABLE_DOMAIN + table).digest()}
         image_id = hashlib.sha256(b"dcg.app.image.v2\x00" + bytes(self.program_id)).digest()
         template_id = hashlib.sha256(TEMPLATE_DOMAIN + ids["graph"] + ids["plan"] + image_id + manifest_root
                                      + ids["table"] + policy[3:]

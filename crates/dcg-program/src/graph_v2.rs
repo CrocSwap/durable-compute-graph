@@ -290,7 +290,7 @@ fn admit_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let graph_id = sealed_blob(program_id, graph, KIND_GRAPH)?;
     let plan_id = sealed_blob(program_id, plan, KIND_PLAN)?;
     let table_id = sealed_blob(program_id, table, KIND_TABLE)?;
-    let verified = verify_canonical_lowering(graph, plan, table, &graph_id, &manifest_root)?;
+    let verified = verify_canonical_lowering(graph, plan, table, &graph_id, &manifest_root, mode)?;
     {
         let t = table.try_borrow_data()?;
         let len = u32_at(&t, 8)? as usize;
@@ -342,6 +342,7 @@ fn verify_canonical_lowering(
     table: &AccountInfo,
     graph_id: &[u8; 32],
     manifest_root: &[u8; 32],
+    mode: u8,
 ) -> Result<bool, ProgramError> {
     let g = graph.try_borrow_data()?;
     let g = &g[BLOB_HEADER..BLOB_HEADER + u32_at(&g, 8)? as usize];
@@ -358,6 +359,14 @@ fn verify_canonical_lowering(
     }
     if decoded_plan.kernel_manifest_root != manifest_root.as_slice() {
         return Err(err(29));
+    }
+    // Every region resolves in the template's mode (sampling is optimistic
+    // resolution plus a slot-hash audit).
+    let region_mode = if mode == MODE_CONSENSUS { dcg_wire::MODE_CONSENSUS } else { dcg_wire::MODE_OPTIMISTIC };
+    if decoded_plan.regions.iter().any(|r| r.mode_id != region_mode)
+        || decoded.regions.iter().any(|r| r.mode_id != region_mode)
+    {
+        return Err(err(31));
     }
     let lowered = dcg_wire::lower(&decoded, &decoded_plan, |id, semantic, abi| {
         dcg_kernels::REGISTRY
