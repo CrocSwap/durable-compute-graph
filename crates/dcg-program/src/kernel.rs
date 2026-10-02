@@ -1432,7 +1432,74 @@ pub mod test_kernel {
         }
     }
 
-    pub static KERNELS: [&'static dyn Kernel; 1] = [&BYTE_SUM];
+    /// SHA-256 over its input spans in order: a generic stand-in with the
+    /// semantics of Basanos form 22 (`window_leaf`), so the v2.1 app-kernel
+    /// replay path can be tested with real captured operands. Not optimistic
+    /// in revision 8; tag 227 STEP resolves it by id and versions.
+    pub struct Sha256Concat {
+        _marker: u8,
+    }
+
+    static SHA_MANIFEST: KernelManifest = KernelManifest {
+        id: KernelId(*b"dcg-test-sha-v1\0"),
+        semantic_version: 1,
+        abi_version: 1,
+        input: PortLayout {
+            id: VersionedId { id: 3, version: 1 },
+            max_bytes: 65_536,
+            alignment: 1,
+        },
+        output: PortLayout {
+            id: VersionedId { id: 4, version: 1 },
+            max_bytes: 32,
+            alignment: 1,
+        },
+        state: None,
+        resources: ResourceLimits {
+            max_input_bytes: 65_536,
+            max_output_bytes: 32,
+            max_state_bytes: 0,
+            max_operations: 1,
+            max_compute_units: 100_000,
+        },
+        modes: &MODES,
+    };
+
+    impl Kernel for Sha256Concat {
+        fn manifest(&self) -> &'static KernelManifest {
+            &SHA_MANIFEST
+        }
+        fn execute(&self, input: &[u8], output: &mut [u8]) -> Result<usize, KernelError> {
+            self.execute_spans(
+                &[AccountSpan {
+                    key: [0; 32],
+                    owner: [0; 32],
+                    is_signer: false,
+                    is_writable: false,
+                    schema: SHA_MANIFEST.input.id,
+                    offset: 0,
+                    data: input,
+                }],
+                output,
+            )
+        }
+        fn execute_spans(&self, inputs: &[AccountSpan<'_>], output: &mut [u8]) -> Result<usize, KernelError> {
+            let total = inputs.iter().try_fold(0usize, |n, s| n.checked_add(s.data.len()));
+            if inputs.is_empty() || total.is_none_or(|n| n == 0 || n > SHA_MANIFEST.resources.max_input_bytes as usize) {
+                return Err(KernelError::InvalidInput);
+            }
+            if output.len() < 32 {
+                return Err(KernelError::OutputTooSmall);
+            }
+            let parts: Vec<&[u8]> = inputs.iter().map(|s| s.data).collect();
+            output[..32].copy_from_slice(&crate::hash::sha256(&parts));
+            Ok(32)
+        }
+    }
+
+    pub static SHA256_CONCAT: Sha256Concat = Sha256Concat { _marker: 0 };
+
+    pub static KERNELS: [&'static dyn Kernel; 2] = [&BYTE_SUM, &SHA256_CONCAT];
     pub static REPLAY_BINDINGS: [OptimisticReplayBinding; 1] = [OptimisticReplayBinding {
         mode: MODE_OPTIMISTIC_V1,
         replay: &BYTE_SUM,

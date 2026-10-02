@@ -89,9 +89,9 @@ def claim_body(sp: S.Spec, kind: str, position: int, name: str, kw: dict) -> byt
         pk = S.decode_producer(d["state_predecessor"])[0]
         return body + (step_opening(kw["producer_opening"]) if pk == 1 else b"")
     if name == "STEP":
-        out = bytes([len(kw["witness"])]) + b"".join(struct.pack("<H", len(v)) + v for v in kw["witness"])
+        out = bytes([len(kw["witness"])]) + b"".join(struct.pack("<I", len(v)) + v for v in kw["witness"])
         if d["state_scheme"]:
-            out += struct.pack("<H", len(kw["state_witness"])) + kw["state_witness"]
+            out += struct.pack("<I", len(kw["state_witness"])) + kw["state_witness"]
         return body + out
     raise ValueError(name)
 

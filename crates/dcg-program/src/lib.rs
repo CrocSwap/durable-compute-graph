@@ -187,12 +187,12 @@ pub fn process_instruction_with_manifest(
 }
 
 #[cfg(feature = "test-kernel")]
-fn application_manifest() -> &'static kernel::ApplicationManifest {
+pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     &kernel::test_kernel::MANIFEST_APP
 }
 
 #[cfg(not(feature = "test-kernel"))]
-fn application_manifest() -> &'static kernel::ApplicationManifest {
+pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     static EMPTY_KERNELS: [&'static dyn kernel::Kernel; 0] = [];
     static EMPTY_REPLAYS: [kernel::OptimisticReplayBinding; 0] = [];
     static EMPTY_FORMS: [kernel::LegacyFormBinding; 0] = [];

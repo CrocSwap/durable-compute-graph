@@ -121,11 +121,22 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
         if body.len() <= DIRECT_LIMIT {
             continue;
         }
+        // Created at most CREATE_STAGE (the role-1 buffer always is), then
+        // grown in 10 KiB steps.
+        let created = if *role == V::ROLE_EXECUTOR { V::CREATE_STAGE } else { body.len().min(V::CREATE_STAGE) };
         let mut data = vec![*role];
-        data.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        data.extend_from_slice(&(created as u32).to_le_bytes());
         tx.send(ctx, ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(dispute, false), AccountMeta::new(buffer(*role), false), AccountMeta::new_readonly(SYSTEM, false)]), &[&c])
             .await
             .unwrap_or_else(|err| panic!("{name}: stage create: {err:?}"));
+        let mut size = created;
+        while size < body.len() {
+            let add = (body.len() - size).min(10_240);
+            tx.send(ctx, ix(V::SUB_STAGE_GROW, &(add as u32).to_le_bytes(), vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(dispute, false), AccountMeta::new(buffer(*role), false), AccountMeta::new_readonly(SYSTEM, false)]), &[&c])
+                .await
+                .unwrap_or_else(|err| panic!("{name}: stage grow: {err:?}"));
+            size += add;
+        }
         let writer = if *role == V::ROLE_EXECUTOR { &e } else { &c };
         // 600-byte pieces fit a live 1,232-byte transaction (as the client).
         for (i, piece) in body.chunks(600).enumerate() {

@@ -76,9 +76,29 @@ def execute(sp, values, nonce, **faults):
     return honest, committed
 
 
+def app_kernel_plan(split: int):
+    """An application kernel (`dcg-test-sha-v1`, SHA-256 over its inputs in
+    order: the semantics of Basanos form 22) over 64 KiB of raw external
+    input, in `split` inputs. Its STEP witness needs grown staging."""
+    from dcg.disputes_v21 import plans as P
+    b = P.PlanBuilder()
+    size = 65_536 // split
+    ins = tuple(P.Input(b.raw_input(e, size), size) for e in range(split))
+    b.enumerated([P.Step(b"dcg-test-sha-v1\x00", ins, ((0, 32, False),))])
+    b.output(S.producer(1, 0, 0), 32)
+    return b.build()
+
+
+def app_cases(rng):
+    for split in (1, 2):
+        data = bytes(rng.randrange(256) for _ in range(65_536))
+        size = 65_536 // split
+        yield f"app-sha-{split}", app_kernel_plan(split), {e: data[e * size:(e + 1) * size] for e in range(split)}
+
+
 def build() -> list[dict]:
     rng = random.Random(20261002)
-    plans = list(T.cases(rng)) + list(T.random_cases(rng, 6))
+    plans = list(T.cases(rng)) + list(T.random_cases(rng, 6)) + list(app_cases(random.Random(65536)))
     out = []
     for name, sp, values in plans:
         n0 = next_nonce()
@@ -117,22 +137,27 @@ def build() -> list[dict]:
                 if c.root != h.root:
                     out.append(scenario_against(f"{name}-k{k}-prior", sp, values, n, c, h))
         # Structural lies, each under a fresh run.
-        rep = next(bi for bi, b in enumerate(sp.blocks) if b.kind == 2)
-        blk, last = sp.blocks[rep], honest.last_running[rep]
+        rep = next((bi for bi, b in enumerate(sp.blocks) if b.kind == 2), None)
         lies = []
-        if last >= 1:
-            def early(c, rep=rep, last=last, blk=blk):
-                for e in range(blk.body_len):
-                    c.leaves[sp.ordinal_of(rep, last, e)] = None
-            lies.append(("early-stop", early))
-        if last + 1 < blk.k:
-            def extra(c, rep=rep, last=last):
-                c.leaves[sp.ordinal_of(rep, last + 1, 0)] = c.leaves[sp.ordinal_of(rep, last, 0)]
-            lies.append(("extra-iteration", extra))
+        if rep is not None:
+            blk, last = sp.blocks[rep], honest.last_running[rep]
+            if last >= 1:
+                def early(c, rep=rep, last=last, blk=blk):
+                    for e in range(blk.body_len):
+                        c.leaves[sp.ordinal_of(rep, last, e)] = None
+                lies.append(("early-stop", early))
+            if last + 1 < blk.k:
+                def extra(c, rep=rep, last=last):
+                    c.leaves[sp.ordinal_of(rep, last + 1, 0)] = c.leaves[sp.ordinal_of(rep, last, 0)]
+                lies.append(("extra-iteration", extra))
 
-        def empty0(c, rep=rep):
-            c.leaves[sp.ordinal_of(rep, 0, 0)] = None
-        lies.append(("empty-iteration-0", empty0))
+            def empty0(c, rep=rep):
+                c.leaves[sp.ordinal_of(rep, 0, 0)] = None
+            lies.append(("empty-iteration-0", empty0))
+        else:
+            def empty_step(c):
+                c.leaves[0] = None
+            lies.append(("empty-step", empty_step))
         if sp.out_specs:
             def out_entry(c):
                 c.out_entries[0] = c.out_entries[0][:23] + bytes(32)

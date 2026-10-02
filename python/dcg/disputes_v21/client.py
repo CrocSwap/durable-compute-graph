@@ -23,13 +23,14 @@ from . import wire as W
 
 TAG = 227
 SUB = {"create_template": 1, "init_run": 2, "commit": 3, "open": 4, "reveal_nodes": 5, "pick": 6,
-       "reveal_leaf": 7, "claim": 8, "stage_create": 14, "stage_write": 15}
+       "reveal_leaf": 7, "claim": 8, "stage_create": 14, "stage_write": 15, "stage_grow": 17}
 KIND = {"STEP_DESCEND": 1, "OUT_DESCEND": 2}
 ROLE_EXECUTOR, ROLE_CHALLENGER, FROM_STAGING = 1, 2, 0xFF
 DIRECT_LIMIT = 700
 # A staged write carries two signatures and five accounts; 600 bytes of
 # body keeps it under the 1,232-byte transaction limit.
 STAGE_PIECE = 600
+CREATE_STAGE = 10_240 - 48  # one CPI creation; larger buffers are grown
 SYSTEM = Pubkey.from_string("11111111111111111111111111111111")
 RULINGS = {0: "open", 1: "E", 2: "C", 3: "moot"}
 
@@ -42,6 +43,43 @@ class DisputeClient:
     def _send(self, sub: str, body: bytes, metas: list[AccountMeta], signers: list[Keypair]) -> str:
         self.sent += 1
         return self.gc.send(bytes([TAG, SUB[sub]]) + body, metas, signers, cu=1_400_000)
+
+    def _send_many(self, items: list[tuple[str, bytes, list[AccountMeta], list[Keypair]]], cap: float = 60.0) -> None:
+        """Send order-independent instructions together (staged writes),
+        then confirm them all, resending any not yet confirmed."""
+        import base64
+
+        from solders.hash import Hash
+        from solders.instruction import Instruction
+        from solders.message import Message
+        from solders.transaction import Transaction
+
+        gc = self.gc
+        budget = Instruction(Pubkey.from_string("ComputeBudget111111111111111111111111111111"),
+                             bytes([2]) + struct.pack("<I", 200_000), [])
+        blockhash = Hash.from_string(gc.rpc("getLatestBlockhash", [{"commitment": "confirmed"}])["value"]["blockhash"])
+        pending = {}
+        for sub, body, metas, signers in items:
+            signers = [gc.payer] + [k for k in signers if k.pubkey() != gc.payer.pubkey()]
+            ix = Instruction(gc.program_id, bytes([TAG, SUB[sub]]) + body, metas)
+            tx = Transaction(signers, Message.new_with_blockhash([budget, ix], gc.payer.pubkey(), blockhash), blockhash)
+            pending[str(tx.signatures[0])] = base64.b64encode(bytes(tx)).decode()
+        self.sent += len(pending)
+        deadline = time.monotonic() + cap
+        while pending and time.monotonic() < deadline:
+            for wire in pending.values():
+                gc.rpc("sendTransaction", [wire, {"encoding": "base64", "skipPreflight": True}])
+            time.sleep(1.5)
+            sigs = list(pending)
+            for at in range(0, len(sigs), 200):
+                batch = sigs[at:at + 200]
+                for sig, st in zip(batch, gc.rpc("getSignatureStatuses", [batch])["value"]):
+                    if st and st.get("confirmationStatus") in ("confirmed", "finalized"):
+                        if st.get("err"):
+                            raise RuntimeError(f"staged write {sig} failed: {st['err']}")
+                        pending.pop(sig)
+        if pending:
+            raise RuntimeError(f"{len(pending)} staged writes not confirmed within {cap}s")
 
     def pda(self, *seeds: bytes) -> Pubkey:
         return self.gc.pda(*seeds)
@@ -108,15 +146,21 @@ class DisputeClient:
             return self.pda(b"dcg21stg", bytes(dispute), bytes([role]))
 
         def stage(role: int, body: bytes, writer: Keypair) -> None:
-            self._send("stage_create", bytes([role]) + struct.pack("<I", len(body)),
-                       [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, False),
-                        AccountMeta(template, False, False), AccountMeta(dispute, False, False),
-                        AccountMeta(buffer(role), False, True), AccountMeta(SYSTEM, False, False)], [challenger])
-            for at in range(0, len(body), STAGE_PIECE):
-                self._send("stage_write", struct.pack("<I", at) + body[at:at + STAGE_PIECE],
-                           [AccountMeta(writer.pubkey(), True, False), AccountMeta(run, False, False),
-                            AccountMeta(template, False, False), AccountMeta(dispute, False, False),
-                            AccountMeta(buffer(role), False, True)], [writer])
+            created = CREATE_STAGE if role == ROLE_EXECUTOR else min(len(body), CREATE_STAGE)
+            grow_metas = [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, False),
+                          AccountMeta(template, False, False), AccountMeta(dispute, False, False),
+                          AccountMeta(buffer(role), False, True), AccountMeta(SYSTEM, False, False)]
+            self._send("stage_create", bytes([role]) + struct.pack("<I", created), grow_metas, [challenger])
+            size = created
+            while size < len(body):
+                add = min(len(body) - size, 10_240)
+                self._send("stage_grow", struct.pack("<I", add), grow_metas, [challenger])
+                size += add
+            write_metas = [AccountMeta(writer.pubkey(), True, False), AccountMeta(run, False, False),
+                           AccountMeta(template, False, False), AccountMeta(dispute, False, False),
+                           AccountMeta(buffer(role), False, True)]
+            self._send_many([("stage_write", struct.pack("<I", at) + body[at:at + STAGE_PIECE], write_metas, [writer])
+                             for at in range(0, len(body), STAGE_PIECE)])
 
         leaf = bytes.fromhex(transcript["leaf"])
         metas = party(executor)

@@ -127,12 +127,18 @@ def replay(kernel_id: bytes, inputs: list[bytes]) -> list[bytes] | None:
 
 def replay_step(kernel_id: bytes, inputs: list[bytes], prior: bytes | None) -> tuple[list[bytes], bytes | None] | None:
     """Replay one step: (outputs by port order, next state or None); None on refusal."""
-    from . import reductions
+    from . import appkernels, reductions
 
     k = reductions.lookup(kernel_id)
     if k is None:
         if prior is not None:
             return None
+        app = appkernels.REGISTRY.get(bytes(kernel_id))
+        if app is not None:
+            try:
+                return app(inputs), None
+            except ValueError:
+                return None
         outs = replay(kernel_id, inputs)
         return None if outs is None else (outs, None)
     if len(inputs) != k.arity or (prior is None) != (k.state_bytes == 0):

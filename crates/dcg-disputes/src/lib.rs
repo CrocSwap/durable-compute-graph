@@ -324,6 +324,12 @@ impl<'a> StepSpec<'a> {
     pub fn kernel_id(&self) -> &'a [u8] {
         &self.0[20..36]
     }
+    pub fn semantic_version(&self) -> u16 {
+        u16::from_le_bytes([self.0[36], self.0[37]])
+    }
+    pub fn abi_version(&self) -> u16 {
+        u16::from_le_bytes([self.0[38], self.0[39]])
+    }
     pub fn state_scheme(&self) -> u8 {
         self.0[120]
     }

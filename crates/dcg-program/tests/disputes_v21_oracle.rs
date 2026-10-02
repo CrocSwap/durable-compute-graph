@@ -180,7 +180,7 @@ async fn replay(s: &serde_json::Value) -> u8 {
         body.push(w.len() as u8);
         for v in w {
             let v = hex(v.as_str().unwrap());
-            body.extend_from_slice(&(v.len() as u16).to_le_bytes());
+            body.extend_from_slice(&(v.len() as u32).to_le_bytes());
             body.extend_from_slice(&v);
         }
     }

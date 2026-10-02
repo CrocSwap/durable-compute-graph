@@ -72,7 +72,11 @@ pub const SUB_STAGE_WRITE: u8 = 15;
 pub const ROLE_EXECUTOR: u8 = 1;
 pub const ROLE_CHALLENGER: u8 = 2;
 pub const STAGE_HEADER: usize = 48;
-pub const MAX_STAGE: usize = 10_240 - STAGE_HEADER;
+/// Created by one CPI (10 KiB), then grown by `SUB_STAGE_GROW` in steps of at
+/// most 10 KiB up to `MAX_STAGE` (a 64 KiB witness plus its claim framing).
+pub const CREATE_STAGE: usize = 10_240 - STAGE_HEADER;
+pub const MAX_STAGE: usize = 128 * 1024;
+pub const SUB_STAGE_GROW: u8 = 17;
 pub const FROM_STAGING: u8 = 0xFF;
 pub const SUB_CACHE_ANSWER: u8 = 16;
 
@@ -376,6 +380,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         SUB_STAGE_CREATE => stage_create(program_id, accounts, &data[2..]),
         SUB_STAGE_WRITE => stage_write(program_id, accounts, &data[2..]),
         SUB_CACHE_ANSWER => cache_answer(program_id, accounts),
+        SUB_STAGE_GROW => stage_grow(program_id, accounts, &data[2..]),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -758,8 +763,8 @@ fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     if !by_challenger && !(role == ROLE_EXECUTOR && executor_signed(c.run, challenger).is_ok()) {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    let size = if role == ROLE_EXECUTOR { MAX_STAGE } else { u32_at(data, 1)? as usize };
-    if !(role == ROLE_EXECUTOR || role == ROLE_CHALLENGER) || size == 0 || size > MAX_STAGE || data.len() != 5 {
+    let size = if role == ROLE_EXECUTOR { CREATE_STAGE } else { u32_at(data, 1)? as usize };
+    if !(role == ROLE_EXECUTOR || role == ROLE_CHALLENGER) || size == 0 || size > CREATE_STAGE || data.len() != 5 {
         return Err(err(29));
     }
     create_pda(program_id, challenger, buffer, system, &[b"dcg21stg", c.dispute.key.as_ref(), &[role]], STAGE_HEADER + size)?;
@@ -768,6 +773,24 @@ fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     b[4] = role;
     b[8..40].copy_from_slice(c.dispute.key.as_ref());
     Ok(())
+}
+
+// 17: [funder(s,w), run, template, dispute, buffer(w), system] add:u32 (at most
+// 10 KiB). Grows a staging buffer; anyone may pay for the growth.
+fn stage_grow(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [funder, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    staging_role(program_id, c.dispute, buffer)?;
+    let add = u32_at(data, 0)? as usize;
+    let new_len = buffer.data_len().checked_add(add).ok_or(err(8))?;
+    if !funder.is_signer || add == 0 || add > 10_240 || new_len > STAGE_HEADER + MAX_STAGE || data.len() != 4 {
+        return Err(err(29));
+    }
+    let need = Rent::get()?.minimum_balance(new_len).saturating_sub(buffer.lamports());
+    if need > 0 {
+        invoke(&system_instruction::transfer(funder.key, buffer.key, need), &[funder.clone(), buffer.clone(), system.clone()])?;
+    }
+    buffer.resize(new_len)
 }
 
 // 15: [writer(s), run, template, dispute, buffer(w)] offset:u32 bytes. Any
@@ -890,7 +913,7 @@ fn step_opening<'a>(t: &Template, root: &[u8], data: &'a [u8], at: &mut usize, o
 //          kind 6: last_running(t)
 //   GATE   step_opening(gate leaf of iteration i-1) gate_value
 //   STATE  kind 1 predecessor: step_opening
-//   STEP   n:u8 (len:u16 bytes)* [len:u16 prior state, if stateful]
+//   STEP   n:u8 (len:u32 bytes)* [len:u32 prior state, if stateful]
 //   OUT    kind 1: step_opening(producer); kind 6: last_running(t)
 // step_opening = present:u8 len:u16 preimage path_len:u8 path;
 // chunk_opening = len:u16 chunk path_len:u8 path;
@@ -1140,18 +1163,18 @@ impl<'a> Referee<'a> {
         }
         let mut ins: [&[u8]; 8] = [&[]; 8];
         for (i, slot) in ins.iter_mut().enumerate().take(n) {
-            let len = u16_at(self.data, *at)? as usize;
-            let v = self.data.get(*at + 2..*at + 2 + len).ok_or(err(1))?;
-            *at += 2 + len;
+            let len = u32_at(self.data, *at)? as usize;
+            let v = self.data.get(*at + 4..*at + 4 + len).ok_or(err(1))?;
+            *at += 4 + len;
             if D::value_digest(&H, v) != leaf.input(i)[23..55] {
                 return Err(err(20));
             }
             *slot = v;
         }
         let prior = if spec.state_scheme() != 0 {
-            let len = u16_at(self.data, *at)? as usize;
-            let v = self.data.get(*at + 2..*at + 2 + len).ok_or(err(1))?;
-            *at += 2 + len;
+            let len = u32_at(self.data, *at)? as usize;
+            let v = self.data.get(*at + 4..*at + 4 + len).ok_or(err(1))?;
+            *at += 4 + len;
             if D::value_digest(&H, v) != *leaf.prior {
                 return Err(err(20));
             }
@@ -1168,6 +1191,29 @@ impl<'a> Referee<'a> {
         }
         if prior.is_some() {
             return Ok(true); // no stateful kernel by that id
+        }
+        // An application kernel, resolved by id and versions from the
+        // image's manifest: one output, stateless (this slice).
+        let id = crate::kernel::KernelId(spec.kernel_id().try_into().unwrap());
+        if let Some(kernel) = crate::application_manifest().resolve(id, spec.semantic_version(), spec.abi_version()) {
+            let m = kernel.manifest();
+            let spans: Vec<crate::kernel::AccountSpan> = ins[..n]
+                .iter()
+                .map(|v| crate::kernel::AccountSpan {
+                    key: [0; 32],
+                    owner: [0; 32],
+                    is_signer: false,
+                    is_writable: false,
+                    schema: m.input.id,
+                    offset: 0,
+                    data: v,
+                })
+                .collect();
+            let mut out = vec![0u8; m.output.max_bytes as usize];
+            return Ok(match kernel.execute_spans(&spans, &mut out) {
+                Err(_) => true,
+                Ok(len) => leaf.output_count() != 1 || D::value_digest(&H, &out[..len]) != leaf.output(0)[23..55],
+            });
         }
         let mut out = [0u8; 4];
         // An unknown kernel cannot replay any output (as in the Python

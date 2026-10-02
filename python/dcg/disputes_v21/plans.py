@@ -45,7 +45,7 @@ class Input:
 
 @dataclass(frozen=True)
 class Step:
-    kernel: str
+    kernel: str | bytes  # a registered name, or an exact 16-byte application kernel id
     inputs: tuple[Input, ...]
     # (port, length, scalar) per output, in port order
     outputs: tuple[tuple[int, int, bool], ...]
@@ -65,6 +65,11 @@ class PlanBuilder:
     # --- declarations --------------------------------------------------------------
     def scalar_input(self, eid: int) -> bytes:
         self.inputs[eid] = (4, 0)
+        return S.producer(2, eid)
+
+    def raw_input(self, eid: int, length: int) -> bytes:
+        """A plain external input of `length` raw bytes (layout 5)."""
+        self.inputs[eid] = (length, -1)
         return S.producer(2, eid)
 
     def chunked_input(self, eid: int, length: int, chunk_log2: int) -> int:
@@ -121,11 +126,13 @@ class PlanBuilder:
         in_records = []
         for eid in in_ids:
             length, chunk_log2 = self.inputs[eid]
-            if chunk_log2:
+            if chunk_log2 > 0:
                 header = S.port_header(0, 0, 0, S.LAYOUT_CHUNKED, chunk_log2, SCHEME_ID, SCHEME_VERSION, length)
+            elif chunk_log2 < 0:
+                header = raw_header(0, 0, 0, length)
             else:
                 header = scalar_header(0, 0, 0)
-            in_records.append(S.in_spec(eid, header, chunk_log2))
+            in_records.append(S.in_spec(eid, header, max(chunk_log2, 0)))
         first_out = 1 + len(self.blocks) + len(in_records)
         regions = [ROOT_REGION]
         first_block_record = first_out + len(self.outputs) + len(regions)
@@ -175,8 +182,9 @@ class PlanBuilder:
                         for port, length, scalar in st.outputs)
         return S.StepSpec(
             region_id=0, dcpl_segment_id=block, node_id=node, kernel_step=1,
-            kernel_id=reductions.kernel_id(st.kernel) if st.kernel in reductions.REGISTRY else
-            (st.kernel + "/v1").encode().ljust(16, b"\x00"),
+            kernel_id=(st.kernel if isinstance(st.kernel, bytes) else
+                       reductions.kernel_id(st.kernel) if st.kernel in reductions.REGISTRY else
+                       (st.kernel + "/v1").encode().ljust(16, b"\x00")),
             semantic_version=1, abi_version=1, decomposition_id=0, decomposition_version=0, max_cu=400_000,
             parameter_digest=bytes(32), port_shapes_digest=bytes(32), inputs=tuple(inputs), outputs=outputs,
             state_scheme=1 if st.state_bytes else 0, state_export_port=st.state_export, state_unit=0,

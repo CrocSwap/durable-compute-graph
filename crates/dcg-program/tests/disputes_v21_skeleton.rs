@@ -297,7 +297,7 @@ async fn a_wrong_output_is_refuted_by_step() {
     let mut body = vec![V::CLAIM_STEP, 0];
     body.extend(ch.spec_opening(STEP_BASE as usize + 1));
     body.push(1);
-    body.extend_from_slice(&4u16.to_le_bytes());
+    body.extend_from_slice(&4u32.to_le_bytes());
     body.extend_from_slice(&42i32.to_le_bytes());
     ch.claim(d, body).await.unwrap();
     assert_eq!(ch.ruling(d).await, 2, "challenger");
@@ -376,7 +376,7 @@ impl Chain {
         let mut body = vec![V::CLAIM_STEP, 0];
         body.extend(self.spec_opening(STEP_BASE as usize + 1));
         body.push(1);
-        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&4u32.to_le_bytes());
         body.extend_from_slice(&42i32.to_le_bytes());
         self.claim(d, body).await.unwrap();
     }
@@ -491,7 +491,7 @@ async fn openings_and_witnesses_can_come_from_staging_buffers() {
     let mut body = vec![V::CLAIM_STEP, 0];
     body.extend(ch.spec_opening(STEP_BASE as usize + 1));
     body.push(1);
-    body.extend_from_slice(&4u16.to_le_bytes());
+    body.extend_from_slice(&4u32.to_le_bytes());
     body.extend_from_slice(&42i32.to_le_bytes());
     ch.stage(d, V::ROLE_CHALLENGER, 4_000, &body, 300).await;
     let cl = kp(0xC1);
