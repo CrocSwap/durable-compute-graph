@@ -458,6 +458,21 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decisions[-1].step_id, "parent")
         self.assertEqual(decisions[-1].data.get("decision"), "abandon")
 
+    async def test_h3_stream_time_cap_is_a_journaled_reconciliation(self):
+        # A packet that never becomes visible: the stream step's time cap
+        # surfaces as StepTimeCapExceeded with a journaled reconciliation
+        # requirement, never a bare TimeoutError.
+        self.rpc.status_resolver = lambda signature, packet, count: None
+        config = _config(latency_mode=LatencyMode.PROCESSED, per_step_time_cap_seconds=0.3)
+        stream = await self.open_stream(latency_mode=LatencyMode.PROCESSED, config=config, name="time-cap")
+        await stream.append(_intent("stuck", write_locks=("lane",)))
+        with self.assertRaises(StepTimeCapExceeded):
+            await asyncio.wait_for(stream.wait(), timeout=3)
+        required = [event for event in stream.plan.lifecycle_events
+                    if event.event == "reconciliation_required" and event.step_id == "stuck"]
+        self.assertEqual(len(required), 1)
+        self.assertIn("time cap", str(required[0].data))
+
     async def test_invalidated_unsigned_descendant_is_journaled_and_can_be_abandoned(self):
         def status(signature, packet, count):
             if b"dcg-step:parent" in packet:
