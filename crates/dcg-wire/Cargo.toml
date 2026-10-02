@@ -1,0 +1,11 @@
+[package]
+name = "dcg-wire"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "DCGG/DCPL v2 wire decoding, validation and step lowering (no_std + alloc)"
+
+[dependencies]
+
+[dev-dependencies]
+base64 = "0.22"

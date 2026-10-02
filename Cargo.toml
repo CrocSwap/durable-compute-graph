@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/dcg-program", "crates/dcg-kernels"]
-default-members = ["crates/dcg-program", "crates/dcg-kernels"]
+members = ["crates/dcg-program", "crates/dcg-kernels", "crates/dcg-wire"]
+default-members = ["crates/dcg-program", "crates/dcg-kernels", "crates/dcg-wire"]
 
 [patch.crates-io]
 curve25519-dalek = { path = "crates/dcg-program/vendor" }

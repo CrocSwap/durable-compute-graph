@@ -1084,6 +1084,7 @@ dependencies = [
  "bincode",
  "blake3",
  "dcg-kernels",
+ "dcg-wire",
  "ed25519-dalek",
  "indexmap",
  "proc-macro-crate 3.3.0",
@@ -1107,6 +1108,13 @@ dependencies = [
  "tokio",
  "zeroize",
  "zeroize_derive",
+]
+
+[[package]]
+name = "dcg-wire"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
 ]
 
 [[package]]

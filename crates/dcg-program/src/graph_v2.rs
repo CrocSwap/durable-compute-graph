@@ -281,6 +281,7 @@ fn admit_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let graph_id = sealed_blob(program_id, graph, KIND_GRAPH)?;
     let plan_id = sealed_blob(program_id, plan, KIND_PLAN)?;
     let table_id = sealed_blob(program_id, table, KIND_TABLE)?;
+    let verified = verify_canonical_lowering(graph, plan, table, &graph_id, &manifest_root)?;
     {
         let t = table.try_borrow_data()?;
         let len = u32_at(&t, 8)? as usize;
@@ -302,6 +303,7 @@ fn admit_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     d[0..4].copy_from_slice(b"DCT2");
     d[4] = mode;
     d[5] = samples;
+    d[6] = verified as u8;
     d[8..16].copy_from_slice(&window.to_le_bytes());
     for (i, part) in [template_id, graph_id, plan_id, table_id, manifest_root, image_id, table.key.to_bytes()]
         .iter()
@@ -310,6 +312,58 @@ fn admit_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         d[16 + 32 * i..48 + 32 * i].copy_from_slice(part);
     }
     Ok(())
+}
+
+/// Conformance (v2.0 §2–3): a canonical DCGG/DCPL pair is decoded and
+/// validated on chain with the reference's refusal rules, the plan must bind
+/// this graph's ID and the declared kernel-manifest root, and its lowering
+/// must equal the step table the template executes (the table blob's prefix;
+/// the rest is the policy suffix). A wire refusal is `0x6400 + code`.
+/// Returns false for the fast-path `DCGGF1` encoding, whose table stays
+/// trusted (the template records which, at byte 6).
+fn verify_canonical_lowering(
+    graph: &AccountInfo,
+    plan: &AccountInfo,
+    table: &AccountInfo,
+    graph_id: &[u8; 32],
+    manifest_root: &[u8; 32],
+) -> Result<bool, ProgramError> {
+    let g = graph.try_borrow_data()?;
+    let g = &g[BLOB_HEADER..BLOB_HEADER + u32_at(&g, 8)? as usize];
+    if !g.starts_with(b"DCGG") {
+        return Ok(false);
+    }
+    let wire = |c: dcg_wire::Code| ProgramError::Custom(0x6400 + c as u32);
+    let decoded = dcg_wire::decode_graph(g).map_err(wire)?;
+    let p = plan.try_borrow_data()?;
+    let p = &p[BLOB_HEADER..BLOB_HEADER + u32_at(&p, 8)? as usize];
+    let decoded_plan = dcg_wire::decode_plan(p).map_err(wire)?;
+    if decoded_plan.graph_id != graph_id.as_slice() {
+        return Err(wire(dcg_wire::Code::LowerGraphId));
+    }
+    if decoded_plan.kernel_manifest_root != manifest_root.as_slice() {
+        return Err(err(20));
+    }
+    let lowered = dcg_wire::lower(&decoded, &decoded_plan, |id, semantic, abi| {
+        dcg_kernels::REGISTRY
+            .iter()
+            .find(|k| {
+                let name = k.name.as_bytes();
+                name.len() <= 16
+                    && id[..name.len()] == *name
+                    && id[name.len()..].iter().all(|b| *b == 0)
+                    && k.semantic_version == semantic
+                    && k.abi_version == abi
+            })
+            .map(|k| k.code)
+    })
+    .map_err(wire)?;
+    let t = table.try_borrow_data()?;
+    let t = &t[BLOB_HEADER..BLOB_HEADER + u32_at(&t, 8)? as usize];
+    if t.len() < lowered.len() || t[..lowered.len()] != lowered[..] {
+        return Err(err(21));
+    }
+    Ok(true)
 }
 
 struct TemplateView {

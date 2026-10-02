@@ -117,7 +117,12 @@ class GraphClient:
         return blob
 
     def admit(self, graph: Graph, mode: str, window_slots: int = 150, samples: int = 0,
-              manifest_root: bytes = b"\0" * 32) -> dict:
+              manifest_root: bytes | None = None) -> dict:
+        if manifest_root is None:
+            # A canonical DCPL binds its kernel-manifest root (bytes 104..136),
+            # and admission checks the declared root against it.
+            plan = graph.plan_bytes()
+            manifest_root = plan[104:136] if plan.startswith(b"DCPL") else b"\0" * 32
         policy = b"POL" + bytes([MODES[mode], samples]) + struct.pack("<Q", window_slots)
         blobs = {
             "graph": self.upload_blob(1, graph.graph_bytes(), GRAPH_DOMAIN),
