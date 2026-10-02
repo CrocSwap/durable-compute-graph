@@ -1064,6 +1064,10 @@ Not in step 1:
    *Python reference done 2026-10-02 for the chunked-kernel slice (4.3a),
    together with SMALL state from step 4 and kind 5 chunk inputs from step 5.*
 4. **State:** SMALL, LOG and CHUNKED, STATE, and state export.
+   *2026-10-02: SMALL done through the program; LOG in the Python reference
+   (`logsum_i32l`, a read-all-then-append KV-cache shape; STEP verifies the
+   read entries and the empty append slot against the prior root). CHUNKED
+   state not started.*
 5. **Chunked values:** constants, residency and the availability source.
 6. **Testnet:** Hello, fan-out, long chain, a gated block, and concurrent
    disputes.

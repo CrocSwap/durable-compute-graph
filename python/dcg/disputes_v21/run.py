@@ -152,6 +152,22 @@ def replay_step(kernel_id: bytes, inputs: list[bytes], prior: bytes | None) -> t
     return outs, (nxt if k.state_bytes else None)
 
 
+def replay_log_step(d: dict, inputs: list[bytes], entries: list[bytes]) -> tuple[list[bytes], list[bytes]] | None:
+    """Replay a LOG step: the kernel reads every entry and appends one."""
+    from . import reductions
+
+    k = reductions.lookup_log(d["kernel_id"])
+    if k is None or len(inputs) != k.arity or d["state_unit"] != k.entry_bytes or len(entries) >= d["state_size"]:
+        return None
+    try:
+        outs, new = k.fn(inputs, entries)
+    except (ValueError, struct.error):
+        return None
+    if len(new) != k.entry_bytes:
+        return None
+    return outs, entries + [new]
+
+
 # --- chunked values (§4.2) ------------------------------------------------------------------
 
 CHUNK_LEAF_DOMAIN = b"dcg.chunk.leaf.v2.1\x00"
@@ -183,6 +199,38 @@ def const_chunk_log2(const_spec_record: bytes) -> int:
     """A chunked constant's chunk_log2: its header's layout_version (layout 3)."""
     header = const_spec_record[8:31]
     return struct.unpack_from("<H", header, 11)[0] if struct.unpack_from("<I", header, 7)[0] == 3 else 0
+
+
+LOG_DOMAIN = b"dcg.log.v2.1\x00"
+LOG_ENTRY_DOMAIN = b"dcg.log.entry.v2.1\x00"
+
+
+def log_entry_leaf(index: int, entry: bytes) -> bytes:
+    return hashlib.sha256(LOG_ENTRY_DOMAIN + struct.pack("<Q", index) + entry).digest()
+
+
+def log_tree(entries: list[bytes], capacity: int) -> trees.Tree:
+    """The fixed-capacity LOG tree: `capacity` slots, empty ones EMPTY_LOG."""
+    if len(entries) > capacity:
+        raise ValueError("log over capacity")
+    leaves = [log_entry_leaf(i, e) for i, e in enumerate(entries)]
+    return trees.build("log", leaves, trees.height_for(capacity))
+
+
+def log_digest_from_root(length: int, root: bytes) -> bytes:
+    return hashlib.sha256(LOG_DOMAIN + struct.pack("<Q", length) + root).digest()
+
+
+def log_digest(entries: list[bytes], capacity: int) -> bytes:
+    return log_digest_from_root(len(entries), log_tree(entries, capacity).root)
+
+
+def state_digest(d: dict, state) -> bytes:
+    """A state's digest by scheme: SMALL is the value digest of its bytes;
+    LOG is H(length || root) over `state_size` slots."""
+    if d["state_scheme"] == 2:
+        return log_digest(state, d["state_size"])
+    return value_digest(state)
 
 
 def small_state_digest(state: bytes) -> bytes:
@@ -295,7 +343,7 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
             return states[a]
         if kind == 2:
             return external_values[a]
-        return bytes(d["state_size"])  # EMPTY_STATE
+        return [] if d["state_scheme"] == 2 else bytes(d["state_size"])  # EMPTY_STATE
 
     def run_step(ordinal: int) -> None:
         d = S.decode_step_spec(spec.step_spec(ordinal))
@@ -304,9 +352,12 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
             in_values = [input_fault(ordinal, i, v) for i, v in enumerate(in_values)]
         in_refs = [value_ref(h, value_digest(v)) for (h, _p, _i), v in zip(d["inputs"], in_values)]
         prior = state_of(d)
-        if prior_fault is not None and prior is not None:
+        if prior_fault is not None and prior is not None and d["state_scheme"] == 1:
             prior = prior_fault(ordinal, prior)
-        result = replay_step(d["kernel_id"], in_values, prior)
+        if d["state_scheme"] == 2:
+            result = replay_log_step(d, in_values, prior)
+        else:
+            result = replay_step(d["kernel_id"], in_values, prior)
         if result is None:
             raise ValueError(f"step {ordinal} refused by its kernel")
         outs, nxt = result
@@ -322,8 +373,8 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
         z = bytes(32)
         leaves[ordinal] = leaf_preimage(
             plan_id, run, d["region"], d["segment"], ordinal, d["node"], d["kernel_step"], in_refs, out_refs,
-            small_state_digest(prior) if prior is not None else z,
-            small_state_digest(nxt) if nxt is not None else z)
+            state_digest(d, prior) if prior is not None else z,
+            state_digest(d, nxt) if nxt is not None else z)
 
     for bi, blk in enumerate(spec.blocks):
         if blk.kind == 1:

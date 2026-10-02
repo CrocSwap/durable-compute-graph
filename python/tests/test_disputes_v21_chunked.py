@@ -124,6 +124,18 @@ def const_plan(seed: int = 1):
     return b.build()
 
 
+def kv_plan(n_chunks: int, capacity: int = 8):
+    """A KV-cache-shaped chunked kernel: iteration i appends the first word of
+    chunk i to LOG state and outputs the sum over every entry so far."""
+    b = P.PlanBuilder()
+    b.chunked_input(0, n_chunks << 6, 6)
+    step = P.Step("logsum_i32l", (P.Input(S.producer(5, 0, 2, 1, 0), 64),), ((0, 8, False), (1, 4, True)),
+                  state_predecessor=S.producer(4, 0, 0, 1), log=(4, capacity))
+    blk = b.repeated([step], n_chunks, (0, 1))
+    b.output(S.producer(6, blk, 0, 0), 8)
+    return b.build()
+
+
 def setup(sp: S.Spec, values: dict[int, bytes], fault=None, **faults):
     refs = {eid: R.external_ref(eid, sp.in_specs[eid][8:31], R.input_digest(sp.in_specs[eid], v))
             for eid, v in values.items()}
@@ -186,11 +198,8 @@ def honest_claims(record, executor, honest, k):
         out.append(("STATE", {"spec_opening": opening,
                               "producer_opening": executor.leaf_opening(a) if pk == 1 else None}))
     witness = [G.honest_value(honest, sp, prod) for _h, prod, _i in d["inputs"]]
-    state = None
-    if d["state_scheme"]:
-        pk, a, *_ = S.decode_producer(d["state_predecessor"])
-        state = honest.states[a] if pk == 1 else bytes(d["state_size"])
-    out.append(("STEP", {"spec_opening": opening, "witness": witness, "state_witness": state}))
+    out.append(("STEP", {"spec_opening": opening, "witness": witness,
+                         "state_witness": G.honest_state_witness(honest, d)}))
     return out
 
 
@@ -206,6 +215,7 @@ def cases(rng):
     yield "unexported-state", unexported_state_plan(6), {0: words(data)}
     yield "matvec", matvec_plan(5), {0: words(data[:16])}
     yield "constants", const_plan(), {}
+    yield "kv-log", kv_plan(6), {0: words(data)}
 
 
 class Honest(unittest.TestCase):
@@ -277,6 +287,8 @@ class Soundness(unittest.TestCase):
                             return outs, nxt
                         if mode == "output":
                             outs[-1] = bytes([outs[-1][0] ^ 1]) + outs[-1][1:]
+                        elif mode == "state" and isinstance(nxt, list):
+                            nxt = nxt[:-1] + [bytes([nxt[-1][0] ^ 1]) + nxt[-1][1:]]  # a LOG append lie
                         elif mode == "state" and nxt is not None:
                             exported = S.decode_step_spec(sp.step_spec(o))["state_export"] != 0xFF
                             nxt = bytes([nxt[0] ^ 1]) + nxt[1:]
@@ -462,6 +474,35 @@ class DishonestChallenger(unittest.TestCase):
         self.assertEqual(d.claim("SHAPE", spec_opening=sp.opening(sp.step_leaf_index(k))), "C")
         d = descend_to(G.RunRecord(PLAN_ID, run, sp, honest.root_bytes, refs), G.Executor(honest), k, 4)
         self.assertEqual(d.claim("SHAPE", spec_opening=sp.opening(sp.step_leaf_index(k))), "E")
+
+
+class ForgedLogWitness(unittest.TestCase):
+    """A challenger forging a LOG STEP witness must not beat an honest
+    executor: a self-consistent fake log, or a garbage append path."""
+
+    def test_forged_log_witnesses_are_refused(self):
+        rng = random.Random(11)
+        data = [rng.randint(-99, 99) for _ in range(96)]
+        sp = kv_plan(6)
+        refs, run, honest, _ = setup(sp, {0: words(data)})
+        record = G.RunRecord(PLAN_ID, run, sp, honest.root_bytes, refs)
+        ex = G.Executor(honest)
+        for k in range(1, 6):
+            d = S.decode_step_spec(sp.step_spec(k))
+            name, kw = [c for c in honest_claims(record, ex, honest, k) if c[0] == "STEP"][0]
+            length, root, entries, append_path = kw["state_witness"]
+            # A fake log of the same length: different entries, its own tree.
+            fake = [bytes([e[0] ^ 1]) + e[1:] for e, _p in entries]
+            tree = R.log_tree(fake, d["state_size"])
+            forged_log = (length, tree.root, [(e, tree.path(i)) for i, e in enumerate(fake)], tree.path(length))
+            # The real log with a garbage append path.
+            garbage = (length, root, entries, [bytes(32)] * len(append_path))
+            # The real length and root with fake entries on the real paths.
+            swapped = (length, root, [(f, p) for f, (_e, p) in zip(fake, entries)], append_path)
+            for witness in (forged_log, garbage, swapped):
+                dispute = descend_to(record, ex, k, 3)
+                with self.assertRaises(G.Refused, msg=(k, witness is garbage)):
+                    dispute.claim(name, **dict(kw, state_witness=witness))
 
 
 class AddressMap(unittest.TestCase):

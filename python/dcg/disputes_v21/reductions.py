@@ -112,6 +112,31 @@ REGISTRY = {k.name: k for k in (
 )}
 
 
+@dataclass(frozen=True)
+class LogKernel:
+    """A step over LOG state (design §4.3): it reads every entry so far and
+    appends one entry of `entry_bytes`."""
+    name: str
+    entry_bytes: int
+    arity: int
+    # (inputs, entries) -> (outputs by port, appended entry); raises ValueError to refuse
+    fn: Callable[[list[bytes], list[bytes]], tuple[list[bytes], bytes]]
+
+
+def _logsum(inputs: list[bytes], entries: list[bytes]) -> tuple[list[bytes], bytes]:
+    """Append the first i32 word of input 0; output the i64 sum of all entries
+    including the new one (the read-all-then-append shape of attention over a
+    KV cache), and the gate (always on)."""
+    if len(inputs[0]) < 4:
+        raise ValueError("input shorter than one word")
+    new = inputs[0][:4]
+    total = sum(struct.unpack("<i", e)[0] for e in entries) + struct.unpack("<i", new)[0]
+    return [struct.pack("<q", total), _gate(True)], new
+
+
+LOG_REGISTRY = {k.name: k for k in (LogKernel("logsum_i32l", 4, 1, _logsum),)}
+
+
 def kernel_id(name: str) -> bytes:
     raw = f"{name}/v1".encode()
     assert len(raw) <= 16
@@ -120,3 +145,7 @@ def kernel_id(name: str) -> bytes:
 
 def lookup(kernel: bytes) -> StatefulKernel | None:
     return REGISTRY.get(kernel.rstrip(b"\x00").decode(errors="replace").split("/")[0])
+
+
+def lookup_log(kernel: bytes) -> LogKernel | None:
+    return LOG_REGISTRY.get(kernel.rstrip(b"\x00").decode(errors="replace").split("/")[0])

@@ -314,7 +314,8 @@ class Dispute:
             if ref is None:
                 return "C"
             return "C" if leaf.prior != ref[20:52] else "E"
-        return "C" if leaf.prior != R.small_state_digest(bytes(d["state_size"])) else "E"
+        empty = [] if d["state_scheme"] == 2 else bytes(d["state_size"])
+        return "C" if leaf.prior != R.state_digest(d, empty) else "E"
 
     def _step(self, leaf: R.Leaf, d: dict, witness: list[bytes] | None, state_witness: bytes | None) -> str:
         if witness is None or len(witness) != len(leaf.inputs):
@@ -322,6 +323,8 @@ class Dispute:
         for value, ref in zip(witness, leaf.inputs):
             if R.value_digest(value) != ref[23:55]:
                 raise Refused("witness value does not match its committed digest")
+        if d["state_scheme"] == 2:
+            return self._log_step(leaf, d, witness, state_witness)
         prior = None
         if d["state_scheme"]:
             if state_witness is None or R.small_state_digest(state_witness) != leaf.prior:
@@ -336,6 +339,32 @@ class Dispute:
         wrong = any(R.value_digest(v) != ref[23:55] for v, ref in zip(outs, leaf.outputs))
         if nxt is not None and R.small_state_digest(nxt) != leaf.next:
             wrong = True
+        return "C" if wrong else "E"
+
+    def _log_step(self, leaf: R.Leaf, d: dict, witness: list[bytes], state_witness) -> str:
+        """STEP over LOG state (§4.3). The witness gives the prior log's length
+        and root, each entry the kernel reads with its path, and the path of
+        the empty slot it appends into. All must match the prior digest; the
+        next digest is recomputed along the append path."""
+        if state_witness is None:
+            raise Refused("a LOG step needs its state witness")
+        length, root, entries, append_path = state_witness
+        cap = d["state_size"]
+        if R.log_digest_from_root(length, root) != leaf.prior or length != len(entries) or length >= cap:
+            raise Refused("log witness does not match the prior digest")
+        for i, (entry, path) in enumerate(entries):
+            if len(entry) != d["state_unit"] or trees.root_from_path("log", R.log_entry_leaf(i, entry), i, path) != root:
+                raise Refused("log entry opening does not verify")
+        if trees.root_from_path("log", trees.EMPTY_LEAVES["log"], length, append_path) != root:
+            raise Refused("append slot is not empty under the prior root")
+        result = R.replay_log_step(d, witness, [e for e, _p in entries])
+        if result is None:
+            return "C"
+        outs, new_entries = result
+        new_root = trees.root_from_path("log", R.log_entry_leaf(length, new_entries[-1]), length, append_path)
+        wrong = (len(outs) != len(leaf.outputs)
+                 or any(R.value_digest(v) != ref[23:55] for v, ref in zip(outs, leaf.outputs))
+                 or R.log_digest_from_root(length + 1, new_root) != leaf.next)
         return "C" if wrong else "E"
 
     def _shape_wrong(self, leaf: R.Leaf, d: dict, k: int) -> bool:
@@ -433,6 +462,19 @@ def honest_value(honest: R.Commitment, sp: S.Spec, prod: bytes) -> bytes:
     raise ValueError(f"producer kind {kind}")
 
 
+def honest_state_witness(honest: R.Commitment, d: dict):
+    """H's prior-state witness for a step: SMALL bytes, or for LOG the
+    (length, root, entries with paths, append path) of the prior log."""
+    if not d["state_scheme"]:
+        return None
+    pk, a, *_ = S.decode_producer(d["state_predecessor"])
+    if d["state_scheme"] == 2:
+        entries = honest.states[a] if pk == 1 else []
+        tree = R.log_tree(entries, d["state_size"])
+        return (len(entries), tree.root, [(e, tree.path(i)) for i, e in enumerate(entries)], tree.path(len(entries)))
+    return honest.states[a] if pk == 1 else honest.values[("ext", a)] if pk == 2 else bytes(d["state_size"])
+
+
 def chunk_args(sp: S.Spec, honest: R.Commitment, a: int, source: int, index: int) -> dict:
     """The chunk opening (and, for a constant, its ConstSpec opening) of a kind 5 read."""
     if source == 3:
@@ -522,10 +564,6 @@ def honest_challenge(record: RunRecord, executor: Executor, honest: R.Commitment
                       producer_opening=executor.leaf_opening(a) if pk == 1 else None)
         return dispute
     witness = [honest_value(honest, sp, prod) for _h, prod, _i in d["inputs"]]
-    state_witness = None
-    if d["state_scheme"]:
-        pk, a, *_ = S.decode_producer(d["state_predecessor"])
-        state_witness = (honest.states[a] if pk == 1 else honest.values[("ext", a)] if pk == 2
-                         else bytes(d["state_size"]))
+    state_witness = honest_state_witness(honest, d)
     dispute.claim("STEP", spec_opening=opening, witness=witness, state_witness=state_witness)
     return dispute

@@ -108,6 +108,7 @@ def decode_step_spec(raw: bytes) -> dict:
         at += 24
     region, segment, node, kernel_step = struct.unpack_from("<IIII", raw, 4)
     return {"magic": raw[:4], "region": region, "state_export": raw[121],
+            "state_unit": struct.unpack_from("<I", raw, 124)[0],
             "state_size": struct.unpack_from("<Q", raw, 128)[0], "state_predecessor": raw[136:160],
             "state_initial": raw[160:184], "segment": segment, "node": node, "kernel_step": kernel_step,
             "kernel_id": raw[20:36], "semantic_version": struct.unpack_from("<H", raw, 36)[0],

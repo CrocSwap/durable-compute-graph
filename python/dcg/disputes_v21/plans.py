@@ -54,6 +54,7 @@ class Step:
     state_predecessor: bytes = S.NO_PRODUCER  # kind 1/4, or the initial producer when first
     state_initial: bytes = S.NO_PRODUCER  # kind 2, or kind 0 for EMPTY_STATE
     state_export: int = 0xFF
+    log: tuple[int, int] | None = None  # (entry_bytes, capacity): LOG state instead of SMALL
 
 
 @dataclass
@@ -220,12 +221,14 @@ class PlanBuilder:
         return S.StepSpec(
             region_id=0, dcpl_segment_id=block, node_id=node, kernel_step=1,
             kernel_id=(st.kernel if isinstance(st.kernel, bytes) else
-                       reductions.kernel_id(st.kernel) if st.kernel in reductions.REGISTRY else
+                       reductions.kernel_id(st.kernel) if st.kernel in reductions.REGISTRY
+                       or st.kernel in reductions.LOG_REGISTRY else
                        (st.kernel + "/v1").encode().ljust(16, b"\x00")),
             semantic_version=1, abi_version=1, decomposition_id=0, decomposition_version=0, max_cu=400_000,
             parameter_digest=bytes(32), port_shapes_digest=bytes(32), inputs=tuple(inputs), outputs=outputs,
-            state_scheme=1 if st.state_bytes else 0, state_export_port=st.state_export, state_unit=0,
-            state_size=st.state_bytes, state_predecessor=st.state_predecessor, state_initial=st.state_initial,
+            state_scheme=2 if st.log else 1 if st.state_bytes else 0, state_export_port=st.state_export,
+            state_unit=st.log[0] if st.log else 0, state_size=st.log[1] if st.log else st.state_bytes,
+            state_predecessor=st.state_predecessor, state_initial=st.state_initial,
             magic=magic).encode()
 
     # --- admission checks (§3.3, a subset: the ones this slice can violate) -------------
