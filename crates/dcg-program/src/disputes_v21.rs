@@ -1027,7 +1027,7 @@ impl<'a> Referee<'a> {
         *at += 1 + len;
         let Some(r) = gate_leaf.output_port(port) else { return Ok(None) };
         if len != 4 || D::value_digest(&H, bytes) != r[23..55] {
-            return Err(err(31));
+            return Err(err(33));
         }
         Ok(Some(i32::from_le_bytes(bytes.try_into().unwrap())))
     }
