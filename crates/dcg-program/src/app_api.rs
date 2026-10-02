@@ -29,6 +29,7 @@
 //!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
 //!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
 //!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     admission_scan: dcg_program::kernel::AdmissionScan::Full,
 //!     decision_routes: &REVISION8_COMPATIBILITY,
 //! };
 //! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
@@ -55,6 +56,7 @@
 //!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
 //!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
 //!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     admission_scan: dcg_program::kernel::AdmissionScan::Full,
 //!     decision_routes: &REVISION8_COMPATIBILITY,
 //! };
 //! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
@@ -85,6 +87,7 @@
 //!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
 //!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
 //!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     admission_scan: dcg_program::kernel::AdmissionScan::Full,
 //!     decision_routes: &REVISION8_COMPATIBILITY,
 //! };
 //! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
@@ -115,6 +118,7 @@
 //!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
 //!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
 //!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     admission_scan: dcg_program::kernel::AdmissionScan::Full,
 //!     decision_routes: &REVISION8_COMPATIBILITY,
 //! };
 //! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
@@ -152,6 +156,7 @@
 //!     application_id: b"compile-fail-app", version: 1, kernels: &KERNELS,
 //!     optimistic_replays: &REPLAYS, legacy_forms: &FORMS,
 //!     require_legacy_form_binding: false, hooks: &REVISION8_COMPATIBILITY,
+//!     admission_scan: dcg_program::kernel::AdmissionScan::Full,
 //!     decision_routes: &REVISION8_COMPATIBILITY,
 //! };
 //! fn preflight(_: dcg_program::app_api::ApplicationAccountCheckContext<'_, '_>) -> solana_program::entrypoint::ProgramResult { Ok(()) }
@@ -1378,6 +1383,7 @@ mod tests {
         optimistic_replays: &EMPTY_REPLAYS,
         legacy_forms: &EMPTY_FORMS,
         require_legacy_form_binding: false,
+        admission_scan: crate::kernel::AdmissionScan::Full,
         hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
