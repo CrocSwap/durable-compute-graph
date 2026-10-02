@@ -13,9 +13,11 @@ from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
 from solders.message import Message
 from solders.pubkey import Pubkey
-from solders.transaction import Transaction
+from solders.transaction import Transaction, VersionedTransaction
+from solders.address_lookup_table_account import AddressLookupTableAccount
+from solders.hash import Hash
 
-from dcg.sequencer.ordered_lane import LaneStep, OrderedLane
+from dcg.sequencer.ordered_lane import LaneStep, OrderedLane, keypair_signer
 
 PROGRAM = Pubkey.from_string("FCzAE7H9q8Q4Ki5YQUikHQmCTbYJbjDjTupGj187BZox")
 BLOCKHASH = "4uQeVj5tqViQh7yWWGStvkEG1Zmhx6uasJtWCJziofM"
@@ -24,8 +26,15 @@ BLOCKHASH = "4uQeVj5tqViQh7yWWGStvkEG1Zmhx6uasJtWCJziofM"
 class Chain:
     """A cursor-guarded program: step k succeeds only when the cursor is k."""
 
-    def __init__(self, reject_sends: bool = False, drop: set[int] | None = None):
+    def __init__(self, reject_sends: bool = False, drop: set[int] | None = None, independent: bool = False,
+                 drop_times: dict[int, int] | None = None):
         self.cursor = 0
+        # independent: step k succeeds once, in any order; a second copy is refused.
+        self.independent = independent
+        self.done: set[int] = set()
+        self.drop_times = dict(drop_times or {})
+        self.blockhashes = 0
+        self.versions: list[object] = []
         self.arrivals: list[int] = []
         self.status: dict[str, dict] = {}
         self.reject_sends = reject_sends
@@ -34,22 +43,30 @@ class Chain:
 
     @staticmethod
     def step_of(raw: bytes) -> tuple[str, int, int]:
-        tx = Transaction.from_bytes(raw)
+        tx = VersionedTransaction.from_bytes(raw)
         ix = tx.message.instructions[-1]
         return str(tx.signatures[0]), bytes(ix.data)[0], len(tx.message.instructions)
 
     def apply(self, raw: bytes, *, simulate: bool) -> dict | None:
         sig, k, _n = self.step_of(raw)
         with self.lock:
-            ok = k == self.cursor
+            if sig in self.status:
+                return None  # the same signature dedupes
+            ok = (k not in self.done) if self.independent else k == self.cursor
             if simulate:
-                return {"err": None if ok else {"InstructionError": [2, {"Custom": 2325}]}}
+                return {"err": None if ok else {"InstructionError": [2, {"Custom": 2325}]},
+                        "unitsConsumed": 1_000 * (k + 1)}
             self.arrivals.append(k)
+            self.versions.append(VersionedTransaction.from_bytes(raw).version())
             if k in self.drop:
                 self.drop.discard(k)
                 return None
+            if self.drop_times.get(k, 0) > 0:
+                self.drop_times[k] -= 1
+                return None
             if ok:
                 self.cursor += 1
+                self.done.add(k)
             self.status[sig] = {"slot": 100 + len(self.arrivals), "err": None if ok else {"Custom": 2325},
                                 "confirmationStatus": "processed"}
             return None
@@ -66,7 +83,8 @@ def make_handler(chain: Chain):
             req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             method, params = req["method"], req["params"]
             if method == "getLatestBlockhash":
-                result = {"value": {"blockhash": BLOCKHASH}}
+                chain.blockhashes += 1
+                result = {"value": {"blockhash": str(Hash.new_unique()) if chain.independent else BLOCKHASH}}
             elif method == "sendTransaction":
                 if chain.reject_sends:
                     body = json.dumps({"jsonrpc": "2.0", "id": req["id"],
@@ -158,6 +176,58 @@ class OrderedLaneTests(unittest.TestCase):
         chain = Chain(reject_sends=True)
         with self.assertRaisesRegex(RuntimeError, "every lane send was rejected"):
             asyncio.run(self.lane(self.serve(chain)).run(self.steps(3)))
+
+
+    def test_lookup_table_steps_are_version_0_and_land_in_order(self):
+        chain = Chain()
+        lane = OrderedLane(self.serve(chain), self.payer.pubkey(), keypair_signer(self.payer))
+        extra = Pubkey.new_unique()
+        table = AddressLookupTableAccount(Pubkey.new_unique(), [extra])
+        steps = [LaneStep(f"s{k}", (Instruction(PROGRAM, bytes([k]), [AccountMeta(self.payer.pubkey(), True, True),
+                                                                        AccountMeta(extra, False, True)]),),
+                          80_000, (table,) if k % 2 else ()) for k in range(6)]
+        result = asyncio.run(lane.run(steps))
+        self.assertEqual((result.landed, chain.cursor), (6, 6))
+        self.assertEqual([str(v) for v in chain.versions],
+                         ["Legacy.Legacy", "0", "Legacy.Legacy", "0", "Legacy.Legacy", "0"])
+
+    def test_size_compute_uses_the_simulation(self):
+        chain = Chain(independent=True)
+        lane = OrderedLane(self.serve(chain), self.payer.pubkey(), keypair_signer(self.payer))
+        sized = asyncio.run(lane.size_compute(self.steps(10)[9]))  # stub consumes 10,000
+        self.assertEqual(sized.compute_unit_limit, 13_500)
+        chain.done.add(9)
+        with self.assertRaisesRegex(RuntimeError, "simulation refused"):
+            asyncio.run(lane.size_compute(self.steps(10)[9]))
+
+    def test_batch_lands_every_independent_step_despite_drops(self):
+        chain = Chain(independent=True, drop_times={1: 1, 4: 2})
+        lane = OrderedLane(self.serve(chain), self.payer.pubkey(), keypair_signer(self.payer))
+        result = asyncio.run(lane.run_batch(self.steps(6), resend_after_seconds=0.1, poll_seconds=0.02,
+                                            max_seconds=10))
+        self.assertEqual(sorted(result.landed), [f"s{k}" for k in range(6)])
+        self.assertEqual((result.failed, result.missing), ({}, []))
+        self.assertGreaterEqual(result.sends, 3)
+        self.assertEqual(chain.done, set(range(6)))
+
+    def test_batch_rebuilds_on_a_fresh_blockhash_and_a_duplicate_is_not_a_failure(self):
+        chain = Chain(independent=True, drop_times={2: 3})
+        lane = OrderedLane(self.serve(chain), self.payer.pubkey(), keypair_signer(self.payer))
+        result = asyncio.run(lane.run_batch(self.steps(4), resend_after_seconds=0.05, poll_seconds=0.02,
+                                            blockhash_max_age=0.0, max_seconds=10))
+        self.assertGreaterEqual(result.rebuilds, 1)
+        self.assertGreaterEqual(chain.blockhashes, 2)
+        self.assertEqual(sorted(result.landed), ["s0", "s1", "s2", "s3"])
+        self.assertEqual(result.failed, {})
+
+    def test_batch_reports_a_refused_step_without_retrying_it(self):
+        chain = Chain(independent=True)
+        chain.done.add(3)  # already attested: the program refuses step 3
+        lane = OrderedLane(self.serve(chain), self.payer.pubkey(), keypair_signer(self.payer))
+        result = asyncio.run(lane.run_batch(self.steps(5), resend_after_seconds=0.1, poll_seconds=0.02))
+        self.assertEqual(list(result.failed), ["s3"])
+        self.assertEqual(sorted(result.landed), ["s0", "s1", "s2", "s4"])
+        self.assertEqual(chain.arrivals.count(3), 1)
 
 
 if __name__ == "__main__":

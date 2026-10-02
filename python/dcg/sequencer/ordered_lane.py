@@ -22,24 +22,40 @@ per frame): per-step confirm waits gave 0.025 frames/s; this lane gave about
 
 The lane does not journal packets; exactly-once comes from the application's
 on-chain guards, which is why those guards are a precondition.
+
+Also here (transport v1.1):
+- a step with ``lookup_tables`` is built as a version-0 message, so a step too
+  large for a 1,232-byte legacy packet can still go through a lane (the
+  ``sign`` callback then receives version-0 message bytes; ``keypair_signer``
+  handles both);
+- ``run_batch`` sends independent steps (no ordering), re-sends the missing
+  ones, and rebuilds them on a fresh blockhash before the old one expires;
+- ``size_compute`` sets a step's compute request from a simulation.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import math
 import socket
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Sequence
 from urllib.parse import urlparse
 
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 from solders.hash import Hash
 from solders.instruction import Instruction
-from solders.message import Message
+from solders.message import Message, MessageV0, from_bytes_versioned, to_bytes_versioned
 from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
+
+# A Fogo blockhash stays valid for about 150 slots of 40 ms (about 6 s); rebuild
+# before that so a re-send is never wasted on an expired message.
+BLOCKHASH_MAX_AGE_SECONDS = 4.0
+MAX_COMPUTE_UNITS = 1_400_000
 
 
 def _read_responses(sock, count: int) -> list[bytes]:
@@ -67,6 +83,8 @@ class LaneStep:
     step_id: str
     instructions: tuple[Instruction, ...]
     compute_unit_limit: int
+    # AddressLookupTableAccount values; non-empty builds a version-0 message.
+    lookup_tables: tuple = ()
 
 
 @dataclass
@@ -91,7 +109,27 @@ class LaneResult:
     statuses: list | None = None
 
 
+@dataclass
+class BatchResult:
+    landed: list[str]
+    failed: dict[str, object]
+    missing: list[str]
+    sends: int
+    rebuilds: int
+    seconds: float
+
+
 Sign = Callable[[bytes], Awaitable[tuple[str, bytes]]]
+
+
+def keypair_signer(*keypairs) -> Sign:
+    """A ``sign`` callback for legacy and version-0 message bytes."""
+
+    async def sign(message: bytes) -> tuple[str, bytes]:
+        tx = VersionedTransaction(from_bytes_versioned(message), list(keypairs))
+        return str(tx.signatures[0]), bytes(tx)
+
+    return sign
 
 
 class OrderedLane:
@@ -114,10 +152,88 @@ class OrderedLane:
         return self.rpc("getLatestBlockhash", [{"commitment": commitment}])["value"]["blockhash"]
 
     async def _build(self, step: LaneStep, blockhash: str, price: int) -> tuple[str, bytes]:
-        message = Message.new_with_blockhash(
-            [set_compute_unit_price(price), set_compute_unit_limit(step.compute_unit_limit), *step.instructions],
-            self.payer, Hash.from_string(blockhash))
-        return await self.sign(bytes(message))
+        ixs = [set_compute_unit_price(price), set_compute_unit_limit(step.compute_unit_limit), *step.instructions]
+        if step.lookup_tables:
+            message = MessageV0.try_compile(self.payer, ixs, list(step.lookup_tables), Hash.from_string(blockhash))
+            return await self.sign(to_bytes_versioned(message))
+        return await self.sign(bytes(Message.new_with_blockhash(ixs, self.payer, Hash.from_string(blockhash))))
+
+    async def size_compute(self, step: LaneStep, *, margin: float = 1.15, extra: int = 2_000,
+                           floor: int = 5_000) -> LaneStep:
+        """``step`` with its compute request set from a simulation:
+        ``ceil(consumed * margin) + extra``, at least ``floor`` and at most
+        1.4M. Fogo charges the *requested* limit against the per-account block
+        cap, so tight requests let more steps share a block. Valid only for a
+        step that can run now (independent, or the next step of a lane)."""
+        probe = replace(step, compute_unit_limit=MAX_COMPUTE_UNITS)
+        _sig, raw = await self._build(probe, self.blockhash("processed"), 0)
+        sim = self.rpc("simulateTransaction", [base64.b64encode(raw).decode(),
+                                               {"encoding": "base64", "commitment": "processed",
+                                                "replaceRecentBlockhash": True}])["value"]
+        if sim.get("err"):
+            raise RuntimeError(f"cannot size {step.step_id}: simulation refused: {sim['err']}")
+        used = int(sim.get("unitsConsumed") or 0)
+        limit = min(MAX_COMPUTE_UNITS, max(floor, math.ceil(used * margin) + extra))
+        return replace(step, compute_unit_limit=limit)
+
+    async def run_batch(self, steps: Sequence[LaneStep], *, price: int = 1000, max_seconds: float = 60.0,
+                        poll_seconds: float = 0.2, resend_after_seconds: float = 0.6,
+                        blockhash_max_age: float = BLOCKHASH_MAX_AGE_SECONDS) -> BatchResult:
+        """Send independent steps (any landing order is valid) until each has
+        landed or failed.
+
+        Missing steps are re-sent with their identical bytes (a landed copy
+        dedupes by signature) and rebuilt on a fresh blockhash once theirs is
+        ``blockhash_max_age`` old. A rebuilt step has a new signature, so the
+        application must refuse a duplicate (as attestations of one output
+        index do). A step that lands with an error is reported, not retried."""
+        t0 = time.monotonic()
+        by_id = {step.step_id: step for step in steps}
+        if len(by_id) != len(steps):
+            raise ValueError("batch step ids must be unique")
+        sigs: dict[str, list[str]] = {sid: [] for sid in by_id}
+        raw: dict[str, bytes] = {}
+        landed: list[str] = []
+        failed: dict[str, object] = {}
+        sends = rebuilds = 0
+        built_at = 0.0
+
+        async def build(ids: list[str]) -> None:
+            nonlocal built_at
+            blockhash = self.blockhash()
+            built_at = time.monotonic()
+            for sid in ids:
+                sig, raw[sid] = await self._build(by_id[sid], blockhash, price)
+                sigs[sid].append(sig)
+
+        pending = list(by_id)
+        await build(pending)
+        while pending and time.monotonic() - t0 < max_seconds:
+            self._send_ordered([raw[sid] for sid in pending])
+            sends += 1
+            resend_at = time.monotonic() + resend_after_seconds
+            while time.monotonic() < resend_at:
+                time.sleep(poll_seconds)
+                flat = [(sid, sig) for sid in pending for sig in sigs[sid]]
+                values = []
+                for i in range(0, len(flat), 256):
+                    values += self.rpc("getSignatureStatuses", [[sig for _sid, sig in flat[i:i + 256]]])["value"]
+                # Success wins: a rebuilt copy of a landed step is refused as a
+                # duplicate, and that refusal must not mark the step failed.
+                seen = [(sid, v) for (sid, _sig), v in zip(flat, values) if v is not None]
+                for sid, v in seen:
+                    if not v.get("err") and sid not in landed:
+                        landed.append(sid)
+                for sid, v in seen:
+                    if v.get("err") and sid not in landed and sid not in failed:
+                        failed[sid] = v["err"]
+                pending = [sid for sid in pending if sid not in failed and sid not in landed]
+                if not pending:
+                    break
+            if pending and time.monotonic() - built_at >= blockhash_max_age:
+                await build(pending)
+                rebuilds += 1
+        return BatchResult(landed, failed, pending, sends, rebuilds, time.monotonic() - t0)
 
     def _send_ordered(self, wires: Sequence[bytes]) -> list[str]:
         u = urlparse(self.url)
@@ -152,7 +268,7 @@ class OrderedLane:
             ceiling, raised = 0, []
             for step in steps:
                 ceiling = max(ceiling, step.compute_unit_limit)
-                raised.append(LaneStep(step.step_id, step.instructions, ceiling))
+                raised.append(replace(step, compute_unit_limit=ceiling))
             steps = raised
         # ``salt`` makes repeated steps unique when a blockhash is reused: an
         # identical (message, blockhash) pair would dedupe as already processed.
