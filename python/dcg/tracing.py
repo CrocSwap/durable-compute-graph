@@ -345,33 +345,116 @@ class Graph:
         return [trace_values[o - n] if o >= n else None for o in self.trace.outputs]
 
     # --- explain ----------------------------------------------------------
-    def explain(self, mode: str = "optimistic", samples: int = 0, measured: dict | None = None) -> str:
-        t, ids = self.trace, self.ids()
+    MODES = ("consensus", "optimistic", "sampling")
+    COMMITMENTS = ("trace", "root")
+
+    def imports(self) -> list[tuple[str, str, int, int, str]]:
+        """Cross-region value flows as ``(source region, destination region,
+        producer step, consumer step, relation)``. The relation is the
+        destination's view of the source: ``parent``, ``child`` or ``other``
+        (a sibling, or a region two or more levels away)."""
+        t, out = self.trace, []
+        parents = t.region_parents
+        for i, s in enumerate(t.steps):
+            for r in s.refs:
+                if r < t.n_inputs:
+                    continue
+                src = t.steps[r - t.n_inputs].region
+                if src == s.region:
+                    continue
+                relation = ("parent" if parents.get(s.region) == src else
+                            "child" if parents.get(src) == s.region else "other")
+                out.append((src, s.region, r - t.n_inputs, i, relation))
+        return out
+
+    def explain(self, mode: str = "optimistic", samples: int = 0, measured: dict | None = None,
+                commitment: str = "trace") -> str:
+        """Describe the graph and the guarantee its run would carry under
+        ``mode`` and ``commitment`` (``trace``: the executor posts every step
+        output, tags 216-219; ``root``: one region root, descent tags 220-226).
+
+        Refuses (``TraceError``) rather than stating a guarantee the program
+        does not provide: an unknown mode or commitment, sampling without
+        samples, a root commitment outside optimistic mode or for a graph that
+        is not canonical v2.0, a kernel that is not registered with the
+        program, and, under a root commitment, a cross-region import that the
+        descent cannot authenticate."""
+        from dcg import kernels
+
+        t = self.trace
+        if mode not in self.MODES:
+            raise TraceError("MODE", f"unsupported mode {mode!r}; supported: {', '.join(self.MODES)}")
+        if commitment not in self.COMMITMENTS:
+            raise TraceError("COMMITMENT", f"unsupported commitment {commitment!r}; supported: trace, root")
+        if mode == "sampling" and samples < 1:
+            raise TraceError("MODE", "sampling needs at least one sample")
+        canonical = self._is_hello_shape() or self.canonical(mode) is not None
+        if commitment == "root" and mode != "optimistic":
+            raise TraceError("COMMITMENT", f"a root commitment is optimistic-only; {mode} runs commit the trace")
+        if commitment == "root" and not canonical:
+            raise TraceError("COMMITMENT", "a root commitment needs canonical v2.0 bytes; this shape lowers to the "
+                                           "fast-path encoding")
+        for i, s in enumerate(t.steps):
+            if kernels.REGISTRY.get(s.kernel.code) != s.kernel:
+                raise TraceError("CAPABILITY", f"step {i} uses {s.kernel.name}/v{s.kernel.semantic_version}, which "
+                                               "is not a registered program kernel; no guarantee is stated", s.where)
+        flows = self.imports()
+        if commitment == "root":
+            loose = [f"step{c} in {d} reads step{p} in {src}" for src, d, p, c, rel in flows if rel == "other"]
+            if loose:
+                raise TraceError("IMPORT_UNAUTHENTICATED",
+                                 "descent authenticates inputs only from the same, parent or child region; "
+                                 + "; ".join(loose) + ". Use commitment='trace' or move the steps")
+
+        ids = self.ids(mode)
         lines = [f"graph {t.name}: {t.n_inputs} i32 inputs ({', '.join(t.input_names)}), {len(t.steps)} kernel steps",
                  f"  graph id {ids['graph'].hex()[:16]}…  plan id {ids['plan'].hex()[:16]}…  table id {ids['table'].hex()[:16]}…",
-                 f"  encoding: {'frozen v2.0 golden DCGG/DCPL' if self._is_hello_shape() else 'canonical v2.0 DCGG/DCPL' if self.canonical() else 'fast-path DCGGF1/DCPLF1 (not canonical v2.0)'}"]
-        regions: dict[str, list[int]] = {}
+                 f"  encoding: {'frozen v2.0 golden DCGG/DCPL' if self._is_hello_shape() else 'canonical v2.0 DCGG/DCPL' if canonical else 'fast-path DCGGF1/DCPLF1 (not canonical v2.0)'}; "
+                 + ("admission verifies the step table against the canonical lowering" if canonical
+                    else "admission trusts the step table as uploaded")]
+        regions: dict[str, list[int]] = {"root": []}
         for i, s in enumerate(t.steps):
-            regions.setdefault(s.region, []).append(i)
+            for name in self._region_path(s.region):
+                regions.setdefault(name, [])
+            regions[s.region].append(i)
+        region_mode = "consensus" if mode == "consensus" else "optimistic"
         for name, steps in regions.items():
-            lines.append(f"  region {name}: steps {steps}")
+            parent = f", parent {t.region_parents[name]}" if name != "root" else ""
+            lines.append(f"  region {name} [{region_mode}{parent}]: steps {steps}")
         for i, s in enumerate(t.steps):
             src = ", ".join(t.input_names[r] if r < t.n_inputs else f"step{r - t.n_inputs}" for r in s.refs)
             lines.append(f"    step{i} = {s.kernel.name}/v{s.kernel.semantic_version}({src})  [{s.where}]")
-        kernels_used = sorted({(s.kernel.name, s.kernel.semantic_version, s.kernel.abi_version) for s in t.steps})
-        lines.append("  required kernels: " + ", ".join(f"{n}/{v} abi {a}" for n, v, a in kernels_used))
+        kernels_used = sorted({(s.kernel.code, s.kernel.name, s.kernel.semantic_version, s.kernel.abi_version)
+                               for s in t.steps})
+        lines.append("  required kernels (registered): "
+                     + ", ".join(f"{n}/v{v} abi {a} code {c}" for c, n, v, a in kernels_used))
+        if flows:
+            lines.append("  imports: " + "; ".join(f"{src} step{p} -> {d} step{c} ({rel})"
+                                                   for src, d, p, c, rel in flows))
+        else:
+            lines.append("  imports: none (no value crosses a region boundary)")
         guarantee = {
             "consensus": "every step executed by the on-chain program; result final when the execute transaction lands",
-            "optimistic": "executor posts the full trace; any single wrong step can be challenged and is replayed on chain "
-                          "before the deadline; final only after the deadline passes unchallenged (requires one honest watcher)",
-            "sampling": f"executor posts the full trace; {samples} steps chosen by a slot hash after the commit are replayed "
-                        f"on chain; a wrong trace with w bad steps escapes with probability (1-w/n)^{samples}; "
-                        "single-step challenges remain open until the deadline",
+            "optimistic": "any single wrong step can be challenged and is replayed on chain before the deadline; final "
+                          "only after the deadline passes unchallenged (requires one honest watcher)",
+            "sampling": f"{samples} steps chosen by a slot hash after the commit are replayed on chain; a wrong trace "
+                        f"with w bad steps of n escapes sampling with probability (1-w/n)^{samples}; single-step "
+                        "challenges remain open until the deadline",
         }[mode]
-        lines.append(f"  mode {mode}: {guarantee}")
-        lines.append("  ceilings (designed): 4-byte cells, ≤8 inputs per step, one step replay fits one transaction")
+        posted = {"trace": "executor posts every step output", "root": "executor posts one region root"}[commitment]
+        lines.append(f"  mode {mode}, {commitment} commitment ({posted}): {guarantee}")
+        lines.append(f"  composition: every region resolves in {region_mode} mode (the program admits one mode per "
+                     "template), and the run finalizes as one unit, so each import is final exactly when its "
+                     "source is (v2.0 finality-gated imports hold trivially)")
+        if commitment == "root" and mode == "optimistic":
+            lines.append("  dispute path: root -> region -> step descent; every input of a replayed step is "
+                         "authenticated (external input, same region, parent region, or child region root)")
+        elif mode != "consensus":
+            lines.append("  dispute path: direct replay of one step against the posted trace")
+        lines.append("  ceilings (designed): 4-byte i32 cells, <=8 inputs per step, region depth <=8, "
+                     "one step replay fits one transaction (1.4M CU, 4 KiB opening)")
         if measured:
             lines.append("  measured: " + ", ".join(f"{k}={v}" for k, v in measured.items()))
         else:
-            lines.append("  measured: none yet")
+            lines.append("  measured: none supplied (see docs/hello-graph.md for testnet runs)")
         return "\n".join(lines)
