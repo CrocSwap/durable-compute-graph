@@ -68,7 +68,7 @@ The instructions live in `crates/dcg-program/src/graph_v2.rs` and use tags 208�
 - `graph-v2-experimental`: adds the sampling audit (219) and root-committed descent (220–226), both under redesign. Without it, a sampling template is refused at admission.
 - `graph-v2-raw-write`: tag 208, for testnet resource uploads only.
 
-The shared testnet program builds with `--features "sbf-lifecycle-test sbf-real-lifecycle-test graph-v2-experimental graph-v2-raw-write"`. Tags:
+The shared testnet program builds with `--features "sbf-lifecycle-test sbf-real-lifecycle-test graph-v2-experimental graph-v2-raw-write graph-v21"`. It was last upgraded on 2026-10-02 from 025efb7: image sha256 `0bc505fa…b566`, 1,716,200 bytes, verified by dump. After the upgrade all five Hello Graph scenarios and the `dishonest-add` descent case passed again (measured). Tag 227 has no testnet client yet. Tags:
 - 208: raw write;
 - 209: close run;
 - 210–212: blob create, write and seal;
