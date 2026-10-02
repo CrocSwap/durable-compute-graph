@@ -140,7 +140,7 @@ class Dispute:
 
     def claim(self, name: str, *, spec_opening=None, index: int = 0, producer_opening=None,
               witness: list[bytes] | None = None, state_witness: bytes | None = None, t: int | None = None,
-              gate_opening=None, gate_value: bytes | None = None, chunk_opening=None) -> str:
+              gate_opening=None, gate_value: bytes | None = None, chunk_opening=None, const_opening=None) -> str:
         if not self.leaf_revealed or self.ruling:
             raise Refused("no leaf to claim against")
         self.claimed = name if name != "EDGE" else f"EDGE{self._edge_kind(index)}"
@@ -170,7 +170,7 @@ class Dispute:
             return self._rule("C" if self._shape_wrong(leaf, d, k) else "E")
         if name == "EDGE":
             return self._rule(self._edge(leaf, d, index, producer_opening, t, gate_opening, gate_value,
-                                         chunk_opening))
+                                         chunk_opening, const_opening))
         if name == "STATE":
             return self._rule(self._state(leaf, d, producer_opening))
         if name == "STEP":
@@ -239,8 +239,17 @@ class Dispute:
                 return None
         return self._port(leaf, port)
 
+    def _const(self, constant_id: int, opening) -> bytes:
+        """The ConstSpec for `constant_id`, from a spec opening at its leaf."""
+        if opening is None:
+            raise Refused("a constant read needs its ConstSpec opening")
+        record = self._spec_record(self.record.spec.const_leaf_index(constant_id), opening)
+        if len(record) != 104 or record[:4] != b"DCN1" or struct.unpack_from("<I", record, 4)[0] != constant_id:
+            raise Refused("not that constant's ConstSpec")
+        return record
+
     def _edge(self, leaf: R.Leaf, d: dict, index: int, producer_opening, t, gate_opening, gate_value,
-              chunk_opening) -> str:
+              chunk_opening, const_opening=None) -> str:
         if index >= len(d["inputs"]) or index >= len(leaf.inputs):
             raise Refused("no such input")
         got = leaf.inputs[index]
@@ -262,14 +271,21 @@ class Dispute:
             if port is None:
                 return "C"
             return "C" if got[7:55] != port[7:55] else "E"
+        if kind == 3:
+            record = self._const(a, const_opening)
+            return "C" if got[7:23] != record[8 + 7:8 + 23] or got[23:55] != record[40:72] else "E"
         if kind == 5:
-            ref = self.record.external_refs.get(a)
-            if ref is None:
-                return "C"
+            if b == 3:
+                root = self._const(a, const_opening)[40:72]
+            else:
+                ref = self.record.external_refs.get(a)
+                if ref is None:
+                    return "C"
+                root = ref[20:52]
             if chunk_opening is None:
                 raise Refused("EDGE kind 5 needs the chunk opening")
             chunk, path = chunk_opening
-            if trees.root_from_path("chunk", R.chunk_leaf(dd, chunk), dd, path) != ref[20:52]:
+            if trees.root_from_path("chunk", R.chunk_leaf(dd, chunk), dd, path) != root:
                 raise Refused("chunk opening does not verify")
             return "C" if got[23:55] != R.value_digest(chunk) or got[7:23] != header[7:23] else "E"
         if kind == 6:
@@ -403,7 +419,11 @@ def honest_value(honest: R.Commitment, sp: S.Spec, prod: bytes) -> bytes:
         return honest.values[(a, b)]
     if kind == 2:
         return honest.values[("ext", a)]
+    if kind == 3:
+        return honest.values[("const", a)]
     if kind == 5:
+        if b == 3:
+            return R.chunks(honest.values[("const", a)], 1 << R.const_chunk_log2(sp.const_specs[a]))[d]
         return R.chunks(honest.values[("ext", a)], 1 << sp.in_specs[a][32])[d]
     if kind == 6:
         t = honest.last_running[a]
@@ -411,6 +431,18 @@ def honest_value(honest: R.Commitment, sp: S.Spec, prod: bytes) -> bytes:
     if kind == 7:
         return struct.pack("<I", a)
     raise ValueError(f"producer kind {kind}")
+
+
+def chunk_args(sp: S.Spec, honest: R.Commitment, a: int, source: int, index: int) -> dict:
+    """The chunk opening (and, for a constant, its ConstSpec opening) of a kind 5 read."""
+    if source == 3:
+        value, log2 = honest.values[("const", a)], R.const_chunk_log2(sp.const_specs[a])
+        extra = {"const_opening": sp.opening(sp.const_leaf_index(a))}
+    else:
+        value, log2 = honest.values[("ext", a)], sp.in_specs[a][32]
+        extra = {}
+    extra["chunk_opening"] = (R.chunks(value, 1 << log2)[index], R.chunk_tree(value, 1 << log2).path(index))
+    return extra
 
 
 def _kind6_args(record: RunRecord, executor: Executor, honest: R.Commitment, a: int, c: int) -> dict:
@@ -477,9 +509,9 @@ def honest_challenge(record: RunRecord, executor: Executor, honest: R.Commitment
             if pk == 1:
                 extra["producer_opening"] = executor.leaf_opening(a)
             elif pk == 5:
-                chunk_bytes = 1 << sp.in_specs[a][32]
-                tree = R.chunk_tree(honest.values[("ext", a)], chunk_bytes)
-                extra["chunk_opening"] = (R.chunks(honest.values[("ext", a)], chunk_bytes)[dd], tree.path(dd))
+                extra.update(chunk_args(sp, honest, a, _b, dd))
+            elif pk == 3:
+                extra["const_opening"] = sp.opening(sp.const_leaf_index(a))
             elif pk == 6:
                 extra = _kind6_args(record, executor, honest, a, c)
             dispute.claim("EDGE", spec_opening=opening, index=i, **extra)

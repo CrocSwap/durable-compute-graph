@@ -188,6 +188,34 @@ def build() -> list[dict]:
                                                 h, h, target=sp.position_of(k), claim=(cname, kw)))
                 except G.Refused:
                     pass
+        # Constant reads opened with another constant's ConstSpec: the
+        # referee must refuse the claim (the dispute stays open).
+        if len(sp.const_specs) >= 2:
+            for k in range(sp.total_steps):
+                d = S.decode_step_spec(sp.step_spec(k))
+                for i, (_h, prod, _init) in enumerate(d["inputs"]):
+                    pk, a, src, _c, dd = S.decode_producer(prod)
+                    if pk not in (3, 5) or (pk == 5 and src != 3):
+                        continue
+                    other = next(c for c in sorted(sp.const_specs) if c != a)
+                    n, h, record, ex = honest_run()
+                    claims = [c for c in T.honest_claims(record, ex, h, k) if c[0] == "EDGE" and c[1]["index"] == i]
+                    t = X.record(record, h, h, DEPTH, target=sp.position_of(k), claim=claims[0])
+                    forged = dict(claims[0][1], const_opening=sp.opening(sp.const_leaf_index(other)))
+                    try:  # the Python referee refuses the forged opening
+                        probe = X.record(record, h, h, DEPTH, target=sp.position_of(k), claim=("EDGE", forged))
+                        raise AssertionError(f"forged constant opening accepted: {probe['ruling']}")
+                    except G.Refused:
+                        pass
+                    body = bytearray(W.claim_body(sp, "STEP_DESCEND", sp.position_of(k), "EDGE", claims[0][1]))
+                    head = W.claim_body(sp, "STEP_DESCEND", sp.position_of(k), "SHAPE", claims[0][1])
+                    rest = (struct.pack("<I", sp.const_leaf_index(other)) + W.spec_opening(forged["const_opening"])
+                            + (W.chunk_opening(forged["chunk_opening"]) if pk == 5 else b""))
+                    body = bytes(body[:len(head)]) + rest
+                    tdata, refs, _run = context(sp, values, n)
+                    out.append({"name": f"{name}-forged-const-k{k}.{i}", "nonce": n.hex(), "template_data": tdata.hex(),
+                                "refs": [refs[e].hex() for e in sorted(refs)], "root_bytes": h.root_bytes.hex(),
+                                **t, "claim": body.hex(), "claim_name": "EDGE", "ruling": "refused"})
         # Kind 6 reads (step inputs and graph outputs) claimed at every
         # iteration up to K + 1. Past the block, the challenger supplies the
         # next block's real leaves: the bound must still rule for E.
@@ -224,7 +252,7 @@ def build() -> list[dict]:
                 except G.Refused:
                     pass
     for s in out:
-        assert s["ruling"] in ("C", "E")
+        assert s["ruling"] in ("C", "E", "refused")
     return out
 
 

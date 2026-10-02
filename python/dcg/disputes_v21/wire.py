@@ -48,6 +48,12 @@ def chunk_opening(opening) -> bytes:
     return struct.pack("<H", len(chunk)) + chunk + path_bytes(path)
 
 
+def const_opening(sp: S.Spec, producer: bytes, opening) -> bytes:
+    """`leaf_index:u32` and the spec opening of the producer's ConstSpec."""
+    cid = S.decode_producer(producer)[1]
+    return struct.pack("<I", sp.const_leaf_index(cid)) + spec_opening(opening)
+
+
 def gate_value(value: bytes | None) -> bytes:
     v = value or b""
     return bytes([len(v)]) + v
@@ -80,8 +86,12 @@ def claim_body(sp: S.Spec, kind: str, position: int, name: str, kw: dict) -> byt
         pk = S.decode_producer(d["inputs"][kw["index"]][1])[0]
         if pk == 1:
             return body + step_opening(kw["producer_opening"])
+        if pk == 3:
+            return body + const_opening(sp, d["inputs"][kw["index"]][1], kw["const_opening"])
         if pk == 5:
-            return body + chunk_opening(kw["chunk_opening"])
+            pre = (const_opening(sp, d["inputs"][kw["index"]][1], kw["const_opening"])
+                   if kw.get("const_opening") is not None else b"")
+            return body + pre + chunk_opening(kw["chunk_opening"])
         if pk == 6:
             return body + last_running(kw)
         return body

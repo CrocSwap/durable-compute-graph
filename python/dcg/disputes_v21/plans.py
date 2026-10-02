@@ -14,6 +14,7 @@ kernels without parameters.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 from dataclasses import dataclass, field
 
@@ -58,6 +59,7 @@ class Step:
 @dataclass
 class PlanBuilder:
     inputs: dict[int, tuple[int, int]] = field(default_factory=dict)  # eid -> (length, chunk_log2)
+    constants: dict[int, tuple[bytes, int]] = field(default_factory=dict)  # id -> (value, chunk_log2)
     blocks: list[tuple] = field(default_factory=list)  # ("enum", [Step]) | ("rep", [Step], K, gate)
     outputs: list[tuple[bytes, int, bool]] = field(default_factory=list)  # (producer, length, scalar)
     node_base: int = 1
@@ -79,6 +81,27 @@ class PlanBuilder:
             raise S.SpecError("this slice reads whole chunks only")
         self.inputs[eid] = (length, chunk_log2)
         return eid
+
+    def committed_constant(self, cid: int, value: bytes, chunk_log2: int = 0) -> int:
+        """A committed (non-resident) constant (design §4.2, §5.1). Chunked
+        (`chunk_log2` 6..16): its ConstSpec carries the chunk-tree root and
+        steps read whole chunks by kind 5 with source 3. Plain (0): raw
+        bytes with the plain value digest, read whole by kind 3. The locator
+        is the SHA-256 of the bytes."""
+        if not value or (chunk_log2 and (not 6 <= chunk_log2 <= 16 or len(value) % (1 << chunk_log2))):
+            raise S.SpecError("a chunked constant is whole chunks of 2^6..2^16 bytes")
+        self.constants[cid] = (value, chunk_log2)
+        return cid
+
+    def chunked_reduce_const(self, kernel: str, cid: int, extra: tuple["Input", ...] = ()) -> int:
+        """A chunked kernel whose iteration i reads chunk i of constant `cid`."""
+        value, chunk_log2 = self.constants[cid]
+        chunk_bytes = 1 << chunk_log2
+        kern = reductions.REGISTRY[kernel]
+        step = Step(kernel=kernel, inputs=(Input(S.producer(5, cid, 3, 1, 0), chunk_bytes),) + extra,
+                    outputs=((0, kern.state_bytes, False), (1, 4, True)), state_bytes=kern.state_bytes,
+                    state_predecessor=S.producer(4, 0, 0, 1), state_export=0)
+        return self.repeated([step], len(value) // chunk_bytes, (0, 1))
 
     def enumerated(self, steps: list[Step]) -> int:
         self.blocks.append(("enum", steps))
@@ -133,7 +156,19 @@ class PlanBuilder:
             else:
                 header = scalar_header(0, 0, 0)
             in_records.append(S.in_spec(eid, header, max(chunk_log2, 0)))
-        first_out = 1 + len(self.blocks) + len(in_records)
+        const_ids = sorted(self.constants)
+        const_records = []
+        for cid in const_ids:
+            value, chunk_log2 = self.constants[cid]
+            from . import run as R
+            if chunk_log2:
+                header = S.port_header(0, 0, 0, S.LAYOUT_CHUNKED, chunk_log2, SCHEME_ID, SCHEME_VERSION, len(value))
+                digest = R.chunked_digest(value, 1 << chunk_log2)
+            else:
+                header = raw_header(0, 0, 0, len(value))
+                digest = R.value_digest(value)
+            const_records.append(S.const_spec(cid, header, 2, 1, digest, hashlib.sha256(value).digest()))
+        first_out = 1 + len(self.blocks) + len(const_records) + len(in_records)
         regions = [ROOT_REGION]
         first_block_record = first_out + len(self.outputs) + len(regions)
         node = self.node_base
@@ -159,9 +194,10 @@ class PlanBuilder:
         for prod, length, scalar in self.outputs:
             header = scalar_header(0, 1, 0) if scalar else raw_header(0, 1, 0, length)
             out_records.append(S.out_spec(header, prod))
-        spec_records = [(S.TYPE_HEADER, S.spec_header(len(blocks), 0, len(in_records), len(out_records), 0,
+        spec_records = [(S.TYPE_HEADER, S.spec_header(len(blocks), len(const_records), len(in_records), len(out_records), 0,
                                                        len(regions), total_steps, len(out_records)))]
         spec_records += [(S.TYPE_BLOCK, b.record()) for b in blocks]
+        spec_records += [(S.TYPE_CONST, r) for r in const_records]
         spec_records += [(S.TYPE_IN, r) for r in in_records]
         spec_records += [(S.TYPE_OUT, r) for r in out_records]
         spec_records += [(S.TYPE_REGION, S.region_spec(r)) for r in regions]
@@ -169,7 +205,8 @@ class PlanBuilder:
             code = S.TYPE_STEP if b.kind == 1 else S.TYPE_BODY
             spec_records += [(code, r) for r in records]
         sp = S.Spec(spec_records, blocks, block_records, dict(zip(in_ids, in_records)), out_records, total_steps,
-                    len(out_records), height, first_out)
+                    len(out_records), height, first_out, dict(zip(const_ids, const_records)),
+                    {cid: self.constants[cid][0] for cid in const_ids})
         self._check(sp)
         return sp
 
@@ -205,7 +242,7 @@ class PlanBuilder:
                 if kind == 6 and a >= bi:
                     raise S.SpecError("kind 6 must name an earlier block")
                 if kind == 5:
-                    length, chunk_log2 = self.inputs[a]
+                    length, chunk_log2 = self.inputs[a] if pb == 2 else (len(self.constants[a][0]), self.constants[a][1])
                     if dd >= length >> chunk_log2:
                         raise S.SpecError("chunk index out of range")
                     if struct.unpack_from("<I", header, 19)[0] != 1 << chunk_log2:

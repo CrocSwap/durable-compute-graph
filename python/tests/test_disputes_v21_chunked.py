@@ -95,6 +95,35 @@ def unexported_state_plan(n_chunks: int):
     return b.build()
 
 
+def matvec_plan(rows: int, seed: int = 0):
+    """y = W x with W (rows x 16 i32) a committed constant read one row per
+    iteration (kind 5 from source 3) and x a raw external input."""
+    import random as _r
+    rng = _r.Random(seed)
+    w = words([rng.randint(-50, 50) for _ in range(rows * 16)])
+    b = P.PlanBuilder()
+    b.committed_constant(0, w, 6)
+    x = b.raw_input(0, 64)
+    blk = b.chunked_reduce_const("rowdot_i32c", 0, extra=(P.Input(x, 64), P.Input(S.producer(7), 4, scalar=True)))
+    b.output(S.producer(6, blk, 0, 0), 512)
+    return b.build()
+
+
+def const_plan(seed: int = 1):
+    """A plain constant read whole (kind 3) and a chunked constant read by
+    chunk (kind 5, source 3): head_i32 of the plain one, and a chunked sum."""
+    import random as _r
+    rng = _r.Random(seed)
+    b = P.PlanBuilder()
+    b.committed_constant(0, words([rng.randint(-99, 99) for _ in range(16)]))
+    b.committed_constant(1, words([rng.randint(-99, 99) for _ in range(48)]), 6)
+    b.enumerated([P.Step("head_i32", (P.Input(S.producer(3, 0), 64),), ((0, 4, True),))])
+    s = b.chunked_reduce_const("sumchunk_i32", 1)
+    b.output(S.producer(1, 0, 0), 4, scalar=True)
+    b.output(S.producer(6, s, 0, 0), 8)
+    return b.build()
+
+
 def setup(sp: S.Spec, values: dict[int, bytes], fault=None, **faults):
     refs = {eid: R.external_ref(eid, sp.in_specs[eid][8:31], R.input_digest(sp.in_specs[eid], v))
             for eid, v in values.items()}
@@ -146,9 +175,9 @@ def honest_claims(record, executor, honest, k):
         if pk == 1:
             extra["producer_opening"] = executor.leaf_opening(a)
         elif pk == 5:
-            data = honest.values[("ext", a)]
-            cb = 1 << sp.in_specs[a][32]
-            extra["chunk_opening"] = (R.chunks(data, cb)[dd], R.chunk_tree(data, cb).path(dd))
+            extra = G.chunk_args(sp, honest, a, _b, dd)
+        elif pk == 3:
+            extra["const_opening"] = sp.opening(sp.const_leaf_index(a))
         elif pk == 6:
             extra = G._kind6_args(record, executor, honest, a, c)
         out.append(("EDGE", {"spec_opening": opening, "index": i, **extra}))
@@ -175,6 +204,8 @@ def cases(rng):
     yield "two-reductions", two_reductions_plan(6), {0: words(data)}
     yield "sum-then-scan", sum_then_scan_plan(6), {0: words(data), 1: struct.pack("<i", data[3])}
     yield "unexported-state", unexported_state_plan(6), {0: words(data)}
+    yield "matvec", matvec_plan(5), {0: words(data[:16])}
+    yield "constants", const_plan(), {}
 
 
 class Honest(unittest.TestCase):

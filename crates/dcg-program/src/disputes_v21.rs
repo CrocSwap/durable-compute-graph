@@ -909,8 +909,8 @@ fn step_opening<'a>(t: &Template, root: &[u8], data: &'a [u8], at: &mut usize, o
 // 8: [challenger(s), run(w), template, dispute(w), executor(w), challenger_account(w)]
 // claim:u8 index:u8 spec_opening, then by claim (design §7.3):
 //   SHAPE  -
-//   EDGE   kind 1: step_opening(producer); kind 2, 7: -; kind 5: chunk_opening;
-//          kind 6: last_running(t)
+//   EDGE   kind 1: step_opening(producer); kind 2, 7: -; kind 3: const_opening;
+//          kind 5: [const_opening, from a constant] chunk_opening; kind 6: last_running(t)
 //   GATE   step_opening(gate leaf of iteration i-1) gate_value
 //   STATE  kind 1 predecessor: step_opening
 //   STEP   n:u8 (len:u32 bytes)* [len:u32 prior state, if stateful]
@@ -918,6 +918,7 @@ fn step_opening<'a>(t: &Template, root: &[u8], data: &'a [u8], at: &mut usize, o
 // step_opening = present:u8 len:u16 preimage path_len:u8 path;
 // chunk_opening = len:u16 chunk path_len:u8 path;
 // gate_value = len:u8 bytes (len 0 when the gate leaf is empty);
+// const_opening = leaf_index:u32 spec_opening (of the constant's ConstSpec);
 // last_running(t) = t:u32 step_opening(leaf (B, t, e')) and, unless
 // t = K - 1, step_opening(gate leaf (B, t, g)) gate_value.
 fn claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -1038,6 +1039,23 @@ impl<'a> Referee<'a> {
         self.refs.chunks_exact(52).find(|r| u32::from_le_bytes(r[0..4].try_into().unwrap()) as u64 == id)
     }
 
+    /// A constant's `ConstSpec`, opened as `leaf_index:u32 spec_opening`. The
+    /// index lies between the BlockSpecs and the OutSpecs (where ConstSpec
+    /// and InSpec records sit), the record is a ConstSpec, and its id is the
+    /// producer's. Spec leaves are typed, so this pins the constant.
+    fn constant(&self, at: &mut usize, id: u64) -> Result<Vec<u8>, ProgramError> {
+        let index = u32_at(self.data, *at)? as u64;
+        *at += 4;
+        if index < 1 + self.t.blocks().len() as u64 || index >= self.t.out_spec_base {
+            return Err(err(34));
+        }
+        let (type_code, record) = spec_record(self.t, self.data, at, index)?;
+        if type_code != 3 || record.len() != 104 || &record[..4] != b"DCN1" || u32_at(record, 4)? as u64 != id {
+            return Err(err(34));
+        }
+        Ok(record.to_vec())
+    }
+
     fn opening(&self, at: &mut usize, ordinal: u64) -> Result<Option<&'a [u8]>, ProgramError> {
         step_opening(self.t, self.root, self.data, at, ordinal)
     }
@@ -1115,14 +1133,23 @@ impl<'a> Referee<'a> {
                 None => true,
                 Some(prod) => prod.output_port(b as u16).is_none_or(|o| got[7..55] != o[7..55]),
             },
+            3 => {
+                let record = self.constant(at, a)?;
+                got[7..23] != record[8 + 7..8 + 23] || got[23..55] != record[40..72]
+            }
             5 => {
-                let Some(r) = self.external_ref(a) else { return Ok(true) };
+                let root: [u8; 32] = if b == 3 {
+                    key32(&self.constant(at, a)?, 40)?
+                } else {
+                    let Some(r) = self.external_ref(a) else { return Ok(true) };
+                    r[20..52].try_into().unwrap()
+                };
                 let len = u16_at(self.data, *at)? as usize;
                 let chunk = self.data.get(*at + 2..*at + 2 + len).ok_or(err(1))?;
                 let path = read_path(self.data, *at + 2 + len)?;
                 *at += 2 + len + 1 + 32 * path.1;
                 let leaf_hash = D::chunk_leaf(&H, d as u64, chunk);
-                if D::root_from_path(&H, D::Tree::Chunk, &leaf_hash, d as u64, &path.0[..path.1]) != r[20..52] {
+                if D::root_from_path(&H, D::Tree::Chunk, &leaf_hash, d as u64, &path.0[..path.1]) != root {
                     return Err(err(32));
                 }
                 got[23..55] != D::value_digest(&H, chunk) || got[7..23] != header[7..23]

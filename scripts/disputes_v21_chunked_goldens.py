@@ -81,6 +81,25 @@ def kernel_vectors(rng):
     return out
 
 
+def rowdot_vectors():
+    rng = random.Random(64)
+    out = []
+    # (row, width, magnitude): two in range, an i64 overflow, a row past 63.
+    for i, n, m in ((0, 16, 1 << 20), (63, 4, 1 << 31), (5, 16, 1 << 31), (64, 16, 9)):
+        if i == 5:  # all maximal: 16 products of about 2^62 overflow i64
+            w = x = struct.pack(f"<{n}i", *[(1 << 31) - 1] * n)
+        else:
+            w = struct.pack(f"<{n}i", *[rng.randint(-m, m - 1) for _ in range(n)])
+            x = struct.pack(f"<{n}i", *[rng.randint(-m, m - 1) for _ in range(n)])
+        prior = bytes(rng.randrange(256) for _ in range(512))
+        inputs = [w, x, struct.pack("<I", i)]
+        result = R.replay_step(K.kernel_id("rowdot_i32c"), inputs, prior)
+        out.append({"kernel": K.kernel_id("rowdot_i32c").hex(), "inputs": [v.hex() for v in inputs],
+                    "prior": prior.hex(), "outputs": None if result is None else [v.hex() for v in result[0]],
+                    "next": None if result is None else result[1].hex()})
+    return out
+
+
 def build() -> dict:
     rng = random.Random(20261002)
     data = [rng.randint(-1000, 1000) for _ in range(16 * 4)]
@@ -91,8 +110,9 @@ def build() -> dict:
         ("scan-early-stop", T.scan_plan(4), {0: w(data), 1: struct.pack("<i", data[16 + 2])}),
         ("two-reductions", T.two_reductions_plan(3), {0: w(data[:48])}),
         ("unexported-state", T.unexported_state_plan(3), {0: w(data[:48])}),
+        ("matvec-const", T.matvec_plan(4, seed=3), {0: w(data[:16])}),
     ]
-    return {"plans": [plan_vector(*p) for p in plans], "kernels": kernel_vectors(rng),
+    return {"plans": [plan_vector(*p) for p in plans], "kernels": kernel_vectors(rng) + rowdot_vectors(),
             "chunk_leaf": [{"index": i, "chunk": c.hex(), "leaf": R.chunk_leaf(i, c).hex()}
                            for i, c in enumerate([b"", b"\x01" * 64, bytes(range(128))])]}
 

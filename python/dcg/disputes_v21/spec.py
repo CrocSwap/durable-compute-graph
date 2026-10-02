@@ -251,6 +251,10 @@ class Spec:
     total_outputs: int
     address_height: int
     first_out_record: int
+    const_specs: dict[int, bytes] = field(default_factory=dict)  # by constant id
+    # Off-chain availability of committed constants (not part of any record):
+    # the bytes an executor and challenger fetch by locator.
+    constant_values: dict[int, bytes] = field(default_factory=dict)
     tree: trees.Tree = field(init=False)
 
     def __post_init__(self):
@@ -321,6 +325,10 @@ class Spec:
 
     def out_leaf_index(self, j: int) -> int:
         return self.first_out_record + j
+
+    def const_leaf_index(self, constant_id: int) -> int:
+        """ConstSpec records follow the BlockSpecs, by constant id."""
+        return 1 + len(self.blocks) + sorted(self.const_specs).index(constant_id)
 
     def pickable(self, level: int, position: int) -> bool:
         """Structural (§7.1): the subtree at (level, position) holds a step position."""

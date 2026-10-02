@@ -4,13 +4,23 @@
 //! `python/dcg/disputes_v21/reductions.py`. No allocation.
 
 /// Outputs (by port order) and next state of one replayed step.
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Replay {
-    pub outputs: [[u8; 16]; 2],
+    pub outputs: [[u8; MAX_STATE]; 2],
     pub output_len: [usize; 2],
     pub output_count: usize,
-    pub next: [u8; 16],
+    pub next: [u8; MAX_STATE],
     pub next_len: usize,
+}
+
+/// The largest reduction state (`rowdot_i32c`: 64 rows of i64).
+pub const MAX_STATE: usize = 8 * ROWDOT_ROWS;
+pub const ROWDOT_ROWS: usize = 64;
+
+impl Default for Replay {
+    fn default() -> Self {
+        Replay { outputs: [[0; MAX_STATE]; 2], output_len: [0; 2], output_count: 0, next: [0; MAX_STATE], next_len: 0 }
+    }
 }
 
 impl Replay {
@@ -40,6 +50,7 @@ pub fn lookup(kernel_id: &[u8]) -> Option<(&'static str, usize, usize)> {
         b"argmax_i32c" => Some(("argmax_i32c", 12, 2)),
         b"scan_i32c" => Some(("scan_i32c", 8, 3)),
         b"head_i32" => Some(("head_i32", 0, 1)),
+        b"rowdot_i32c" => Some(("rowdot_i32c", MAX_STATE, 3)),
         _ => None,
     }
 }
@@ -116,6 +127,24 @@ pub fn replay(kernel_id: &[u8], inputs: &[&[u8]], prior: Option<&[u8]>) -> Optio
             nxt[4..8].copy_from_slice(&index.to_le_bytes());
             r.push(&nxt);
             r.push(&gate(found == 0));
+            r.set_next(&nxt);
+        }
+        "rowdot_i32c" => {
+            // y[i] = sum_j w[j] * x[j] in i64; y is 64 i64 entries of state.
+            let (w, x) = (inputs[0], inputs[1]);
+            let i = u32_of(inputs[2])? as usize;
+            if w.len() % 4 != 0 || w.len() != x.len() || i >= ROWDOT_ROWS {
+                return None;
+            }
+            let mut acc: i64 = 0;
+            for (a, b) in words(w)?.zip(words(x)?) {
+                acc = acc.checked_add((a as i64).checked_mul(b as i64)?)?;
+            }
+            let mut nxt = [0u8; MAX_STATE];
+            nxt.copy_from_slice(prior?);
+            nxt[8 * i..8 * i + 8].copy_from_slice(&acc.to_le_bytes());
+            r.push(&nxt);
+            r.push(&gate(true));
             r.set_next(&nxt);
         }
         "head_i32" => {

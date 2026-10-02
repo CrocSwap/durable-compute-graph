@@ -74,6 +74,28 @@ def _scan(inputs: list[bytes], prior: bytes) -> tuple[list[bytes], bytes]:
     return [nxt, _gate(not found)], nxt
 
 
+ROWDOT_ROWS = 64
+
+
+def _rowdot(inputs: list[bytes], prior: bytes) -> tuple[list[bytes], bytes]:
+    """One row of a matrix-vector product: y[i] = sum_j w[j] * x[j] in i64,
+    for weight row w (a constant chunk), vector x and row index i < 64.
+    State: y as 64 i64 entries."""
+    w, x = _words(inputs[0]), _words(inputs[1])
+    (i,) = struct.unpack("<I", inputs[2])
+    if len(w) != len(x) or i >= ROWDOT_ROWS:
+        raise ValueError("shape")
+    y = list(struct.unpack(f"<{ROWDOT_ROWS}q", prior))
+    acc = 0
+    for a, b in zip(w, x):
+        acc += a * b
+        if not I64_MIN <= acc <= I64_MAX:
+            raise ValueError("i64 overflow")
+    y[i] = acc
+    nxt = struct.pack(f"<{ROWDOT_ROWS}q", *y)
+    return [nxt, _gate(True)], nxt
+
+
 def _head(inputs: list[bytes], _prior: bytes) -> tuple[list[bytes], bytes]:
     """Stateless: the first i32 word of a value (reads a reduction's result)."""
     if len(inputs[0]) < 4:
@@ -86,6 +108,7 @@ REGISTRY = {k.name: k for k in (
     StatefulKernel("argmax_i32c", 12, 2, _argmax),
     StatefulKernel("scan_i32c", 8, 3, _scan),
     StatefulKernel("head_i32", 0, 1, _head),
+    StatefulKernel("rowdot_i32c", 8 * ROWDOT_ROWS, 3, _rowdot),
 )}
 
 

@@ -179,6 +179,12 @@ def input_digest(in_spec_record: bytes, value: bytes) -> bytes:
     return chunked_digest(value, 1 << chunk_log2) if chunk_log2 else value_digest(value)
 
 
+def const_chunk_log2(const_spec_record: bytes) -> int:
+    """A chunked constant's chunk_log2: its header's layout_version (layout 3)."""
+    header = const_spec_record[8:31]
+    return struct.unpack_from("<H", header, 11)[0] if struct.unpack_from("<I", header, 7)[0] == 3 else 0
+
+
 def small_state_digest(state: bytes) -> bytes:
     return value_digest(state)
 
@@ -245,14 +251,17 @@ def value_ref(header: bytes, digest: bytes) -> bytes:
 def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int, bytes],
             fault: Callable[[int, list[bytes], bytes | None], tuple[list[bytes], bytes | None]] | None = None,
             input_fault: Callable[[int, int, bytes], bytes] | None = None,
-            prior_fault: Callable[[int, bytes], bytes] | None = None) -> Commitment:
+            prior_fault: Callable[[int, bytes], bytes] | None = None,
+            constants: dict[int, bytes] | None = None) -> Commitment:
     """The honest execution H (or, with `fault`, an executor that corrupts one
     step's results and then continues consistently from them).
 
     `fault(ordinal, outputs, next_state)` may return altered results;
     `input_fault(ordinal, index, value)` an altered input value and
     `prior_fault(ordinal, prior)` an altered prior state, both before replay."""
+    constants = spec.constant_values if constants is None else constants
     values: dict = {("ext", eid): v for eid, v in external_values.items()}
+    values.update({("const", cid): v for cid, v in constants.items()})
     states: dict[int, bytes] = {}
     leaves: list[bytes | None] = [None] * spec.total_steps
     last_running: dict[int, int] = {}
@@ -263,7 +272,11 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
             return values[(a, b)]
         if kind == 2:
             return external_values[a]
+        if kind == 3:
+            return constants[a]
         if kind == 5:
+            if b == 3:
+                return chunks(constants[a], 1 << const_chunk_log2(spec.const_specs[a]))[d]
             chunk_bytes = 1 << spec.in_specs[a][32]
             return chunks(external_values[a], chunk_bytes)[d]
         if kind == 6:

@@ -161,9 +161,13 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
     } else {
         claim
     };
-    tx.send(ctx, ix(V::SUB_CLAIM, &claim_data, accounts), &[&c])
-        .await
-        .unwrap_or_else(|err| panic!("{name}: the claim is refused: {err:?}"));
+    let sent = tx.send(ctx, ix(V::SUB_CLAIM, &claim_data, accounts), &[&c]).await;
+    if s["ruling"].as_str() == Some("refused") {
+        // A forged opening must be refused and leave the dispute open.
+        assert!(sent.is_err(), "{name}: a forged claim was accepted");
+        return ctx.banks_client.get_account(dispute).await.unwrap().unwrap().data[6];
+    }
+    sent.unwrap_or_else(|err| panic!("{name}: the claim is refused: {err:?}"));
     ctx.banks_client.get_account(dispute).await.unwrap().unwrap().data[6]
 }
 
@@ -193,7 +197,11 @@ async fn chunked_kernels_rule_as_the_python_oracle() {
     let limit = std::env::var("CHUNKED_ORACLE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     let mut disagreements = vec![];
     for s in scenarios.iter().take(limit) {
-        let want = if s["ruling"].as_str().unwrap() == "C" { V::RULING_CHALLENGER } else { V::RULING_EXECUTOR };
+        let want = match s["ruling"].as_str().unwrap() {
+            "C" => V::RULING_CHALLENGER,
+            "E" => V::RULING_EXECUTOR,
+            _ => V::RULING_OPEN,
+        };
         let got = replay(&mut ctx, &mut tx, s).await;
         if got != want {
             disagreements.push(format!("{} ({}): program {got}, oracle {want}", s["name"].as_str().unwrap(), s["claim_name"].as_str().unwrap()));
