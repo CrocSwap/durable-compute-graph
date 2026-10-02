@@ -1,6 +1,6 @@
 # Stateful session lanes v1 (draft)
 
-Status: **draft design for review, 2026-10-02.** Nothing here is implemented.
+Status: **draft design, 2026-10-02; owner decisions recorded in section 9.** Nothing here is implemented.
 It proposes an additive extension of stateful v3 so one session can keep
 several publications in flight. Numbers are labeled *measured* (with a source)
 or *estimated*; estimates are not capability claims.
@@ -229,13 +229,23 @@ and need copy-on-write (7.1).
   at L = 1, 2, 3, against the 1.66 frames/s single-lane baseline and the 3.35
   reference.
 
-## 9. Decisions for the owner
+## 9. Owner decisions (2026-10-02)
 
-1. Capture-copy (this draft) or copy-on-write state first.
-2. Per-lane views with a publication index (this draft), or shared views
-   committed in order.
-3. Maximum lanes per session (draft: 4) and whether rent for lane workspaces
-   is acceptable for the Doom demo.
-4. Whether render steps may read the session record at all (for binding), or
-   only the lane record, to keep their write and read sets minimal.
-5. Version: subtypes under v3 (this draft) or a new stateful wire version.
+1. **Capture-copy first.** Copy-on-write state (7.1) only if capture is the
+   measured bottleneck.
+2. **Shared outputs, newest-only.** All lanes commit to one set of view
+   outputs; `LANE_COMMIT` refuses a cursor older than the newest published one
+   (2341). This replaces the per-lane views and publication index in section
+   3 and 4.4. The commit is its own transaction, never folded into a
+   lane's last render step, so heavy render steps do not serialize on the
+   shared outputs.
+3. **Rent is acceptable** for up to 4 lanes (one 10.46 MB workspace per Doom
+   lane).
+4. **Render steps read only their lane.** `LANE_CAPTURE_BEGIN` copies the
+   binding (session key, kernel id, resource key and commitment, captured
+   cursor) into the lane record; `LANE_RUN_PHASE` reads the lane record, not
+   the session, because a read of the session conflicts with `ADVANCE`'s write
+   and would serialize render N with advance N+1. Table 4.1 changes
+   accordingly.
+5. **Roll into v3** as additive subtypes under tag 236; sessions without lanes
+   are unchanged.
