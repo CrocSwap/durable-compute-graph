@@ -1,4 +1,4 @@
-"""Run identity, step leaves, honest execution and commitments (design §6), step-1 scope."""
+"""Run identity, step leaves, honest execution and commitments (design §6)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import copy
 import hashlib
 import struct
 from dataclasses import dataclass, field
+from typing import Callable
 
 from dcg.graph import v2 as wire
 
@@ -124,6 +125,58 @@ def replay(kernel_id: bytes, inputs: list[bytes]) -> list[bytes] | None:
     return [struct.pack("<i", out)]
 
 
+def replay_step(kernel_id: bytes, inputs: list[bytes], prior: bytes | None) -> tuple[list[bytes], bytes | None] | None:
+    """Replay one step: (outputs by port order, next state or None); None on refusal."""
+    from . import reductions
+
+    k = reductions.lookup(kernel_id)
+    if k is None:
+        if prior is not None:
+            return None
+        outs = replay(kernel_id, inputs)
+        return None if outs is None else (outs, None)
+    if len(inputs) != k.arity or (prior is None) != (k.state_bytes == 0):
+        return None
+    if prior is not None and len(prior) != k.state_bytes:
+        return None
+    try:
+        outs, nxt = k.fn(inputs, prior if prior is not None else b"")
+    except (ValueError, struct.error):
+        return None
+    return outs, (nxt if k.state_bytes else None)
+
+
+# --- chunked values (§4.2) ------------------------------------------------------------------
+
+CHUNK_LEAF_DOMAIN = b"dcg.chunk.leaf.v2.1\x00"
+
+
+def chunks(value: bytes, chunk_bytes: int) -> list[bytes]:
+    return [value[i:i + chunk_bytes] for i in range(0, len(value), chunk_bytes)] or [b""]
+
+
+def chunk_leaf(index: int, chunk: bytes) -> bytes:
+    return hashlib.sha256(CHUNK_LEAF_DOMAIN + struct.pack("<Q", index) + chunk).digest()
+
+
+def chunk_tree(value: bytes, chunk_bytes: int) -> trees.Tree:
+    return trees.build("chunk", [chunk_leaf(i, c) for i, c in enumerate(chunks(value, chunk_bytes))])
+
+
+def chunked_digest(value: bytes, chunk_bytes: int) -> bytes:
+    return chunk_tree(value, chunk_bytes).root
+
+
+def input_digest(in_spec_record: bytes, value: bytes) -> bytes:
+    """The digest an external ref carries: plain, or the chunk-tree root."""
+    chunk_log2 = in_spec_record[32]
+    return chunked_digest(value, 1 << chunk_log2) if chunk_log2 else value_digest(value)
+
+
+def small_state_digest(state: bytes) -> bytes:
+    return value_digest(state)
+
+
 # --- execution and commitment ---------------------------------------------------------------
 
 @dataclass
@@ -139,13 +192,17 @@ class Commitment:
     step_tree: trees.Tree = field(init=False)
     out_tree: trees.Tree = field(init=False)
     node_overrides: dict[tuple[int, int], bytes] = field(default_factory=dict)  # (level, position) -> hash
+    states: dict[int, bytes] = field(default_factory=dict)  # ordinal -> next state bytes
+    last_running: dict[int, int] = field(default_factory=dict)  # repeated block -> last running iteration
 
     def __post_init__(self):
         self.rebuild()
 
     def rebuild(self) -> None:
-        leaves = [leaf_hash(x) for x in self.leaves]
-        self.step_tree = trees.build("step", leaves, self.spec.address_height)
+        positioned = [trees.EMPTY_LEAF] * (1 << self.spec.address_height)
+        for ordinal, x in enumerate(self.leaves):
+            positioned[self.spec.position_of(ordinal)] = leaf_hash(x)
+        self.step_tree = trees.build("step", positioned, self.spec.address_height)
         for (level, position), h in sorted(self.node_overrides.items()):
             # A forged internal node: replace it and re-fold above it.
             self.step_tree.levels[level][position] = h
@@ -170,6 +227,7 @@ class Commitment:
         c.out_entries = list(self.out_entries)
         c.values = dict(self.values)
         c.node_overrides = dict(self.node_overrides)
+        c.states = dict(self.states)
         c.rebuild()
         return c
 
@@ -178,31 +236,92 @@ def value_ref(header: bytes, digest: bytes) -> bytes:
     return header + digest
 
 
-def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int, bytes]) -> Commitment:
-    """The honest execution H of one enumerated block."""
+def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int, bytes],
+            fault: Callable[[int, list[bytes], bytes | None], tuple[list[bytes], bytes | None]] | None = None,
+            input_fault: Callable[[int, int, bytes], bytes] | None = None,
+            prior_fault: Callable[[int, bytes], bytes] | None = None) -> Commitment:
+    """The honest execution H (or, with `fault`, an executor that corrupts one
+    step's results and then continues consistently from them).
+
+    `fault(ordinal, outputs, next_state)` may return altered results;
+    `input_fault(ordinal, index, value)` an altered input value and
+    `prior_fault(ordinal, prior)` an altered prior state, both before replay."""
     values: dict = {("ext", eid): v for eid, v in external_values.items()}
-    leaves: list[bytes | None] = []
-    for ordinal, raw in enumerate(spec.step_specs):
-        d = S.decode_step_spec(raw)
-        in_values, in_refs = [], []
-        for header, prod, _initial in d["inputs"]:
-            kind, a, b, _c, _d = S.decode_producer(prod)
-            v = external_values[a] if kind == 2 else values[(a, b)]
-            in_values.append(v)
-            in_refs.append(value_ref(header, value_digest(v)))
-        outs = replay(d["kernel_id"], in_values)
-        if outs is None:
+    states: dict[int, bytes] = {}
+    leaves: list[bytes | None] = [None] * spec.total_steps
+    last_running: dict[int, int] = {}
+
+    def fetch(prod: bytes) -> bytes:
+        kind, a, b, _c, d = S.decode_producer(prod)
+        if kind == 1:
+            return values[(a, b)]
+        if kind == 2:
+            return external_values[a]
+        if kind == 5:
+            chunk_bytes = 1 << spec.in_specs[a][32]
+            return chunks(external_values[a], chunk_bytes)[d]
+        if kind == 6:
+            blk = spec.blocks[a]
+            t = last_running[a]
+            return values[(blk.base + t * blk.body_len + _c, b)]
+        if kind == 7:
+            return struct.pack("<I", a)
+        raise ValueError(f"producer kind {kind}")
+
+    def state_of(d: dict) -> bytes | None:
+        if not d["state_scheme"]:
+            return None
+        kind, a, *_ = S.decode_producer(d["state_predecessor"])
+        if kind == 1:
+            return states[a]
+        if kind == 2:
+            return external_values[a]
+        return bytes(d["state_size"])  # EMPTY_STATE
+
+    def run_step(ordinal: int) -> None:
+        d = S.decode_step_spec(spec.step_spec(ordinal))
+        in_values = [fetch(prod) for _h, prod, _i in d["inputs"]]
+        if input_fault is not None:
+            in_values = [input_fault(ordinal, i, v) for i, v in enumerate(in_values)]
+        in_refs = [value_ref(h, value_digest(v)) for (h, _p, _i), v in zip(d["inputs"], in_values)]
+        prior = state_of(d)
+        if prior_fault is not None and prior is not None:
+            prior = prior_fault(ordinal, prior)
+        result = replay_step(d["kernel_id"], in_values, prior)
+        if result is None:
             raise ValueError(f"step {ordinal} refused by its kernel")
+        outs, nxt = result
+        if fault is not None:
+            outs, nxt = fault(ordinal, list(outs), nxt)
         out_refs = []
         for header, v in zip(d["outputs"], outs):
             port = struct.unpack_from("<H", header, 5)[0]
             values[(ordinal, port)] = v
             out_refs.append(value_ref(header, value_digest(v)))
-        leaves.append(leaf_preimage(plan_id, run, d["region"], d["segment"], ordinal, d["node"], d["kernel_step"],
-                                    in_refs, out_refs))
+        if nxt is not None:
+            states[ordinal] = nxt
+        z = bytes(32)
+        leaves[ordinal] = leaf_preimage(
+            plan_id, run, d["region"], d["segment"], ordinal, d["node"], d["kernel_step"], in_refs, out_refs,
+            small_state_digest(prior) if prior is not None else z,
+            small_state_digest(nxt) if nxt is not None else z)
+
+    for bi, blk in enumerate(spec.blocks):
+        if blk.kind == 1:
+            for ordinal in range(blk.base, blk.base + blk.step_count):
+                run_step(ordinal)
+            continue
+        for i in range(blk.k):
+            for e in range(blk.body_len):
+                run_step(blk.base + i * blk.body_len + e)
+            last_running[bi] = i
+            gate = values.get((blk.base + i * blk.body_len + blk.gate_entry, blk.gate_port))
+            if gate is None or struct.unpack("<i", gate)[0] == 0:
+                break
     entries = []
     for raw in spec.out_specs:
         header, prod = raw[8:31], raw[32:56]
-        _k, a, b, _c, _d = S.decode_producer(prod)
-        entries.append(value_ref(header, value_digest(values[(a, b)])))
-    return Commitment(plan_id, run, spec, leaves, entries, values)
+        entries.append(value_ref(header, value_digest(fetch(prod))))
+    c = Commitment(plan_id, run, spec, leaves, entries, values)
+    c.states, c.last_running = states, last_running
+    return c

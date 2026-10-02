@@ -1,7 +1,8 @@
-"""Dispute spec (DCDS) records and derivation (design §5), step-1 scope.
+"""Dispute spec (DCDS) records and derivation (design §5).
 
-Step 1 covers one enumerated block derived from canonical DCGG/DCPL, with
-producer kinds 1 (earlier step) and 2 (external input). The record encoders
+`derive` lowers a canonical DCGG/DCPL to one enumerated block. `plans.py`
+builds multi-block specs with repeated blocks (gates, producer kinds 4 to 7),
+SMALL state and chunked inputs: the chunked-kernel slice. The record encoders
 cover every type so goldens can pin their bytes.
 """
 
@@ -106,7 +107,9 @@ def decode_step_spec(raw: bytes) -> dict:
         outs.append(raw[at:at + 23])
         at += 24
     region, segment, node, kernel_step = struct.unpack_from("<IIII", raw, 4)
-    return {"magic": raw[:4], "region": region, "segment": segment, "node": node, "kernel_step": kernel_step,
+    return {"magic": raw[:4], "region": region, "state_export": raw[121],
+            "state_size": struct.unpack_from("<Q", raw, 128)[0], "state_predecessor": raw[136:160],
+            "state_initial": raw[160:184], "segment": segment, "node": node, "kernel_step": kernel_step,
             "kernel_id": raw[20:36], "semantic_version": struct.unpack_from("<H", raw, 36)[0],
             "max_cu": struct.unpack_from("<Q", raw, 48)[0], "parameter_digest": raw[56:88],
             "port_shapes_digest": raw[88:120], "state_scheme": raw[120], "inputs": ins, "outputs": outs}
@@ -188,18 +191,66 @@ def port_shapes_digest(ports: list[wire.PortV1]) -> bytes:
     return hashlib.sha256(PORTS_DOMAIN + body).digest()
 
 
+@dataclass(frozen=True)
+class Block:
+    """One BlockSpec, with its place in the step tree's address map (§6.2)."""
+
+    kind: int  # 1 enumerated, 2 repeated
+    base: int
+    step_count: int
+    k: int  # iterations (repeated)
+    body_len: int
+    gate_entry: int
+    gate_port: int
+    first_record: int
+    record_count: int
+    address_base: int
+    address_height: int
+
+    @property
+    def hb(self) -> int:
+        return trees.height_for(self.body_len) if self.kind == 2 else 0
+
+    def record(self) -> bytes:
+        return block_spec(self.kind, self.base, self.step_count, self.k, self.body_len, self.gate_entry,
+                          self.gate_port, self.first_record, self.record_count, self.address_base,
+                          self.address_height)
+
+
+def place_blocks(shapes: list[tuple[int, int, int]]) -> tuple[list[tuple[int, int]], int]:
+    """Address map (§6.2): for (kind, step_count or body_len, K) per block, the
+    (address_base, address_height) of each, and the global tree height."""
+    out, end = [], 0
+    for kind, n, k in shapes:
+        height = trees.height_for(n) if kind == 1 else trees.height_for(k) + trees.height_for(n)
+        size = 1 << height
+        base = -(-end // size) * size
+        out.append((base, height))
+        end = base + size
+    return out, trees.height_for(end)
+
+
+def chunk_header(scheme_id: int, scheme_version: int, chunk_bytes: int) -> bytes:
+    """The derived header of one chunk read as a plain value (§3.3, R3-B3)."""
+    return port_header(0, 0, 0, LAYOUT_RAW, 1, scheme_id, scheme_version, chunk_bytes)
+
+
+LAYOUT_SCALAR, LAYOUT_CHUNKED, LAYOUT_LOG, LAYOUT_RAW = 1, 3, 4, 5
+
+
 @dataclass
 class Spec:
-    """A derived DCDS: records in spec-tree order, with the indices the referee needs."""
+    """A derived DCDS: records in spec-tree order, the blocks and the indices the referee needs."""
 
     records: list[tuple[int, bytes]]  # (type code, record bytes), in leaf order
-    step_specs: list[bytes]  # by ordinal
+    blocks: list[Block]
+    block_records: list[list[bytes]]  # per block: its StepSpec records or body entries
     in_specs: dict[int, bytes]  # by external id
     out_specs: list[bytes]  # by out index
     total_steps: int
     total_outputs: int
     address_height: int
-    first_step_record: int
+    first_out_record: int
     tree: trees.Tree = field(init=False)
 
     def __post_init__(self):
@@ -213,15 +264,111 @@ class Spec:
         t, r = self.records[leaf_index]
         return t, r, self.tree.path(leaf_index)
 
+    # --- ordinals, records and addresses ------------------------------------------------
+    def locate(self, ordinal: int) -> tuple[int, Block, int, int]:
+        """(block index, block, iteration, entry) of a step ordinal."""
+        for bi, b in enumerate(self.blocks):
+            if b.base <= ordinal < b.base + b.step_count:
+                r = ordinal - b.base
+                if b.kind == 1:
+                    return bi, b, 0, r
+                return bi, b, r // b.body_len, r % b.body_len
+        raise SpecError("ordinal out of range")
+
+    def ordinal_of(self, block: int, iteration: int, entry: int) -> int:
+        b = self.blocks[block]
+        return b.base + (iteration * b.body_len + entry if b.kind == 2 else entry)
+
     def step_leaf_index(self, ordinal: int) -> int:
-        return self.first_step_record + ordinal
+        _bi, b, _i, e = self.locate(ordinal)
+        return b.first_record + e
+
+    def position_of(self, ordinal: int) -> int:
+        _bi, b, i, e = self.locate(ordinal)
+        return b.address_base + ((i << b.hb) + e if b.kind == 2 else e)
+
+    def ordinal_at(self, position: int) -> int | None:
+        for b in self.blocks:
+            r = position - b.address_base
+            if not 0 <= r < (1 << b.address_height):
+                continue
+            if b.kind == 1:
+                return b.base + r if r < b.step_count else None
+            i, e = r >> b.hb, r & ((1 << b.hb) - 1)
+            return b.base + i * b.body_len + e if i < b.k and e < b.body_len else None
+        return None
+
+    def gated(self, ordinal: int) -> bool:
+        """A step whose presence depends on a gate: iteration >= 1 of a repeated block."""
+        _bi, b, i, _e = self.locate(ordinal)
+        return b.kind == 2 and i >= 1
+
+    def step_spec(self, ordinal: int) -> bytes:
+        """StepSpec(k): stored, or generated from its body entry (§5.2)."""
+        bi, b, i, e = self.locate(ordinal)
+        raw = self.block_records[bi][e]
+        if b.kind == 1:
+            return raw
+        return generate(raw, b, i)
+
+    @property
+    def step_specs(self) -> list[bytes]:
+        return [self.step_spec(k) for k in range(self.total_steps)]
+
+    @property
+    def first_step_record(self) -> int:
+        return self.blocks[0].first_record
 
     def out_leaf_index(self, j: int) -> int:
-        return 1 + 1 + len(self.in_specs) + j  # header, one block, (no consts), ins, outs
+        return self.first_out_record + j
 
     def pickable(self, level: int, position: int) -> bool:
         """Structural (§7.1): the subtree at (level, position) holds a step position."""
-        return (position << level) < self.total_steps
+        lo, hi = position << level, (position + 1) << level
+        for b in self.blocks:
+            blo = max(lo, b.address_base) - b.address_base
+            bhi = min(hi, b.address_base + (1 << b.address_height)) - b.address_base
+            if blo >= bhi:
+                continue
+            if b.kind == 1:
+                if blo < b.step_count:
+                    return True
+                continue
+            i = blo >> b.hb
+            if i < b.k and (i << b.hb) + b.body_len > blo:
+                return True
+            if i + 1 < b.k and ((i + 1) << b.hb) < bhi:
+                return True
+        return False
+
+
+def _resolve(prod: bytes, initial: bytes, b: Block, i: int) -> bytes:
+    kind, a, pb, c, d = decode_producer(prod)
+    if kind == 4:
+        lag = c
+        if i >= lag:
+            return producer(1, b.base + (i - lag) * b.body_len + a, pb)
+        return initial
+    if kind == 5:
+        return producer(5, a, pb, 0, i * c + d)
+    if kind == 7:
+        return producer(7, i)
+    return prod
+
+
+def generate(body_entry: bytes, b: Block, i: int) -> bytes:
+    """Resolve a body entry's relative producers for iteration i (§5.2)."""
+    if body_entry[:4] != b"DSB1":
+        raise SpecError("not a body entry")
+    out = bytearray(b"DSS1" + body_entry[4:])
+    initial_state = body_entry[160:184]
+    out[136:160] = _resolve(body_entry[136:160], initial_state, b, i)
+    at = 192
+    for _ in range(body_entry[184]):
+        out[at + 23:at + 47] = _resolve(body_entry[at + 23:at + 47], body_entry[at + 47:at + 71], b, i)
+        out[at + 47:at + 71] = NO_PRODUCER
+        at += 72
+    return bytes(out)
 
 
 def derive(graph_bytes: bytes, plan_bytes: bytes, max_cu: int = 200_000) -> Spec:
@@ -285,14 +432,16 @@ def derive(graph_bytes: bytes, plan_bytes: bytes, max_cu: int = 200_000) -> Spec
         outs.append(out_spec(header_of(port, regions[nodes[o.source_node].region_id]),
                              producer(1, produced[(o.source_node, o.source_port)], o.source_port)))
     n = len(steps)
-    height = trees.height_for(n)
+    [(address_base, block_height)], height = place_blocks([(1, n, 0)])
     in_records = [in_spec(eid, in_headers[eid]) for eid in sorted(in_headers)]
-    first_step = 1 + 1 + len(in_records) + len(outs) + len(graph.regions)
+    first_out = 1 + 1 + len(in_records)
+    first_step = first_out + len(outs) + len(graph.regions)
+    block = Block(1, 0, n, 0, 0, 0, 0, first_step, n, address_base, block_height)
     records = [(TYPE_HEADER, spec_header(1, 0, len(in_records), len(outs), 0, len(graph.regions), n, len(outs))),
-               (TYPE_BLOCK, block_spec(1, 0, n, 0, 0, 0, 0, first_step, n, 0, height))]
+               (TYPE_BLOCK, block.record())]
     records += [(TYPE_IN, r) for r in in_records]
     records += [(TYPE_OUT, r) for r in outs]
     records += [(TYPE_REGION, region_spec(r)) for r in sorted(graph.regions, key=lambda r: r.region_id)]
     records += [(TYPE_STEP, r) for r in step_specs]
-    return Spec(records, step_specs, {eid: r for eid, r in zip(sorted(in_headers), in_records)}, outs, n,
-                len(outs), height, first_step)
+    return Spec(records, [block], [step_specs], {eid: r for eid, r in zip(sorted(in_headers), in_records)}, outs,
+                n, len(outs), height, first_out)
