@@ -1091,6 +1091,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "dcg-disputes",
  "dcg-kernels",
  "dcg-wire",
  "ed25519-dalek",

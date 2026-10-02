@@ -17,6 +17,9 @@ graph-v2-experimental = ["graph-v2"]
 # Routes the raw owner-signed write (208). Testnet resource uploads only;
 # never in a production image.
 graph-v2-raw-write = ["graph-v2"]
+# Optimistic disputes v2.1 skeleton (tag 227). Testnet only: the template's
+# spec root is trusted from the admitter (design O1).
+graph-v21 = []
 test-rev8-before-payer-alias-fix = []
 no-entrypoint = []
 custom-heap = []
@@ -42,6 +45,7 @@ crate-type = ["cdylib", "lib"]
 solana-program = "=2.3.0"
 dcg-kernels = { path = "../dcg-kernels" }
 dcg-wire = { path = "../dcg-wire" }
+dcg-disputes = { path = "../dcg-disputes" }
 sha2 = { version = "=0.10.9", default-features = false }
 indexmap = "=2.13.0"
 blake3 = "=1.8.2"

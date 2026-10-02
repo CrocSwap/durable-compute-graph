@@ -25,6 +25,8 @@ pub mod desc_upload;
 pub mod descriptor;
 pub mod envelope_seal;
 pub mod graph_v2;
+#[cfg(feature = "graph-v21")]
+pub mod disputes_v21;
 pub mod hash;
 pub mod kernel;
 pub mod kernel_svm;
@@ -148,6 +150,8 @@ pub fn process_instruction_with_manifest(
         // (208 raw write and 219-226 are testnet-only features).
         #[cfg(feature = "graph-v2")]
         208..=226 => graph_v2::process(program_id, accounts, data),
+        #[cfg(feature = "graph-v21")]
+        227 => disputes_v21::process(program_id, accounts, data),
         140 => pt1_onchain::init_fresh(program_id, accounts, data),
         141 => pt1_onchain::upload(program_id, accounts, data),
         142 => pt1_onchain::seal(program_id, accounts, data),
