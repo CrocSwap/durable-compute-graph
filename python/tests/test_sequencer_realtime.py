@@ -26,6 +26,7 @@ from dcg.sequencer import (
     LatencyMode,
     MultiSigner,
     PostconditionResult,
+    JournalError,
     ReconciliationRequired,
     RetryPolicy,
     RpcUnavailable,
@@ -414,6 +415,48 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reconciliation_required", [event.event for event in events])
         self.assertEqual(len(self.rpc.reconciliations), 2, "both signed packets are checked by the app adapter")
         self.assertEqual(len(self.rpc.send_packets), 2, "the invalidated child is never silently replayed")
+
+    async def _dropped_parent_stream(self, name, parent_lands):
+        def status(signature, packet, count):
+            if b"dcg-step:parent" in packet:
+                if parent_lands["now"]:
+                    return _status(signature, Commitment.CONFIRMED)
+                return _status(signature, Commitment.PROCESSED) if count == 2 else None
+            return _status(signature, Commitment.CONFIRMED)
+
+        self.rpc.status_resolver = status
+        stream = await self.open_stream(
+            latency_mode=LatencyMode.PROCESSED,
+            config=_config(latency_mode=LatencyMode.PROCESSED),
+            name=name,
+        )
+        await stream.append(_intent("parent", write_locks=("lane",)))
+        await stream.append(_intent("child", dependencies=("parent",), write_locks=("lane",)))
+        with self.assertRaises(ReconciliationRequired):
+            await asyncio.wait_for(stream.wait(), timeout=2)
+        return stream
+
+    async def test_h2_decide_continue_resumes_dropped_parent_and_descendant(self):
+        lands = {"now": False}
+        stream = await self._dropped_parent_stream("decide-continue", lands)
+        lands["now"] = True
+        await stream.decide("parent", "continue", "evidence-continue")
+        result = await asyncio.wait_for(stream.wait(), timeout=3)
+        self.assertEqual(set(result.outcomes), {"parent", "child"})
+        decisions = [event for event in stream.plan.lifecycle_events if event.event == "reconciliation_decision"]
+        self.assertEqual([(event.step_id, event.data.get("decision")) for event in decisions][:1],
+                         [("parent", "continue")])
+
+    async def test_h2_decide_abandon_is_journaled_and_rejects_bad_input(self):
+        stream = await self._dropped_parent_stream("decide-abandon", {"now": False})
+        with self.assertRaises(ValueError):
+            await stream.decide("parent", "retry", "evidence")
+        with self.assertRaises(JournalError):
+            await stream.decide("child-that-was-not-dropped", "continue", "evidence")
+        await stream.decide("parent", "abandon", "evidence-abandon")
+        decisions = [event for event in stream.plan.lifecycle_events if event.event == "reconciliation_decision"]
+        self.assertEqual(decisions[-1].step_id, "parent")
+        self.assertEqual(decisions[-1].data.get("decision"), "abandon")
 
     async def test_invalidated_unsigned_descendant_is_journaled_and_can_be_abandoned(self):
         def status(signature, packet, count):

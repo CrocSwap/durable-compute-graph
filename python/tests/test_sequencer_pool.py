@@ -243,6 +243,29 @@ class EndpointPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fallback.route.affinity_key, "lane-1")
         await fallback.close()
 
+    async def test_m5_route_group_fails_within_group_then_over_to_pool(self) -> None:
+        clock = FakeClock()
+        pool = EndpointPool(
+            [self.node("a1", route_group="g"), self.node("a2", route_group="g"),
+             self.node("b", route_group="other")],
+            health_policy=HealthPolicy(cooldown_seconds=0.05, max_cooldown_seconds=0.1),
+            clock=clock,
+        )
+        bad = await pool.acquire(RequestKind.RPC, endpoint_id="a1")
+        await bad.observe(HealthObservation(HealthSignal.UNHEALTHY))
+        await bad.close()
+        within = await pool.acquire(RequestKind.RPC, route_group="g")
+        self.assertEqual(within.endpoint_id, "a2", "a cooling node fails over inside its group first")
+        await within.close()
+
+        clock.advance(0.0001)
+        bad = await pool.acquire(RequestKind.RPC, endpoint_id="a2")
+        await bad.observe(HealthObservation(HealthSignal.UNHEALTHY))
+        await bad.close()
+        outside = await asyncio.wait_for(pool.acquire(RequestKind.RPC, route_group="g"), timeout=1)
+        self.assertEqual(outside.endpoint_id, "b", "a fully cooling group fails over to the whole pool")
+        await outside.close()
+
     async def test_abandoned_probe_does_not_rehabilitate_endpoint(self) -> None:
         clock = FakeClock()
         pool = EndpointPool(
