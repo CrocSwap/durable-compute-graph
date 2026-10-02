@@ -23,6 +23,14 @@
 //! 209 close run, 210 blob create, 211 blob write, 212 blob seal,
 //! 213 admit template, 214 init run, 215 execute (consensus), 216 commit
 //! (optimistic), 217 challenge step, 218 finalize, 219 sampling audit.
+//!
+//! Features (review 2026-10-02): `graph-v2` routes the trace-committed path
+//! (209-218). `graph-v2-experimental` adds the sampling audit (219) and the
+//! root-committed descent (220-226), which are under redesign; without it a
+//! sampling template is refused at admission. `graph-v2-raw-write` routes the
+//! raw owner-signed write (208), for testnet resource uploads only.
+
+#![cfg_attr(not(feature = "graph-v2-experimental"), allow(dead_code))]
 
 use solana_program::{
     account_info::AccountInfo,
@@ -58,6 +66,12 @@ pub const STATUS_FINAL: u8 = 2;
 pub const STATUS_CHALLENGER_WON: u8 = 3;
 
 const CELL: usize = 4;
+
+/// Challenge window bounds, in slots. Zero would make a commit final in the
+/// same slot; the upper bound (about 4.6 days at 40 ms) keeps `slot + window`
+/// far from overflow and a bond from being locked indefinitely.
+pub const MIN_WINDOW_SLOTS: u64 = 1;
+pub const MAX_WINDOW_SLOTS: u64 = 10_000_000;
 
 // Blob: magic(4) kind(1) sealed(1) pad(2) len(4) id(32) writer(32) bytes.
 const BLOB_HEADER: usize = 76;
@@ -100,19 +114,42 @@ fn create_pda<'a>(
     if expected != *target.key {
         return Err(err(2));
     }
-    if target.lamports() != 0 {
+    // An initialized record is never recreated. A system-owned empty address
+    // may already hold lamports (anyone can send some to a predictable PDA),
+    // so creation tops up, allocates and assigns instead of refusing.
+    if *target.owner != solana_program::system_program::id() || !target.data_is_empty() {
         return Err(err(3));
     }
-    let lamports = Rent::get()?.minimum_balance(space);
     let bump_seed = [bump];
     let mut signer: [&[u8]; 4] = [&[]; 4];
     signer[..seeds.len()].copy_from_slice(seeds);
     signer[seeds.len()] = &bump_seed;
-    invoke_signed(
-        &system_instruction::create_account(payer.key, target.key, lamports, space as u64, program_id),
-        &[payer.clone(), target.clone(), system.clone()],
-        &[&signer[..seeds.len() + 1]],
-    )
+    let signer = &signer[..seeds.len() + 1];
+    let need = Rent::get()?.minimum_balance(space);
+    if target.lamports() == 0 {
+        return invoke_signed(
+            &system_instruction::create_account(payer.key, target.key, need, space as u64, program_id),
+            &[payer.clone(), target.clone(), system.clone()],
+            &[signer],
+        );
+    }
+    if target.lamports() < need {
+        invoke(
+            &system_instruction::transfer(payer.key, target.key, need - target.lamports()),
+            &[payer.clone(), target.clone(), system.clone()],
+        )?;
+    }
+    invoke_signed(&system_instruction::allocate(target.key, space as u64), &[target.clone(), system.clone()], &[signer])?;
+    invoke_signed(&system_instruction::assign(target.key, program_id), &[target.clone(), system.clone()], &[signer])
+}
+
+/// A record must sit at the address its own identity derives (review B1): a
+/// program-owned keypair account with the right magic is not a record.
+fn derived(program_id: &Pubkey, account: &AccountInfo, seeds: &[&[u8]]) -> ProgramResult {
+    if Pubkey::find_program_address(seeds, program_id).0 != *account.key {
+        return Err(err(2));
+    }
+    Ok(())
 }
 
 fn owned(program_id: &Pubkey, account: &AccountInfo) -> ProgramResult {
@@ -124,6 +161,7 @@ fn owned(program_id: &Pubkey, account: &AccountInfo) -> ProgramResult {
 
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     match data[0] {
+        #[cfg(feature = "graph-v2-raw-write")]
         208 => raw_write(program_id, accounts, data),
         209 => close_run(program_id, accounts),
         210 => blob_create(program_id, accounts, data),
@@ -135,13 +173,21 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         216 => commit(program_id, accounts, data),
         217 => challenge(program_id, accounts, data),
         218 => finalize(program_id, accounts),
+        #[cfg(feature = "graph-v2-experimental")]
         219 => sample_audit(program_id, accounts),
+        #[cfg(feature = "graph-v2-experimental")]
         220 => commit_root(program_id, accounts, data),
+        #[cfg(feature = "graph-v2-experimental")]
         221 => open_dispute(program_id, accounts),
+        #[cfg(feature = "graph-v2-experimental")]
         222 => reveal_region(program_id, accounts, data),
+        #[cfg(feature = "graph-v2-experimental")]
         223 => choose(program_id, accounts, data),
+        #[cfg(feature = "graph-v2-experimental")]
         224 => reveal_leaf(program_id, accounts, data),
+        #[cfg(feature = "graph-v2-experimental")]
         225 => replay_leaf(program_id, accounts, data),
+        #[cfg(feature = "graph-v2-experimental")]
         226 => settle_descent(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -201,10 +247,13 @@ fn blob_seal(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if !writer.is_signer || d[44..76] != writer.key.as_ref()[..] {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    if d[5] != 0 {
+    if d.len() < BLOB_HEADER || &d[0..4] != b"DCB2" || d[5] != 0 {
         return Err(err(6));
     }
     let len = u32_at(&d, 8)? as usize;
+    if BLOB_HEADER + len != d.len() {
+        return Err(err(7));
+    }
     let domain = match d[4] {
         KIND_GRAPH => GRAPH_DOMAIN,
         KIND_PLAN => PLAN_DOMAIN,
@@ -221,10 +270,12 @@ fn blob_seal(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 fn sealed_blob(program_id: &Pubkey, blob: &AccountInfo, kind: u8) -> Result<[u8; 32], ProgramError> {
     owned(program_id, blob)?;
     let d = blob.try_borrow_data()?;
-    if &d[0..4] != b"DCB2" || d[4] != kind || d[5] != 1 {
+    if d.len() < BLOB_HEADER || &d[0..4] != b"DCB2" || d[4] != kind || d[5] != 1 {
         return Err(err(9));
     }
-    key32(&d, 12)
+    let id = key32(&d, 12)?;
+    derived(program_id, blob, &[b"dcg2blob", &[kind], &id])?;
+    Ok(id)
 }
 
 /// Parsed step table: n_inputs, n_steps, then per step kernel:u16 n_in:u8 refs:u16*n_in.
@@ -284,8 +335,17 @@ fn admit_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     if !(MODE_CONSENSUS..=MODE_SAMPLING).contains(&mode) {
         return Err(err(11));
     }
+    #[cfg(not(feature = "graph-v2-experimental"))]
+    if mode == MODE_SAMPLING {
+        // The sampling audit is not routed in this image; a sampling run
+        // could never finalize and its bond would be stranded.
+        return Err(err(11));
+    }
     let samples = data[2];
     let window = u64_at(data, 3)?;
+    if !(MIN_WINDOW_SLOTS..=MAX_WINDOW_SLOTS).contains(&window) {
+        return Err(err(32));
+    }
     let manifest_root = key32(data, 11)?;
     let graph_id = sealed_blob(program_id, graph, KIND_GRAPH)?;
     let plan_id = sealed_blob(program_id, plan, KIND_PLAN)?;
@@ -402,9 +462,10 @@ struct TemplateView {
 fn template_view(program_id: &Pubkey, template: &AccountInfo) -> Result<TemplateView, ProgramError> {
     owned(program_id, template)?;
     let d = template.try_borrow_data()?;
-    if &d[0..4] != b"DCT2" {
+    if d.len() < TEMPLATE_BOND || &d[0..4] != b"DCT2" {
         return Err(err(14));
     }
+    derived(program_id, template, &[b"dcg2tmpl", &key32(&d, 16)?])?;
     Ok(TemplateView {
         mode: d[4],
         samples: d[5],
@@ -458,10 +519,10 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
 fn run_checked(program_id: &Pubkey, run: &AccountInfo, template: &AccountInfo) -> ProgramResult {
     owned(program_id, run)?;
     let d = run.try_borrow_data()?;
-    if &d[0..4] != b"DCR2" || d[64..96] != template.key.as_ref()[..] {
+    if d.len() < RUN_HEADER || &d[0..4] != b"DCR2" || d[64..96] != template.key.as_ref()[..] {
         return Err(err(17));
     }
-    Ok(())
+    derived(program_id, run, &[b"dcg2run", &key32(&d, 32)?])
 }
 
 /// Evaluate one step against the run's cells (inputs then trace).
@@ -542,7 +603,8 @@ fn commit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
         d = run.try_borrow_mut_data()?;
     }
     d[16..24].copy_from_slice(&slot.to_le_bytes());
-    d[24..32].copy_from_slice(&(slot + view.window).to_le_bytes());
+    let deadline = slot.checked_add(view.window).ok_or(err(32))?;
+    d[24..32].copy_from_slice(&deadline.to_le_bytes());
     d[128..160].copy_from_slice(executor.key.as_ref());
     Ok(())
 }
@@ -679,13 +741,15 @@ fn sample_audit(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     Ok(())
 }
 
-// 209: [payer(s,w), run(w), template] close a terminal run, rent to its payer.
+// 209: [payer(s,w), run(w), template] close a terminal run, or one no
+// executor ever committed (review S5), rent to its payer. An open run holds
+// no bond, so closing it takes nothing from anyone.
 fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [payer, run, template, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     run_checked(program_id, run, template)?;
     {
         let d = run.try_borrow_data()?;
-        if d[4] != STATUS_FINAL && d[4] != STATUS_CHALLENGER_WON {
+        if d[4] != STATUS_FINAL && d[4] != STATUS_CHALLENGER_WON && d[4] != STATUS_OPEN {
             return Err(err(19));
         }
         if !payer.is_signer || d[96..128] != payer.key.as_ref()[..] {
@@ -960,7 +1024,8 @@ fn commit_root(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         d[4] = STATUS_COMMITTED;
         d[RUN_ROOT_MODE] = 1;
         d[16..24].copy_from_slice(&slot.to_le_bytes());
-        d[24..32].copy_from_slice(&(slot + view.window).to_le_bytes());
+        let deadline = slot.checked_add(view.window).ok_or(err(32))?;
+    d[24..32].copy_from_slice(&deadline.to_le_bytes());
         d[128..160].copy_from_slice(executor.key.as_ref());
     }
     create_pda(program_id, executor, dispute, system, &[b"dcg2disp", run.key.as_ref()], DISPUTE_BYTES)?;

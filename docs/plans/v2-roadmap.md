@@ -17,10 +17,19 @@ milestone follows.
 | 5 | Doom consumer | **Running on stateful v3, below target.** Doom runs on DCG stateful v3 sessions (not the v2 graph lifecycle) at 1.63–1.66 frames/s on testnet (*measured*, Basanos `docs/experiments/fast-path-status-2026-10-01.md`) against the 3.0/s goal. The limit is v3's single cursor, phase lock and write set; `docs/design/stateful-session-lanes-v1.md` is the designed fix (owner decisions recorded, not implemented). |
 | 6–8 | Sampling, Freivalds, ZK | Not started. |
 
-Next, in order: fix the trace-committed path's blockers (B1 without tag 208,
-S1, S3, S5) with a program-test suite, so tags 209–218 can enter default
-builds; redesign descent and sampling (B2–B8); lanes implementation; a
-testnet run of the transport v1.1 work (done offline,
+Trace-path blockers (2026-10-02, offline): `graph-v2` now routes only
+209–218; sampling and descent moved to `graph-v2-experimental`, raw write to
+`graph-v2-raw-write`. B1 (derived addresses for blobs, templates and runs;
+blob seal checks its magic and length), S1 (dust-proof creation), S3
+(window 1–10,000,000 slots, checked deadline) and S5 (payer closes an
+uncommitted run) are fixed, with a native program-test suite
+(`crates/dcg-program/tests/graph_v2_trace.rs`, 10 tests). Not done: an SBF
+build and a redeploy of the shared testnet program, which still runs the
+pre-review image; S2, S4, S6–S11 are open.
+
+Next, in order: a re-review of the trace path for default builds; SBF build
+and testnet redeploy; redesign descent and sampling (B2–B8); lanes
+implementation; a testnet run of the transport v1.1 work (done offline,
 `docs/design/realtime-transport-v1.md`).
 
 ## Original sequence (kickoff estimates)

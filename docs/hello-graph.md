@@ -63,7 +63,12 @@ After the 10-02 conformance upgrades, all five pass again with verified admissio
 
 ## On-chain surface
 
-The instructions live in `crates/dcg-program/src/graph_v2.rs` and use tags 208–226, routed only in builds with the `graph-v2` feature (the shared testnet program: `--features "sbf-lifecycle-test sbf-real-lifecycle-test graph-v2"`):
+The instructions live in `crates/dcg-program/src/graph_v2.rs` and use tags 208–226. Three features route them (split after the 2026-10-02 review):
+- `graph-v2`: the trace-committed path, 209–218. Records are accepted only at their derived addresses, a pre-funded address can still be created, the challenge window is 1 to 10,000,000 slots, and a payer can close a run nobody committed. Native program tests: `cargo test -p dcg-program --features graph-v2 --test graph_v2_trace`.
+- `graph-v2-experimental`: adds the sampling audit (219) and root-committed descent (220–226), both under redesign. Without it, a sampling template is refused at admission.
+- `graph-v2-raw-write`: tag 208, for testnet resource uploads only.
+
+The shared testnet program builds with `--features "sbf-lifecycle-test sbf-real-lifecycle-test graph-v2-experimental graph-v2-raw-write"`. Tags:
 - 208: raw write;
 - 209: close run;
 - 210–212: blob create, write and seal;

@@ -9,8 +9,14 @@ license = "GPL-3.0-only"
 default = ["custom-heap", "revision-8"]
 revision-7 = []
 revision-8 = []
-# Routes the DCG v2 graph lifecycle (tags 208-226). Shared testnet graph program only.
+# Routes the DCG v2 trace-committed graph lifecycle (tags 209-218).
 graph-v2 = []
+# Adds the sampling audit (219) and root-committed descent (220-226); under
+# redesign after the 2026-10-02 review. Shared testnet graph program only.
+graph-v2-experimental = ["graph-v2"]
+# Routes the raw owner-signed write (208). Testnet resource uploads only;
+# never in a production image.
+graph-v2-raw-write = ["graph-v2"]
 test-rev8-before-payer-alias-fix = []
 no-entrypoint = []
 custom-heap = []
