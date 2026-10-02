@@ -6,9 +6,9 @@ the challenger picks a child region or a leaf of that region's step tree, the
 executor reveals the leaf and its Merkle path, and the challenger replays it on
 chain with every input authenticated against its source.
 
-Encodings are the frozen §5 ones from ``dcg.graph.v2``. The value digest is
-PROVISIONAL (the spec does not fix it): SHA256("dcg.value.v2.provisional\\0" ||
-value bytes), matching the program's ``VALUE_DOMAIN``.
+Encodings are the frozen §5 ones from ``dcg.graph.v2``. A value digest is
+SHA256("dcg.value.v2\\0" || value bytes) (graph-plan-v2 §5), matching the
+program's ``VALUE_DOMAIN``.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from dcg.graph import v2 as wire
 from dcg.graph_client import SYSTEM, GraphClient
 from dcg.tracing import Graph, PLAN_DOMAIN
 
-VALUE_DOMAIN = b"dcg.value.v2.provisional\x00"
+VALUE_DOMAIN = b"dcg.value.v2\x00"
 LEAF_DOMAIN = b"dcg.region.leaf.v2\x00"
 NODE_DOMAIN = b"dcg.region.node.v2\x00"
 

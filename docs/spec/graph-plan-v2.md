@@ -242,6 +242,14 @@ scheme_version:u16, byte_length:u32, value_digest:[32]` (52 bytes), sorted by
 ascending `external_id`, with no duplicate ID. The `u32` count is the frozen
 record delimiter for this profile.
 
+**Value digest** (owner decision 2026-10-02, additive to v2.0): a
+`value_digest` is `SHA256("dcg.value.v2\0" || value_bytes)`, where
+`value_bytes` are the port's canonical bytes (exactly `byte_length` bytes).
+Layout, scheme and length are bound by the enclosing reference, not the
+digest. Vector: the i32 value 42 (`2a000000`) has digest
+`1747c7d807a1bde7bbdbf92a721cfbe688e61715ce4391980fe7ee09e2ff95e1`. (The step-leaf row in `hashes_v1.tsv` predates this and
+keeps placeholder digests; it still checks leaf encoding.)
+
 `ValueRefV1` is `node_id:u32, direction:u8, port_id:u16, layout_id:u32,
 layout_version:u16, scheme_id:u32, scheme_version:u16, byte_length:u32,
 value_digest:[32]` (55 bytes). `ChildRootV1` is

@@ -733,10 +733,10 @@ fn raw_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
 // in a child region by that child's revealed RegionRootV1 outputs. A silent
 // party loses at its deadline.
 //
-// PROVISIONAL (not frozen by the spec): a value digest is
-// SHA256("dcg.value.v2.provisional\0" || value bytes).
+// A value digest is SHA256("dcg.value.v2\0" || value bytes) (graph-plan-v2
+// §5, value digest; owner decision 2026-10-02).
 
-pub const VALUE_DOMAIN: &[u8] = b"dcg.value.v2.provisional\x00";
+pub const VALUE_DOMAIN: &[u8] = b"dcg.value.v2\x00";
 pub const LEAF_DOMAIN: &[u8] = b"dcg.region.leaf.v2\x00";
 pub const NODE_DOMAIN: &[u8] = b"dcg.region.node.v2\x00";
 pub const ROOT_DOMAIN: &[u8] = b"dcg.region.root.v2\x00";
@@ -1294,5 +1294,16 @@ fn settle_descent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
             take_bond(run, executor)
         }
         _ => Err(err(23)),
+    }
+}
+
+#[cfg(test)]
+mod value_digest_tests {
+    /// graph-plan-v2 §5 vector, shared with python/tests/test_descent_vectors.py.
+    #[test]
+    fn value_digest_matches_the_spec_vector() {
+        let d = super::value_digest(&42i32.to_le_bytes());
+        let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "1747c7d807a1bde7bbdbf92a721cfbe688e61715ce4391980fe7ee09e2ff95e1");
     }
 }
