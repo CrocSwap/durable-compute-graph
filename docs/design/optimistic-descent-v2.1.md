@@ -248,6 +248,58 @@ Replay refuses on a missing chunk.
   steps then read the state as an ordinary chunked input with chunk
   openings. This is how Basanos family consumers read family logs.
 
+### 4.3a Chunked kernels (added 2026-10-02)
+
+A kernel too large to replay in one transaction is written as a **chunked
+kernel**. It has no new protocol objects: it is a repeated block (3.3) whose
+body is one stateful step, with this shape:
+
+- **iteration `i` reads chunk `i`** of a chunked input (kind 5, stride 1);
+- it may also read `i` itself (kind 7) and plain inputs (kind 1 before the block, kind 2);
+- **its running partial is SMALL state**, chained by a kind 4 state predecessor with lag 1, starting from `EMPTY_STATE`;
+- it **exports the state on port 0** and **drives the gate on port 1**, which allows an early stop;
+- later steps and graph outputs read the result through kind 6.
+
+A dispute then replays one chunk-step: one chunk, one prior state.
+
+**Reductions this covers.** Every wide operation in a transformer layer is
+a reduction followed by cheap per-element work. Each reduction keeps a fixed-width
+integer partial:
+- sums, such as a dot product or a matrix-vector row (a running `i64`);
+- max, and argmax with the lowest index on ties;
+- softmax, as a running max with a rescaled running sum;
+- the sum of squares for a norm.
+
+The integer rescale rule for softmax belongs to the application's kernel.
+DCG ships only generic integer reductions (`sumchunk_i32`, `argmax_i32c`,
+`scan_i32c`), as test and example kernels.
+
+**Sizing target (measured on the Basanos K=10,240 fixture, 2026-10-02).** The widest compiler-v1 operations read up to 36 producer inputs and about 67 KB per operation:
+- form 22, class 237 reads 35 chunks of 256 to 1,024 bytes plus one of 32 KB;
+- form 22, class 238 reads one 64 KB input.
+
+About 1,591 form-22 classes exist; 831 of them read more than one input.
+
+Attention reads up to `K = 10,240` positions per head. A chunk-step must fit
+one transaction: its chunk (at most `2^16` bytes), its prior state (at most
+4,096 bytes), hashing both, and replaying the kernel over them, all within
+`max_cu`.
+
+The single-route app adapter of revision 8 (one input, an opening of at most
+900 bytes) cannot carry these operations. They are chunked kernels in v2.1.
+Probe: Basanos `out/runs/attested-admission-2026-10-02/route-rule-probe.md`.
+
+**Status.** There is a Python reference: `plans.py`, `reductions.py`, and `test_disputes_v21_chunked.py` (*measured*):
+- every consistent output, state, gate, input and prior fault in 72 chunked plans is convicted;
+- every structural lie is convicted: early stop, extra iteration, empty iteration 0, malformed leaf, out entry, chunk edge;
+- every claim against honest runs rules for E, including kind 6 claims naming every other iteration;
+- 12 planted referee bugs are each caught.
+
+Not yet built:
+- the native crate and the program handlers;
+- chunked inputs read whole with chunk openings (only kind 5 is in this slice);
+- constants, LOG and CHUNKED state, and `OutBlockSpec`.
+
 ### 4.4 Availability (R2-B6, R2-S10)
 
 P-sound requires C to compute H inside the challenge window. Admission and
@@ -989,6 +1041,8 @@ Not in step 1:
    - ProgramTest against the Python oracle.
 3. **Repeated blocks:** gates, kinds 4, 5, 6 and 7, generated specs, and the
    multi-block address map.
+   *Python reference done 2026-10-02 for the chunked-kernel slice (4.3a),
+   together with SMALL state from step 4 and kind 5 chunk inputs from step 5.*
 4. **State:** SMALL, LOG and CHUNKED, STATE, and state export.
 5. **Chunked values:** constants, residency and the availability source.
 6. **Testnet:** Hello, fan-out, long chain, a gated block, and concurrent
