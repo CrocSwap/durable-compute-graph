@@ -871,7 +871,26 @@ the happy path only.
 ## 16. Open items
 
 - **O1.** `write_rate`, `write_slots` and staged-write landing throughput on
-  Fogo. These must be measured before the window constants are fixed.
+  Fogo.
+
+  **Measured on testnet, 2026-10-02.** The script is
+  `scripts/measure_write_rate.py`. It writes 1,165 × 900-byte chunks (1 MiB)
+  into one 10,164-byte graph-v2 blob, which models one staging account.
+
+  | Sender | Sequential (wait each) | Ordered lane, 128 per window | Unordered batch (`run_batch`) |
+  |---|---|---|---|
+  | Mac, direct node `.172` | 0.95 writes/s | 65 writes/s (18 s) | 170–211 writes/s (5.5–6.9 s per MiB, all on the first send, 3 runs) |
+  | Tokyo box, 1.6 ms from node `.173` | 7.7 writes/s | 312 writes/s (3.7 s) | 722–771 writes/s (1.5–1.6 s per MiB, 2 runs) |
+
+  - Staging writes are independent, so they go unordered.
+  - A 1 MiB witness therefore lands in under 10 s from an ordinary host.
+  - The floor for the window formula should come from the slower host. So
+    `write_rate × write_slots` should allow about 100 writes/s, which gives a
+    20 s margin for 1 MiB, with `phase_window` sized from the 30 s minimum.
+  - Each write requested 20,000 CU. Every write in a batch targets the same
+    account, so all of them count against that account's 2.5M CU block cap;
+    20,000 CU allows up to 125 writes per block.
+  - Raw data: `out/write-rate-2026-10-02*.jsonl` (ignored path).
 - **O2.** CU for replay plus witness hashing per kernel. SHA-256 over 1 MiB
   is roughly 0.5M CU (*estimated*, R1-S11). Admission refuses a step whose
   declared `max_cu` exceeds the budget, and such steps must be decomposed.
