@@ -390,6 +390,10 @@ async fn earliest_opened_winner_takes_the_pot_and_later_disputes_are_moot() {
     let n = l.len();
     l[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
     let c = commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(l)], h.outs.clone());
+    // Conservation: every lamport moved below stays among these accounts
+    // (fees come from the test payer, which is not tracked).
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), ch.run, ch.dispute(10), ch.dispute(11), ch.dispute(12)];
+    let before = total_lamports(&mut ch.ctx, &tracked).await;
     ch.commit(&c).await;
     let d0 = ch.open(10, V::KIND_STEP_DESCEND).await; // sequence 0 (the honest challenger)
     let d1 = ch.open(11, V::KIND_STEP_DESCEND).await; // sequence 1 (a faster puppet)
@@ -423,6 +427,15 @@ async fn earliest_opened_winner_takes_the_pot_and_later_disputes_are_moot() {
     let share = EXECUTOR_BOND * SLASHER_BPS as u64 / 10_000;
     assert_eq!(ch.ctx.banks_client.get_balance(kp(0xC1).pubkey()).await.unwrap(), challenger_before + share);
     assert!(send(&mut ch.ctx, pot(d0, ch.run, ch.template), &[&caller]).await.is_err(), "paid once");
+    assert_eq!(total_lamports(&mut ch.ctx, &tracked).await, before, "lamports are conserved");
+    // The run keeps exactly its rent floor; the disputes keep theirs.
+    let run_acct = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
+    let rent = ch.ctx.banks_client.get_rent().await.unwrap();
+    assert_eq!(run_acct.lamports, rent.minimum_balance(run_acct.data.len()));
+    for d in [d0, d1, d2] {
+        let a = ch.ctx.banks_client.get_account(d).await.unwrap().unwrap();
+        assert_eq!(a.lamports, rent.minimum_balance(a.data.len()));
+    }
 }
 
 impl Chain {
@@ -598,4 +611,12 @@ async fn admission_refuses_bad_templates_and_runs() {
     let e = kp(0xE1);
     let i = ix(V::SUB_COMMIT, &c.root_bytes, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
     assert!(send(&mut ch.ctx, i, &[&e]).await.is_err());
+}
+
+async fn total_lamports(ctx: &mut ProgramTestContext, keys: &[Pubkey]) -> u128 {
+    let mut t = 0u128;
+    for k in keys {
+        t += ctx.banks_client.get_balance(*k).await.unwrap() as u128;
+    }
+    t
 }
