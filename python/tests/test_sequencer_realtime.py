@@ -473,6 +473,32 @@ class RealtimeSequencerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(required), 1)
         self.assertIn("time cap", str(required[0].data))
 
+    async def test_crash_after_send_resumes_the_same_signed_packet(self):
+        # Crash injection: the process dies after the packet was sent but
+        # before it was seen. A fresh process reopens the journal; the step
+        # must resume polling the original signature, never sign a second
+        # generation that could land twice.
+        self.rpc.status_resolver = lambda signature, packet, count: None
+        first = await self.open_stream(name="crash")
+        await first.append(_intent("only", write_locks=("lane",)))
+        for _ in range(100):
+            if self.rpc.send_packets:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(self.rpc.send_packets), 1)
+        original = str(Signature.from_bytes(self.rpc.send_packets[0][1:65]))
+        await first.close()
+        self.streams.remove(first)
+
+        self.rpc.status_resolver = lambda signature, packet, count: _status(signature, Commitment.CONFIRMED)
+        resumed = await self.open_stream(name="crash")
+        await resumed.append(_intent("only", write_locks=("lane",)))
+        result = await asyncio.wait_for(resumed.wait(), timeout=3)
+        self.assertIn("only", result.outcomes)
+        signatures = {str(Signature.from_bytes(raw[1:65])) for raw in self.rpc.send_packets}
+        self.assertEqual(signatures, {original}, "only the original packet was ever sent")
+        self.assertEqual(resumed.plan.terminal_summaries["only"].signature, original)
+
     async def test_invalidated_unsigned_descendant_is_journaled_and_can_be_abandoned(self):
         def status(signature, packet, count):
             if b"dcg-step:parent" in packet:
