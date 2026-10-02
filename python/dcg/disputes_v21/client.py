@@ -27,6 +27,9 @@ SUB = {"create_template": 1, "init_run": 2, "commit": 3, "open": 4, "reveal_node
 KIND = {"STEP_DESCEND": 1, "OUT_DESCEND": 2}
 ROLE_EXECUTOR, ROLE_CHALLENGER, FROM_STAGING = 1, 2, 0xFF
 DIRECT_LIMIT = 700
+# A staged write carries two signatures and five accounts; 600 bytes of
+# body keeps it under the 1,232-byte transaction limit.
+STAGE_PIECE = 600
 SYSTEM = Pubkey.from_string("11111111111111111111111111111111")
 RULINGS = {0: "open", 1: "E", 2: "C", 3: "moot"}
 
@@ -109,8 +112,8 @@ class DisputeClient:
                        [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, False),
                         AccountMeta(template, False, False), AccountMeta(dispute, False, False),
                         AccountMeta(buffer(role), False, True), AccountMeta(SYSTEM, False, False)], [challenger])
-            for at in range(0, len(body), 800):
-                self._send("stage_write", struct.pack("<I", at) + body[at:at + 800],
+            for at in range(0, len(body), STAGE_PIECE):
+                self._send("stage_write", struct.pack("<I", at) + body[at:at + STAGE_PIECE],
                            [AccountMeta(writer.pubkey(), True, False), AccountMeta(run, False, False),
                             AccountMeta(template, False, False), AccountMeta(dispute, False, False),
                             AccountMeta(buffer(role), False, True)], [writer])

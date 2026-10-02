@@ -54,13 +54,22 @@ def main() -> int:
     chosen = sample(json.loads(SCENARIOS.read_text()), args.per)
     cl.fund(executor.pubkey(), 50_000_000 * len(chosen))
     cl.fund(challenger.pubkey(), 50_000_000 * len(chosen))
-    agree = 0
+    agree = skipped = 0
     t0 = time.monotonic()
     for s in chosen:
         tdata = bytes.fromhex(s["template_data"])
         template_id = hashlib.sha256(W.TEMPLATE_DOMAIN + tdata).digest()
         template = cl.create_template(tdata, gc.payer)
         refs = [bytes.fromhex(r) for r in s["refs"]]
+        flat = b"".join(sorted(refs, key=lambda r: int.from_bytes(r[:4], "little")))
+        run_id = hashlib.sha256(b"dcg.run.id.v2.1\x00" + template_id + bytes.fromhex(s["nonce"])
+                                + len(refs).to_bytes(4, "little") + flat + bytes(executor.pubkey())).digest()
+        if gc.account(cl.pda(b"dcg21run", run_id)) is not None:
+            # A recorded run id is fixed by its leaves; one already on this
+            # cluster (an earlier, interrupted replay) cannot be replayed.
+            print(json.dumps({"name": s["name"], "skipped": "run exists on this cluster"}), flush=True)
+            skipped += 1
+            continue
         run = cl.init_run(template, template_id, bytes.fromhex(s["nonce"]), executor.pubkey(), refs, gc.payer)
         cl.commit(run, template, bytes.fromhex(s["root_bytes"]), executor)
         out = cl.play(run, template, s, executor, challenger)
@@ -68,9 +77,9 @@ def main() -> int:
         agree += ok
         print(json.dumps({"name": s["name"], "claim": s["claim_name"], "oracle": s["ruling"], **out,
                           "rounds": len(s["rounds"]), "claim_bytes": len(s["claim"]) // 2, "agree": ok}), flush=True)
-    print(json.dumps({"scenarios": len(chosen), "agree": agree, "transactions": cl.sent,
+    print(json.dumps({"scenarios": len(chosen), "agree": agree, "skipped": skipped, "transactions": cl.sent,
                       "wall_s": round(time.monotonic() - t0, 1)}))
-    return 0 if agree == len(chosen) else 1
+    return 0 if agree + skipped == len(chosen) else 1
 
 
 if __name__ == "__main__":

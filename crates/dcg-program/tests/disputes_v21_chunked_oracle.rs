@@ -127,8 +127,9 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
             .await
             .unwrap_or_else(|err| panic!("{name}: stage create: {err:?}"));
         let writer = if *role == V::ROLE_EXECUTOR { &e } else { &c };
-        for (i, piece) in body.chunks(800).enumerate() {
-            let mut w = ((i * 800) as u32).to_le_bytes().to_vec();
+        // 600-byte pieces fit a live 1,232-byte transaction (as the client).
+        for (i, piece) in body.chunks(600).enumerate() {
+            let mut w = ((i * 600) as u32).to_le_bytes().to_vec();
             w.extend_from_slice(piece);
             tx.send(ctx, ix(V::SUB_STAGE_WRITE, &w, vec![AccountMeta::new_readonly(writer.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(dispute, false), AccountMeta::new(buffer(*role), false)]), &[writer])
                 .await

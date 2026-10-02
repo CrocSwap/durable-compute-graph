@@ -68,7 +68,7 @@ The instructions live in `crates/dcg-program/src/graph_v2.rs` and use tags 208�
 - `graph-v2-experimental`: adds the sampling audit (219) and root-committed descent (220–226), both under redesign. Without it, a sampling template is refused at admission.
 - `graph-v2-raw-write`: tag 208, for testnet resource uploads only.
 
-The shared testnet program builds with `--features "sbf-lifecycle-test sbf-real-lifecycle-test graph-v2-experimental graph-v2-raw-write graph-v21"`. It was last upgraded on 2026-10-02 from 025efb7: image sha256 `0bc505fa…b566`, 1,716,200 bytes, verified by dump. After the upgrade all five Hello Graph scenarios and the `dishonest-add` descent case passed again (measured). Tag 227 has no testnet client yet. Tags:
+The shared testnet program builds with `--features "sbf-lifecycle-test sbf-real-lifecycle-test graph-v2-experimental graph-v2-raw-write graph-v21"`. It was last upgraded on 2026-10-02 from 38fb13e (chunked kernels): image sha256 `6997da2b…28b8`, 1,754,120 bytes, verified by dump. Hello Graph and `dishonest-add` pass again on it. Tag 227 is exercised by `examples/hello-graph/chunked_dispute.py` (a planted lie in a chunked sum is ruled for the challenger, an honest control for the executor; 5 transactions, about 4 s each) and by `scripts/disputes_v21_testnet_replay.py` (measured: 23 of 23 recorded oracle scenarios agree, every claim type with both rulings, staged claims up to 1,345 bytes, at most 8.4 s and 11 transactions per dispute; log in Basanos `out/runs/dcg-chunked-testnet-2026-10-02/`). Main's gate-value refusal code 33 (1b1dc29) is not yet deployed; the image returns 31 there. Tags:
 - 208: raw write;
 - 209: close run;
 - 210–212: blob create, write and seal;
