@@ -65,7 +65,12 @@ class Machine(Protocol):
 
     def transition(self, position: int, index: int) -> Transition: ...
 
-    def initial_state(self) -> dict[int, bytes]: ...
+    def initial_state(self) -> dict[int, bytes]:
+        """The state before position 0, a pure function of the admitted inputs
+        (review H1): R_0 is recomputed, never taken from the executor."""
+
+    def output_slots(self) -> tuple[int, ...]:
+        """Carried slots holding the run's outputs in the final state (review H3)."""
 
 
 def height(machine: Machine) -> int:
@@ -164,11 +169,13 @@ def execute(machine: Machine, fault: Fault | None = None) -> Execution:
 
 @dataclass(frozen=True)
 class Commitment:
-    """What a run commits: checkpoint roots every k positions, and the final root."""
+    """What a run commits: checkpoint roots every k positions, the final root,
+    and the claimed outputs. The checkpoint coordinates are derived from `k` and
+    the schedule (review H2); the executor supplies only the roots and outputs."""
 
     k: int
-    coordinates: tuple[int, ...]  # global coordinates of the checkpoints, 0 and total included
     roots: tuple[bytes, ...]
+    outputs: Mapping[int, bytes | None]  # output slot -> claimed value
 
 
 def checkpoint_coordinates(schedule: Schedule, k: int) -> tuple[int, ...]:
@@ -179,9 +186,26 @@ def checkpoint_coordinates(schedule: Schedule, k: int) -> tuple[int, ...]:
     return tuple(schedule.position_start(p) for p in marks)
 
 
-def commit(run: Execution, k: int) -> Commitment:
+def commit(run: Execution, k: int, outputs: Mapping[int, bytes | None] | None = None) -> Commitment:
     coords = checkpoint_coordinates(run.schedule, k)
-    return Commitment(k, coords, tuple(run.root_at(c) for c in coords))
+    final = run.states[-1]
+    claimed = {s: final.get(s) for s in run.machine.output_slots()} if outputs is None else dict(outputs)
+    return Commitment(k, tuple(run.root_at(c) for c in coords), claimed)
+
+
+def admit_commitment(machine: Machine, commitment: Commitment) -> tuple[int, ...]:
+    """What COMMIT checks: the root array has the derived length, R_0 is the
+    root of the admitted initial state, and the outputs name exactly the output
+    slots. Returns the derived coordinates. On chain, R_0 is checked with a few
+    paths over the input subtree (design §3), not by rebuilding the tree."""
+    coords = checkpoint_coordinates(Schedule(machine), commitment.k)
+    if len(commitment.roots) != len(coords):
+        raise LxRefused("the checkpoint array does not have the derived length")
+    if commitment.roots[0] != state_root(machine, machine.initial_state()):
+        raise LxRefused("R_0 is not the admitted initial state's root")
+    if set(commitment.outputs) != set(machine.output_slots()):
+        raise LxRefused("outputs do not name exactly the output slots")
+    return coords
 
 
 # --- multi-proofs ----------------------------------------------------------------------------
@@ -261,15 +285,33 @@ class Dispute:
         if self.arity < 2:
             raise ValueError("arity must be at least 2")
         self.schedule = Schedule(self.machine)
+        self.coordinates = admit_commitment(self.machine, self.commitment)
 
     # Opening: C names a checkpoint pair (agreed lower, disputed upper).
     def open(self, pair: int) -> None:
         c = self.commitment
-        if not 0 <= pair < len(c.coordinates) - 1:
+        if not 0 <= pair < len(self.coordinates) - 1:
             raise LxRefused("no such checkpoint pair")
-        self.lo, self.hi = c.coordinates[pair], c.coordinates[pair + 1]
+        lo, hi = self.coordinates[pair], self.coordinates[pair + 1]
+        if hi <= lo:
+            raise LxRefused("an empty checkpoint interval cannot be disputed")  # review L1
+        self.lo, self.hi = lo, hi
         self.root_lo, self.root_hi = c.roots[pair], c.roots[pair + 1]
         self.phase = PH_MIDPOINTS if self.hi - self.lo > 1 else PH_OPENING
+
+    def claim_output(self, proof: MultiProof) -> str:
+        """OUTPUT (review H3): C opens the output slots against the committed
+        final root R_T; C wins if any opened value differs from the claimed
+        output. One transaction, no bisection."""
+        if self.phase != PH_MIDPOINTS or self.lo or self.hi:
+            raise LxRefused("OUTPUT is a claim of its own, made before any interval opens")
+        slots = set(self.machine.output_slots())
+        if set(proof.values) != slots:
+            raise LxRefused("the opening does not cover the output slots")
+        if root_over(self.machine, proof, proof.values) != self.commitment.roots[-1]:
+            raise LxRefused("the opening does not verify against R_T")
+        lie = any(proof.values[s] != self.commitment.outputs.get(s) for s in slots)
+        return self._rule("C" if lie else "E")
 
     def midpoint_coordinates(self) -> list[int]:
         """Fixed by the interval: a-1 evenly spaced interior points (fewer when
@@ -311,7 +353,13 @@ class Dispute:
         if root_over(self.machine, proof, proof.values) != self.root_lo:
             raise LxRefused("the opening does not verify against the lower root")
         written = dict(proof.values)
-        for slot, value in t.apply({s: proof.values[s] for s in t.reads}).items():
+        try:
+            updates = t.apply({s: proof.values[s] for s in t.reads})
+        except Exception:
+            # A kernel failure on a verified opening rules for C (review L2):
+            # the committed lower state cannot lead to any committed upper root.
+            return self._rule("C")
+        for slot, value in updates.items():
             if slot not in t.writes:
                 raise ValueError(f"{t.label} wrote undeclared slot {slot}")
             written[slot] = value
@@ -332,11 +380,19 @@ class Dispute:
 # --- honest parties --------------------------------------------------------------------------
 
 def first_disputed_pair(commitment: Commitment, mine: Execution) -> int | None:
-    """The first checkpoint whose committed root differs from my execution's."""
-    for j, (c, r) in enumerate(zip(commitment.coordinates, commitment.roots)):
+    """The first checkpoint whose committed root differs from my execution's.
+    R_0 is checked at admission, so a differing R_0 never reaches a dispute."""
+    coords = checkpoint_coordinates(mine.schedule, commitment.k)
+    for j, (c, r) in enumerate(zip(coords, commitment.roots)):
         if r != mine.root_at(c):
             return j - 1 if j > 0 else None
     return None
+
+
+def output_lie(commitment: Commitment, mine: Execution) -> bool:
+    """Every checkpoint agrees but a claimed output differs: dispute with OUTPUT."""
+    final = mine.states[-1]
+    return any(commitment.outputs.get(s) != final.get(s) for s in mine.machine.output_slots())
 
 
 def executor_midpoints(run: Execution, dispute: Dispute) -> list[bytes]:

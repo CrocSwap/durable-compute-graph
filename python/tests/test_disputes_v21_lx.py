@@ -101,7 +101,7 @@ def test_malformed_submissions_are_refused_without_state_change():
     with pytest.raises(L.LxRefused):
         d.pick(len(d.midpoints) + 1)  # no such sub-interval
     with pytest.raises(L.LxRefused):
-        L.Dispute(M, c).open(len(c.coordinates))
+        L.Dispute(M, c).open(len(c.roots))
 
 
 def test_a_forged_opening_is_refused():
@@ -160,3 +160,96 @@ def test_a_lie_that_heals_before_a_checkpoint_is_not_disputable():
     # With a checkpoint right after it (k=1), the same deviation is committed and convicted.
     d = L.play(M, liar, truth, 1, 16)
     assert d.ruling == "C" and d.lo == coord_of("p6.finish")
+
+
+# --- review fixes (2026-10-03 LX1 design review) ----------------------------------------
+
+def test_h1_a_lying_initial_root_is_refused_at_commit():
+    """A run from a different initial state (another prompt or entropy) differs
+    at R_0; COMMIT recomputes R_0 from the admitted inputs and refuses it."""
+    other = ToyMachine(positions_count=9, window=3, h0=8)
+    c = L.commit(L.execute(other), 4)
+    with pytest.raises(L.LxRefused):
+        L.admit_commitment(M, c)
+    with pytest.raises(L.LxRefused):
+        L.Dispute(M, c)
+
+
+def test_h2_checkpoint_coordinates_are_derived_not_supplied():
+    run = honest()
+    c = L.commit(run, 4)
+    short = L.Commitment(c.k, c.roots[:-1], c.outputs)
+    with pytest.raises(L.LxRefused):
+        L.admit_commitment(M, short)
+    # A run committed at k=4 is judged at k=4's derived coordinates; roots
+    # shuffled between checkpoints are disputable at the first mismatch.
+    shuffled = L.Commitment(c.k, (c.roots[0], c.roots[2], c.roots[1]) + c.roots[3:], c.outputs)
+    pair = L.first_disputed_pair(shuffled, run)
+    assert pair == 0
+    d = L.Dispute(M, shuffled); d.open(pair)
+    while d.phase == L.PH_MIDPOINTS:
+        d.commit_midpoints(L.executor_midpoints(run, d))
+        d.pick(L.challenger_pick(run, d))
+    assert d.submit_opening(L.executor_opening(run, d)) == "C"
+
+
+def test_h3_an_output_lie_with_honest_checkpoints_is_convicted_by_output():
+    run = honest()
+    honest_c = L.commit(run, 4)
+    liar = L.commit(run, 4, outputs={M.H: enc(42)})
+    assert L.first_disputed_pair(liar, run) is None and L.output_lie(liar, run)
+    proof = L.prove(M, run.states[-1], list(M.output_slots()))
+    assert L.Dispute(M, liar).claim_output(proof) == "C"
+    assert L.Dispute(M, honest_c).claim_output(proof) == "E"
+    # A forged opening of R_T is refused.
+    forged = L.MultiProof({M.H: enc(42)}, proof.siblings)
+    with pytest.raises(L.LxRefused):
+        L.Dispute(M, liar).claim_output(forged)
+
+
+class EmptyPositionMachine(ToyMachine):
+    """A position with no transitions: two checkpoints share a coordinate."""
+
+    def transitions_in(self, p: int) -> int:
+        return 0 if p == 4 else super().transitions_in(p)
+
+
+
+def test_l1_an_empty_checkpoint_interval_cannot_be_opened():
+    m = EmptyPositionMachine(positions_count=9, window=3)
+    coords = L.checkpoint_coordinates(L.Schedule(m), 1)
+    roots = (L.state_root(m, m.initial_state()),) + tuple(bytes([i]) * 32 for i in range(1, len(coords)))
+    c = L.Commitment(1, roots, {m.H: None})
+    pair = next(j for j in range(len(coords) - 1) if coords[j] == coords[j + 1])
+    with pytest.raises(L.LxRefused):
+        L.Dispute(m, c).open(pair)
+
+
+def test_l2_a_kernel_failure_on_a_verified_opening_rules_for_the_challenger():
+    """Only a state the executor committed can hold a malformed value. Here the
+    executor's states inside position 5 hold a non-i64 in scratch (its
+    checkpoints are honest, since scratch is empty at boundaries). A challenger
+    steers to the step that reads it; the replay's kernel fails on the verified
+    opening, and the executor loses rather than the referee crashing."""
+    truth = honest()
+    s = L.Schedule(M)
+    start, finish = coord_of("p5.start"), coord_of("p5.finish")
+    states = [dict(st) for st in truth.states]
+    for c in range(start + 1, finish + 1):
+        states[c][M.A] = b"bad"
+    liar = L.Execution(M, s, states)
+    c = L.commit(liar, 1)
+    d = L.Dispute(M, c, arity=2)
+    d.open(5)
+
+    def toward(target):
+        def pick(dd):
+            bounds = [dd.lo] + [m for m, _r in dd.midpoints] + [dd.hi]
+            return next(i for i in range(len(bounds) - 1) if bounds[i] <= target < bounds[i + 1])
+        return pick
+
+    while d.phase == L.PH_MIDPOINTS:
+        d.commit_midpoints(L.executor_midpoints(liar, d))
+        d.pick(toward(finish)(d))
+    assert d.lo == finish
+    assert d.submit_opening(L.executor_opening(liar, d)) == "C"

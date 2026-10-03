@@ -72,6 +72,9 @@ class ToyMachine:
     def initial_state(self) -> dict[int, bytes]:
         return {self.H: enc(self.h0)}
 
+    def output_slots(self) -> tuple[int, ...]:
+        return (self.H,)
+
     def transition(self, p: int, i: int) -> Transition:
         from .lx import Schedule  # noqa: F401  (coordinates come from the schedule below)
         base = sum(self.transitions_in(q) for q in range(p))
