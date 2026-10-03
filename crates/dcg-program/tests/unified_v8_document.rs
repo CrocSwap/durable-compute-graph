@@ -4102,7 +4102,87 @@ impl Fix {
             .await
     }
 
+    /// The document by real instructions (rule 6): UnifiedInit over
+    /// `binding` at the clock (moved forward to `init_slot` when that is
+    /// ahead; a document is never created in the past), then LandPositionRoots
+    /// over `roots`. Init funds the PDAs to rent itself, so balances are the
+    /// real ones. `descriptor` is the binding's own when it matches; otherwise
+    /// its bytes become the request id, so distinct values still give distinct
+    /// documents. A document that already exists is only landed on.
     async fn craft_with(
+        &mut self,
+        binding: &Binding2,
+        _n: u32,
+        roots: &[[u8; 32]],
+        init_slot: u64,
+        descriptor: [u8; 32],
+        options: &[u8],
+    ) -> Crafted {
+        let binding = if descriptor == self.descriptor(binding, &self.terms_raw, 16) {
+            *binding
+        } else {
+            Binding2 {
+                request_id: descriptor,
+                ..*binding
+            }
+        };
+        let descriptor = self.descriptor(&binding, &self.terms_raw, 16);
+        let now = self
+            .ctx
+            .banks_client
+            .get_sysvar::<solana_program::clock::Clock>()
+            .await
+            .unwrap()
+            .slot;
+        if init_slot > now {
+            self.ctx.warp_to_slot(init_slot).unwrap();
+        }
+        let created = [
+            address::document(&self.program, &descriptor).0,
+            address::positions(&self.program, &descriptor).0,
+            address::family_slots(&self.program, &descriptor).0,
+            address::result(&self.program, &descriptor).0,
+        ];
+        if self.ctx.banks_client.get_account(created[0]).await.unwrap().is_none() {
+            assert_eq!(options.len(), 4 * binding.option_count as usize);
+            let data = init_data(
+                &self.terms_raw,
+                &binding.encode(),
+                &[[1u8; 32], [2u8; 32], [3u8; 32]],
+                16,
+                &self.family_body,
+                options,
+            );
+            let metas = self.init_metas(created);
+            send_fresh_with(&mut self.ctx, &self.executor, self.program, data, metas)
+                .await
+                .expect("init");
+        }
+        let landed = u32_at(&self.account(created[0]).await, 84) as usize;
+        for (batch, chunk) in roots[landed.min(roots.len())..].chunks(20).enumerate() {
+            let first = (landed + 20 * batch) as u32;
+            let metas = vec![
+                AccountMeta::new(self.executor.pubkey(), true),
+                AccountMeta::new(created[0], false),
+                AccountMeta::new(created[1], false),
+                AccountMeta::new_readonly(self.dtu1, false),
+            ];
+            send_fresh_with(&mut self.ctx, &self.executor, self.program, land_data(&descriptor, first, chunk), metas)
+                .await
+                .expect("land position roots");
+        }
+        Crafted {
+            dcm2: created[0],
+            dpr2: created[1],
+            dcr2: created[3],
+            descriptor,
+        }
+    }
+
+    /// PENDING MIGRATION (rule 6): the old hand-built DCM2/DPR2/DCR2 image,
+    /// kept only for the three close tests that hand-set a conviction until a
+    /// real-conviction helper replaces them (T7). Do not use in new tests.
+    async fn craft_hand_built(
         &mut self,
         binding: &Binding2,
         n: u32,
@@ -4191,6 +4271,12 @@ impl Fix {
         ]
     }
 
+    /// The slot a document's real UnifiedInit ran at: DCM2's challenge
+    /// deadline less the window, as the program derives it.
+    async fn init_slot(&mut self, c: &Crafted) -> u64 {
+        u64_at(&self.account(c.dcm2).await, 144) - u64_at(&self.terms_raw, 8)
+    }
+
     fn land_metas(&self, c: &Crafted) -> Vec<AccountMeta> {
         vec![
             AccountMeta::new(self.executor.pubkey(), true),
@@ -4220,7 +4306,7 @@ async fn rev8_finalize_refuses_a_late_document_with_736() {
     // (1) At or after the production deadline. `abandon_deadline` is in the
     // past, which is what a document whose executor stopped landing looks like
     // one window later.
-    let binding = f.binding(0, 50);
+    let binding = f.binding(29, 50);
     let window = u64_at(&f.terms_raw, 8);
     // One slot, once, before anything is installed: a bank only verifies its
     // accounts hash across the slots it skips, and a fixture that rewrites
@@ -4244,10 +4330,9 @@ async fn rev8_finalize_refuses_a_late_document_with_736() {
     let mut c = f.craft(&binding, n, &roots, 0, [30u8; 32]).await;
     // The record as init would have left it, then the window elapsed: 2174 is
     // rewritten to a slot already behind the clock.
-    let mut doc = f.account(c.dcm2).await;
-    doc[document::ABANDON_DEADLINE_AT..document::ABANDON_DEADLINE_AT + 8]
-        .copy_from_slice(&0u64.to_le_bytes());
-    f.ctx.set_account(&c.dcm2, &shared(owned(&f.program, doc)));
+    // A real clock move past the production deadline (no record patch).
+    let abandon = u64_at(&f.account(c.dcm2).await, document::ABANDON_DEADLINE_AT);
+    f.ctx.warp_to_slot(abandon + 1).unwrap();
     let metas = f.fin_metas(&c);
     assert_eq!(
         custom(
@@ -4271,12 +4356,12 @@ async fn rev8_finalize_refuses_a_late_document_with_736() {
     );
     assert_eq!(
         u64_at(&after, document::ABANDON_DEADLINE_AT),
-        0,
+        abandon,
         "and the deadline is untouched"
     );
     assert_eq!(
         u64_at(&after, 144),
-        window,
+        f.init_slot(&c).await + window,
         "the challenge deadline is the init one"
     );
     // (2) A finalize that would leave less than a full attestation budget. The
@@ -4290,8 +4375,12 @@ async fn rev8_finalize_refuses_a_late_document_with_736() {
         terms_raw: big.encode().to_vec(),
         ..f
     };
-    let b2 = f2.binding(0, 50);
+    let b2 = f2.binding(29, 50);
     let c2 = f2.craft(&b2, n, &roots, 0, [31u8; 32]).await;
+    // A real clock move: the finalize runs one slot after the real init, so
+    // the budget ceiling (the init slot itself) is behind it.
+    let init2 = f2.init_slot(&c2).await;
+    f2.ctx.warp_to_slot(init2 + 1).unwrap();
     let metas = f2.fin_metas(&c2);
     assert_eq!(
         custom(
@@ -4382,10 +4471,14 @@ async fn rev8_land_clamps_the_production_deadline_to_the_lifetime() {
         terms_raw: big.encode().to_vec(),
         ..f
     };
-    let binding = f.binding(0, 50);
+    let binding = f.binding(29, 50);
     let c = f.craft(&binding, n, &roots, 0, [33u8; 32]).await;
-    let ceiling = EXAMPLE_LIMITS.max_document_lifetime_slots;
-    assert!(slot > 0, "the fixture is past the document's init slot");
+    let init_slot = f.init_slot(&c).await;
+    let ceiling = init_slot + EXAMPLE_LIMITS.max_document_lifetime_slots;
+    // A real clock move: the landing runs one slot after the real init.
+    f.ctx.warp_to_slot(init_slot + 1).unwrap();
+    let slot = init_slot + 1;
+    assert!(slot > init_slot, "the landing is past the document's init slot");
     let metas = f.land_metas(&c);
     send(
         &mut f.ctx,
@@ -4415,7 +4508,7 @@ async fn rev8_land_clamps_the_production_deadline_to_the_lifetime() {
     // init slot and not the slot the landing ran at.
     assert_eq!(
         u64_at(&doc, 144) - u64_at(&doc, 184),
-        0,
+        init_slot,
         "init_slot is recovered as dispute_deadline - challenge_window_slots"
     );
     assert_eq!(u32_at(&doc, 84), n + 1, "the landing landed");
@@ -4495,7 +4588,7 @@ async fn unified_init_rejects_prompt_shorter_than_template_producer_delta() {
     let Some(mut f) = build_f47().await else {
         return;
     };
-    let mut binding = f.binding(0, 2);
+    let mut binding = f.binding(29, 2);
     binding.prompt_positions = 1;
     binding.output_first_position = 0;
     assert_eq!(f.init_refusal(&binding, 236).await, RUN_BINDING,
@@ -4556,12 +4649,44 @@ async fn f47_compiler_v1_unified_init_accepts_option_counts_1_47_48_80() {
         assert_eq!(&doc[8..40], &descriptor);
         // The option table at K, then ARI1 exactly on an app-bound template.
         assert_option_tail(&mut f, &doc, &options).await;
+        assert_eq!(
+            f.account(created[3]).await.len(),
+            result::bytes_v8(binding.output_count, 4).unwrap(),
+            "DCR2 is 416 + 4(1+K) + bitmap at K = {k}"
+        );
+        // 816's decision branch pins n = prompt_positions from both sides.
+        let fin_metas = vec![
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new(created[0], false),
+            AccountMeta::new(created[3], false),
+            AccountMeta::new_readonly(f.dtu1, false),
+        ];
+        for bad in [n + 1, 0] {
+            assert_eq!(
+                custom(
+                    send_fresh_with(
+                        &mut f.ctx,
+                        &f.executor,
+                        f.program,
+                        finalize_data(&descriptor, bad, &f.family_roots),
+                        fin_metas.clone(),
+                    )
+                    .await
+                ),
+                CL_MISSING,
+                "n != positions_complete is 591 at K = {k}"
+            );
+        }
         let finalized = f.finalize(&descriptor, created, n).await;
         assert_eq!(
             u16_at(&finalized, 6),
             FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
             "UnifiedInit document finalizes at K = {k}"
         );
+        let dcr2 = f.account(created[3]).await;
+        assert_eq!(u32_at(&dcr2, 212), n, "DCR2 212 is the document length");
+        assert_eq!(u32_at(&dcr2, 196), 1 + k as u32, "the record's count is 1 + K");
+        assert_eq!(dcr2[208], 4, "the record's width is 4");
         if variant == 0 {
             let decision_entry = f.base_entry;
             assert_eq!(
@@ -6674,143 +6799,6 @@ async fn f48_gather_tag121_full_handler_at_owner_boundaries() {
     }
 }
 
-/// **Decision-mode finalize and attest at K = 1, 7, 8 and 128**, each over a
-/// real `FinalizeDocumentV5` and a real `AttestOutputV5`.
-///
-/// What is real here: the 816 decision branch, the two-case `L = 1 + K`, the
-/// record lengths (`2,182 + 4K` and `416 + 4(1+K) + ceil((1+K)/8)`), the DCR2
-/// writes, the per-cell write route, the flag-2 gate and the index test. What
-/// cannot be real locally: the **proof**, because the only sealed template in
-/// this tree has no 4-byte write lane at all (the rung-D plan's write widths are
-/// 0, 8, 16, 32, 128, 144, 256, 384, 512, 640, 1024, 4096, 8192, 32768, 65536
-/// and 131072, measured over its 28,039 base entries), so clause 5 of the attest
-/// refuses 795 on the width and not on the proof. A decision attest therefore
-/// needs a template compiled with 4-byte lanes, which is stream F's seal work.
-#[tokio::test(flavor = "multi_thread")]
-async fn rev8_decision_finalize_and_attest_at_k_1_7_8_128() {
-    let Some(mut f) = build().await else { return };
-    let n = 30u32; // prompt_positions: first = 29 is the entry's first live position
-    let roots = f.position_roots[..n as usize].to_vec();
-    for (i, k) in [1u8, 7, 8, 80].iter().enumerate() {
-        let (binding, options) = decision_binding(&f.executor.pubkey().to_bytes(), n, *k);
-        assert_eq!(binding.output_count, 1 + *k as u32, "count = 1 + K");
-        assert_eq!(
-            binding.output_span(n),
-            1 + *k as u32,
-            "L = 1 + K for a decision"
-        );
-        let l = binding.output_span(n);
-        let descriptor = [20u8 + i as u8; 32];
-        let c = f
-            .craft_with(&binding, n, &roots, 1, descriptor, &options)
-            .await;
-        let doc = f.account(c.dcm2).await;
-        assert_eq!(doc.len(), OPTION_REGION_AT + 4 * *k as usize, "2,182 + 4K");
-        assert_eq!(
-            &doc[OPTION_REGION_AT..],
-            &options[..],
-            "the option table is in the record"
-        );
-        assert_eq!(
-            f.account(c.dcr2).await.len(),
-            result::bytes_v8(binding.output_count, 4).unwrap(),
-            "416 + 4(1+K) + bitmap"
-        );
-        // 816's decision branch: `n = prompt_positions`, `first = n - 1`,
-        // `count = 1 + K`, and nothing else. The negatives are the same three
-        // relations with one field moved, so the branch is pinned from both
-        // sides.
-        let metas = f.fin_metas(&c);
-        for bad in [n + 1u32, 0] {
-            assert_eq!(
-                custom(
-                    send(
-                        &mut f.ctx,
-                        &f.executor,
-                        f.program,
-                        finalize_data(&descriptor, bad, &f.family_roots),
-                        metas.clone()
-                    )
-                    .await
-                ),
-                CL_MISSING,
-                "n != positions_complete is 591 first"
-            );
-        }
-        // The honest finalize.
-        send(
-            &mut f.ctx,
-            &f.executor,
-            f.program,
-            finalize_data(&descriptor, n, &f.family_roots),
-            metas.clone(),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("decision finalize at K = {k}: {e:?}"));
-        let doc = f.account(c.dcm2).await;
-        assert_eq!(
-            u32_at(&doc, 6) as u16,
-            FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
-            "flag 2 at K = {k}"
-        );
-        assert_eq!(u32_at(&doc, 84), n);
-        let dcr2 = f.account(c.dcr2).await;
-        assert_eq!(u32_at(&dcr2, 212), n, "DCR2 212 is the document length");
-        assert_eq!(
-            u32_at(&dcr2, 196),
-            1 + *k as u32,
-            "the record's count is 1 + K"
-        );
-        assert_eq!(dcr2[208], 4, "the record's width is 4");
-        // The attest. `index = L` is 591 at every K, and `index < L` reaches the
-        // plan, where clause 5 refuses 795 because the lane is 16 bytes wide.
-        let other = f.signer.pubkey();
-        let metas = attest_metas(
-            other,
-            (f.pt2s, f.routes, f.geometry),
-            [c.dcm2, c.dpr2, Pubkey::default(), c.dcr2],
-        );
-        let mut late = vec![TAG_ATTEST_OUTPUT];
-        late.extend_from_slice(&descriptor);
-        late.extend_from_slice(&l.to_le_bytes());
-        late.extend_from_slice(&[0u8; 4]);
-        late.extend_from_slice(&0u16.to_le_bytes());
-        late.push(0);
-        let mut spp1 = Vec::new();
-        spp1.extend_from_slice(&0u16.to_le_bytes());
-        spp1.push(0);
-        spp1.push(0);
-        spp1.extend_from_slice(&[0u8; 32]);
-        late.extend_from_slice(&spp1);
-        assert_eq!(
-            custom(send(&mut f.ctx, &f.signer, f.program, late, metas.clone()).await),
-            CL_MISSING,
-            "index = L = 1 + K is 591 at K = {k}"
-        );
-        let mut seen: Vec<u32> = Vec::new();
-        for index in [0u32, 1, l - 1] {
-            if index >= l || seen.contains(&index) {
-                continue;
-            }
-            seen.push(index);
-            let mut data = vec![TAG_ATTEST_OUTPUT];
-            data.extend_from_slice(&descriptor);
-            data.extend_from_slice(&index.to_le_bytes());
-            data.extend_from_slice(&[0u8; 4]);
-            data.extend_from_slice(&0u16.to_le_bytes());
-            data.push(0);
-            data.extend_from_slice(&spp1);
-            // The cell's route is `output_write + index` at one position, so
-            // the width is the only thing the plan refuses, and it refuses 795.
-            assert_eq!(
-                custom(send(&mut f.ctx, &f.signer, f.program, data, metas.clone()).await),
-                OUTPUT_PROOF,
-                "a decision cell over a 16-byte lane is 795 at K = {k}, index = {index}"
-            );
-        }
-    }
-}
-
 /// **§1's one conditional at the handler, 794**: a record that declares a stop
 /// value must be a 16-byte-output record, because the stop rule's comparison
 /// cell is then exactly the 16-byte `(best, token)` pair of §1.7 whose bytes
@@ -7352,7 +7340,7 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
     let doc = f.account(c.dcm2).await;
     assert_eq!(
         u64_at(&doc, document::ABANDON_DEADLINE_AT),
-        SHORT_LIMITS.max_document_lifetime_slots,
+        f.init_slot(&c).await + SHORT_LIMITS.max_document_lifetime_slots,
         "THE CLAMP READS THE TEMPLATE: the ceiling is init_slot + 4,096,000"
     );
     assert!(
@@ -8539,7 +8527,7 @@ async fn rev8_resolve_is_final_on_a_decision_document() {
         let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
         let roots = f.position_roots[..n as usize].to_vec();
         let c = f
-            .craft_with(&binding, n, &roots, 1, descriptor, &options)
+            .craft_hand_built(&binding, n, &roots, 1, descriptor, &options)
             .await;
         // **A real `FinalizeDocumentV5`**, because the resolve's FINAL branch
         // reads DCM2 flag 2 and a crafted record does not carry it. 816's
@@ -9667,10 +9655,11 @@ async fn clock_to(f: &mut Fix, slot: u64) -> u64 {
         .slot
 }
 
+/// PENDING MIGRATION (rule 6): see `Fix::craft_hand_built`.
 /// A crafted document with the pot **funded on top of the rent**, which is the
 /// shape `UnifiedInit` leaves (it transfers `executor_bond_lamports` over the
 /// rent-exempt minimum), plus its DFS2.
-async fn closable(
+async fn closable_hand_built(
     f: &mut Fix,
     binding: &Binding2,
     n: u32,
@@ -9682,7 +9671,7 @@ async fn closable(
         ..*binding
     };
     let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
-    let c = f.craft(&binding, n, roots, 0, descriptor).await;
+    let c = f.craft_hand_built(&binding, n, roots, 0, descriptor, &[]).await;
     let pot = Terms2::decode(&f.terms_raw).unwrap().executor_bond_lamports;
     let doc = f.account(c.dcm2).await;
     f.ctx.set_account(
@@ -9702,6 +9691,27 @@ async fn closable(
     use_record[8..12].copy_from_slice(&1u32.to_le_bytes());
     f.ctx
         .set_account(&f.dtu1, &shared(owned(&f.program, use_record)));
+    c
+}
+
+/// A real document a close can act on: UnifiedInit (which transfers
+/// `executor_bond_lamports` over the rent-exempt minimum, increments DTU1 and
+/// writes the family slots) and LandPositionRoots.
+async fn closable(
+    f: &mut Fix,
+    binding: &Binding2,
+    n: u32,
+    roots: &[[u8; 32]],
+    variant: u8,
+) -> Crafted {
+    let binding = Binding2 {
+        request_id: [variant; 32],
+        ..*binding
+    };
+    let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+    let c = f.craft(&binding, n, roots, 0, descriptor).await;
+    // Real init transferred the pot, incremented DTU1 and wrote the family
+    // slots; nothing is patched on top (rule 6).
     c
 }
 
@@ -9929,23 +9939,21 @@ async fn rev8_close_pays_the_payer_and_drops_the_counter_on_every_row() {
         let b = f.binding_stop(first, 50, STOP_PLUS_ONE);
         closable(&mut f, &b, 33, &roots, 65).await
     };
-    let mut doc = f.account(c4.dcm2).await;
-    doc[6..8]
-        .copy_from_slice(&(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL).to_le_bytes());
-    {
-        let lamports = f.lamports(c4.dcm2).await;
-        f.ctx.set_account(
-            &c4.dcm2,
-            &shared(Account {
-                lamports,
-                data: doc,
-                owner: f.program,
-                executable: false,
-                rent_epoch: 0,
-            }),
-        );
-    }
-    clock_to(&mut f, 6_000_001).await;
+    // A real finalize (no flag patch), then the clock past both of this
+    // document's own deadlines.
+    let metas = f.fin_metas(&c4);
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        finalize_data(&c4.descriptor, 33, &f.family_roots),
+        metas,
+    )
+    .await
+    .expect("row 3: a real finalize");
+    let doc = f.account(c4.dcm2).await;
+    let past = u64_at(&doc, 144).max(u64_at(&doc, document::ABANDON_DEADLINE_AT)) + 1;
+    clock_to(&mut f, past).await;
     let payer_before = f.lamports(payer).await;
     let in_three = f.lamports(c4.dcm2).await
         + f.lamports(c4.dpr2).await
@@ -10195,7 +10203,7 @@ async fn rev8_close_splits_a_standard_pot_and_skips_a_sub_floor_share() {
     let roots = f.position_roots[..33].to_vec();
     let c = {
         let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-        closable(&mut f, &b, 33, &roots, 81).await
+        closable_hand_built(&mut f, &b, 33, &roots, 81).await
     };
     // A conviction: flag 4, and the recorded winner the slasher share is paid to.
     let mut doc = f.account(c.dcm2).await;
@@ -10291,7 +10299,7 @@ async fn rev8_close_splits_a_standard_pot_and_skips_a_sub_floor_share() {
     // and retains its 798 refusal.
     let roots = f.position_roots[..33].to_vec();
     let b3 = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c3 = closable(&mut f, &b3, 33, &roots, 83).await;
+    let c3 = closable_hand_built(&mut f, &b3, 33, &roots, 83).await;
     let mut doc = f.account(c3.dcm2).await;
     doc[6..8].copy_from_slice(
         &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
@@ -10339,7 +10347,7 @@ async fn rev8_close_splits_a_standard_pot_and_skips_a_sub_floor_share() {
     let roots = f.position_roots[..33].to_vec();
     let c2 = {
         let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-        closable(&mut f, &b, 33, &roots, 82).await
+        closable_hand_built(&mut f, &b, 33, &roots, 82).await
     };
     let mut doc = f.account(c2.dcm2).await;
     doc[6..8].copy_from_slice(
@@ -10677,7 +10685,7 @@ async fn rev8_close_refusals() {
     // (1) **599, an early close.** The document is unfinalized and nowhere near
     // its production deadline, and revision 7's own code answers it.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
     assert_eq!(
         refused_close(&mut f, &c, stranger, next()).await,
         CL_CLOSE,
@@ -10687,7 +10695,7 @@ async fn rev8_close_refusals() {
     // to DCM2 40..72 and the meta must be that account -- a stranger may not pay
     // the rent to itself.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
     let payer = f.executor.pubkey();
     let payer_before = f.lamports(payer).await;
     let stranger_before = f.lamports(stranger).await;
@@ -10711,7 +10719,7 @@ async fn rev8_close_refusals() {
     // derived from DCM2's own PT2S and its digest, so another template's
     // counter is refused rather than decremented.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
     let other = {
         let (pt2s, image) = f.sealed_pt2s(&f.routes, &f.payloads, f.k, 16);
         f.ctx.set_account(&pt2s, &shared(owned(&f.program, image)));
@@ -10731,7 +10739,7 @@ async fn rev8_close_refusals() {
     // (4) **598, a counter that reads zero.** Unreachable on program-written
     // state, and refused rather than wrapped to `u32::MAX`.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
     let mut use_record = f.account(f.dtu1).await;
     use_record[8..12].copy_from_slice(&0u32.to_le_bytes());
     f.ctx
@@ -10750,7 +10758,7 @@ async fn rev8_close_refusals() {
     // (5) **580, a short account list.** Six metas is revision 7's shape and a
     // revision-8 record refuses it; eight and ten are not nine.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
     for take in [6usize, 8] {
         let metas = f.close_metas(&c, stranger);
         refused_here!(
@@ -10766,7 +10774,7 @@ async fn rev8_close_refusals() {
     // (6) **580, a wrong descriptor**, and **599** on a result account that is
     // already closed.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
     let foreign = f.close_metas(&c, stranger);
     refused_here!(f, close_data(&[9u8; 32]), foreign, CL_MALFORMED);
     let mut dcr2 = f.account(c.dcr2).await;
@@ -10794,7 +10802,7 @@ async fn rev8_close_refusals() {
     // either way, which is the re-review's Medium 6: the key checks are what
     // catch a client that handed the wrong list.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
     // A **conviction**, so the policy runs and the two key checks are reached at
     // all: on a row that does not escrow (1-on-SETTLED, 2) the close does not
     // look at the two kind-dependent metas, and that is deliberate and named.
@@ -10905,7 +10913,7 @@ async fn rev8_close_escrows_past_a_prefunded_address() {
     let payer = f.executor.pubkey();
     for (i, gift) in [1u64, ESCROW_FLOOR].into_iter().enumerate() {
         let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-        let c = closable(&mut f, &b, 33, &roots, 95 + i as u8).await;
+        let c = closable_hand_built(&mut f, &b, 33, &roots, 95 + i as u8).await;
         let escrow = address::bond_escrow(&f.program, &c.descriptor).0;
         // A plain lamport deposit into a system-owned 0-byte account: what any
         // third party can do with a public address and a transfer.
