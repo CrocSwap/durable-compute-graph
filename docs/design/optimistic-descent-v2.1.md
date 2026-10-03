@@ -972,10 +972,22 @@ of tag 227 at bc4e391:
   - **Follow-up B (done):** each executor wait gets a fixed, capped deadline
     based on other live executor waits when it starts. Puppets cannot bank
     time for future phases or revive an expired one.
-  - The shared testnet image needs a drain before an in-place upgrade: no
-    open v2.1 disputes. Old runs with a 12-byte load trailer are explicitly
-    refused by the new handler; the new trailer is 4 bytes. The earlier run
-    address change also strands older runs. Fresh addresses avoid both issues.
+  - **Upgrading in place needs a full drain** (re-review M1). Every run
+    created before this change must first be finalized or refuted, paid and
+    closed, not just have no open disputes. The new handler refuses any run
+    without the 4-byte wait trailer, with error 40 (`0x6628`), and that
+    includes runs created on DCG main before this change. The earlier
+    run-address change also strands older runs. Fresh program addresses avoid
+    both issues, and testnet already uses them.
+  - **An honest executor's slack under a burst of picks is smaller than
+    with F4.** Each wait's deadline is counted when it starts, so the k-th of
+    N simultaneous picks gets k windows, not N each (re-review probe RR-N7).
+    Answering in order still meets every deadline if each answer lands within
+    one phase window. The answer time under pick spam (R3-S5) is still
+    unmeasured, and it must be measured before the constants are fixed.
+  - Subs 5, 6, 7 and 16 now write the run (the wait count). Every pick and
+    answer therefore write-locks the run account, which adds to the R3-S5
+    contention concern.
   - The commit deadline reuses the challenge window; the design's own
     commit deadline (after the inputs are complete) is not built.
   - Consumers identify a run by its address. The run id is not unique
@@ -983,8 +995,7 @@ of tag 227 at bc4e391:
   - Follow-ups A and B change endings and get their own independent review
     (Basanos project rule 10).
 
-**Follow-ups A and B (fix round, 2026-10-03; independent review
-pending).** PlanBuilder refuses LOG kind 1 chains with a different scheme or
+**Follow-ups A and B (fix round, 2026-10-03; re-reviewed, fixes applied).** PlanBuilder refuses LOG kind 1 chains with a different scheme or
 capacity. The program cannot make this check at template admission because
 its instruction receives only the spec root and block metadata. For safety,
 all LOG STATE and STEP claims remain neutral in this image. A program-side
@@ -995,7 +1006,8 @@ executor wait; REVEAL_NODES, CACHE_ANSWER and REVEAL_LEAF leave it. The
 entering dispute's deadline is fixed then, capped at `MAX_WINDOW` per phase.
 Ruling or mooting an executor wait decrements `waiting_E`. Arithmetic is
 checked; overflow refuses the instruction. The changed run size requires
-fresh testnet runs.
+fresh testnet runs or a full drain (above). PlanBuilder also refuses a SMALL
+step whose kind-1 predecessor is LOG, which has no honest execution.
 
 **Who profits by calling first?** OPEN is funded by its challenger; opening
 while another dispute waits on E extends only the new dispute's deadline.

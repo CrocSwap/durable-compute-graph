@@ -1560,3 +1560,363 @@ async fn the_shared_test_kernel_image_does_not_dispatch_legacy_create_subtype_25
     assert!(send(&mut ch.ctx, i, &[&attacker]).await.is_err());
     assert!(ch.gone(ch.template).await, "the shared image cannot recreate it through subtype 250");
 }
+
+
+// ======== Independent re-review probes (2026-10-03), kept as regressions ========
+impl Chain {
+    async fn dl(&mut self, d: Pubkey) -> (u8, u64) {
+        let a = self.ctx.banks_client.get_account(d).await.unwrap().unwrap();
+        (a.data[4], u64::from_le_bytes(a.data[24..32].try_into().unwrap()))
+    }
+    async fn waits(&mut self) -> u32 { matrix_wait(self).await.0 }
+    async fn slot(&mut self) -> u64 { self.ctx.banks_client.get_root_slot().await.unwrap() }
+    fn timeout_ix(&self, d: Pubkey) -> Instruction {
+        ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(kp(0xA1).pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new(d, false), AccountMeta::new(kp(0xE1).pubkey(), false), AccountMeta::new(kp(0xC1).pubkey(), false)])
+    }
+    async fn timeout(&mut self, d: Pubkey) -> Result<(), TransactionError> {
+        let i = self.timeout_ix(d);
+        send(&mut self.ctx, i, &[&kp(0xA1)]).await
+    }
+    async fn nodes(&mut self, d: Pubkey, c: &Commit) -> Result<(), TransactionError> {
+        let mut nodes = Vec::new();
+        nodes.extend_from_slice(&c.step[0][0]);
+        nodes.extend_from_slice(&c.step[0][1]);
+        let i = ix(V::SUB_REVEAL_NODES, &nodes, self.party(0xE1, d));
+        send(&mut self.ctx, i, &[&kp(0xE1)]).await
+    }
+    async fn pick1(&mut self, d: Pubkey) -> Result<(), TransactionError> {
+        let i = ix(V::SUB_PICK, &[1], self.party(0xC1, d));
+        send(&mut self.ctx, i, &[&kp(0xC1)]).await
+    }
+    async fn leaf1(&mut self, d: Pubkey, c: &Commit) -> Result<(), TransactionError> {
+        let mut leaf = vec![1];
+        leaf.extend_from_slice(c.leaves[1].as_ref().unwrap());
+        let i = ix(V::SUB_REVEAL_LEAF, &leaf, self.party(0xE1, d));
+        send(&mut self.ctx, i, &[&kp(0xE1)]).await
+    }
+    async fn try_open(&mut self, nonce: u8) -> Result<Pubkey, TransactionError> {
+        let c = kp(0xC1);
+        let d = self.dispute(nonce);
+        let mut data = vec![nonce; 32];
+        data.push(V::KIND_STEP_DESCEND);
+        send(&mut self.ctx, ix(V::SUB_OPEN, &data, vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new(d, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&c]).await.map(|_| d)
+    }
+}
+
+/// RR-P1 (old P1 adapted): an expired E phase is not revived by a later OPEN.
+#[tokio::test(flavor = "multi_thread")]
+async fn rr_p1_no_revival() {
+    let mut ch = Chain::new(5_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let s = ch.slot().await;
+    let dx = ch.open(90, V::KIND_STEP_DESCEND).await;
+    let (_, dl0) = ch.dl(dx).await;
+    ch.ctx.warp_to_slot(s + 800).unwrap();
+    let _dp = ch.open(91, V::KIND_STEP_DESCEND).await;
+    assert_eq!(ch.dl(dx).await.1, dl0, "stored deadline moved");
+    assert!(ch.nodes(dx, &c).await.is_err(), "E answered an expired phase");
+    ch.timeout(dx).await.unwrap();
+    assert_eq!(ch.ruling(dx).await, V::RULING_CHALLENGER);
+    println!("RR-P1 ok: dl0={dl0} s={s}");
+}
+
+/// RR-P2 (old P2 adapted): toggled puppets bank nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn rr_p2_no_banking() {
+    let mut ch = Chain::new(5_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let a = ch.open(70, V::KIND_STEP_DESCEND).await;
+    let b = ch.open(71, V::KIND_STEP_DESCEND).await;
+    for d in [a, b] { ch.nodes(d, &c).await.unwrap(); }
+    for d in [a, b] { ch.pick1(d).await.unwrap(); }
+    for d in [a, b] { ch.leaf1(d, &c).await.unwrap(); }
+    assert_eq!(ch.waits().await, 0);
+    let t0 = ch.slot().await;
+    let h = ch.open(72, V::KIND_STEP_DESCEND).await;
+    let (_, dl) = ch.dl(h).await;
+    println!("RR-P2 t0={t0} honest deadline={dl}");
+    assert!(dl <= t0 + 750 + 2);
+    ch.ctx.warp_to_slot(dl).unwrap();
+    assert!(ch.timeout(h).await.is_err(), "timeout at deadline");
+    ch.ctx.warp_to_slot(dl + 1).unwrap();
+    ch.timeout(h).await.unwrap();
+}
+
+/// RR-N1: puppet opened just before the honest dispute's E phase begins
+/// (the honest C's PICK). The extension is fixed at the pick; nothing later
+/// (puppet answer, puppet pick, puppet leaf, new opens, cache answer, timeouts,
+/// rulings) moves the honest stored deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn rr_n1_puppet_before_phase_start_then_invariance() {
+    for puppet_first in [true, false] {
+        let mut ch = Chain::new(20_000).await;
+        let c = ch.honest();
+        ch.commit(&c).await;
+        let h = ch.open(100, V::KIND_STEP_DESCEND).await;
+        ch.nodes(h, &c).await.unwrap(); // honest is in PICK
+        let p = if puppet_first { Some(ch.open(101, V::KIND_STEP_DESCEND).await) } else { None };
+        let s = ch.slot().await;
+        ch.pick1(h).await.unwrap(); // honest E phase (LEAF) begins
+        let (ph, dl) = ch.dl(h).await;
+        println!("RR-N1 puppet_first={puppet_first} slot={s} honest LEAF deadline={dl} (+{})", dl - s);
+        assert_eq!(ph, 3);
+        if puppet_first { assert!(dl - s >= 1_500 && dl - s <= 1_510); } else { assert!(dl - s <= 760); }
+        // Now perturb the run in every way and re-check the stored deadline.
+        let p = match p { Some(p) => p, None => ch.open(101, V::KIND_STEP_DESCEND).await };
+        assert_eq!(ch.dl(h).await.1, dl);
+        // cache path: answer p from a cache made by a second dispute q
+        let q = ch.open(102, V::KIND_STEP_DESCEND).await;
+        let cache = matrix_cache(&ch);
+        let mut nodes = Vec::new();
+        nodes.extend_from_slice(&c.step[0][0]);
+        nodes.extend_from_slice(&c.step[0][1]);
+        let mut acc = ch.party(0xE1, q);
+        acc[0] = AccountMeta::new(kp(0xE1).pubkey(), true);
+        acc.push(AccountMeta::new(cache, false));
+        acc.push(AccountMeta::new_readonly(SYSTEM, false));
+        send(&mut ch.ctx, ix(V::SUB_REVEAL_NODES, &nodes, acc), &[&kp(0xE1)]).await.unwrap();
+        assert_eq!(ch.dl(h).await.1, dl);
+        let w0 = ch.waits().await;
+        let cl = kp(0xC1);
+        let ans = |d: Pubkey, run: Pubkey, t: Pubkey| ix(V::SUB_CACHE_ANSWER, &[], vec![AccountMeta::new_readonly(cl.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(t, false), AccountMeta::new(d, false), AccountMeta::new_readonly(cache, false)]);
+        send(&mut ch.ctx, ans(p, ch.run, ch.template), &[&cl]).await.unwrap();
+        let w1 = ch.waits().await;
+        assert_eq!(w1 + 1, w0, "cache answer ends exactly one wait");
+        // Twice: second cache answer and an E reveal on p both refused, count unchanged.
+        assert!(send(&mut ch.ctx, ans(p, ch.run, ch.template), &[&cl]).await.is_err());
+        assert!(ch.nodes(p, &c).await.is_err());
+        // cache answer on q (already answered by E) refused
+        assert!(send(&mut ch.ctx, ans(q, ch.run, ch.template), &[&cl]).await.is_err());
+        // Two cache answers in ONE transaction for the same dispute.
+        let r = ch.open(103, V::KIND_STEP_DESCEND).await;
+        let w2 = ch.waits().await;
+        {
+            let blockhash = ch.ctx.get_new_latest_blockhash().await.unwrap();
+            let i1 = ans(r, ch.run, ch.template);
+            let tx = Transaction::new(&[&ch.ctx.payer, &cl], solana_message::Message::new(&[i1.clone(), i1], Some(&ch.ctx.payer.pubkey())), blockhash);
+            let res = ch.ctx.banks_client.process_transaction_with_metadata(tx).await.unwrap().result;
+            assert!(res.is_err(), "double cache answer in one tx");
+        }
+        assert_eq!(ch.waits().await, w2);
+        assert_eq!(ch.waits().await, w1 + 1);
+        ch.pick1(p).await.unwrap();
+        ch.leaf1(p, &c).await.unwrap();
+        assert_eq!(ch.dl(h).await.1, dl);
+        // The honest E answers inside its fixed window; a timeout before the deadline fails.
+        assert!(ch.timeout(h).await.is_err());
+        ch.leaf1(h, &c).await.unwrap();
+        println!("RR-N1 puppet_first={puppet_first} waits at end={}", ch.waits().await);
+    }
+}
+
+/// RR-N2: many puppets at once. Deadlines are (k+1)*w for the k-th, the
+/// count returns to zero when they are all answered, and a fresh honest open
+/// gets one window.
+#[tokio::test(flavor = "multi_thread")]
+async fn rr_n2_many_puppets() {
+    let mut ch = Chain::new(200_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let mut ps = Vec::new();
+    for k in 0..24u8 {
+        let s = ch.slot().await;
+        let p = ch.open(110 + k, V::KIND_STEP_DESCEND).await;
+        let (_, dl) = ch.dl(p).await;
+        assert!(dl - s >= 750 * (k as u64 + 1) && dl - s <= 750 * (k as u64 + 1) + 10, "k={k} dl-s={}", dl - s);
+        ps.push(p);
+    }
+    assert_eq!(ch.waits().await, 24);
+    let s = ch.slot().await;
+    let h = ch.open(150, V::KIND_STEP_DESCEND).await;
+    let (_, hdl) = ch.dl(h).await;
+    println!("RR-N2 honest after 24 puppets: +{}", hdl - s);
+    // E answers every puppet; the honest deadline does not shrink or grow.
+    for p in &ps { ch.nodes(*p, &c).await.unwrap(); }
+    assert_eq!(ch.dl(h).await.1, hdl);
+    assert_eq!(ch.waits().await, 1);
+    // Puppets cycle back into E waits in one burst; honest unchanged.
+    for p in &ps { ch.pick1(*p).await.unwrap(); }
+    assert_eq!(ch.waits().await, 25);
+    assert_eq!(ch.dl(h).await.1, hdl);
+    for p in &ps { ch.leaf1(*p, &c).await.unwrap(); }
+    ch.nodes(h, &c).await.unwrap();
+    assert_eq!(ch.waits().await, 0);
+    let s = ch.slot().await;
+    let f = ch.open(151, V::KIND_STEP_DESCEND).await;
+    let (_, fdl) = ch.dl(f).await;
+    assert!(fdl - s <= 760, "fresh got {}", fdl - s);
+    // Puppets in CLAIM (C owes) time out for E and do not touch the counter.
+    let mut mx = 0;
+    for p in &ps { let (ph, dl) = ch.dl(*p).await; assert_eq!(ph, 4); mx = mx.max(dl); }
+    ch.ctx.warp_to_slot(mx + 1).unwrap();
+    for p in &ps { ch.timeout(*p).await.unwrap(); assert_eq!(ch.ruling(*p).await, V::RULING_EXECUTOR); }
+    assert_eq!(ch.waits().await, 1);
+}
+
+/// RR-N3: the counter balances over every exit: E timeout in NODES, F1-moot
+/// timeout in LEAF, moot in NODES and LEAF, moot in PICK, claim ruling.
+#[tokio::test(flavor = "multi_thread")]
+async fn rr_n3_counter_balances_over_exits() {
+    let mut ch = Chain::new(50_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let s = ch.slot().await;
+    let a = ch.open(160, V::KIND_STEP_DESCEND).await; // will time out in NODES
+    let b = ch.open(161, V::KIND_STEP_DESCEND).await; // moot in NODES
+    let d = ch.open(162, V::KIND_STEP_DESCEND).await; // moot in PICK
+    let e = ch.open(163, V::KIND_STEP_DESCEND).await; // F1 timeout in LEAF
+    ch.nodes(d, &c).await.unwrap();
+    ch.nodes(e, &c).await.unwrap();
+    ch.pick1(e).await.unwrap();
+    assert_eq!(ch.waits().await, 3);
+    let (_, adl) = ch.dl(a).await;
+    // Answer b just enough to keep it alive? No: b waits; warp past a only.
+    ch.ctx.warp_to_slot(adl + 1).unwrap();
+    ch.timeout(a).await.unwrap();
+    assert_eq!(ch.run_status().await, V::RUN_REFUTED);
+    assert_eq!(ch.waits().await, 2);
+    let caller = kp(0xA1);
+    let moot = |dd: Pubkey, run: Pubkey, tmpl: Pubkey| ix(V::SUB_MOOT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(tmpl, false), AccountMeta::new(dd, false), AccountMeta::new(kp(0xC1).pubkey(), false)]);
+    send(&mut ch.ctx, moot(b, ch.run, ch.template), &[&caller]).await.unwrap();
+    assert_eq!(ch.waits().await, 1);
+    send(&mut ch.ctx, moot(d, ch.run, ch.template), &[&caller]).await.unwrap();
+    assert_eq!(ch.waits().await, 1);
+    let (_, edl) = ch.dl(e).await;
+    ch.ctx.warp_to_slot(edl.max(s) + 1).unwrap();
+    ch.timeout(e).await.unwrap();
+    assert_eq!(ch.ruling(e).await, V::RULING_MOOT);
+    assert_eq!(ch.waits().await, 0);
+}
+
+/// RR-N4: post-ruling staging on both buffers, created before the ruling.
+#[tokio::test(flavor = "multi_thread")]
+async fn rr_n4_post_ruling_staging_refused_and_close_works() {
+    for executor_truthful in [true, false] {
+        let mut ch = Chain::new(5_000).await;
+        let h = ch.honest();
+        let c = if executor_truthful { h } else {
+            let mut leaf = h.leaves[1].clone().unwrap();
+            let n = leaf.len();
+            leaf[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
+            commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(leaf)], h.outs)
+        };
+        ch.commit(&c).await;
+        let d = ch.open(170, V::KIND_STEP_DESCEND).await;
+        // E creates its OWN buffer (role E, signed by E) before the ruling; C creates C's.
+        let e = kp(0xE1);
+        let be = ch.buffer(d, V::ROLE_EXECUTOR);
+        let bc = ch.buffer(d, V::ROLE_CHALLENGER);
+        let mut data = vec![V::ROLE_EXECUTOR];
+        data.extend_from_slice(&0u32.to_le_bytes());
+        send(&mut ch.ctx, ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(be, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&e]).await.unwrap();
+        ch.stage(d, V::ROLE_CHALLENGER, 100, &[1, 2, 3], 3).await;
+        ch.step(d, &c, 1).await;
+        let mut body = vec![if executor_truthful { V::CLAIM_EDGE } else { V::CLAIM_STEP }, 0];
+        body.extend(ch.spec_opening(STEP_BASE as usize + 1));
+        if executor_truthful { body.extend(ch.step_opening(&c, 0)); } else {
+            body.push(1); body.extend_from_slice(&4u32.to_le_bytes()); body.extend_from_slice(&42i32.to_le_bytes());
+        }
+        ch.claim(d, body).await.unwrap();
+        let want = if executor_truthful { V::RULING_EXECUTOR } else { V::RULING_CHALLENGER };
+        assert_eq!(ch.ruling(d).await, want);
+        let bal_e = ch.ctx.banks_client.get_balance(be).await.unwrap();
+        let bal_c = ch.ctx.banks_client.get_balance(bc).await.unwrap();
+        let len_c = ch.ctx.banks_client.get_account(bc).await.unwrap().unwrap().data.len();
+        let cl = kp(0xC1);
+        let x = kp(0xB1);
+        let mut results = Vec::new();
+        for (buf, writer) in [(be, &e), (bc, &cl)] {
+            let w = ix(V::SUB_STAGE_WRITE, &[0, 0, 0, 0, 0xAA], vec![AccountMeta::new_readonly(writer.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false)]);
+            results.push(("write", send(&mut ch.ctx, w, &[writer]).await));
+            for funder in [writer, &x] {
+                let g = ix(V::SUB_STAGE_GROW, &1024u32.to_le_bytes(), vec![AccountMeta::new(funder.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+                results.push(("grow", send(&mut ch.ctx, g, &[funder]).await));
+            }
+        }
+        for (role, signer) in [(V::ROLE_EXECUTOR, &e), (V::ROLE_CHALLENGER, &cl)] {
+            let mut data = vec![role];
+            data.extend_from_slice(&10u32.to_le_bytes());
+            let buf = ch.buffer(d, role);
+            let i = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(signer.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+            results.push(("create", send(&mut ch.ctx, i, &[signer]).await));
+        }
+        println!("RR-N4 truthful={executor_truthful} {:?}", results.iter().map(|(n, r)| (n, r.is_ok())).collect::<Vec<_>>());
+        assert!(results.iter().all(|(_, r)| r.is_err()));
+        assert_eq!(ch.ctx.banks_client.get_balance(be).await.unwrap(), bal_e);
+        assert_eq!(ch.ctx.banks_client.get_balance(bc).await.unwrap(), bal_c);
+        assert_eq!(ch.ctx.banks_client.get_account(bc).await.unwrap().unwrap().data.len(), len_c);
+        ch.advance(d).await.unwrap();
+        if !executor_truthful {
+            let caller = kp(0xA1);
+            let pay = ix(V::SUB_PAY_POT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(kp(0xC1).pubkey(), false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+            send(&mut ch.ctx, pay, &[&caller]).await.unwrap();
+        }
+        let e0 = ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap();
+        ch.close_dispute(d).await.unwrap();
+        assert_eq!(ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap(), e0 + bal_e, "E's own buffer rent back to E");
+        assert!(ch.gone(be).await && ch.gone(bc).await && ch.gone(d).await);
+    }
+}
+
+/// RR-N5: E-buffer freeze still holds in CLAIM, while C's buffer stays writable.
+#[tokio::test(flavor = "multi_thread")]
+async fn rr_n5_claim_phase_buffer_rules() {
+    let mut ch = Chain::new(5_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let d = ch.open(175, V::KIND_STEP_DESCEND).await;
+    ch.stage(d, V::ROLE_EXECUTOR, 100, &[1], 1).await;
+    ch.stage(d, V::ROLE_CHALLENGER, 100, &[1], 1).await;
+    ch.step(d, &c, 1).await; // CLAIM
+    let e = kp(0xE1); let cl = kp(0xC1);
+    let we = ix(V::SUB_STAGE_WRITE, &[0, 0, 0, 0, 9], vec![AccountMeta::new_readonly(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(ch.buffer(d, V::ROLE_EXECUTOR), false)]);
+    assert!(send(&mut ch.ctx, we, &[&e]).await.is_err());
+    let wc = ix(V::SUB_STAGE_WRITE, &[0, 0, 0, 0, 9], vec![AccountMeta::new_readonly(cl.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(ch.buffer(d, V::ROLE_CHALLENGER), false)]);
+    send(&mut ch.ctx, wc, &[&cl]).await.unwrap();
+}
+
+/// RR-N6: a run in main's layout (no load trailer) after an in-place upgrade:
+/// can its executor still finalize, and can its payer still close it?
+#[tokio::test(flavor = "multi_thread")]
+async fn rr_n6_main_layout_run_after_upgrade() {
+    let mut ch = Chain::new(1_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let mut acct = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
+    let n = acct.data.len();
+    acct.data.truncate(n - 4); // main's size: R_REFS + 52 n
+    ch.ctx.set_account(&ch.run, &acct.into());
+    ch.ctx.warp_to_slot(5_000).unwrap();
+    let caller = kp(0xA1);
+    let fin = ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(kp(0xE1).pubkey(), false)]);
+    // A run created before the wait trailer is refused with a named error
+    // (40): the upgrade rule is a full drain first (re-review M1).
+    let named = TransactionError::InstructionError(0, solana_instruction::error::InstructionError::Custom(0x6600 + 40));
+    assert_eq!(send(&mut ch.ctx, fin, &[&caller]).await, Err(named));
+    assert!(ch.try_open(180).await.is_err());
+}
+
+/// RR-N7: honest E under C-side Sybil burst: 12 disputes in PICK all picked
+/// in one burst; E answers FIFO, one per slot-window, and must make every
+/// deadline. Prints the deadlines vs the main formula (open*w).
+#[tokio::test(flavor = "multi_thread")]
+async fn rr_n7_burst_fifo_feasible() {
+    let mut ch = Chain::new(200_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let mut ds = Vec::new();
+    for k in 0..12u8 { ds.push(ch.open(190 + k, V::KIND_STEP_DESCEND).await); }
+    for d in &ds { ch.nodes(*d, &c).await.unwrap(); }
+    let s = ch.slot().await;
+    for d in &ds { ch.pick1(*d).await.unwrap(); }
+    let mut dls = Vec::new();
+    for d in &ds { dls.push(ch.dl(*d).await.1 - s); }
+    println!("RR-N7 deadlines after burst (slots from burst start): {:?}; main would give {} each", dls, 750 * 12);
+    // E answers FIFO, each answer landing one full window after the previous.
+    for (k, d) in ds.iter().enumerate() {
+        ch.ctx.warp_to_slot(s + 750 * (k as u64 + 1) - 2).unwrap();
+        ch.leaf1(*d, &c).await.unwrap();
+    }
+}

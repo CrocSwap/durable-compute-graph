@@ -161,6 +161,23 @@ def test_log_kind1_predecessor_must_keep_scheme_and_capacity():
                 b.build()
 
 
+def test_log_to_small_chain_is_refused():
+    # Re-review of the fix round: a SMALL step whose kind-1 predecessor is LOG has
+    # no honest execution (the reference kernel refuses it), so the plan refuses it.
+    for small_bytes in (8, 16, 32):
+        b = P.PlanBuilder()
+        b.chunked_input(0, 128, 6)
+        s0 = P.Step("logsum_i32l", (P.Input(S.producer(5, 0, 2, 0, 0), 64),),
+                    ((0, 8, False), (1, 4, True)), log=(4, 4))
+        s1 = P.Step("sum_i32", (P.Input(S.producer(5, 0, 2, 0, 1), 64),),
+                    ((0, 8, False), (1, 4, True)), state_predecessor=S.producer(1, 0),
+                    state_bytes=small_bytes, state_export=0)
+        b.enumerated([s0, s1])
+        b.output(S.producer(1, 1, 0), 8)
+        with pytest.raises(S.SpecError, match="same scheme and capacity"):
+            b.build()
+
+
 def test_log_kind2_state_claim_stays_neutral():
     step = {"state_scheme": 2, "state_predecessor": S.producer(2, 0)}
     assert G.log_claim_neutral(step, "STATE")

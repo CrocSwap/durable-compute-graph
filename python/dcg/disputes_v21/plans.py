@@ -254,13 +254,16 @@ class PlanBuilder:
         for k in range(sp.total_steps):
             bi, b, i, _e = sp.locate(k)
             d = S.decode_step_spec(sp.step_spec(k))
-            if d["state_scheme"] == 2 and S.decode_producer(d["state_predecessor"])[0] == 1:
+            if S.decode_producer(d["state_predecessor"])[0] == 1:
                 predecessor = S.decode_producer(d["state_predecessor"])[1]
-                if predecessor >= k:
-                    raise S.SpecError("LOG predecessor must be earlier")
-                prior = S.decode_step_spec(sp.step_spec(predecessor))
-                if prior["state_scheme"] != 2 or prior["state_size"] != d["state_size"]:
-                    raise S.SpecError("LOG predecessor must use the same scheme and capacity")
+                prior = S.decode_step_spec(sp.step_spec(predecessor)) if predecessor < k else None
+                if d["state_scheme"] == 2 or (prior is not None and prior["state_scheme"] == 2):
+                    # A LOG link in either direction keeps one scheme and capacity
+                    # (re-review A1; LOG -> SMALL has no honest execution either).
+                    if prior is None:
+                        raise S.SpecError("LOG predecessor must be earlier")
+                    if prior["state_scheme"] != d["state_scheme"] or prior["state_size"] != d["state_size"]:
+                        raise S.SpecError("LOG predecessor must use the same scheme and capacity")
             list_element_counts = []
             for header, prod, _init in d["inputs"]:
                 kind, a, pb, _c, dd = S.decode_producer(prod)

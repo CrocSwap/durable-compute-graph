@@ -433,8 +433,12 @@ fn run_checked(program_id: &Pubkey, run: &AccountInfo, template: &AccountInfo) -
         return Err(err(5));
     }
     let refs_end = R_REFS.checked_add((u32_at(&d, R_NEXT)? as usize).checked_mul(52).ok_or(err(8))?).ok_or(err(8))?;
-    if d.len() == refs_end.checked_add(12).ok_or(err(8))? {
-        solana_program::msg!("legacy v2.1 run size {} (12-byte load trailer); drain before upgrade", d.len());
+    if d.len() == refs_end {
+        // A run created before the 4-byte executor-wait trailer (DCG main
+        // before the follow-up B fix) cannot be served by this image. Upgrade
+        // in place only after every run is finalized or refuted, paid and
+        // closed (design §8.3, re-review M1).
+        solana_program::msg!("v2.1 run size {} predates the wait trailer; drain all runs before an in-place upgrade", d.len());
         return Err(err(40));
     }
     if d.len() != refs_end.checked_add(R_LOAD_BYTES).ok_or(err(8))? { return Err(err(8)); }
@@ -838,7 +842,7 @@ fn tree_of(kind: u8) -> D::Tree {
     if kind == KIND_STEP_DESCEND { D::Tree::Step } else { D::Tree::Out }
 }
 
-// 5: [executor(s), run, template, dispute(w)] the pickable hashes, in position order.
+// 5: [executor(s), run(w), template, dispute(w)] the pickable hashes, in position order.
 fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
@@ -896,7 +900,7 @@ fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     next_phase(&mut d, PH_PICK, c.t.phase_window)
 }
 
-// 16: [anyone, run, template, dispute(w), cache] answer AWAIT_NODES from a
+// 16: [anyone, run(w), template, dispute(w), cache] answer AWAIT_NODES from a
 // cached, verified reveal of the same node.
 fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [_caller, run, tmpl, dispute, cache, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
@@ -924,7 +928,7 @@ fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     next_phase(&mut d, PH_PICK, c.t.phase_window)
 }
 
-// 6: [challenger(s), run, template, dispute(w)] index:u8
+// 6: [challenger(s), run(w), template, dispute(w)] index:u8
 fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [challenger, run, tmpl, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
@@ -1147,7 +1151,7 @@ fn staged_leaf_lists(
     validate_leaf_lists(present, body, lists, framed)
 }
 
-// 7: [executor(s), run, template, dispute(w)] present:u8 preimage
+// 7: [executor(s), run(w), template, dispute(w)] present:u8 preimage
 fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
@@ -1355,8 +1359,9 @@ fn claim(
             return Err(err(17));
         }
         let gated = block.kind == 2 && it >= 1;
-        // LOG predecessor checks for kinds 1 and 2 need no LOG opening.
-        // LOG STEP and initial-state checks still need unavailable openings.
+        // Every LOG STATE and STEP claim is neutral (moot) until LOG is judged
+        // on chain: the program sees only the spec root, so it cannot refuse a
+        // LOG chain that changes scheme or capacity (re-review A1).
         if !present {
             // Empty is a violation unless the step is gated; then GATE decides.
             if !gated {
