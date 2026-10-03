@@ -19,6 +19,7 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use solana_transaction_error::TransactionError;
+use std::path::PathBuf;
 
 const PROGRAM: Pubkey = Pubkey::new_from_array([0xD5; 32]);
 const SYSTEM: Pubkey = system_program::ID;
@@ -71,7 +72,7 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
     let name = s["name"].as_str().unwrap();
     let tdata = hex(s["template_data"].as_str().unwrap());
     let template_id = sha256(&[V::TEMPLATE_DOMAIN, &tdata]);
-    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
+    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, admitter.pubkey().as_ref()], &PROGRAM).0;
     if ctx.banks_client.get_account(template).await.unwrap().is_none() {
         tx.send(ctx, ix(V::SUB_CREATE_TEMPLATE, &tdata, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter])
             .await
@@ -86,7 +87,7 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
     init.extend_from_slice(&flat);
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &nonce, &(refs.len() as u32).to_le_bytes(), &flat, e.pubkey().as_ref()]);
     let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
-    tx.send(ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter])
+    tx.send(ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter])
         .await
         .unwrap_or_else(|err| panic!("{name}: init: {err:?}"));
     let root = hex(s["root_bytes"].as_str().unwrap());
@@ -176,9 +177,20 @@ async fn chunked_kernels_rule_as_the_python_oracle() {
     // CHUNKED_SCENARIOS names another recorded set (for example Basanos
     // captures); by default, the checked-in goldens.
     let golden = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/dcg/disputes_v21/chunked_scenarios.json");
-    let path = std::env::var("CHUNKED_SCENARIOS").unwrap_or_else(|_| golden.to_string());
-    let scenarios: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert!(path != golden || scenarios.len() >= 400);
+    let path = std::env::var_os("CHUNKED_SCENARIOS").map_or_else(
+        || PathBuf::from(golden),
+        |raw| {
+            let path = PathBuf::from(raw);
+            if path.is_absolute() || path.exists() {
+                path
+            } else {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(path)
+            }
+        },
+    );
+    let scenarios: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(path != PathBuf::from(golden) || scenarios.len() >= 400);
     // V21_SBF=1 (with BPF_OUT_DIR naming a graph-v21 image) runs the SBF
     // program, which also checks stack frames and compute; otherwise native.
     let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");

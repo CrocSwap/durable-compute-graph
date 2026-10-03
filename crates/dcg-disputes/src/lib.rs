@@ -29,6 +29,7 @@ pub enum Tree {
     Chunk,
     Log,
     Spec,
+    List,
 }
 
 impl Tree {
@@ -39,6 +40,7 @@ impl Tree {
             Tree::Chunk => b"dcg.chunk.node.v2.1\x00",
             Tree::Log => b"dcg.log.node.v2.1\x00",
             Tree::Spec => b"dcg.spec.node.v2.1\x00",
+            Tree::List => b"dcg.list.node.v2.1\x00",
         }
     }
     pub fn empty_label(self) -> &'static [u8] {
@@ -48,6 +50,7 @@ impl Tree {
             Tree::Chunk => b"dcg.chunk.empty.v2.1\x00",
             Tree::Log => b"dcg.log.empty.v2.1\x00",
             Tree::Spec => b"dcg.spec.empty.v2.1\x00",
+            Tree::List => b"dcg.list.empty.v2.1\x00",
         }
     }
 }
@@ -57,9 +60,19 @@ pub const VALUE_DOMAIN: &[u8] = b"dcg.value.v2\x00";
 pub const OUT_LEAF_DOMAIN: &[u8] = b"dcg.out.leaf.v2.1\x00";
 pub const RUN_ROOT_DOMAIN: &[u8] = b"dcg.run.root.v2.1\x00";
 pub const SPEC_LEAF_DOMAIN: &[u8] = b"dcg.spec.leaf.v2.1\x00";
+pub const LIST_LEAF_DOMAIN: &[u8] = b"dcg.list.leaf.v2.1\x00";
+pub const LIST_DIGEST_DOMAIN: &[u8] = b"dcg.list.v2.1\x00";
 pub const RUN_ROOT_BYTES: usize = 176;
 pub const VALUE_REF_BYTES: usize = 55;
 pub const PORT_HEADER_BYTES: usize = 23;
+pub const MAX_LIST_ELEMENTS: usize = 128;
+/// Explicit total list-input cap per step: 8 inputs × 128 elements. The
+/// reviewer measured the 8×128 SHA-kernel STEP replay at 729,674 CU, below
+/// the 1.4M transaction budget; keep this bound if either inner limit grows.
+pub const MAX_LIST_ELEMENTS_PER_STEP: usize = 1_024;
+pub const PRODUCER_LIST: u8 = 8;
+pub const LAYOUT_LIST: u32 = 6;
+pub const TYPE_LIST: u8 = 10;
 pub const MAX_DEPTH: u32 = 5;
 
 pub fn node<H: Sha256>(h: &H, tree: Tree, level: u16, left: &Hash, right: &Hash) -> Hash {
@@ -169,6 +182,64 @@ pub fn out_leaf<H: Sha256>(h: &H, index: u64, entry: Option<&[u8]>) -> Hash {
 
 pub fn spec_leaf<H: Sha256>(h: &H, type_code: u8, record: &[u8]) -> Hash {
     h.hash(&[SPEC_LEAF_DOMAIN, &[type_code], record])
+}
+
+/// One DLS1 list element: `H("dcg.list.leaf.v2.1\\0" || index:u32 || ref55)`.
+pub fn list_leaf<H: Sha256>(h: &H, index: u32, element_ref: &[u8]) -> Option<Hash> {
+    (element_ref.len() == VALUE_REF_BYTES)
+        .then(|| h.hash(&[LIST_LEAF_DOMAIN, &index.to_le_bytes(), element_ref]))
+}
+
+/// Digest of a packed sequence of 55-byte refs. The list tree uses its own
+/// empty leaf and ordinary v2.1 odd-tree padding; count is committed outside
+/// the root, exactly as in the Python reference.
+pub fn list_digest<H: Sha256>(h: &H, refs: &[u8]) -> Option<Hash> {
+    if refs.is_empty() || refs.len() % VALUE_REF_BYTES != 0 {
+        return None;
+    }
+    let count = refs.len() / VALUE_REF_BYTES;
+    list_digest_iter(h, count, refs.chunks_exact(VALUE_REF_BYTES))
+}
+
+/// Digest an already parsed list of fixed-width refs without packing them into
+/// a second buffer. This keeps wide STEP claims inside the SVM heap limit.
+pub fn list_digest_elements<H: Sha256>(h: &H, refs: &[[u8; VALUE_REF_BYTES]]) -> Option<Hash> {
+    list_digest_iter(h, refs.len(), refs.iter().map(|r| r.as_slice()))
+}
+
+fn list_digest_iter<'a, H: Sha256>(
+    h: &H,
+    count: usize,
+    mut refs: impl Iterator<Item = &'a [u8]>,
+) -> Option<Hash> {
+    if count == 0 {
+        return None;
+    }
+    if count > MAX_LIST_ELEMENTS {
+        return None;
+    }
+    let height = usize::BITS - (count - 1).leading_zeros();
+    let capacity = 1usize << height;
+    // Fold as a binary carry so SBF uses 256 bytes of stack instead of a
+    // 128-hash (4 KiB) row.
+    let mut stack = [[0u8; 32]; 8];
+    let empty_leaf = empty(h, Tree::List, 0);
+    for position in 0..capacity {
+        let mut current = if position < count {
+            list_leaf(h, position as u32, refs.next()?)?
+        } else {
+            empty_leaf
+        };
+        let mut p = position;
+        let mut level = 0usize;
+        while p & 1 == 1 {
+            current = node(h, Tree::List, level as u16, &stack[level], &current);
+            p >>= 1;
+            level += 1;
+        }
+        stack[level] = current;
+    }
+    Some(h.hash(&[LIST_DIGEST_DOMAIN, &(count as u32).to_le_bytes(), &stack[height as usize]]))
 }
 
 pub fn run_root<H: Sha256>(h: &H, root_bytes: &[u8; RUN_ROOT_BYTES]) -> Hash {
@@ -360,6 +431,35 @@ impl<'a> StepSpec<'a> {
     pub fn output_header(&self, i: usize) -> &'a [u8] {
         let at = Self::HEAD + self.input_count() * Self::INPUT + i * Self::OUTPUT;
         &self.0[at..at + PORT_HEADER_BYTES]
+    }
+}
+
+/// Strict view of a DLS1 record. Elements are `header(23), producer(24), pad(1)`.
+pub struct ListSpec<'a>(pub &'a [u8]);
+
+impl<'a> ListSpec<'a> {
+    pub fn valid(&self) -> bool {
+        let r = self.0;
+        if r.len() < 12 || &r[..4] != b"DLS1" {
+            return false;
+        }
+        let count = u32_at(r, 8).unwrap_or(0) as usize;
+        (1..=MAX_LIST_ELEMENTS).contains(&count) && r.len() == 12 + 48 * count
+    }
+    pub fn id(&self) -> u32 {
+        u32_at(self.0, 4).unwrap()
+    }
+    pub fn count(&self) -> usize {
+        u32_at(self.0, 8).unwrap() as usize
+    }
+    pub fn element_header(&self, index: usize) -> &'a [u8] {
+        let at = 12 + 48 * index;
+        &self.0[at..at + PORT_HEADER_BYTES]
+    }
+    /// (kind, a, b, c, d)
+    pub fn element_producer(&self, index: usize) -> (u8, u64, u32, u32, u32) {
+        let at = 12 + 48 * index + PORT_HEADER_BYTES;
+        producer(&self.0[at..at + 24])
     }
 }
 

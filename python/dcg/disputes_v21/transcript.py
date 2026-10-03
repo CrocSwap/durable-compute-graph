@@ -60,8 +60,9 @@ def record(record: G.RunRecord, committed: R.Commitment, honest: R.Commitment, d
         dispute.pick(pick)
         rounds.append({"reveal": reveal.hex(), "pick": pick})
     leaf = executor.leaf(dispute)
-    dispute.reveal_leaf(leaf)
+    lists = executor.lists(dispute)
+    dispute.reveal_leaf(leaf, lists)
     body = W.claim_body(sp, kind, dispute.position, name, kw)
     ruling = dispute.claim(name, **kw)
-    return {"kind": kind, "rounds": rounds, "leaf": W.leaf_body(leaf).hex(), "claim": body.hex(),
+    return {"kind": kind, "rounds": rounds, "leaf": W.leaf_body(leaf, lists if lists else None).hex(), "claim": body.hex(),
             "claim_name": name, "ruling": ruling}

@@ -42,6 +42,10 @@ legacy-basanos-fixtures = ["legacy-hclosure-handlers"]
 legacy-hclosure-handlers = []
 pt2p-seal-profile = []
 test-kernel = []
+# Enables subtype 250's legacy, untracked v2.1 template creator only in an
+# explicitly requested compatibility-test image. The shared testnet image
+# uses `test-kernel` and does not enable this route.
+test-legacy-template-create = []
 sbf-lifecycle-test = ["test-kernel"]
 sbf-real-lifecycle-test = ["test-kernel"]
 sbf-unbound-form-test = ["sbf-real-lifecycle-test"]

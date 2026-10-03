@@ -57,6 +57,8 @@ class Dispute:
     ruling: str | None = None
     rounds: int = 0
     claimed: str | None = None  # the claim made (EDGE carries its producer kind)
+    # input index -> E's element refs for a list input, bound at leaf reveal
+    lists: dict[int, list[bytes]] = field(default_factory=dict)
 
     def __post_init__(self):
         sp = self.record.spec
@@ -103,7 +105,9 @@ class Dispute:
         self.current = self.revealed[index]
         self.revealed = {}
 
-    def reveal_leaf(self, preimage: bytes | None) -> None:
+    def reveal_leaf(self, preimage: bytes | None, lists: dict[int, list[bytes]] | None = None) -> None:
+        """E reveals the leaf and, for each list input, the element refs under
+        its list digest (bound here, so every later claim uses them)."""
         if self.level != 0 or self.leaf_revealed:
             raise Refused("not awaiting a leaf")
         if self.kind == "STEP_DESCEND":
@@ -112,7 +116,21 @@ class Dispute:
             h = R.out_leaf(self.position, preimage)
         if h != self.current:
             raise ExecutorRefused("leaf does not match the committed hash")
-        self.leaf, self.leaf_revealed = preimage, True
+        lists = dict(lists or {})
+        leaf = R.parse_leaf(preimage) if self.kind == "STEP_DESCEND" and preimage is not None else None
+        wanted = set()
+        if leaf is not None:
+            for i, ref in enumerate(leaf.inputs):
+                if struct.unpack_from("<I", ref, 7)[0] != S.LAYOUT_LIST:
+                    continue
+                wanted.add(i)
+                refs = lists.get(i)
+                if (refs is None or not 1 <= len(refs) <= S.MAX_LIST_ELEMENTS or any(len(r) != 55 for r in refs)
+                        or R.list_digest(refs) != ref[23:55]):
+                    raise ExecutorRefused("list elements do not match the leaf's list digest")
+        if set(lists) != wanted:
+            raise ExecutorRefused("element refs for an input that is not a list")
+        self.leaf, self.leaf_revealed, self.lists = preimage, True, lists
 
     def timeout(self, silent: str) -> str:
         self.ruling = "C" if silent == "E" else "E"
@@ -140,7 +158,8 @@ class Dispute:
 
     def claim(self, name: str, *, spec_opening=None, index: int = 0, producer_opening=None,
               witness: list[bytes] | None = None, state_witness: bytes | None = None, t: int | None = None,
-              gate_opening=None, gate_value: bytes | None = None, chunk_opening=None, const_opening=None) -> str:
+              gate_opening=None, gate_value: bytes | None = None, chunk_opening=None, const_opening=None,
+              element: int = 0, list_opening=None) -> str:
         if not self.leaf_revealed or self.ruling:
             raise Refused("no leaf to claim against")
         self.claimed = name if name != "EDGE" else f"EDGE{self._edge_kind(index)}"
@@ -170,7 +189,7 @@ class Dispute:
             return self._rule("C" if self._shape_wrong(leaf, d, k) else "E")
         if name == "EDGE":
             return self._rule(self._edge(leaf, d, index, producer_opening, t, gate_opening, gate_value,
-                                         chunk_opening, const_opening))
+                                         chunk_opening, const_opening, element, list_opening))
         if name == "STATE":
             return self._rule(self._state(leaf, d, producer_opening))
         if name == "STEP":
@@ -248,13 +267,44 @@ class Dispute:
             raise Refused("not that constant's ConstSpec")
         return record
 
+    def _list(self, list_id: int, opening) -> list[tuple[bytes, bytes]]:
+        """The elements of ListSpec `list_id`, from a spec opening at its leaf."""
+        if opening is None:
+            raise Refused("a list input needs its ListSpec opening")
+        record = self._spec_record(self.record.spec.list_leaf_index(list_id), opening)
+        decoded = S.decode_list_spec(record)
+        if decoded is None or decoded[0] != list_id:
+            raise Refused("not that list's ListSpec")
+        return decoded[1]
+
     def _edge(self, leaf: R.Leaf, d: dict, index: int, producer_opening, t, gate_opening, gate_value,
-              chunk_opening, const_opening=None) -> str:
+              chunk_opening, const_opening=None, element: int = 0, list_opening=None) -> str:
         if index >= len(d["inputs"]) or index >= len(leaf.inputs):
             raise Refused("no such input")
         got = leaf.inputs[index]
-        header = d["inputs"][index][0]
-        kind, a, b, c, dd = S.decode_producer(d["inputs"][index][1])
+        header, prod = d["inputs"][index][0], d["inputs"][index][1]
+        if prod[0] == S.PRODUCER_LIST:
+            # EDGE(index, element): one element against its one producer.
+            elements = self._list(S.decode_producer(prod)[1], list_opening)
+            if not 0 <= element < len(elements):
+                raise Refused("no such list element")
+            refs = self.lists.get(index)
+            if refs is None or len(refs) != len(elements):
+                return "C"  # E's list has the wrong element count (or no list here)
+            element_header, element_prod = elements[element]
+            if refs[element][:23] != element_header:
+                return "C"
+            if S.decode_producer(element_prod)[0] not in (1, 2, 3):
+                raise Refused("list element producer kind not supported")
+            return self._edge_value(refs[element], element_header, element_prod, producer_opening, t,
+                                    gate_opening, gate_value, chunk_opening, const_opening)
+        return self._edge_value(got, header, prod, producer_opening, t, gate_opening, gate_value, chunk_opening,
+                                const_opening)
+
+    def _edge_value(self, got: bytes, header: bytes, prod: bytes, producer_opening, t, gate_opening, gate_value,
+                    chunk_opening, const_opening) -> str:
+        """Whether the 55-byte ref `got` (layout fields and digest) is the value its producer committed."""
+        kind, a, b, c, dd = S.decode_producer(prod)
         if kind == 2:
             ref = self.record.external_refs.get(a)
             if ref is None:  # the run never posted that input
@@ -317,12 +367,22 @@ class Dispute:
         empty = [] if d["state_scheme"] == 2 else bytes(d["state_size"])
         return "C" if leaf.prior != R.state_digest(d, empty) else "E"
 
-    def _step(self, leaf: R.Leaf, d: dict, witness: list[bytes] | None, state_witness: bytes | None) -> str:
+    def _step(self, leaf: R.Leaf, d: dict, witness: list | None, state_witness: bytes | None) -> str:
         if witness is None or len(witness) != len(leaf.inputs):
             raise Refused("witness has the wrong input count")
-        for value, ref in zip(witness, leaf.inputs):
-            if R.value_digest(value) != ref[23:55]:
+        step_inputs = d["inputs"]
+        for i, (value, ref) in enumerate(zip(witness, leaf.inputs)):
+            producer_kind = S.decode_producer(step_inputs[i][1])[0]
+            if producer_kind == S.PRODUCER_LIST:
+                if i not in self.lists:
+                    raise Refused("list input has no revealed element refs")
+                refs = self.lists[i]
+                if (not isinstance(value, list) or len(value) != len(refs)
+                        or any(R.value_digest(v) != r[23:55] for v, r in zip(value, refs))):
+                    raise Refused("list witness does not match the revealed elements")
+            elif not isinstance(value, bytes) or R.value_digest(value) != ref[23:55]:
                 raise Refused("witness value does not match its committed digest")
+        witness = R.flatten(witness)
         if d["state_scheme"] == 2:
             return self._log_step(leaf, d, witness, state_witness)
         prior = None
@@ -428,6 +488,13 @@ class Executor:
             return self.c.leaves[dispute.ordinal]
         return self.c.out_entries[dispute.position]
 
+    def lists(self, dispute: Dispute) -> dict[int, list[bytes]]:
+        """The element refs E reveals with a step leaf (its list inputs)."""
+        if dispute.kind != "STEP_DESCEND":
+            return {}
+        k = dispute.ordinal
+        return {i: list(refs) for (o, i), refs in self.c.lists.items() if o == k}
+
     def leaf_opening(self, ordinal: int):
         return self.c.leaves[ordinal], self.c.step_tree.path(self.c.spec.position_of(ordinal))
 
@@ -459,7 +526,29 @@ def honest_value(honest: R.Commitment, sp: S.Spec, prod: bytes) -> bytes:
         return honest.values[(sp.ordinal_of(a, t, c), b)]
     if kind == 7:
         return struct.pack("<I", a)
+    if kind == S.PRODUCER_LIST:
+        _lid, elements = S.decode_list_spec(sp.list_specs[a])
+        return [honest_value(honest, sp, ep) for _eh, ep in elements]
     raise ValueError(f"producer kind {kind}")
+
+
+def list_edge_args(record: RunRecord, executor: Executor, dispute: Dispute, honest: R.Commitment, k: int,
+                   index: int, list_id: int) -> dict:
+    """EDGE on list input `index`: the first element whose ref differs from H's,
+    with the ListSpec opening and that element's producer opening."""
+    sp = record.spec
+    mine = honest.lists[(k, index)]
+    theirs = dispute.lists.get(index, [])
+    j = next((j for j, (a, b) in enumerate(zip(theirs, mine)) if a != b), min(len(theirs), len(mine)))
+    j = min(j, len(mine) - 1)
+    _lid, elements = S.decode_list_spec(sp.list_specs[list_id])
+    ek, ea, *_ = S.decode_producer(elements[j][1])
+    extra = {"element": j, "list_opening": sp.opening(sp.list_leaf_index(list_id))}
+    if ek == 1:
+        extra["producer_opening"] = executor.leaf_opening(ea)
+    elif ek == 3:
+        extra["const_opening"] = sp.opening(sp.const_leaf_index(ea))
+    return extra
 
 
 def honest_state_witness(honest: R.Commitment, d: dict):
@@ -517,7 +606,7 @@ def honest_challenge(record: RunRecord, executor: Executor, honest: R.Commitment
         if not diff:
             raise AssertionError("no differing child under a differing node")
         dispute.pick(diff[0])
-    dispute.reveal_leaf(executor.leaf(dispute))
+    dispute.reveal_leaf(executor.leaf(dispute), executor.lists(dispute))
     sp = record.spec
     if kind == "OUT_DESCEND":
         j = dispute.position
@@ -556,6 +645,8 @@ def honest_challenge(record: RunRecord, executor: Executor, honest: R.Commitment
                 extra["const_opening"] = sp.opening(sp.const_leaf_index(a))
             elif pk == 6:
                 extra = _kind6_args(record, executor, honest, a, c)
+            elif pk == S.PRODUCER_LIST:
+                extra = list_edge_args(record, executor, dispute, honest, k, i, a)
             dispute.claim("EDGE", spec_opening=opening, index=i, **extra)
             return dispute
     if leaf.prior != mine.prior:
