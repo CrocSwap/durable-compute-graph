@@ -21,6 +21,7 @@ const MALFORMED: u32 = 730;
 const AUTH: u32 = 731;
 const STATE: u32 = 733;
 const PROOF: u32 = 734;
+const LEGACY_DCR1_DISABLED: u32 = 742;
 const DEADLINE: u32 = 736;
 const ROUTE: u32 = 738;
 const ROW_BYTES: usize = 120;
@@ -128,8 +129,17 @@ fn live(
     {
         return Err(no(STATE));
     }
-    if version != challenge::VERSION && record.owner != program {
-        return Err(no(AUTH));
+    if version != challenge::VERSION {
+        if !cfg!(feature = "legacy-hclosure-handlers") {
+            return Err(no(LEGACY_DCR1_DISABLED));
+        }
+        let descriptor: [u8; 32] = raw[72..104].try_into().map_err(|_| no(STATE))?;
+        let challenger = Pubkey::new_from_array(raw[8..40].try_into().map_err(|_| no(STATE))?);
+        let nonce = u32_at(&raw, 140)?;
+        let expected = address::challenge(program, &descriptor, &challenger, nonce).0;
+        if record.owner != program || *record.key != expected {
+            return Err(no(AUTH));
+        }
     }
     if !manifest
         .dispute_hooks()
@@ -2089,21 +2099,16 @@ fn execute(
             return Err(no(PROOF));
         }
     } else {
-        rule_legacy(&mut state, &accounts[2], honest)?;
+        if !honest {
+            let mut doc = accounts[2].try_borrow_mut_data()?;
+            let wins = u32_at(&doc, 132)?.checked_add(1).ok_or(no(STATE))?;
+            doc[132..136].copy_from_slice(&wins.to_le_bytes());
+            let flags = u16_at(&doc, 6)? | 4;
+            doc[6..8].copy_from_slice(&flags.to_le_bytes());
+        }
+        state[4] = 3;
+        state[5] = if honest { 1 } else { 2 };
     }
-    Ok(())
-}
-
-fn rule_legacy(state: &mut [u8], document: &AccountInfo, honest: bool) -> ProgramResult {
-    if !honest {
-        let mut doc = document.try_borrow_mut_data()?;
-        let wins = u32_at(&doc, 132)?.checked_add(1).ok_or(no(STATE))?;
-        doc[132..136].copy_from_slice(&wins.to_le_bytes());
-        let flags = u16_at(&doc, 6)? | 4;
-        doc[6..8].copy_from_slice(&flags.to_le_bytes());
-    }
-    state[4] = 3;
-    state[5] = if honest { 1 } else { 2 };
     Ok(())
 }
 
