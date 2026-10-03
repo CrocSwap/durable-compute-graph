@@ -1,7 +1,8 @@
 # Referee laws for v2.1 disputes (tag 227)
 
 Status: **designed contract**, written 2026-10-03 against DCG main `3df716d`
-and the queued follow-up fix round. It states what every accepted tag 227
+plus the follow-up fix round (`fast/v21-followups-ab-fix2`), and corrected
+after that round's independent re-review. It states what every accepted tag 227
 transition must satisfy. It is not a proof that the program satisfies it. Each
 law lists the evidence that exists today and the known violations still open.
 
@@ -30,9 +31,9 @@ Uses:
 | Template | `["dcg21tmpl", template_id, payer]` | admitter (sub 1) | the admitter |
 | Run | `["dcg21run", run_id, payer]` | payer (sub 2) | the run payer |
 | Receipt | the run's own address, after sub 19 | the run, shrunk | the run payer |
-| Dispute | `["dcg2dsp", run, challenger, nonce]` | challenger (sub 4) | the challenger |
-| Staging buffer | per dispute and party | challenger at open for both (sub 4), each party for growth (subs 14, 17) | recorded creator, byte 5 |
-| Reveal cache | keyed by the run, the parent position and hash | executor (sub 16) | the executor, recorded in the cache |
+| Dispute | `["dcg21dsp", run, challenger, nonce]` | challenger (sub 4) | the challenger |
+| Staging buffer | `["dcg21stg", dispute, role]` | sub 14: C may create either role; E may create its own if C has not. Any signer may fund growth (sub 17) | the recorded creator, byte 5 |
+| Reveal cache | `["dcg21rc", run, kind, level, position]` | the executor, at REVEAL_NODES (sub 5) | the executor, recorded in the cache |
 
 **Parties.** `A` is a template's admitter, `P` a run's payer, `E` the run's
 executor, `C` a dispute's challenger, and `X` anyone at all, including any of
@@ -49,8 +50,9 @@ witness staged), and finally `RULED`. A ruling is `EXECUTOR`, `CHALLENGER` or
 
 **Time.** `now` is the Clock slot. An action is allowed while
 `now <= deadline`. A timeout is allowed only when `now > deadline`. Every
-deadline is computed with checked `u64` arithmetic, and windows are bounded at
-admission (`MIN_PHASE_WINDOW ≤ window ≤ MAX_WINDOW`).
+deadline is computed with checked `u64` arithmetic. Admission bounds the
+challenge window to `[MIN_WINDOW, MAX_WINDOW]` (`MIN_WINDOW` is 1 slot) and
+the phase window to `[MIN_PHASE_WINDOW, MAX_WINDOW]` (750 slots minimum).
 
 **Refusal.** A refused instruction changes no program-owned bytes or
 lamports. The transaction fee is still charged by the runtime, and is outside
@@ -97,8 +99,11 @@ challenger cannot make because its witness exceeds a buffer.
   oracle (687), the list oracle (12) and the LOG goldens, native and SBF. The
   12 list rulings were also replayed from the real client's instruction
   stream.
-- **Open violation:** A1, on branch `review/v21-followups-ab` only, not on
-  main. The fix round refuses capacity-changing LOG chains at admission.
+- A1 is avoided, not judged. The program sees only the spec root, so it
+  cannot refuse a LOG chain that changes scheme or capacity. It therefore rules
+  every LOG STATE and STEP claim moot (§8), as main already did. The Python
+  plan builder refuses such chains, including LOG → SMALL; the program does
+  not.
 
 ## 2. Conservation
 
@@ -120,9 +125,11 @@ touched accounts is unchanged.
 | 1 create template | A → template: rent. An adopted pre-fund stays in the template and is A's at close. |
 | 2 init run | P → run: rent. |
 | 3 commit | E → run: the executor bond. |
-| 4 open | C → dispute: rent and the challenger bond. C → both staging buffers: rent at their admitted sizes. |
-| 14, 17 stage create, grow | the writing party → its own buffer: rent. |
-| 16 cache answer | E → cache: rent. |
+| 4 open | C → dispute: rent and the challenger bond. |
+| 5 reveal nodes | E → reveal cache: rent, when it creates a cache entry. |
+| 14 stage create | the creator (C for either role, or E for its own) → the buffer: creation rent. |
+| 17 stage grow | any signer → the buffer: rent for the growth; refunded through the buffer's recorded creator at close. |
+| 16 cache answer | none; anyone may call it. |
 | ruling (CLAIM resolution or 9 timeout) | the dispute's lamports above its rent floor (C's bond) → E on an executor win, → C on a challenger win or a neutral (moot) outcome. |
 | 12 moot | C's bond → C. E gains nothing. |
 | 10 finalize | E's bond → E, from the run, on a run that ends `FINAL`. |
@@ -225,8 +232,10 @@ and nobody can revive a phase once it has expired.
 - Each dispute has at most `2 × (ceil(h/d) + 3)` phases. A run is final at
   most `challenge_window + D(N)` after commit (design §10.2), where `N` counts
   the opens.
-- Every rent-bearing account has a permissionless route to close once its
-  run settles (§7).
+- Every dispute, run, cache and staging account has a permissionless route
+  to close once its run settles (§7). A template closes only with its
+  admitter's signature, once its active-run count is zero; until then its
+  rent is the admitter's own choice to leave in place.
 
 **Catches.**
 - **B1** (2026-10-03, high): E banks extension through puppet disputes. Every
@@ -237,10 +246,18 @@ and nobody can revive a phase once it has expired.
   challenger count toward E's extension, up to `MAX_WINDOW`.
 
 **Status.**
-- **Open violations.** On main: the F4 puppet stretch, bounded by
-  `MAX_WINDOW`. On `review/v21-followups-ab`: B1 and B2.
-- The fix round stores each phase's deadline at phase start. Its
-  regressions must fail on `21e530c` and pass after the fix.
+- **Main (`3df716d`): open violation.** F4 counts puppets that are waiting
+  on their own challenger toward E's extension, bounded by `MAX_WINDOW`.
+- **After the fix round:** each phase's deadline is stored at its start
+  (open, pick, `next_phase`), and nothing else writes it. The re-review
+  measured this with probes RR-P1, RR-P2 and RR-N1 to RR-N3: no revival, no
+  banking, invariance under puppet bursts, and the wait count balanced over
+  every exit. Those probes are kept as regressions in the skeleton suite.
+- **Accepted cost:** under a burst of N picks, the k-th wait gets k windows,
+  not N each (RR-N7). An honest executor answering in order still meets every
+  deadline. The answer time under pick spam (R3-S5) is unmeasured.
+- **Upgrade:** runs created before the wait trailer are refused with
+  error 40, so an in-place upgrade needs a full drain first (design §9).
 
 ## 6. Determinism and order
 
@@ -270,6 +287,8 @@ an answer here. A new instruction is not complete without one.
 | 10 finalize | anyone | nothing; needs zero open disputes past the deadline |
 | 11 advance prefix | anyone | nothing; moves over already-ruled disputes |
 | 12 moot | anyone | nothing; returns C's bond |
+| 16 cache answer | anyone | nothing; it ends one executor wait with an already-verified answer, at most once per dispute and node |
+| 17 stage grow | any funder | nothing; the funder pays rent that is refunded to the buffer's recorded creator, not to the funder |
 | 13 pay pot | anyone | nothing; recipients are recorded |
 | 18–20 closes | anyone | nothing; rent goes to recorded payers |
 | 1 create template | any admitter | its own address only; no control of another payer's template |
@@ -290,8 +309,12 @@ account stays open while something still needs it. Its rent then goes to the
 party that paid it, never to the closer.
 
 **Law.**
-- After `RULED`, every dispute instruction except the closes is refused.
-  That includes staging create, write and grow on its buffers.
+- After `RULED`, the only instructions that may act on the dispute are:
+  - advance prefix (11) and pay pot (13), which read its ruling;
+  - the closes (18–20).
+
+  Every other dispute instruction is refused, including staging create,
+  write and grow on both of its buffers.
 - `CLOSE_DISPUTE` needs a ruled or moot dispute that the ruled prefix has
   passed. A winning challenger's dispute also waits until its pot is paid.
 - `CLOSE_RUN` needs a settled run with every dispute closed. It leaves the
@@ -309,8 +332,11 @@ after its receipt was closed.
   receipts, claim and timeout rulings, moot, legacy read-only templates,
   pre-funded adoption and front-run creation. Nine planted guard bugs were
   each caught.
-- **Open violation:** post-ruling staging. The ignored reproducer is in
-  `2dfb0e0`, and the fix round refuses it.
+- **Main (`3df716d`): open violation.** Staging is accepted after a ruling.
+- **After the fix round:** it is refused. Probe RR-N4 creates both buffers
+  before the ruling, then tries create, write and grow (by the owner and by
+  a third-party funder), all refused, with balances and sizes unchanged.
+  Close then still pays the recorded creators.
 
 ## 8. Neutrality
 
@@ -322,8 +348,9 @@ declared in advance, so that nobody can steer a dispute into it for free.
 - A dispute ends `MOOT` only in these cases:
   - it was opened after `best_win` on a refuted run (F1);
   - its claim falls in a case this spec declares undecidable. Today that is
-    LOG STEP claims; LOG STATE claims whose predecessor is the initial state
-    (kinds 0 and 3); and, pending a reference model, kind 2.
+    every LOG STATE and LOG STEP claim (state scheme 2 or above), whatever
+    its predecessor kind. The program cannot check LOG chain shapes, so it
+    does not judge any of them (A1).
 - On an admitted template, a challenger cannot reach a declared-undecidable
   case. Admitters must refuse LOG-state templates until LOG is judged on chain
   (re-review condition, design §9). The program cannot check this, because it
@@ -335,34 +362,45 @@ that delays finality. An undecidable case that rules against either party.
 **Status.**
 - Designed. The admitter rule is a documented condition, not something the
   program enforces.
-- Python and the program disagree on state scheme 3 and above (`game.py`
-  checks `!= 2`, the program `> 1`). The fix round aligns them.
+- Python and the program agree on the neutral cases after the fix round:
+  both treat scheme 2 and above as neutral.
 
 ## 9. Admission bounds
 
 **Plain English.** A template can only be admitted with economics and limits
 under which the other laws can hold.
 
-**Law.** Admission refuses a template unless:
-- the executor and challenger bonds are nonzero (F4);
-- `bond_slasher_bps < 10,000`, so the remainder is nonzero (design §10.3),
-  and `init_run` refuses a payer equal to the named executor, since the payer
-  receives the remainder. An executor can still pay through a key it controls
-  under another name; the deterrent then rests on the payer being a real
-  watcher (F11, accepted);
-- every window is within `[MIN_PHASE_WINDOW, MAX_WINDOW]`;
-- `extend_slots` is at least the measured `answer_slots` (§8.3);
-- the largest opening, leaf, spec record, reveal and witness each fit the
-  staging cap (1 MiB), and each STEP claim fits the challenger's 128 KiB
-  claim buffer;
-- every kernel resolves by its exact id and advertises the mode its claims
-  need (F2, F9);
-- a list step has at most 1,024 elements;
-- LOG chains keep one state scheme and capacity (A1, after the fix round).
+**Law.** These bounds are enforced in three places.
 
-**Status.** Measured for the planner and program refusals in the list and
-skeleton suites. The `answer_slots` measurement under pick spam (R3-S5) is
-still open.
+*The program, at template admission (sub 1) and `init_run` (sub 2):*
+- the executor and challenger bonds are nonzero (F4);
+- `bond_slasher_bps < 10,000`, so the remainder is nonzero (design §10.3);
+- `init_run` refuses a payer equal to the named executor, since the payer
+  receives the remainder. An executor can still pay through a key it
+  controls under another name; the deterrent then rests on the payer being a
+  real watcher (F11, accepted);
+- the challenge window is within `[MIN_WINDOW, MAX_WINDOW]`, and the phase
+  window within `[MIN_PHASE_WINDOW, MAX_WINDOW]`.
+
+*The program, at claim time (not at admission):*
+- a kernel resolves only by its exact id and must advertise the mode the
+  claim needs (F2, F9); otherwise the claim rules as the spec says;
+- a list step has at most 1,024 elements.
+
+*The planner (Python `PlanBuilder`) and the admitter, which the program
+trusts through the spec root:*
+- every opening, leaf, spec record, reveal and witness fits the 1 MiB staging
+  cap, and every STEP claim fits the challenger's 128 KiB claim buffer;
+- a kind-1 state link that touches LOG on either side keeps one scheme and
+  capacity, which also refuses LOG → SMALL (A1);
+- LOG-state templates are refused while LOG is neutral (§8).
+
+There is no `extend_slots` parameter. The executor's extension is one phase
+window per other live executor wait (§5).
+
+**Status.** Measured for the program refusals in the skeleton suite, and for
+the planner refusals in the Python suite. A template admitted without the
+planner is trusted subjectively, as the admission-cursor decision allows.
 
 ## 10. LX1 additions (designed)
 
@@ -414,12 +452,12 @@ Out of scope for bendSVM:
 
 | Law | Main `3df716d` | After the follow-up fix round |
 |---|---|---|
-| 1 Honest wins | measured for the scenario sets | A1 must be refused at admission |
+| 1 Honest wins | measured for the scenario sets | A1 avoided by LOG neutrality; planner refuses the chains |
 | 2 Conservation | measured per matrix cell | unchanged |
 | 3 Authority | lint green for tag 227 writers | unchanged |
 | 4 Binding | measured (buffer freeze, template binding) | unchanged |
-| 5 Deadlines | **F4 puppet stretch, bounded by `MAX_WINDOW`** | B1/B2 regressions must pass |
+| 5 Deadlines | **F4 puppet stretch, bounded by `MAX_WINDOW`** | fixed at phase start; RR probes kept as regressions; full drain before upgrade |
 | 6 Order | measured for two-dispute orders | fuzzer pending |
-| 7 Terminality | **post-ruling staging accepted** | refusal must pass |
-| 8 Neutrality | designed; admitter rule documented | scheme check aligned |
-| 9 Admission | measured for current refusals | LOG chain rule added |
+| 7 Terminality | **post-ruling staging accepted** | refused (RR-N4) |
+| 8 Neutrality | all LOG claims moot; admitter rule documented | unchanged; Python aligned |
+| 9 Admission | program bonds and windows; planner fits | planner refuses LOG chain changes, including LOG → SMALL |
