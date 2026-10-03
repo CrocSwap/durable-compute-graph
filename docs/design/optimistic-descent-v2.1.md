@@ -892,6 +892,31 @@ of tag 227 at bc4e391:
   exact `name/v1` id, NUL-padded with nothing after the padding, in the
   program and in Python. Invalid UTF-8 is an unknown kernel in Python, not a
   crash.
+- **Re-review (2026-10-03, keep 0862470), conditions and follow-ups:**
+  - Until the program implements LOG, **template admitters must refuse
+    LOG-state templates**. On such a template, a challenger can steer any
+    dispute to a LOG step and get a free moot (no dispute cost, delayed
+    finality), and a lie at a LOG step cannot be convicted. The program
+    cannot enforce this, because it trusts the spec root.
+  - **Follow-up A (queued):** narrow F3 to keep judging the STATE
+    predecessor check for producer kinds 1 and 2, which does not depend on
+    the scheme.
+  - **Follow-up B (queued):** the load extension counts every open dispute,
+    including the executor's own puppets waiting on their challenger, so an
+    executor can stretch its own deadlines up to `MAX_WINDOW` per phase (a
+    probe: 20 puppets, 15,750-slot deadlines, about 0.36 SOL locked and all
+    returned). Implement §8.3's additive extension, counted only while
+    disputes wait on the executor. There is no false finality: finalize
+    needs zero open disputes.
+  - Upgrading an existing program in place strands runs created before
+    0862470 (the run address changed). Drain them first, or deploy at
+    fresh addresses, as testnet already does.
+  - The commit deadline reuses the challenge window; the design's own
+    commit deadline (after the inputs are complete) is not built.
+  - Consumers identify a run by its address. The run id is not unique
+    across payers.
+  - Follow-ups A and B change endings and get their own independent review
+    (Basanos project rule 10).
 - **Not changed:** F6 (buffers an executor created before bc4e391 refund the
   challenger; testnet only), F7 (receipt offsets differ from a live run;
   status stays at byte 4, and the Python client now checks the magic), F8 (a

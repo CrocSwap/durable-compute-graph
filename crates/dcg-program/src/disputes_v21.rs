@@ -1607,8 +1607,9 @@ fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
 
 // 19: [caller(s), run(w), template, payer(w)]. A settled run whose disputes
 // are all closed shrinks to its receipt (design §6.4) at the same address, so
-// consumers can still read its final status and root and the run id stays
-// single-use; anyone may send it. An uncommitted run is cancelled (closed
+// consumers can still read its final status and root at the run's address
+// (consumers identify a run by its address: the run id alone is not unique
+// across payers); anyone may send it. An uncommitted run is cancelled (closed
 // whole) by its payer only. Freed rent goes to the run's payer.
 fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [caller, run, tmpl, payer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };

@@ -43,7 +43,11 @@ independently reviewed yet.
 
 ## Next, in order
 
-1. The independent v2.1 review: done 10-03; F1–F5 and F9 fixed (0862470).
+1. The independent v2.1 review: done 10-03; F1–F5 and F9 fixed (0862470),
+   re-reviewed and kept. Follow-ups A (narrow LOG neutrality) and B (§8.3's
+   additive load extension, counted only while waiting on the executor) are
+   queued with their own review; until LOG is on chain, admitters refuse
+   LOG-state templates.
 2. List inputs and template closes in the program (in progress).
 3. A run-level dispute model in the Python reference (several disputes, ruled
    prefix, best win, bonds), fuzzed against the program with random
