@@ -26,6 +26,7 @@ NODE_DOMAINS = {
     "spec": b"dcg.spec.node.v2.1\x00",
     "lazy": b"dcg.lazy.node.v1\x00",
     "lxstate": b"dcg.lx.state.node.v1\x00",
+    "lxcheckpoint": b"dcg.lx.checkpoint.node.v1\x00",
     "list": b"dcg.list.node.v2.1\x00",
 }
 EMPTY_LEAVES = {
@@ -36,6 +37,7 @@ EMPTY_LEAVES = {
     "spec": _h(b"dcg.spec.empty.v2.1\x00"),
     "lazy": _h(b"dcg.lazy.empty.v1\x00"),
     "lxstate": _h(b"dcg.lx.slot.empty.v1\x00"),
+    "lxcheckpoint": _h(b"dcg.lx.checkpoint.empty.v1\x00"),
     "list": _h(b"dcg.list.empty.v2.1\x00"),
 }
 EMPTY_LEAF = EMPTY_LEAVES["step"]

@@ -344,6 +344,13 @@ pub trait Kernel: Sync {
         }
         self.execute(input.data, output)
     }
+
+    /// An LX1 machine factory (design `v2.1-lazy-expansion.md` §8). Only
+    /// kernels that are LX1 machines override this.
+    #[cfg(feature = "graph-v21")]
+    fn lx_machine(&self) -> Option<&dyn crate::disputes_v21::lx::LxFactory> {
+        None
+    }
 }
 
 /// Optional state-transition contract. Consensus-only kernels may implement
@@ -1521,7 +1528,11 @@ pub mod test_kernel {
 
     pub static SHA256_CONCAT: Sha256Concat = Sha256Concat { _marker: 0 };
 
+    #[cfg(not(feature = "graph-v21"))]
     pub static KERNELS: [&'static dyn Kernel; 2] = [&BYTE_SUM, &SHA256_CONCAT];
+    #[cfg(feature = "graph-v21")]
+    pub static KERNELS: [&'static dyn Kernel; 3] =
+        [&BYTE_SUM, &SHA256_CONCAT, &crate::disputes_v21::lx::toy::TOY_KERNEL];
     pub static REPLAY_BINDINGS: [OptimisticReplayBinding; 1] = [OptimisticReplayBinding {
         mode: MODE_OPTIMISTIC_V1,
         replay: &BYTE_SUM,

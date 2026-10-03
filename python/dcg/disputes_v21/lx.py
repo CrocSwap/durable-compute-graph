@@ -208,6 +208,29 @@ def admit_commitment(machine: Machine, commitment: Commitment) -> tuple[int, ...
     return coords
 
 
+# --- program commitments (tag 227 LX1, design §8) -------------------------------------
+
+OUTPUTS_DOMAIN = b"dcg.lx.outputs.v1\x00"
+
+
+def outputs_digest(values: Sequence[bytes | None]) -> bytes:
+    """Chained digest of the claimed outputs in output-slot order (mirrors
+    `dcg_disputes::lx::outputs_digest`)."""
+    acc = bytes(32)
+    for v in values:
+        if v is None:
+            acc = hashlib.sha256(OUTPUTS_DOMAIN + acc + b"\x00").digest()
+        else:
+            acc = hashlib.sha256(OUTPUTS_DOMAIN + acc + b"\x01" + len(v).to_bytes(4, "little") + v).digest()
+    return acc
+
+
+def checkpoint_tree(roots: Sequence[bytes]) -> trees.Tree:
+    """The run commits one root over its checkpoint roots; a dispute opens the
+    two it names with paths."""
+    return trees.build("lxcheckpoint", list(roots))
+
+
 # --- multi-proofs ----------------------------------------------------------------------------
 
 @dataclass(frozen=True)

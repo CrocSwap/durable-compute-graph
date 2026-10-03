@@ -1,0 +1,1288 @@
+{
+ "initial_root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+ "outputs": [
+  {
+   "commitment": {
+    "checkpoint_root": "0600b42cfda7d09ab4979a926bb5a3e24c73e81b7c0a236c70b4ee28255d8651",
+    "k": 4,
+    "outputs": [
+     "0a464c0000000000"
+    ],
+    "outputs_digest": "332d9c582f1aee800ca8c42e791626fc0cd347074775302a583d1fd3a68e29a9",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "opening": {
+    "opened": [
+     [
+      0,
+      "0a464c0000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6",
+     "e96c79ddce845f9a977709667be47e27294bee188e5ff7606973732078015160"
+    ]
+   },
+   "ruling": "E"
+  },
+  {
+   "commitment": {
+    "checkpoint_root": "0600b42cfda7d09ab4979a926bb5a3e24c73e81b7c0a236c70b4ee28255d8651",
+    "k": 4,
+    "outputs": [
+     "3930000000000000"
+    ],
+    "outputs_digest": "0c89332797c40de5440d797129a9a8e58185948b6158258693a9505c813b5a17",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "opening": {
+    "opened": [
+     [
+      0,
+      "0a464c0000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6",
+     "e96c79ddce845f9a977709667be47e27294bee188e5ff7606973732078015160"
+    ]
+   },
+   "ruling": "C"
+  }
+ ],
+ "params": "090000000000000003000000000000000700000000000000",
+ "plays": [
+  {
+   "arity": 16,
+   "commitment": {
+    "checkpoint_root": "314779277d4045260c3e8345b86ce44fbdabbfa85e141de65133b4ab2c8f7d58",
+    "k": 4,
+    "outputs": [
+     "55674c0000000000"
+    ],
+    "outputs_digest": "a82a6b1326d63b586c9f619d5914a0cb8cb7f5a72426305781c7e3ddddffa952",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "cade84a87ddf121c65a45d1a5c4bf412172e29e66e91956d20d406a9fabed57a",
+     "8a6bb4a3a6dd38eae4ae92f59fc19ea742a171f13ded48ee3f4aec994a3bf2d6",
+     "bd91a2e2bfd0cac2dc24a389d7a09083f8ff8e9c28dd5ad45f6a57dab59dc8b9"
+    ]
+   },
+   "name": "executor-lies k=4 a=16 fault=13",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "7700000000000000"
+     ],
+     [
+      4,
+      null
+     ],
+     [
+      10,
+      "6901000000000000"
+     ],
+     [
+      11,
+      "7700000000000000"
+     ],
+     [
+      12,
+      "aa00000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 0,
+   "rounds": [
+    {
+     "midpoints": [
+      "c10bc4eeb794ca2200e7c88b08f0f39c6c348edccd9c429fc0e3f0c1ae1b8641",
+      "b3712bcaf259ff97c24acadabb6853282d94ded72cd1dfd0f95688cbbd4fdbfa",
+      "9f63e0cca0c1110b88bb56f25dad1465973f83ec5732917df54c134c24b4e455",
+      "6b94918e49c3cdc98b76faa71878c5c3ecb20005eaada8d617b7c0c0893ae8df",
+      "210e9c200c4ff5a8c714eab14303e76fe215409df4ff2904daf12eb380c2ce1b",
+      "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+      "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+      "3675241f466fa39eab86754253e2017d042a3cd39552e184685f5e8e0784150b",
+      "17cdffedbcb0322705541233dda732e38f437f9ac3760ad030dd3e8a2956a579",
+      "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+      "1f38971187946bdb36abdd15ea10e57b073b960ab7de6e07d9b6373a1ca51a53",
+      "4323000046dbc5e88d426c2c4b1b0d57bd03adfe14c9a64bec1e2eea4f888264",
+      "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469"
+     ],
+     "pick": 13
+    }
+   ],
+   "ruling": "C",
+   "terminal": 13
+  },
+  {
+   "arity": 16,
+   "commitment": {
+    "checkpoint_root": "0600b42cfda7d09ab4979a926bb5a3e24c73e81b7c0a236c70b4ee28255d8651",
+    "k": 4,
+    "outputs": [
+     "0a464c0000000000"
+    ],
+    "outputs_digest": "332d9c582f1aee800ca8c42e791626fc0cd347074775302a583d1fd3a68e29a9",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "name": "challenger-lies k=4 a=16 fault=13",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "7700000000000000"
+     ],
+     [
+      4,
+      null
+     ],
+     [
+      10,
+      "6901000000000000"
+     ],
+     [
+      11,
+      "7700000000000000"
+     ],
+     [
+      12,
+      "aa00000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 0,
+   "rounds": [
+    {
+     "midpoints": [
+      "c10bc4eeb794ca2200e7c88b08f0f39c6c348edccd9c429fc0e3f0c1ae1b8641",
+      "b3712bcaf259ff97c24acadabb6853282d94ded72cd1dfd0f95688cbbd4fdbfa",
+      "9f63e0cca0c1110b88bb56f25dad1465973f83ec5732917df54c134c24b4e455",
+      "6b94918e49c3cdc98b76faa71878c5c3ecb20005eaada8d617b7c0c0893ae8df",
+      "210e9c200c4ff5a8c714eab14303e76fe215409df4ff2904daf12eb380c2ce1b",
+      "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+      "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+      "3675241f466fa39eab86754253e2017d042a3cd39552e184685f5e8e0784150b",
+      "17cdffedbcb0322705541233dda732e38f437f9ac3760ad030dd3e8a2956a579",
+      "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+      "1f38971187946bdb36abdd15ea10e57b073b960ab7de6e07d9b6373a1ca51a53",
+      "4323000046dbc5e88d426c2c4b1b0d57bd03adfe14c9a64bec1e2eea4f888264",
+      "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469"
+     ],
+     "pick": 13
+    }
+   ],
+   "ruling": "E",
+   "terminal": 13
+  },
+  {
+   "arity": 16,
+   "commitment": {
+    "checkpoint_root": "e37c517ef32376d76bac2e864b24247ad7ef9a98e296a97536df4d4f0214c036",
+    "k": 4,
+    "outputs": [
+     "25464c0000000000"
+    ],
+    "outputs_digest": "230ac8822a87828748ad19e160f79f0111602fb70ac6d96e339835a33bdda0b1",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "eb23ee7f6ca535f0191acbf60d33ecad342b93276008842428b9699503c2f28e",
+     "b427275a1928bfb57f545d9bb0cfea59a976428e5c216c229af3f61b13471a1b"
+    ]
+   },
+   "name": "executor-lies k=4 a=16 fault=31",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "b329000000000000"
+     ],
+     [
+      7,
+      null
+     ],
+     [
+      10,
+      "207d000000000000"
+     ],
+     [
+      11,
+      "b329000000000000"
+     ],
+     [
+      12,
+      "d2c6000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 1,
+   "rounds": [
+    {
+     "midpoints": [
+      "0f011ebf2191e9ddbba5d6e74d422f64b9a626096acc90c2b678948cc8db4f99",
+      "257d8a35d2de0fe8868b2d9c9e41f08385da88a4f1ecc882176d6873a71e4a0c",
+      "b435d2b2c334b7cb41f3add78d301faa08aa40fcc1fb433cfb6afec6f45cafc9",
+      "268a96796a1605a7f0b901ea849f67c35fec8b2a71637a1567e98567b1308bfc",
+      "cfc8d2ccec117fb9ea4a9367a1565aec951fc8a57946c44c51e40388012c59d4",
+      "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+      "2e75682b4f0b10c9f735dcf3ea90c324258a8dadbeac25f3ce138cb634e26cfd",
+      "5f2a937f24c46f2237c3167876d8ef36e52e7df834f40c6609c2a0ca4832a865",
+      "9678067876c81989d0b57e6eb96aab31b187f067fbdea8946a57d090d3f37b0d",
+      "74247af31e81c1e2a3562718403c60f8cfed5258d88d2e0b74ab0ae64bc3d106",
+      "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701",
+      "62771ac22cb52ed5092d1cbc1ffce006cb0e5244ed6cc6ecb47f329854153a5c",
+      "188cf4a9309e72581149ec6f6d2022510043bb8ea097c5e66ae3797918a9ac76",
+      "86e0c242c00679ccaafa783797fd4e4550597fc028cdd89c9e7b4aa621b1190d",
+      "e45e72fe6a3259d405123b27d76a46d4a853d65f89ad307aca75f7d340bfa5c4"
+     ],
+     "pick": 11
+    },
+    {
+     "midpoints": [
+      "c86a52ec3c477a5c09cf424c9e758ae0ad720e9779192023b2759f5a8be1c03d"
+     ],
+     "pick": 0
+    }
+   ],
+   "ruling": "C",
+   "terminal": 31
+  },
+  {
+   "arity": 16,
+   "commitment": {
+    "checkpoint_root": "0600b42cfda7d09ab4979a926bb5a3e24c73e81b7c0a236c70b4ee28255d8651",
+    "k": 4,
+    "outputs": [
+     "0a464c0000000000"
+    ],
+    "outputs_digest": "332d9c582f1aee800ca8c42e791626fc0cd347074775302a583d1fd3a68e29a9",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "name": "challenger-lies k=4 a=16 fault=31",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "b329000000000000"
+     ],
+     [
+      7,
+      null
+     ],
+     [
+      10,
+      "207d000000000000"
+     ],
+     [
+      11,
+      "b329000000000000"
+     ],
+     [
+      12,
+      "d2c6000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 1,
+   "rounds": [
+    {
+     "midpoints": [
+      "0f011ebf2191e9ddbba5d6e74d422f64b9a626096acc90c2b678948cc8db4f99",
+      "257d8a35d2de0fe8868b2d9c9e41f08385da88a4f1ecc882176d6873a71e4a0c",
+      "b435d2b2c334b7cb41f3add78d301faa08aa40fcc1fb433cfb6afec6f45cafc9",
+      "268a96796a1605a7f0b901ea849f67c35fec8b2a71637a1567e98567b1308bfc",
+      "cfc8d2ccec117fb9ea4a9367a1565aec951fc8a57946c44c51e40388012c59d4",
+      "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+      "2e75682b4f0b10c9f735dcf3ea90c324258a8dadbeac25f3ce138cb634e26cfd",
+      "5f2a937f24c46f2237c3167876d8ef36e52e7df834f40c6609c2a0ca4832a865",
+      "9678067876c81989d0b57e6eb96aab31b187f067fbdea8946a57d090d3f37b0d",
+      "74247af31e81c1e2a3562718403c60f8cfed5258d88d2e0b74ab0ae64bc3d106",
+      "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701",
+      "8f970fb3807d6377219fd6cce28c1bc13cfb7a123657e90cf149bc0cb6bf6839",
+      "28439dd6a18117ef1e389ca0b16478dc438580d0aaa2046b9cb69adb47232016",
+      "1a112cebcb0f2934f0150969b577af25f857cb97313c7f0bcd9e581d8f0aca86",
+      "0bfd046e66433b1ce68ec6f4a1a33894c75c89c398b5320cc37208e778cefccf"
+     ],
+     "pick": 11
+    },
+    {
+     "midpoints": [
+      "4d2ceab98f972492c43b20e26ebd0d97fc556fd4d6c1b81b8587b80657cf1e3c"
+     ],
+     "pick": 0
+    }
+   ],
+   "ruling": "E",
+   "terminal": 31
+  },
+  {
+   "arity": 2,
+   "commitment": {
+    "checkpoint_root": "44ac2f40a4d10842ed5612049d53572dfb7704c8fe6be60983f2c34d2c0344cf",
+    "k": 1,
+    "outputs": [
+     "55674c0000000000"
+    ],
+    "outputs_digest": "a82a6b1326d63b586c9f619d5914a0cb8cb7f5a72426305781c7e3ddddffa952",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "b3712bcaf259ff97c24acadabb6853282d94ded72cd1dfd0f95688cbbd4fdbfa",
+     "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+     "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+     "cade84a87ddf121c65a45d1a5c4bf412172e29e66e91956d20d406a9fabed57a",
+     "ae7752d04343289b33e183c4b2bed45d90137d211b49edcbc9ee2fc84d47b29b",
+     "6cc35e221bdf8587d0d2bcd6cb198d818899faa76bd953d80ffae8eccaf82b64",
+     "92a940a5b54ef121d0282087d3bf04a7bff662cafc81941a1b52b8ffc6f76940",
+     "8a6bb4a3a6dd38eae4ae92f59fc19ea742a171f13ded48ee3f4aec994a3bf2d6",
+     "bd91a2e2bfd0cac2dc24a389d7a09083f8ff8e9c28dd5ad45f6a57dab59dc8b9"
+    ]
+   },
+   "name": "executor-lies k=1 a=2 fault=13",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "7700000000000000"
+     ],
+     [
+      4,
+      null
+     ],
+     [
+      10,
+      "6901000000000000"
+     ],
+     [
+      11,
+      "7700000000000000"
+     ],
+     [
+      12,
+      "aa00000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 3,
+   "rounds": [
+    {
+     "midpoints": [
+      "4323000046dbc5e88d426c2c4b1b0d57bd03adfe14c9a64bec1e2eea4f888264"
+     ],
+     "pick": 1
+    },
+    {
+     "midpoints": [
+      "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469"
+     ],
+     "pick": 1
+    }
+   ],
+   "ruling": "C",
+   "terminal": 13
+  },
+  {
+   "arity": 2,
+   "commitment": {
+    "checkpoint_root": "41197efe8a36a6908da60543a9a6dc2a16fb7dccaa6e2373bd2fe23e1abb5c36",
+    "k": 1,
+    "outputs": [
+     "0a464c0000000000"
+    ],
+    "outputs_digest": "332d9c582f1aee800ca8c42e791626fc0cd347074775302a583d1fd3a68e29a9",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "b3712bcaf259ff97c24acadabb6853282d94ded72cd1dfd0f95688cbbd4fdbfa",
+     "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+     "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "268a96796a1605a7f0b901ea849f67c35fec8b2a71637a1567e98567b1308bfc",
+     "570499802f0981978a50ee2190c7a6477d41f32cd9adb7dc5a3d09f5e221479a",
+     "4d2ceab98f972492c43b20e26ebd0d97fc556fd4d6c1b81b8587b80657cf1e3c",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "name": "challenger-lies k=1 a=2 fault=13",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "7700000000000000"
+     ],
+     [
+      4,
+      null
+     ],
+     [
+      10,
+      "6901000000000000"
+     ],
+     [
+      11,
+      "7700000000000000"
+     ],
+     [
+      12,
+      "aa00000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 3,
+   "rounds": [
+    {
+     "midpoints": [
+      "4323000046dbc5e88d426c2c4b1b0d57bd03adfe14c9a64bec1e2eea4f888264"
+     ],
+     "pick": 1
+    },
+    {
+     "midpoints": [
+      "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469"
+     ],
+     "pick": 1
+    }
+   ],
+   "ruling": "E",
+   "terminal": 13
+  },
+  {
+   "arity": 2,
+   "commitment": {
+    "checkpoint_root": "9944a4ab0b0d12f738a9a334d8d9ad4e188734a471fb8a1eaa9a8d1d2f85db75",
+    "k": 1,
+    "outputs": [
+     "25464c0000000000"
+    ],
+    "outputs_digest": "230ac8822a87828748ad19e160f79f0111602fb70ac6d96e339835a33bdda0b1",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "b3712bcaf259ff97c24acadabb6853282d94ded72cd1dfd0f95688cbbd4fdbfa",
+     "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+     "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "268a96796a1605a7f0b901ea849f67c35fec8b2a71637a1567e98567b1308bfc",
+     "570499802f0981978a50ee2190c7a6477d41f32cd9adb7dc5a3d09f5e221479a",
+     "c86a52ec3c477a5c09cf424c9e758ae0ad720e9779192023b2759f5a8be1c03d",
+     "eb23ee7f6ca535f0191acbf60d33ecad342b93276008842428b9699503c2f28e",
+     "b427275a1928bfb57f545d9bb0cfea59a976428e5c216c229af3f61b13471a1b"
+    ]
+   },
+   "name": "executor-lies k=1 a=2 fault=31",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "b329000000000000"
+     ],
+     [
+      7,
+      null
+     ],
+     [
+      10,
+      "207d000000000000"
+     ],
+     [
+      11,
+      "b329000000000000"
+     ],
+     [
+      12,
+      "d2c6000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 6,
+   "rounds": [
+    {
+     "midpoints": [
+      "0c31a4990668be297a4f38fda031e3e7822ec70bcbef0e4bb00651a0ca550ac6"
+     ],
+     "pick": 1
+    },
+    {
+     "midpoints": [
+      "74247af31e81c1e2a3562718403c60f8cfed5258d88d2e0b74ab0ae64bc3d106"
+     ],
+     "pick": 1
+    },
+    {
+     "midpoints": [
+      "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701"
+     ],
+     "pick": 1
+    }
+   ],
+   "ruling": "C",
+   "terminal": 31
+  },
+  {
+   "arity": 2,
+   "commitment": {
+    "checkpoint_root": "41197efe8a36a6908da60543a9a6dc2a16fb7dccaa6e2373bd2fe23e1abb5c36",
+    "k": 1,
+    "outputs": [
+     "0a464c0000000000"
+    ],
+    "outputs_digest": "332d9c582f1aee800ca8c42e791626fc0cd347074775302a583d1fd3a68e29a9",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "b3712bcaf259ff97c24acadabb6853282d94ded72cd1dfd0f95688cbbd4fdbfa",
+     "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+     "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "268a96796a1605a7f0b901ea849f67c35fec8b2a71637a1567e98567b1308bfc",
+     "570499802f0981978a50ee2190c7a6477d41f32cd9adb7dc5a3d09f5e221479a",
+     "4d2ceab98f972492c43b20e26ebd0d97fc556fd4d6c1b81b8587b80657cf1e3c",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "name": "challenger-lies k=1 a=2 fault=31",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "b329000000000000"
+     ],
+     [
+      7,
+      null
+     ],
+     [
+      10,
+      "207d000000000000"
+     ],
+     [
+      11,
+      "b329000000000000"
+     ],
+     [
+      12,
+      "d2c6000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 6,
+   "rounds": [
+    {
+     "midpoints": [
+      "0c31a4990668be297a4f38fda031e3e7822ec70bcbef0e4bb00651a0ca550ac6"
+     ],
+     "pick": 1
+    },
+    {
+     "midpoints": [
+      "74247af31e81c1e2a3562718403c60f8cfed5258d88d2e0b74ab0ae64bc3d106"
+     ],
+     "pick": 1
+    },
+    {
+     "midpoints": [
+      "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701"
+     ],
+     "pick": 1
+    }
+   ],
+   "ruling": "E",
+   "terminal": 31
+  },
+  {
+   "arity": 3,
+   "commitment": {
+    "checkpoint_root": "314779277d4045260c3e8345b86ce44fbdabbfa85e141de65133b4ab2c8f7d58",
+    "k": 4,
+    "outputs": [
+     "55674c0000000000"
+    ],
+    "outputs_digest": "a82a6b1326d63b586c9f619d5914a0cb8cb7f5a72426305781c7e3ddddffa952",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "cade84a87ddf121c65a45d1a5c4bf412172e29e66e91956d20d406a9fabed57a",
+     "8a6bb4a3a6dd38eae4ae92f59fc19ea742a171f13ded48ee3f4aec994a3bf2d6",
+     "bd91a2e2bfd0cac2dc24a389d7a09083f8ff8e9c28dd5ad45f6a57dab59dc8b9"
+    ]
+   },
+   "name": "executor-lies k=4 a=3 fault=13",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "7700000000000000"
+     ],
+     [
+      4,
+      null
+     ],
+     [
+      10,
+      "6901000000000000"
+     ],
+     [
+      11,
+      "7700000000000000"
+     ],
+     [
+      12,
+      "aa00000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 0,
+   "rounds": [
+    {
+     "midpoints": [
+      "6b94918e49c3cdc98b76faa71878c5c3ecb20005eaada8d617b7c0c0893ae8df",
+      "17cdffedbcb0322705541233dda732e38f437f9ac3760ad030dd3e8a2956a579"
+     ],
+     "pick": 2
+    },
+    {
+     "midpoints": [
+      "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+      "4323000046dbc5e88d426c2c4b1b0d57bd03adfe14c9a64bec1e2eea4f888264"
+     ],
+     "pick": 2
+    },
+    {
+     "midpoints": [
+      "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469"
+     ],
+     "pick": 1
+    }
+   ],
+   "ruling": "C",
+   "terminal": 13
+  },
+  {
+   "arity": 3,
+   "commitment": {
+    "checkpoint_root": "0600b42cfda7d09ab4979a926bb5a3e24c73e81b7c0a236c70b4ee28255d8651",
+    "k": 4,
+    "outputs": [
+     "0a464c0000000000"
+    ],
+    "outputs_digest": "332d9c582f1aee800ca8c42e791626fc0cd347074775302a583d1fd3a68e29a9",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "name": "challenger-lies k=4 a=3 fault=13",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "7700000000000000"
+     ],
+     [
+      4,
+      null
+     ],
+     [
+      10,
+      "6901000000000000"
+     ],
+     [
+      11,
+      "7700000000000000"
+     ],
+     [
+      12,
+      "aa00000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 0,
+   "rounds": [
+    {
+     "midpoints": [
+      "6b94918e49c3cdc98b76faa71878c5c3ecb20005eaada8d617b7c0c0893ae8df",
+      "17cdffedbcb0322705541233dda732e38f437f9ac3760ad030dd3e8a2956a579"
+     ],
+     "pick": 2
+    },
+    {
+     "midpoints": [
+      "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+      "4323000046dbc5e88d426c2c4b1b0d57bd03adfe14c9a64bec1e2eea4f888264"
+     ],
+     "pick": 2
+    },
+    {
+     "midpoints": [
+      "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469"
+     ],
+     "pick": 1
+    }
+   ],
+   "ruling": "E",
+   "terminal": 13
+  },
+  {
+   "arity": 3,
+   "commitment": {
+    "checkpoint_root": "e37c517ef32376d76bac2e864b24247ad7ef9a98e296a97536df4d4f0214c036",
+    "k": 4,
+    "outputs": [
+     "25464c0000000000"
+    ],
+    "outputs_digest": "230ac8822a87828748ad19e160f79f0111602fb70ac6d96e339835a33bdda0b1",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "eb23ee7f6ca535f0191acbf60d33ecad342b93276008842428b9699503c2f28e",
+     "b427275a1928bfb57f545d9bb0cfea59a976428e5c216c229af3f61b13471a1b"
+    ]
+   },
+   "name": "executor-lies k=4 a=3 fault=31",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "b329000000000000"
+     ],
+     [
+      7,
+      null
+     ],
+     [
+      10,
+      "207d000000000000"
+     ],
+     [
+      11,
+      "b329000000000000"
+     ],
+     [
+      12,
+      "d2c6000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 1,
+   "rounds": [
+    {
+     "midpoints": [
+      "cfc8d2ccec117fb9ea4a9367a1565aec951fc8a57946c44c51e40388012c59d4",
+      "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701"
+     ],
+     "pick": 2
+    },
+    {
+     "midpoints": [
+      "1c41775a370ab7adec0457f8573cfdbe0ad87096a6f0d1573b9445ce23380cf1",
+      "60d57290e9d5ab62e00158aaa005ce2b20b9b5539809dd2191ca13d6377c1832"
+     ],
+     "pick": 0
+    },
+    {
+     "midpoints": [
+      "c86a52ec3c477a5c09cf424c9e758ae0ad720e9779192023b2759f5a8be1c03d",
+      "62771ac22cb52ed5092d1cbc1ffce006cb0e5244ed6cc6ecb47f329854153a5c"
+     ],
+     "pick": 0
+    }
+   ],
+   "ruling": "C",
+   "terminal": 31
+  },
+  {
+   "arity": 3,
+   "commitment": {
+    "checkpoint_root": "0600b42cfda7d09ab4979a926bb5a3e24c73e81b7c0a236c70b4ee28255d8651",
+    "k": 4,
+    "outputs": [
+     "0a464c0000000000"
+    ],
+    "outputs_digest": "332d9c582f1aee800ca8c42e791626fc0cd347074775302a583d1fd3a68e29a9",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "name": "challenger-lies k=4 a=3 fault=31",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "b329000000000000"
+     ],
+     [
+      7,
+      null
+     ],
+     [
+      10,
+      "207d000000000000"
+     ],
+     [
+      11,
+      "b329000000000000"
+     ],
+     [
+      12,
+      "d2c6000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 1,
+   "rounds": [
+    {
+     "midpoints": [
+      "cfc8d2ccec117fb9ea4a9367a1565aec951fc8a57946c44c51e40388012c59d4",
+      "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701"
+     ],
+     "pick": 2
+    },
+    {
+     "midpoints": [
+      "4f997fbec0ec7d200b663a4be741ef17f758de46cbe935dba7c79731fe4ff591",
+      "8ce85edba3197e630b59cedd67e41cfdbbdb3bf23cde53537e446b93a06c8f6b"
+     ],
+     "pick": 0
+    },
+    {
+     "midpoints": [
+      "4d2ceab98f972492c43b20e26ebd0d97fc556fd4d6c1b81b8587b80657cf1e3c",
+      "8f970fb3807d6377219fd6cce28c1bc13cfb7a123657e90cf149bc0cb6bf6839"
+     ],
+     "pick": 0
+    }
+   ],
+   "ruling": "E",
+   "terminal": 31
+  },
+  {
+   "arity": 4,
+   "commitment": {
+    "checkpoint_root": "b55b6437bf4dd3d4c96f104c08e6516215d030f6de6884a42da8c2dfd12df821",
+    "k": 2,
+    "outputs": [
+     "55674c0000000000"
+    ],
+    "outputs_digest": "a82a6b1326d63b586c9f619d5914a0cb8cb7f5a72426305781c7e3ddddffa952",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+     "cade84a87ddf121c65a45d1a5c4bf412172e29e66e91956d20d406a9fabed57a",
+     "6cc35e221bdf8587d0d2bcd6cb198d818899faa76bd953d80ffae8eccaf82b64",
+     "8a6bb4a3a6dd38eae4ae92f59fc19ea742a171f13ded48ee3f4aec994a3bf2d6",
+     "bd91a2e2bfd0cac2dc24a389d7a09083f8ff8e9c28dd5ad45f6a57dab59dc8b9"
+    ]
+   },
+   "name": "executor-lies k=2 a=4 fault=13",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "7700000000000000"
+     ],
+     [
+      4,
+      null
+     ],
+     [
+      10,
+      "6901000000000000"
+     ],
+     [
+      11,
+      "7700000000000000"
+     ],
+     [
+      12,
+      "aa00000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 1,
+   "rounds": [
+    {
+     "midpoints": [
+      "3675241f466fa39eab86754253e2017d042a3cd39552e184685f5e8e0784150b",
+      "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+      "4323000046dbc5e88d426c2c4b1b0d57bd03adfe14c9a64bec1e2eea4f888264"
+     ],
+     "pick": 3
+    },
+    {
+     "midpoints": [
+      "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469"
+     ],
+     "pick": 1
+    }
+   ],
+   "ruling": "C",
+   "terminal": 13
+  },
+  {
+   "arity": 4,
+   "commitment": {
+    "checkpoint_root": "8a4feeee10e76ba557b3413a7db72c2c103f0b740da446f9e0332e402183823d",
+    "k": 2,
+    "outputs": [
+     "0a464c0000000000"
+    ],
+    "outputs_digest": "332d9c582f1aee800ca8c42e791626fc0cd347074775302a583d1fd3a68e29a9",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "570499802f0981978a50ee2190c7a6477d41f32cd9adb7dc5a3d09f5e221479a",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "name": "challenger-lies k=2 a=4 fault=13",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "7700000000000000"
+     ],
+     [
+      4,
+      null
+     ],
+     [
+      10,
+      "6901000000000000"
+     ],
+     [
+      11,
+      "7700000000000000"
+     ],
+     [
+      12,
+      "aa00000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 1,
+   "rounds": [
+    {
+     "midpoints": [
+      "3675241f466fa39eab86754253e2017d042a3cd39552e184685f5e8e0784150b",
+      "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+      "4323000046dbc5e88d426c2c4b1b0d57bd03adfe14c9a64bec1e2eea4f888264"
+     ],
+     "pick": 3
+    },
+    {
+     "midpoints": [
+      "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469"
+     ],
+     "pick": 1
+    }
+   ],
+   "ruling": "E",
+   "terminal": 13
+  },
+  {
+   "arity": 4,
+   "commitment": {
+    "checkpoint_root": "18f531e82dcb2722b342c8ac51d6e2a0d753b04df046a9293c1f0b99d3600f5b",
+    "k": 2,
+    "outputs": [
+     "25464c0000000000"
+    ],
+    "outputs_digest": "230ac8822a87828748ad19e160f79f0111602fb70ac6d96e339835a33bdda0b1",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "570499802f0981978a50ee2190c7a6477d41f32cd9adb7dc5a3d09f5e221479a",
+     "eb23ee7f6ca535f0191acbf60d33ecad342b93276008842428b9699503c2f28e",
+     "b427275a1928bfb57f545d9bb0cfea59a976428e5c216c229af3f61b13471a1b"
+    ]
+   },
+   "name": "executor-lies k=2 a=4 fault=31",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "b329000000000000"
+     ],
+     [
+      7,
+      null
+     ],
+     [
+      10,
+      "207d000000000000"
+     ],
+     [
+      11,
+      "b329000000000000"
+     ],
+     [
+      12,
+      "d2c6000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 3,
+   "rounds": [
+    {
+     "midpoints": [
+      "0c31a4990668be297a4f38fda031e3e7822ec70bcbef0e4bb00651a0ca550ac6",
+      "62771ac22cb52ed5092d1cbc1ffce006cb0e5244ed6cc6ecb47f329854153a5c",
+      "86e0c242c00679ccaafa783797fd4e4550597fc028cdd89c9e7b4aa621b1190d"
+     ],
+     "pick": 1
+    },
+    {
+     "midpoints": [
+      "74247af31e81c1e2a3562718403c60f8cfed5258d88d2e0b74ab0ae64bc3d106",
+      "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701",
+      "c86a52ec3c477a5c09cf424c9e758ae0ad720e9779192023b2759f5a8be1c03d"
+     ],
+     "pick": 2
+    }
+   ],
+   "ruling": "C",
+   "terminal": 31
+  },
+  {
+   "arity": 4,
+   "commitment": {
+    "checkpoint_root": "8a4feeee10e76ba557b3413a7db72c2c103f0b740da446f9e0332e402183823d",
+    "k": 2,
+    "outputs": [
+     "0a464c0000000000"
+    ],
+    "outputs_digest": "332d9c582f1aee800ca8c42e791626fc0cd347074775302a583d1fd3a68e29a9",
+    "roots": [
+     "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+     "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+     "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+     "570499802f0981978a50ee2190c7a6477d41f32cd9adb7dc5a3d09f5e221479a",
+     "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+     "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f"
+    ]
+   },
+   "name": "challenger-lies k=2 a=4 fault=31",
+   "opening": {
+    "opened": [
+     [
+      0,
+      "b329000000000000"
+     ],
+     [
+      7,
+      null
+     ],
+     [
+      10,
+      "207d000000000000"
+     ],
+     [
+      11,
+      "b329000000000000"
+     ],
+     [
+      12,
+      "d2c6000000000000"
+     ]
+    ],
+    "siblings": [
+     "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+     "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+     "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+     "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+     "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+     "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+    ]
+   },
+   "pair": 3,
+   "rounds": [
+    {
+     "midpoints": [
+      "0c31a4990668be297a4f38fda031e3e7822ec70bcbef0e4bb00651a0ca550ac6",
+      "8f970fb3807d6377219fd6cce28c1bc13cfb7a123657e90cf149bc0cb6bf6839",
+      "1a112cebcb0f2934f0150969b577af25f857cb97313c7f0bcd9e581d8f0aca86"
+     ],
+     "pick": 1
+    },
+    {
+     "midpoints": [
+      "74247af31e81c1e2a3562718403c60f8cfed5258d88d2e0b74ab0ae64bc3d106",
+      "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701",
+      "4d2ceab98f972492c43b20e26ebd0d97fc556fd4d6c1b81b8587b80657cf1e3c"
+     ],
+     "pick": 2
+    }
+   ],
+   "ruling": "E",
+   "terminal": 31
+  }
+ ]
+}

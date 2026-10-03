@@ -9,7 +9,7 @@ use crate::{empty, node, Hash, Sha256, Tree};
 pub const SLOT_LEAF_DOMAIN: &[u8] = b"dcg.lx.slot.leaf.v1\x00";
 
 /// The leaf of one slot: its index and value, or the empty-slot leaf.
-pub fn slot_leaf<H: Sha256>(h: &H, slot: u32, value: Option<&[u8]>) -> Hash {
+pub fn slot_leaf<H: Sha256 + ?Sized>(h: &H, slot: u32, value: Option<&[u8]>) -> Hash {
     match value {
         None => empty(h, Tree::LxState, 0),
         Some(v) => h.hash(&[SLOT_LEAF_DOMAIN, &slot.to_le_bytes(), &(v.len() as u32).to_le_bytes(), v]),
@@ -23,7 +23,7 @@ pub fn slot_leaf<H: Sha256>(h: &H, slot: u32, value: Option<&[u8]>) -> Hash {
 /// the nodes not derivable from the opened leaves, in canonical order: level
 /// ascending, then position ascending. Returns `None` for unsorted or
 /// out-of-range slots, a missing or extra sibling, or an empty opening.
-pub fn fold<H: Sha256>(h: &H, height: u16, nodes: &mut [(u64, Hash)], siblings: &[Hash]) -> Option<Hash> {
+pub fn fold<H: Sha256 + ?Sized>(h: &H, height: u16, nodes: &mut [(u64, Hash)], siblings: &[Hash]) -> Option<Hash> {
     let mut n = nodes.len();
     if n == 0 {
         return None;
@@ -173,7 +173,7 @@ pub trait LxMachine {
 
 /// Map a global coordinate to `(position, index)`. `None` outside the
 /// schedule, or if the machine's prefix sums are inconsistent there.
-pub fn locate<M: LxMachine>(m: &M, coordinate: u64) -> Option<(u64, u64)> {
+pub fn locate<M: LxMachine + ?Sized>(m: &M, coordinate: u64) -> Option<(u64, u64)> {
     let n = m.positions();
     if coordinate >= m.position_start(n) {
         return None;
@@ -232,7 +232,7 @@ pub struct Scratch<'a> {
 /// cover the slots or rebuild `root_lo`. Otherwise rules: the executor wins if
 /// the replayed state rebuilds `root_hi`; the challenger wins on a mismatch or
 /// a kernel failure.
-pub fn replay<'v, H: Sha256, M: LxMachine>(
+pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
     h: &H,
     m: &M,
     coordinate: u64,
@@ -305,7 +305,7 @@ pub fn replay<'v, H: Sha256, M: LxMachine>(
 /// The OUTPUT claim (design review H3): `opened` covers exactly `output_slots`
 /// (sorted, distinct) against the final root `root_t`; the challenger wins if
 /// any opened value differs from the claimed output at the same index.
-pub fn output_claim<H: Sha256>(
+pub fn output_claim<H: Sha256 + ?Sized>(
     h: &H,
     height: u16,
     output_slots: &[u32],
@@ -329,4 +329,21 @@ pub fn output_claim<H: Sha256>(
     }
     let lie = opened.iter().zip(claimed).any(|((_, v), c)| v != c);
     Ok(if lie { LxRuling::Challenger } else { LxRuling::Executor })
+}
+
+pub const OUTPUTS_DOMAIN: &[u8] = b"dcg.lx.outputs.v1\x00";
+
+/// The digest a run commits for its claimed outputs, in output-slot order:
+/// each value is `present:u8` then, if present, `len:u32le` and its bytes.
+pub fn outputs_digest<H: Sha256 + ?Sized>(h: &H, outputs: &[Option<&[u8]>]) -> Hash {
+    // One hash call per value keeps this allocation-free; the chaining is
+    // `acc = H(domain, acc, present, len, bytes)` from a zero start.
+    let mut acc = [0u8; 32];
+    for v in outputs {
+        acc = match v {
+            None => h.hash(&[OUTPUTS_DOMAIN, &acc, &[0]]),
+            Some(b) => h.hash(&[OUTPUTS_DOMAIN, &acc, &[1], &(b.len() as u32).to_le_bytes(), b]),
+        };
+    }
+    acc
 }
