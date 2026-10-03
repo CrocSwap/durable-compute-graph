@@ -380,13 +380,47 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "closure_v2_bootstrap.rs::pub init_v4",
     "closure_v2_bootstrap.rs::pub seal_v2",
     "closure_v2_bootstrap.rs::pub upload_v2",
+    "closure_v2_generic.rs::private rule_v6", // execute authenticates the v5 DCR1 and v6 DCM2 PDAs, size and kind before this helper.
     "desc_upload.rs::private store_dcd1",
     "desc_upload.rs::pub process_alloc",
     "desc_upload.rs::pub process_upload",
+    "disputes_v21.rs::private advance", // dispute_ctx authenticates run, template and dispute; the ruled sequence must equal the prefix.
+    "disputes_v21.rs::private cache_answer", // dispute_ctx authenticates the target; the cache is an owned, derived D21C for this node.
+    "disputes_v21.rs::private change_template_run_count", // init_run and close_run authenticate the tracked D21T before changing its count.
+    "disputes_v21.rs::private close_dispute", // dispute_ctx binds D21R/D21D; each staged PDA and refund recipient is checked before close.
+    "disputes_v21.rs::private close_into", // callers authenticate the account and refund key before this writable close helper.
+    "disputes_v21.rs::private close_run", // run_checked and template authenticate both PDAs; the payer and terminal state are checked.
+    "disputes_v21.rs::private commit", // run_checked binds D21R to D21T; only its recorded executor signer can commit.
+    "disputes_v21.rs::private create_pda", // exact seed/bump, empty system owner and caller-signed payer precede allocation.
+    "disputes_v21.rs::private finalize", // run_checked binds D21R to D21T; deadline and recorded executor key gate payout.
+    "disputes_v21.rs::private moot", // dispute_ctx binds both PDAs; best-win sequence and challenger key gate the ruling.
+    "disputes_v21.rs::private move_lamports", // callers authenticate program-owned source and recorded payout recipient before transfer.
+    "disputes_v21.rs::private pay_pot", // dispute_ctx binds both PDAs; best sequence, paid flag and payee keys gate payout.
+    "disputes_v21.rs::private pick", // dispute_ctx binds both PDAs; recorded challenger signer and phase gate the write.
+    "disputes_v21.rs::private retire_template", // template authenticates D21T; recorded payer signer and tracking shape gate retirement.
+    "disputes_v21.rs::private reveal_leaf", // dispute_ctx binds both PDAs; executor signer, phase and committed leaf hash gate reveal.
+    "disputes_v21.rs::private rule", // authenticated Ctx supplies both PDAs; ruling state and recorded payee keys gate writes.
+    "disputes_v21.rs::private stage_grow", // dispute_ctx and staging_role bind D21D/D21S; signer-funded growth is bounded.
+    "disputes_v21.rs::private stage_write", // dispute_ctx and staging_role bind D21D/D21S; role signer and bounds gate writes.
     "envelope_seal.rs::private create_pda",
     "envelope_seal.rs::pub admission_step",
     "envelope_seal.rs::pub registry_freeze",
     "envelope_seal.rs::pub registry_write",
+    "graph_v2.rs::private challenge", // run_checked binds DCR2 to DCT2; proved wrong step and challenger signer gate ruling.
+    "graph_v2.rs::private choose", // checked run/dispute PDAs, recorded challenger signer and phase gate the choice.
+    "graph_v2.rs::private close_run", // run_checked binds DCR2 to DCT2; recorded payer signer and terminal state gate close.
+    "graph_v2.rs::private commit", // run_checked binds DCR2 to DCT2; executor signer and open status gate commit.
+    "graph_v2.rs::private create_pda", // exact seed/bump, empty system owner and caller-signed payer precede allocation.
+    "graph_v2.rs::private execute", // run_checked binds DCR2 to DCT2; signed caller and open consensus mode gate execution.
+    "graph_v2.rs::private finalize", // run_checked binds DCR2 to DCT2; deadline and recorded executor key gate payout.
+    "graph_v2.rs::private open_dispute", // run_checked and dispute_checked bind DCR2/DCD2; challenger signer and phase gate opening.
+    "graph_v2.rs::private reveal_leaf", // checked run/dispute PDAs, executor signer and phase gate the leaf write.
+    "graph_v2.rs::private reveal_region", // checked run/dispute PDAs, executor signer and committed root gate the region write.
+    "graph_v2.rs::private rule_challenger", // checked run/dispute callers bind PDAs; recorded challenger key gates ruling and bond.
+    "graph_v2.rs::private rule_executor", // checked run/dispute callers bind PDAs; recorded executor key gates bond payout.
+    "graph_v2.rs::private sample_audit", // run_checked binds DCR2 to DCT2; slot-hash proof gates audit and bond.
+    "graph_v2.rs::private settle_descent", // checked run/dispute PDAs, deadlines and payee keys gate timeout rulings.
+    "graph_v2.rs::private take_bond", // callers authenticate the run or dispute PDA and recipient before moving excess rent.
     "pt1_onchain.rs::private init_pt1x",
     "pt1_onchain.rs::private init_with_magic",
     "pt1_onchain.rs::pub init_variant",
