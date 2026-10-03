@@ -4758,11 +4758,8 @@ async fn f47_unified_init_accepts_unsorted_and_duplicate_options_sbf() {
 
         let (descriptor, created) = f.run_document_with_options(&binding, n, &table).await;
         let doc = f.account(created[0]).await;
-        assert_eq!(
-            &doc[OPTION_REGION_AT..],
-            table.as_slice(),
-            "UnifiedInit preserves options {options:?} in order"
-        );
+        // The options in order, then ARI1 exactly on an app-bound template.
+        assert_option_tail(&mut f, &doc, &table).await;
         let finalized = f.finalize(&descriptor, created, n).await;
         assert_eq!(
             u16_at(&finalized, 6),
