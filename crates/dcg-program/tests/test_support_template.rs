@@ -56,3 +56,41 @@ async fn admission_can_stop_after_begin() {
     let dea2 = t.chain.data(t.dea2).await;
     assert_eq!(u32::from_le_bytes(dea2[148..152].try_into().unwrap()), 0, "no class admitted");
 }
+
+/// The regeneration check (owner decision 2026-10-02): a fresh real run of
+/// the stage equals the saved snapshot byte for byte, and two fresh runs
+/// equal each other. A mismatch means the program or builder changed and the
+/// snapshot (or the key) is stale.
+#[tokio::test(flavor = "multi_thread")]
+async fn template_snapshots_regenerate_byte_for_byte() {
+    use dcg_test_support::fixtures::Fixture;
+    use dcg_test_support::snapshot::Snapshot;
+    for kind in [FixtureKind::K80, FixtureKind::F47] {
+        let target = target();
+        let Some(fixture) = Fixture::load(kind) else { continue };
+        let key = Template::snapshot_key(&target, &TemplateOptions::new(kind), &fixture);
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let mut t = Template::build(&target, TemplateOptions::new(kind)).await.unwrap();
+            let keys = t.accounts();
+            runs.push(Snapshot::capture(&mut t.chain, key, &keys).await);
+        }
+        assert_eq!(runs[0].differences(&runs[1]), Vec::<String>::new(), "{kind:?}: two real runs differ");
+        match Snapshot::load(&key) {
+            Some(saved) => assert_eq!(saved.differences(&runs[0]), Vec::<String>::new(), "{kind:?}: stale snapshot"),
+            None => runs[0].save(),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_template_is_the_real_one() {
+    // The first call may build and save; the second restores.
+    for _ in 0..2 {
+        let Some(mut t) = Template::build_cached(&target(), TemplateOptions::new(FixtureKind::K80)).await else { return };
+        let dea2 = t.chain.data(t.dea2).await;
+        assert_eq!(u16::from_le_bytes([dea2[6], dea2[7]]) & 1, 1);
+        assert_eq!(u32::from_le_bytes(dea2[148..152].try_into().unwrap()), t.class_total);
+        assert_eq!(dcg_program::hash::sha256(&[&t.chain.data(t.pt2s).await]), t.pt2s_sha);
+    }
+}

@@ -356,6 +356,83 @@ impl Template {
         })
     }
 
+    /// The snapshot key of this stage with these options and program.
+    pub fn snapshot_key(target: &Target, options: &TemplateOptions, fixture: &Fixture) -> [u8; 32] {
+        let admission = match options.admission {
+            Admission::Complete => 0u8,
+            Admission::Form48Only => 1,
+            Admission::Begun => 2,
+        };
+        let opts = [options.kind as u8, options.swap_roles as u8, admission, target.is_sbf() as u8];
+        crate::snapshot::key("template", &opts, &fixture.digest(), &target.identity)
+    }
+
+    /// `build`, or a restore of a snapshot a previous real `build` saved with
+    /// the same key (owner decision 2026-10-02). The first call saves it.
+    pub async fn build_cached(target: &Target, options: TemplateOptions) -> Option<Template> {
+        let fixture = Fixture::load(options.kind)?;
+        let key = Template::snapshot_key(target, &options, &fixture);
+        if let Some(snapshot) = crate::snapshot::Snapshot::load(&key) {
+            return Some(Template::restore(target, options, fixture, snapshot).await);
+        }
+        drop(fixture);
+        let mut t = Template::build(target, options).await?;
+        let keys = t.accounts();
+        crate::snapshot::Snapshot::capture(&mut t.chain, key, &keys).await.save();
+        Some(t)
+    }
+
+    async fn restore(
+        target: &Target,
+        options: TemplateOptions,
+        fixture: Fixture,
+        snapshot: crate::snapshot::Snapshot,
+    ) -> Template {
+        let roles = Roles::fixed(options.swap_roles);
+        let program = target.program_id;
+        let mut test = target.program_test(roles.executor.pubkey());
+        for (key, account) in &snapshot.accounts {
+            test.add_account(*key, account.clone());
+        }
+        let mut chain = Chain::start(test, program, &[roles.executor.pubkey(), roles.signer.pubkey()]).await;
+        if options.trace_cu {
+            chain.trace_cu_tags = vec![140, 141, 142, 143, 144, 145, 156, 157, 158, 159, 160, 176, 193];
+        }
+        let [pt1x, pt2s, routes, geometry, payloads] = resource_keys().map(|k| k.pubkey());
+        let pt2s_image = chain.data(pt2s).await;
+        let pt2s_sha = dcg_program::hash::sha256(&[&pt2s_image]);
+        let drp2 = address::registry(&program, 1).0;
+        let reg_root: [u8; 32] = chain.data(drp2).await[152..184].try_into().unwrap();
+        let (k, segments, class_total) = {
+            let view = fixture.view();
+            (view.position_count, view.segment_count, dcg_program::unified::classes::class_count(&view).unwrap())
+        };
+        let locator = locator_for(&fixture);
+        Template {
+            chain,
+            roles,
+            program,
+            config: address::config(&program).0,
+            pt1x,
+            pt2s,
+            routes,
+            geometry,
+            payloads,
+            drp2,
+            dta1: address::template_seal(&program, &pt2s, &pt2s_sha).0,
+            dtu1: address::template_use(&program, &pt2s, &pt2s_sha).0,
+            dea2: address::admission(&program, &drp2, &pt2s, k).0,
+            pt2s_image,
+            pt2s_sha,
+            reg_root,
+            locator,
+            k,
+            segments,
+            class_total,
+            fixture,
+        }
+    }
+
     /// Every account this stage created (the snapshot set).
     pub fn accounts(&self) -> Vec<Pubkey> {
         vec![
