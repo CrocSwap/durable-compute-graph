@@ -71,14 +71,14 @@ versions.
 
 ## Open questions
 
-- **Adversarial corruption of program-owned accounts.** Some refusal tests
-  replace or corrupt an account only the program can write, for example a
-  wrong-kind or stale record. Such a state is unreachable on chain. Should
-  these tests:
-  - (a) be dropped;
-  - (b) be expressed as instruction-level attacks (pass a different real account in the slot); or
-  - (c) be kept through a named, documented `Chain::inject_fault`?
-
-  The inventory counts them; the owner decides.
+- **Adversarial corruption of program-owned accounts: decided (b), 2026-10-02.**
+  A refusal test is written as the attack an adversary could actually make on
+  chain: it passes a different *real* account in the slot. Examples: a
+  record of the wrong kind, a stale record from an earlier run, a second
+  instance, or another template's record, each created by the builder. A
+  corruption that no instruction-level attack can produce, meaning bytes
+  only the program could have written wrongly, is not tested by patching.
+  If it is worth keeping as defense in depth, it becomes a unit test of the
+  parsing function.
 - **How far down the stages to go before migrating.** The plan is the stages
   the inventory shows tests actually need, nothing speculative.
