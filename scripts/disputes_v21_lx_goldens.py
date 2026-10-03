@@ -45,7 +45,41 @@ def build() -> dict:
         d = L.Dispute.__new__(L.Dispute)
         d.lo, d.hi, d.arity = lo, hi, arity
         midpoints.append({"lo": lo, "hi": hi, "arity": arity, "coordinates": d.midpoint_coordinates()})
-    return {"slot_leaf_domain": L.SLOT_LEAF_DOMAIN.hex(), "cases": cases,
+    plays = []
+    tm = ToyMachine(positions_count=9, window=3)
+    honest = L.execute(tm)
+    configs = ((4, 16), (1, 2), (4, 3), (16, 16), (2, 4), (3, 5))
+    candidates = []
+    for c in range(L.Schedule(tm).total):
+        for k, arity in configs:
+            def f(coord, state, c=c):
+                if coord == c:
+                    state = dict(state)
+                    state[tm.H] = (int.from_bytes(state[tm.H], "little", signed=True) + 1).to_bytes(8, "little", signed=True)
+                return state
+            if L.first_disputed_pair(L.commit(L.execute(tm, f), k), honest) is not None:
+                candidates.append((c, k, arity))
+    chosen = []
+    for i, cfg in enumerate(configs):  # one fault per (k, arity), spread over the schedule
+        mine = [x for x in candidates if x[1:] == cfg]
+        if mine:
+            chosen.append(mine[len(mine) * (i + 1) // (len(configs) + 1)])
+    for c, k, arity in chosen:
+        def fault(coord, state, c=c):
+            if coord == c:
+                state = dict(state)
+                state[tm.H] = (int.from_bytes(state[tm.H], "little", signed=True) + 1).to_bytes(8, "little", signed=True)
+            return state
+        liar = L.execute(tm, fault)
+        rounds = []
+
+        def pick(d, rounds=rounds):
+            i = L.challenger_pick(honest, d)
+            rounds.append({"lo": d.lo, "hi": d.hi, "pick": i})
+            return i
+        d = L.play(tm, liar, honest, k, arity, pick=pick)
+        plays.append({"fault": c, "k": k, "arity": arity, "rounds": rounds, "final": [d.lo, d.hi], "ruling": d.ruling})
+    return {"plays": plays, "slot_leaf_domain": L.SLOT_LEAF_DOMAIN.hex(), "cases": cases,
             "schedules": schedules, "midpoints": midpoints}
 
 

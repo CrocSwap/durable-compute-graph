@@ -92,3 +92,16 @@ pub fn midpoint_coordinates(lo: u64, hi: u64, arity: u64, out: &mut [u64]) -> Op
     }
     Some(n)
 }
+
+/// The sub-interval a challenger names by `index` after the executor's
+/// midpoints over `[lo, hi)`: bounds are `lo`, the midpoints, then `hi`, and
+/// `index` selects `[bound[index], bound[index + 1]]`. `None` if the interval
+/// is empty, `arity < 2`, or `index` names no sub-interval.
+pub fn pick_interval(lo: u64, hi: u64, arity: u64, index: u64) -> Option<(u64, u64)> {
+    let mut mids = [0u64; 255];
+    let cap = (arity.min(256) as usize).saturating_sub(1);
+    let n = midpoint_coordinates(lo, hi, arity, &mut mids[..cap])?;
+    let bound = |i: usize| if i == 0 { lo } else if i <= n { mids[i - 1] } else { hi };
+    let i = index as usize;
+    (index <= n as u64).then(|| (bound(i), bound(i + 1)))
+}

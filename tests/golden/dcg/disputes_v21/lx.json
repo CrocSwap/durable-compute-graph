@@ -674,6 +674,140 @@
    "lo": 2
   }
  ],
+ "plays": [
+  {
+   "arity": 16,
+   "fault": 5,
+   "final": [
+    5,
+    6
+   ],
+   "k": 4,
+   "rounds": [
+    {
+     "hi": 14,
+     "lo": 0,
+     "pick": 5
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 2,
+   "fault": 9,
+   "final": [
+    9,
+    10
+   ],
+   "k": 1,
+   "rounds": [
+    {
+     "hi": 10,
+     "lo": 6,
+     "pick": 1
+    },
+    {
+     "hi": 10,
+     "lo": 8,
+     "pick": 1
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 3,
+   "fault": 13,
+   "final": [
+    13,
+    14
+   ],
+   "k": 4,
+   "rounds": [
+    {
+     "hi": 14,
+     "lo": 0,
+     "pick": 2
+    },
+    {
+     "hi": 14,
+     "lo": 9,
+     "pick": 2
+    },
+    {
+     "hi": 14,
+     "lo": 12,
+     "pick": 1
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 16,
+   "fault": 25,
+   "final": [
+    25,
+    26
+   ],
+   "k": 16,
+   "rounds": [
+    {
+     "hi": 48,
+     "lo": 0,
+     "pick": 8
+    },
+    {
+     "hi": 27,
+     "lo": 24,
+     "pick": 1
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 4,
+   "fault": 31,
+   "final": [
+    31,
+    32
+   ],
+   "k": 2,
+   "rounds": [
+    {
+     "hi": 40,
+     "lo": 26,
+     "pick": 1
+    },
+    {
+     "hi": 33,
+     "lo": 29,
+     "pick": 2
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 5,
+   "fault": 39,
+   "final": [
+    39,
+    40
+   ],
+   "k": 3,
+   "rounds": [
+    {
+     "hi": 48,
+     "lo": 26,
+     "pick": 3
+    },
+    {
+     "hi": 43,
+     "lo": 39,
+     "pick": 0
+    }
+   ],
+   "ruling": "C"
+  }
+ ],
  "schedules": [
   {
    "checkpoints": {

@@ -113,3 +113,32 @@ fn midpoint_coordinates_match_python() {
     assert_eq!(midpoint_coordinates(6, 5, 16, &mut out), None);
     assert_eq!(midpoint_coordinates(0, 9, 1, &mut out), None);
 }
+
+#[test]
+fn bisection_picks_match_python_plays() {
+    use dcg_disputes::lx::pick_interval;
+    let g = golden();
+    let plays = g["plays"].as_array().unwrap();
+    assert!(plays.len() >= 5);
+    for p in plays {
+        let arity = p["arity"].as_u64().unwrap();
+        let rounds = p["rounds"].as_array().unwrap();
+        let fin = p["final"].as_array().unwrap();
+        let mut next: Option<(u64, u64)> = None;
+        for r in rounds {
+            let (lo, hi, pick) = (r["lo"].as_u64().unwrap(), r["hi"].as_u64().unwrap(), r["pick"].as_u64().unwrap());
+            if let Some(n) = next {
+                assert_eq!(n, (lo, hi));
+            }
+            next = pick_interval(lo, hi, arity, pick);
+            assert!(next.is_some());
+            assert_eq!(pick_interval(lo, hi, arity, arity), None, "index past the last sub-interval");
+        }
+        assert_eq!(next.unwrap(), (fin[0].as_u64().unwrap(), fin[1].as_u64().unwrap()));
+        assert_eq!(next.unwrap().1 - next.unwrap().0, 1);
+        assert_eq!(p["ruling"].as_str(), Some("C"), "the planted lie is convicted");
+    }
+    assert_eq!(pick_interval(4, 4, 16, 0), None);
+    assert_eq!(pick_interval(4, 5, 16, 0), Some((4, 5)));
+    assert_eq!(pick_interval(4, 5, 16, 1), None);
+}
