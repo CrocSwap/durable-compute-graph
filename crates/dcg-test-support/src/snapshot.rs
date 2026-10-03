@@ -12,7 +12,7 @@ use solana_pubkey::Pubkey;
 use std::path::PathBuf;
 
 /// Bump when a stage's real flow changes in a way its key does not cover.
-pub const BUILDER_VERSION: u32 = 2;
+pub const BUILDER_VERSION: u32 = 4;
 const MAGIC: &[u8; 8] = b"DCGSNAP1";
 
 pub struct Snapshot {

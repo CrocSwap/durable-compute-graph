@@ -16491,3 +16491,53 @@ async fn lifecycle_property_v2_generated_valid_paths() {
         std::fs::write(path, text).unwrap();
     }
 }
+
+// ------------------------------------------------- T8 planted-bug survivors
+
+/// Planted bug M6 survived (2026-10-03): nothing checked that real attested
+/// admission records its scan. The standard-mode template's DEA2 is complete,
+/// app-bound and attested, exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_attested_admission_records_complete_app_bound_and_attested() {
+    let Some(mut f) = build().await else { return };
+    assert_eq!(
+        u16_at(&f.account(f.dea2).await, 6),
+        1 | 2 | 4,
+        "DEA2 flags: complete | app-bound | attested"
+    );
+}
+
+/// Planted bug M4 survived (2026-10-03): nothing closed a finalized document
+/// while a challenge was open. A real open challenge (166) holds the close
+/// (599) even past the dispute and production deadlines; the document's
+/// accounts are untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn rev8_close_waits_for_an_open_challenge() {
+    let Some(mut f) = build().await else { return };
+    let binding = f.binding(29, 50);
+    let (descriptor, created, proofs) = attest_all(&mut f, &binding, 31, &[], 83).await;
+    let record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), 51).0;
+    let packet = challenge_leaf_packet(&f, &descriptor, &proofs[0], 51);
+    let metas = challenge_leaf_metas(&f, created, record);
+    send_fresh(&mut f.ctx, &f.signer, f.program, packet, metas)
+        .await
+        .expect("the challenger opens a leaf challenge");
+    assert_eq!(u32_at(&f.account(created[0]).await, 128), 1);
+    let doc = f.account(created[0]).await;
+    let past = u64_at(&doc, 144).max(u64_at(&doc, document::ABANDON_DEADLINE_AT)) + 1;
+    clock_to(&mut f, past).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    let before = f.account(created[3]).await;
+    let metas = f.close_metas(&c, f.signer.pubkey());
+    assert_eq!(
+        custom(send_fresh(&mut f.ctx, &f.signer, f.program, close_data(&descriptor), metas).await),
+        CL_CLOSE,
+        "an open challenge holds the close"
+    );
+    assert_eq!(f.account(created[3]).await, before, "the refused close wrote nothing");
+}

@@ -20,6 +20,7 @@ use solana_instruction::account_meta::AccountMeta;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
+use solana_transaction_error::TransactionError;
 
 /// The template authority (also the executor) and a second identity (the
 /// challenger), with fixed keys so compute-unit census figures compare
@@ -63,11 +64,14 @@ pub struct TemplateOptions {
     pub trace_cu: bool,
     /// The five limits the template seal (176) approves.
     pub limits: TemplateLimits,
+    /// Seal against registry rows whose `execute_cu` is 0 (canonical, but
+    /// outside the transaction profile), so real admission (160) refuses.
+    pub narrowed_registry: bool,
 }
 
 impl TemplateOptions {
     pub fn new(kind: FixtureKind) -> TemplateOptions {
-        TemplateOptions { kind, swap_roles: false, admission: Admission::Complete, trace_cu: false, limits: EXAMPLE_LIMITS }
+        TemplateOptions { kind, swap_roles: false, admission: Admission::Complete, trace_cu: false, limits: EXAMPLE_LIMITS, narrowed_registry: false }
     }
 }
 
@@ -222,7 +226,12 @@ impl Template {
         let pt2s_sha = dcg_program::hash::sha256(&[&pt2s_image]);
 
         // The registry (156-158).
-        let (rows, census) = fixture.registry_rows();
+        let (mut rows, census) = fixture.registry_rows();
+        if options.narrowed_registry {
+            for row in rows.chunks_exact_mut(registry::ROW_BYTES) {
+                row[20..24].copy_from_slice(&0u32.to_le_bytes());
+            }
+        }
         let drp2 = address::registry(&program, 1).0;
         chain.transfer(ex, drp2, 50_000_000_000).await;
         let mut data = vec![TAG_REGISTRY_CREATE];
@@ -373,7 +382,13 @@ impl Template {
             Admission::Form48Only => 1,
             Admission::Begun => 2,
         };
-        let mut opts = vec![options.kind as u8, options.swap_roles as u8, admission, target.is_sbf() as u8];
+        let mut opts = vec![
+            options.kind as u8,
+            options.swap_roles as u8,
+            admission,
+            target.is_sbf() as u8,
+            options.narrowed_registry as u8,
+        ];
         let l = &options.limits;
         for v in [
             l.max_challenge_window_slots,
@@ -451,6 +466,23 @@ impl Template {
             class_total,
             fixture,
         }
+    }
+
+    /// One real admission step (160) over `count` classes from `first`.
+    pub async fn admission_step(&mut self, first: u32, count: u16) -> Result<(), TransactionError> {
+        let mut step = vec![160];
+        step.extend_from_slice(&first.to_le_bytes());
+        step.extend_from_slice(&count.to_le_bytes());
+        let metas = vec![
+            AccountMeta::new(self.dea2, false),
+            AccountMeta::new_readonly(self.drp2, false),
+            AccountMeta::new_readonly(self.pt2s, false),
+            AccountMeta::new_readonly(self.pt1x, false),
+            AccountMeta::new_readonly(self.routes, false),
+            AccountMeta::new_readonly(self.geometry, false),
+        ];
+        let ex = self.roles.executor.insecure_clone();
+        self.chain.send(&ex, &[], step, metas).await
     }
 
     /// Every account this stage created (the snapshot set).

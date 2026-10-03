@@ -106,3 +106,32 @@ async fn config_init_on_sbf_writes_the_native_dcf1_image() {
     assert_eq!(real.owner, native.owner, "DCF1 owner");
     assert_eq!(real.lamports, native.lamports, "DCF1 lamports");
 }
+
+/// Planted bug M5 survived (2026-10-03): nothing showed real admission
+/// refusing a class its registry row rules out. Sealed against rows whose
+/// execute_cu is 0 (canonical, outside the transaction profile), real
+/// admission (160) must refuse the first class with OVER_CU, and admission
+/// stays incomplete.
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_refuses_a_class_its_registry_row_cannot_hold() {
+    let mut options = TemplateOptions::new(FixtureKind::K80);
+    options.admission = Admission::Begun;
+    options.narrowed_registry = true;
+    let Some(mut t) = Template::build_cached(&target(), options).await else { return };
+    let mut refusal = None;
+    let mut at = 0u32;
+    while at < t.class_total {
+        let count = (t.class_total - at).min(16) as u16;
+        match t.admission_step(at, count).await {
+            Ok(()) => at += count as u32,
+            Err(e) => {
+                refusal = Some((at, dcg_test_support::custom(Err(e))));
+                break;
+            }
+        }
+    }
+    let (at, code) = refusal.expect("real admission refuses a class its row cannot hold");
+    assert_eq!((at, code), (0, dcg_program::envelope_seal::OVER_CU), "the first step, OVER_CU (779)");
+    let dea2 = t.chain.data(t.dea2).await;
+    assert_eq!(u16::from_le_bytes([dea2[6], dea2[7]]) & 1, 0, "admission is not complete");
+}
