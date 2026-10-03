@@ -218,6 +218,33 @@ def const_chunk_log2(const_spec_record: bytes) -> int:
     return struct.unpack_from("<H", header, 11)[0] if struct.unpack_from("<I", header, 7)[0] == 3 else 0
 
 
+LIST_DOMAIN = b"dcg.list.v2.1\x00"
+LIST_LEAF_DOMAIN = b"dcg.list.leaf.v2.1\x00"
+
+
+def list_leaf(index: int, element_ref: bytes) -> bytes:
+    """One list element: its 55-byte value ref (ListSpec header, value digest)."""
+    assert len(element_ref) == 55
+    return hashlib.sha256(LIST_LEAF_DOMAIN + struct.pack("<I", index) + element_ref).digest()
+
+
+def list_tree(element_refs: list[bytes]) -> trees.Tree:
+    return trees.build("list", [list_leaf(j, r) for j, r in enumerate(element_refs)])
+
+
+def list_digest(element_refs: list[bytes]) -> bytes:
+    """A list input's digest: H(count || root of the element tree)."""
+    return hashlib.sha256(LIST_DOMAIN + struct.pack("<I", len(element_refs)) + list_tree(element_refs).root).digest()
+
+
+def flatten(values: list) -> list[bytes]:
+    """Kernel inputs: a list input contributes its elements in order."""
+    out = []
+    for v in values:
+        out.extend(v if isinstance(v, list) else [v])
+    return out
+
+
 LOG_DOMAIN = b"dcg.log.v2.1\x00"
 LOG_ENTRY_DOMAIN = b"dcg.log.entry.v2.1\x00"
 
@@ -271,6 +298,8 @@ class Commitment:
     node_overrides: dict[tuple[int, int], bytes] = field(default_factory=dict)  # (level, position) -> hash
     states: dict[int, bytes] = field(default_factory=dict)  # ordinal -> next state bytes
     last_running: dict[int, int] = field(default_factory=dict)  # repeated block -> last running iteration
+    # (ordinal, input index) -> the list input's element refs, revealed with the leaf
+    lists: dict[tuple[int, int], list[bytes]] = field(default_factory=dict)
 
     def __post_init__(self):
         self.rebuild()
@@ -305,6 +334,7 @@ class Commitment:
         c.values = dict(self.values)
         c.node_overrides = dict(self.node_overrides)
         c.states = dict(self.states)
+        c.lists = {k: list(v) for k, v in self.lists.items()}
         c.rebuild()
         return c
 
@@ -317,19 +347,22 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
             fault: Callable[[int, list[bytes], bytes | None], tuple[list[bytes], bytes | None]] | None = None,
             input_fault: Callable[[int, int, bytes], bytes] | None = None,
             prior_fault: Callable[[int, bytes], bytes] | None = None,
-            constants: dict[int, bytes] | None = None) -> Commitment:
+            constants: dict[int, bytes] | None = None,
+            list_fault: Callable[[int, int, int, bytes], bytes] | None = None) -> Commitment:
     """The honest execution H (or, with `fault`, an executor that corrupts one
     step's results and then continues consistently from them).
 
     `fault(ordinal, outputs, next_state)` may return altered results;
     `input_fault(ordinal, index, value)` an altered input value and
-    `prior_fault(ordinal, prior)` an altered prior state, both before replay."""
+    `prior_fault(ordinal, prior)` an altered prior state, both before replay;
+    `list_fault(ordinal, index, element, value)` an altered list element."""
     constants = spec.constant_values if constants is None else constants
     values: dict = {("ext", eid): v for eid, v in external_values.items()}
     values.update({("const", cid): v for cid, v in constants.items()})
     states: dict[int, bytes] = {}
     leaves: list[bytes | None] = [None] * spec.total_steps
     last_running: dict[int, int] = {}
+    lists: dict[tuple[int, int], list[bytes]] = {}
 
     def fetch(prod: bytes) -> bytes:
         kind, a, b, _c, d = S.decode_producer(prod)
@@ -350,6 +383,9 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
             return values[(blk.base + t * blk.body_len + _c, b)]
         if kind == 7:
             return struct.pack("<I", a)
+        if kind == S.PRODUCER_LIST:
+            _lid, elements = S.decode_list_spec(spec.list_specs[a])
+            return [fetch(prod) for _h, prod in elements]
         raise ValueError(f"producer kind {kind}")
 
     def state_of(d: dict) -> bytes | None:
@@ -366,15 +402,25 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
         d = S.decode_step_spec(spec.step_spec(ordinal))
         in_values = [fetch(prod) for _h, prod, _i in d["inputs"]]
         if input_fault is not None:
-            in_values = [input_fault(ordinal, i, v) for i, v in enumerate(in_values)]
-        in_refs = [value_ref(h, value_digest(v)) for (h, _p, _i), v in zip(d["inputs"], in_values)]
+            in_values = [v if isinstance(v, list) else input_fault(ordinal, i, v) for i, v in enumerate(in_values)]
+        in_refs = []
+        for i, ((h, prod, _i), v) in enumerate(zip(d["inputs"], in_values)):
+            if not isinstance(v, list):
+                in_refs.append(value_ref(h, value_digest(v)))
+                continue
+            if list_fault is not None:
+                v = in_values[i] = [list_fault(ordinal, i, j, e) for j, e in enumerate(v)]
+            _lid, elements = S.decode_list_spec(spec.list_specs[S.decode_producer(prod)[1]])
+            refs = [value_ref(eh, value_digest(e)) for (eh, _p), e in zip(elements, v)]
+            lists[(ordinal, i)] = refs
+            in_refs.append(value_ref(h, list_digest(refs)))
         prior = state_of(d)
         if prior_fault is not None and prior is not None and d["state_scheme"] == 1:
             prior = prior_fault(ordinal, prior)
         if d["state_scheme"] == 2:
             result = replay_log_step(d, in_values, prior)
         else:
-            result = replay_step(d["kernel_id"], in_values, prior,
+            result = replay_step(d["kernel_id"], flatten(in_values), prior,
                                  d["semantic_version"], d["abi_version"])
         if result is None:
             raise ValueError(f"step {ordinal} refused by its kernel")
@@ -411,5 +457,5 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
         header, prod = raw[8:31], raw[32:56]
         entries.append(value_ref(header, value_digest(fetch(prod))))
     c = Commitment(plan_id, run, spec, leaves, entries, values)
-    c.states, c.last_running = states, last_running
+    c.states, c.last_running, c.lists = states, last_running, lists
     return c

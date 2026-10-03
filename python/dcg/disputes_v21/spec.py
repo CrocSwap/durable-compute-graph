@@ -20,7 +20,12 @@ SPEC_LEAF_DOMAIN = b"dcg.spec.leaf.v2.1\x00"
 PARAMS_DOMAIN = b"dcg.params.v2.1\x00"
 PORTS_DOMAIN = b"dcg.ports.v2.1\x00"
 
-TYPE_HEADER, TYPE_BLOCK, TYPE_CONST, TYPE_IN, TYPE_OUT, TYPE_OUT_BLOCK, TYPE_REGION, TYPE_STEP, TYPE_BODY = range(1, 10)
+TYPE_HEADER, TYPE_BLOCK, TYPE_CONST, TYPE_IN, TYPE_OUT, TYPE_OUT_BLOCK, TYPE_REGION, TYPE_STEP, TYPE_BODY, TYPE_LIST = range(1, 11)
+
+# A list input (wide steps, design v2.1-wide-steps.md option B): producer
+# kind 8 names ListSpec `a`, an ordered list of element producers.
+PRODUCER_LIST = 8
+MAX_LIST_ELEMENTS = 128
 
 
 class SpecError(ValueError):
@@ -146,6 +151,29 @@ def const_spec(constant_id: int, header: bytes, residency: int, source_kind: int
     return raw
 
 
+def list_spec(list_id: int, elements: list[tuple[bytes, bytes]]) -> bytes:
+    """`DLS1 list_id:u32 count:u32` then per element `header(23) producer(24) pad(1)`.
+    An element producer is kind 1, 2 or 3 (a step output, an external input or a
+    plain constant)."""
+    if not 1 <= len(elements) <= MAX_LIST_ELEMENTS:
+        raise SpecError("a list has 1..128 elements")
+    raw = b"DLS1" + struct.pack("<II", list_id, len(elements))
+    for header, prod in elements:
+        assert len(header) == 23 and len(prod) == 24
+        raw += header + prod + b"\x00"
+    return raw
+
+
+def decode_list_spec(raw: bytes) -> tuple[int, list[tuple[bytes, bytes]]] | None:
+    """(list id, [(header, producer)]); None if malformed."""
+    if len(raw) < 12 or raw[:4] != b"DLS1":
+        return None
+    list_id, count = struct.unpack_from("<II", raw, 4)
+    if not 1 <= count <= MAX_LIST_ELEMENTS or len(raw) != 12 + 48 * count:
+        return None
+    return list_id, [(raw[12 + 48 * j:35 + 48 * j], raw[35 + 48 * j:59 + 48 * j]) for j in range(count)]
+
+
 def out_spec(header: bytes, prod: bytes) -> bytes:
     raw = b"DOU1" + bytes(4) + header + b"\x00" + prod
     assert len(raw) == 56
@@ -237,7 +265,7 @@ def chunk_header(scheme_id: int, scheme_version: int, chunk_bytes: int) -> bytes
     return port_header(0, 0, 0, LAYOUT_RAW, 1, scheme_id, scheme_version, chunk_bytes)
 
 
-LAYOUT_SCALAR, LAYOUT_CHUNKED, LAYOUT_LOG, LAYOUT_RAW = 1, 3, 4, 5
+LAYOUT_SCALAR, LAYOUT_CHUNKED, LAYOUT_LOG, LAYOUT_RAW, LAYOUT_LIST = 1, 3, 4, 5, 6
 
 
 @dataclass
@@ -257,6 +285,10 @@ class Spec:
     # Off-chain availability of committed constants (not part of any record):
     # the bytes an executor and challenger fetch by locator.
     constant_values: dict[int, bytes] = field(default_factory=dict)
+    # ListSpec records by list id. They are the last records of the spec
+    # tree, so a spec without lists keeps its bytes and root.
+    list_specs: dict[int, bytes] = field(default_factory=dict)
+    first_list_record: int = 0
     tree: trees.Tree = field(init=False)
 
     def __post_init__(self):
@@ -284,6 +316,9 @@ class Spec:
     def ordinal_of(self, block: int, iteration: int, entry: int) -> int:
         b = self.blocks[block]
         return b.base + (iteration * b.body_len + entry if b.kind == 2 else entry)
+
+    def list_leaf_index(self, list_id: int) -> int:
+        return self.first_list_record + sorted(self.list_specs).index(list_id)
 
     def step_leaf_index(self, ordinal: int) -> int:
         _bi, b, _i, e = self.locate(ordinal)
