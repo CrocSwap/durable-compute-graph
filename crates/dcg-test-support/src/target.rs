@@ -135,6 +135,7 @@ fn collect(path: &std::path::Path, out: &mut Vec<PathBuf>) {
 pub const PROGRAM_FEATURES: &[&str] = &[
     "revision-7",
     "revision-8",
+    "revision-8-lifecycle",
     "graph-v2",
     "graph-v2-experimental",
     "graph-v2-raw-write",
@@ -168,6 +169,7 @@ macro_rules! program_features {
         let enabled: &[(&str, bool)] = &[
             ("revision-7", cfg!(feature = "revision-7")),
             ("revision-8", cfg!(feature = "revision-8")),
+            ("revision-8-lifecycle", cfg!(feature = "revision-8-lifecycle")),
             ("graph-v2", cfg!(feature = "graph-v2")),
             ("graph-v2-experimental", cfg!(feature = "graph-v2-experimental")),
             ("graph-v2-raw-write", cfg!(feature = "graph-v2-raw-write")),

@@ -62,7 +62,7 @@ pub fn process_instruction(
 ) -> ProgramResult {
     let Some(tag) = data.first().copied() else {
         return Err(ProgramError::InvalidInstructionData);
-    };
+    }; if !cfg!(feature = "revision-8-lifecycle") && (115..=200).contains(&tag) { return Err(ProgramError::InvalidInstructionData); } // the revision-8 lifecycle routes only with its feature; one line, so linked line numbers do not move
     if matches!(tag, 120..=124 | 126..=129) {
         return closure_v2_generic::process_generic_dispute_tag(
             program_id,
@@ -123,7 +123,7 @@ pub fn process_instruction_with_manifest(
 ) -> ProgramResult {
     let Some(tag) = data.first().copied() else {
         return Err(ProgramError::InvalidInstructionData);
-    };
+    }; if !cfg!(feature = "revision-8-lifecycle") && (115..=200).contains(&tag) { return Err(ProgramError::InvalidInstructionData); } // the revision-8 lifecycle routes only with its feature; one line, so linked line numbers do not move
     #[cfg(feature = "sbf-lifecycle-test")]
     if (240..=250).contains(&tag) {
         return test_lifecycle::process(program_id, accounts, data);

@@ -7,7 +7,7 @@ publish = false
 description = "Real-flow state builder for DCG program tests: protocol states are reached by real instructions, never by hand-built account bytes"
 
 [dependencies]
-dcg-program = { path = "../dcg-program", default-features = false, features = ["revision-8"] }
+dcg-program = { path = "../dcg-program", default-features = false, features = ["revision-8", "revision-8-lifecycle"] }
 serde_json = "=1.0.151"
 solana-account = "=2.2.1"
 solana-compute-budget-interface = "=2.2.2"

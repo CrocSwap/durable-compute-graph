@@ -9,6 +9,12 @@ license = "GPL-3.0-only"
 default = ["custom-heap", "revision-8"]
 revision-7 = []
 revision-8 = []
+# Routes the revision-8 document lifecycle (tags 115-200). It is Basanos's
+# production path, not part of DCG's public surface, so it is off by default
+# and images that need it name it. The code still compiles under revision-8;
+# without this feature its tags are refused. Planned: retire it once Basanos
+# documents run on v2.1 (docs/plans/v2-roadmap.md).
+revision-8-lifecycle = ["revision-8"]
 # Routes the DCG v2 trace-committed graph lifecycle (tags 209-218).
 graph-v2 = []
 # Adds the sampling audit (219) and root-committed descent (220-226); under
