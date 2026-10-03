@@ -879,10 +879,11 @@ recorded below with their implementation results.
   template ID remains the hash of the exact template wire bytes, while new
   template addresses derive from `["dcg21tmpl", template_id, payer]`.
   The instruction's account order is unchanged. New creates refuse the old
-  ignored trailing four-byte word; previously created accounts remain readable.
-  Existing template accounts retain their
-  original size and remain usable with their original read-only template
-  metas; they lack reliable provenance and are therefore not closeable.
+  ignored trailing four-byte word; previously created accounts at the old PDA
+  remain readable. The original size remains usable with read-only template
+  metas; those accounts lack reliable provenance and are not closeable. The
+  earlier tracked accounts at the old PDA retain their recorded payer and
+  close lifecycle.
   `INIT_RUN` increments the count. `CLOSE_RUN` decrements it only when an
   uncommitted run is cancelled or a settled run becomes a receipt. Thus the
   count remains nonzero for every live run, including a run whose disputes

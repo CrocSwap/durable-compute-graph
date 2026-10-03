@@ -317,10 +317,12 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
     {
         return Err(err(4));
     }
-    if d.len() == T_BYTES_V2 {
-        derived(program_id, account, &[b"dcg21tmpl", &d[96..128], &d[T_PAYER..T_PAYER + 32]])?;
-    } else {
-        derived(program_id, account, &[b"dcg21tmpl", &d[96..128]])?;
+    let old_address = Pubkey::find_program_address(&[b"dcg21tmpl", &d[96..128]], program_id).0;
+    let new_address = (d.len() == T_BYTES_V2).then(|| Pubkey::find_program_address(
+        &[b"dcg21tmpl", &d[96..128], &d[T_PAYER..T_PAYER + 32]], program_id,
+    ).0);
+    if account.owner != program_id || (*account.key != old_address && new_address != Some(*account.key)) {
+        return Err(err(2));
     }
     let block_count = d[T_FIXED] as usize;
     if !(1..=MAX_BLOCKS).contains(&block_count) {

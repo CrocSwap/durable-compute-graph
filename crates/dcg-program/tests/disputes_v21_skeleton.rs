@@ -1213,6 +1213,32 @@ async fn a_front_runner_cannot_squat_on_another_payers_template() {
     assert!(ch.ctx.banks_client.get_account(squat).await.unwrap().is_some());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_existing_tracked_template_at_the_old_address_remains_readable() {
+    let mut ch = Chain::new(30).await;
+    let template_id = sha256(&[V::TEMPLATE_DOMAIN, &template_body(&ch.g, 30)]);
+    let old = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
+    assert_ne!(old, ch.template);
+    let account = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap();
+    ch.ctx.set_account(&old, &account.into());
+    let admitter = kp(0xA1);
+    let executor = kp(0xE1).pubkey();
+    let nonce = [7u8; 32];
+    let mut refs = ch.g.refs[0].clone();
+    refs.extend_from_slice(&ch.g.refs[1]);
+    let mut init = nonce.to_vec();
+    init.extend_from_slice(executor.as_ref());
+    init.extend_from_slice(&2u32.to_le_bytes());
+    init.extend_from_slice(&refs);
+    let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &nonce, &2u32.to_le_bytes(), &refs, executor.as_ref()]);
+    let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
+    send(&mut ch.ctx, ix(V::SUB_INIT_RUN, &init, vec![
+        AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false),
+        AccountMeta::new(old, false), AccountMeta::new_readonly(SYSTEM, false),
+    ]), &[&admitter]).await.unwrap();
+    assert!(ch.ctx.banks_client.get_account(run).await.unwrap().is_some());
+}
+
 #[cfg(all(feature = "test-kernel", not(feature = "test-legacy-template-create")))]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_shared_test_kernel_image_does_not_dispatch_legacy_create_subtype_250() {

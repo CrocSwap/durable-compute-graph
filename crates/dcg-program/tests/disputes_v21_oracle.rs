@@ -75,8 +75,13 @@ async fn send(ctx: &mut ProgramTestContext, i: Instruction, signers: &[&Keypair]
 
 async fn replay(s: &serde_json::Value) -> u8 {
     let mut test = ProgramTest::default();
-    test.prefer_bpf(false);
-    test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction));
+    let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
+    test.prefer_bpf(sbf);
+    if sbf {
+        test.add_program("dcg_program", PROGRAM, None);
+    } else {
+        test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction));
+    }
     for b in [0xA1u8, 0xE1, 0xC1] {
         test.add_account(kp(b).pubkey(), Account { lamports: 10_000_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 });
     }
