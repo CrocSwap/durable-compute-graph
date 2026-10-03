@@ -8427,483 +8427,78 @@ async fn rev8_resolve_refusals() {
         FLAG_FINAL,
         "the fixture's document is finalized"
     );
-    let mut doc = good_doc.clone();
-    doc[128..132].copy_from_slice(&1u32.to_le_bytes());
-    f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
+    // An open challenge, for real: a second document whose first output the
+    // challenger opens (166), past its deadline.
+    let open_binding = Binding2 {
+        request_id: [12u8; 32],
+        ..binding
+    };
+    let (d_open, c_open, open_proofs) = attest_all(&mut f, &open_binding, n, &tokens, 12).await;
+    let record = address::challenge(&f.program, &d_open, &f.signer.pubkey(), 41).0;
+    let packet = challenge_leaf_packet(&f, &d_open, &open_proofs[0], 41);
+    let metas = challenge_leaf_metas(&f, c_open, record);
+    send_fresh(&mut f.ctx, &f.signer, f.program, packet, metas)
+        .await
+        .expect("the challenger opens a leaf challenge");
+    assert_eq!(u32_at(&f.account(c_open[0]).await, 128), 1);
+    past_deadline(&mut f, c_open[0]).await;
     assert_eq!(
-        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        refused_resolve(&mut f, c_open[3], resolve_data(&d_open), pair(c_open[0], c_open[3])).await,
         RESULT_STATE,
         "an open challenge is 796"
     );
-    let mut doc = good_doc.clone();
-    doc[128..132].copy_from_slice(&0u32.to_le_bytes());
-    doc[6..8].copy_from_slice(&(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED).to_le_bytes());
-    f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
+    // An unfinalized document, for real: landed to n, never finalized.
+    let unfinal = Binding2 {
+        request_id: [13u8; 32],
+        ..binding
+    };
+    let (d_unfinal, c_unfinal) = f.run_document(&unfinal, n).await;
+    past_deadline(&mut f, c_unfinal[0]).await;
     assert_eq!(
-        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
+        refused_resolve(&mut f, c_unfinal[3], resolve_data(&d_unfinal), pair(c_unfinal[0], c_unfinal[3])).await,
         RESULT_STATE,
         "an unfinalized document is 796"
     );
-    // And `L` really is a function of `n`: moving `first` forward in the
-    // binding makes `L = 1` while the record has 3 attested outputs, which the
-    // partial-bitmap clause refuses rather than resolving.
-    let mut doc = good_doc.clone();
-    doc[document::BINDING_AT_V8 + 136..document::BINDING_AT_V8 + 140]
-        .copy_from_slice(&30u32.to_le_bytes());
-    f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
+    // The partial-bitmap clause (the counter either way, a clear bit inside
+    // [0, L), a set bit at L, a padding bit, L > count), the checked
+    // challenger_wins + 1 (598), and the malformed DCM2, DRB1 and DCR2 images
+    // are states only a program bug could write: unit tests
+    // (unified_v8_resolve_check.rs; result::reader_gate_tests;
+    // document::drb1_decodes_and_refuses_cheats; owner decision 2026-10-02).
     past_deadline(&mut f, dcm2).await;
-    assert_eq!(
-        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
-        RESULT_STATE,
-        "L = 1 with three attested outputs is 796"
-    );
-    f.ctx
-        .set_account(&dcm2, &shared(owned(&f.program, good_doc.clone())));
 
-    // **796, the partial bitmap**: the counter in both directions, and a bit
-    // that disagrees with it inside `[0, L)`. The clause's load-bearing case:
-    // with `stop_plus_one = 1` an **unattested** cell is 16 zero bytes whose
-    // token is 0, which *is* the declared stop value, so without the bitmap
-    // clause the stop rule would read an unattested cell and convict an honest
-    // document. This document is exactly that: `stop_plus_one = 1`, the stop
-    // value at `L-1`, and no other cell.
-    let stop_one = f.binding_stop(first, 50, 1);
-    let (d1, k1, _) = attest_all(&mut f, &stop_one, n, &[(l - 1, 0u32)], 15).await;
-    let (m1, r1) = (k1[0], k1[3]);
-    let m1_pair = pair(m1, r1);
-    past_deadline(&mut f, m1).await;
-    // **The honest record, read before any of the four manglings below**, so
-    // the "and it still resolves" at the end restores exactly what the attest
-    // wrote rather than the last refusal's version of it.
-    let honest_res = f.account(r1).await;
-    let seen = past_deadline(&mut f, m1).await;
-    assert_eq!(
-        honest_res[204..208],
-        l.to_le_bytes(),
-        "the attest wrote L outputs"
-    );
-    assert_eq!(
-        u64_at(&f.account(m1).await, 144) + 1,
-        seen,
-        "the deadline this document's finalize wrote, and the slot the resolve reads"
-    );
-    let bitmap_at = result::HEADER_V6 + 50 * 16;
-    for (attested, label) in [
-        (l - 1, "attested = L-1"),
-        (l + 1, "attested = L+1"),
-        (0, "attested = 0"),
-        (50, "attested = count"),
-    ] {
-        let mut res = f.account(r1).await;
-        res[204..208].copy_from_slice(&attested.to_le_bytes());
-        f.ctx.set_account(&r1, &shared(owned(&f.program, res)));
-        assert_eq!(
-            refused_resolve(&mut f, r1, resolve_data(&d1), m1_pair.clone()).await,
-            RESULT_STATE,
-            "{label} is 796"
-        );
-    }
-    let mut res = f.account(r1).await;
-    res[bitmap_at] &= !(1 << 1);
-    f.ctx.set_account(&r1, &shared(owned(&f.program, res)));
-    assert_eq!(
-        refused_resolve(&mut f, r1, resolve_data(&d1), m1_pair.clone()).await,
-        RESULT_STATE,
-        "an unattested output inside [0, L) is 796, not a conviction"
-    );
-    let mut res = f.account(r1).await;
-    res[bitmap_at + 2] |= 1 << 0;
-    res[204..208].copy_from_slice(&(l + 1).to_le_bytes());
-    f.ctx.set_account(&r1, &shared(owned(&f.program, res)));
-    assert_eq!(
-        refused_resolve(&mut f, r1, resolve_data(&d1), m1_pair.clone()).await,
-        RESULT_STATE,
-        "a set bit at L is 796"
-    );
-    let mut res = f.account(r1).await;
-    res[bitmap_at + 6] |= 0b1000_0000;
-    f.ctx.set_account(&r1, &shared(owned(&f.program, res)));
-    assert_eq!(
-        refused_resolve(&mut f, r1, resolve_data(&d1), m1_pair.clone()).await,
-        RESULT_STATE,
-        "a nonzero padding bit is 796"
-    );
-    // **And the same document with its honest bitmap still resolves**, so the
-    // five 796s above were the clause and not a broken fixture.
-    f.ctx
-        .set_account(&r1, &shared(owned(&f.program, honest_res.clone())));
-    send_fresh(
-        &mut f.ctx,
-        &f.signer,
-        f.program,
-        resolve_data(&d1),
-        m1_pair.clone(),
-    )
-    .await
-    .expect("the honest record still resolves");
-    assert_eq!(f.account(r1).await[6], result::STATUS_FINAL);
-
-    // **598, the checked add.** The record is convicted (a stop value in the
-    // middle, put back into the cell the attest wrote) and DCM2's
-    // `challenger_wins` is at `u32::MAX`, so the conviction's increment
-    // overflows and the whole instruction fails with nothing written.
-    let mut violating = honest_res.clone();
-    // Output 1 of this document is 16 zero bytes, whose token is 0, which is
-    // the **declared** stop value (`stop_plus_one = 1`). Putting it at output 1
-    // — inside `[0, L-2) = [0, 2)` — is exactly a clause-1 violation, and the
-    // count and the bitmap still say `[0, L)`, so only the stop rule convicts.
-    violating[result::HEADER_V6 + 16 + 8..result::HEADER_V6 + 16 + 16]
-        .copy_from_slice(&0u64.to_le_bytes());
-    let mut doc = f.account(m1).await;
-    assert_eq!(
-        u16_at(&doc, 6) & FLAG_REFUTED,
-        0,
-        "the honest document is not refuted"
-    );
-    f.ctx
-        .set_account(&r1, &shared(owned(&f.program, violating)));
-    doc[132..136].copy_from_slice(&u32::MAX.to_le_bytes());
-    f.ctx.set_account(&m1, &shared(owned(&f.program, doc)));
-    let before_doc = f.account(m1).await;
-    let before_res = f.account(r1).await;
-    assert_eq!(
-        custom(
-            send_fresh(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&d1),
-                vec![AccountMeta::new(m1, false), AccountMeta::new(r1, false)]
-            )
-            .await
-        ),
-        CL_OVERFLOW,
-        "challenger_wins + 1 is a checked add"
-    );
-    assert_eq!(
-        f.account(m1).await,
-        before_doc,
-        "the refused add wrote nothing to DCM2"
-    );
-    assert_eq!(f.account(r1).await, before_res, "and nothing to the record");
-    assert_eq!(
-        u16_at(&f.account(m1).await, 6) & FLAG_REFUTED,
-        0,
-        "and no flag 4"
-    );
-    assert_eq!(
-        f.account(r1).await[6],
-        result::STATUS_PENDING,
-        "and no status"
-    );
-    // With the count one lower the same packet convicts, so the 598 was the
-    // arithmetic and not the record.
-    let mut doc = f.account(m1).await;
-    doc[132..136].copy_from_slice(&(u32::MAX - 1).to_le_bytes());
-    f.ctx.set_account(&m1, &shared(owned(&f.program, doc)));
-    send_fresh(
-        &mut f.ctx,
-        &f.signer,
-        f.program,
-        resolve_data(&d1),
-        vec![AccountMeta::new(m1, false), AccountMeta::new(r1, false)],
-    )
-    .await
-    .expect("the conviction at u32::MAX - 1");
-    assert_eq!(
-        u32_at(&f.account(r1).await, 192),
-        u32::MAX,
-        "the last representable count"
-    );
-
-    // **580 on DCM2**: the reader split (a revision-6 record), a wrong magic, a
-    // header descriptor the account is not derived from, the ROOT_ONLY and
-    // SEALED bits, a truncated record, and the same well-formed record at
-    // another address.
-    let good_doc = f.account(dcm2).await;
-    assert_eq!(
-        good_doc[4..6],
-        7u16.to_le_bytes(),
-        "the fixture's DCM2 is a v7"
-    );
-    let mut v6 = good_doc.clone();
-    v6[4..6].copy_from_slice(&6u16.to_le_bytes());
-    v6.truncate(document::DCM2_V6_BYTES);
-    f.ctx.set_account(&dcm2, &shared(owned(&f.program, v6)));
-    assert_eq!(
-        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
-        CL_MALFORMED,
-        "a DCM2 v6 is 580 at the reader split"
-    );
-    let mut not_doc = good_doc.clone();
-    not_doc[..4].copy_from_slice(b"XXXX");
-    f.ctx
-        .set_account(&dcm2, &shared(owned(&f.program, not_doc)));
-    assert_eq!(
-        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
-        CL_MALFORMED,
-        "a wrong magic is 580"
-    );
-    let mut wrong_desc = good_doc.clone();
-    wrong_desc[8..40].copy_from_slice(&[9u8; 32]);
-    f.ctx
-        .set_account(&dcm2, &shared(owned(&f.program, wrong_desc)));
-    assert_eq!(
-        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
-        CL_MALFORMED,
-        "a header descriptor the account is not derived from is 580"
-    );
-    let mut cleared = good_doc.clone();
-    cleared[6..8].copy_from_slice(&FLAG_FINAL.to_le_bytes());
-    f.ctx
-        .set_account(&dcm2, &shared(owned(&f.program, cleared)));
-    assert_eq!(
-        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
-        CL_MALFORMED,
-        "a record without ROOT_ONLY|SEALED is 580"
-    );
-    let mut short = good_doc.clone();
-    short.truncate(document::OPTION_REGION_AT - 1);
-    f.ctx.set_account(&dcm2, &shared(owned(&f.program, short)));
-    assert_eq!(
-        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
-        CL_MALFORMED,
-        "a truncated DCM2 is 580"
-    );
-    f.ctx
-        .set_account(&dcm2, &shared(owned(&f.program, good_doc.clone())));
-    let elsewhere = address::document(&f.program, &[7u8; 32]).0;
-    f.ctx
-        .set_account(&elsewhere, &shared(owned(&f.program, good_doc.clone())));
+    // The attacker's DCM2: another real document passed in its place, 580.
+    let elsewhere_binding = Binding2 {
+        request_id: [14u8; 32],
+        ..binding
+    };
+    let (_, c_else) = f.run_document(&elsewhere_binding, n).await;
     let mut metas = base.clone();
-    metas[0] = AccountMeta::new_readonly(elsewhere, false);
+    metas[0] = AccountMeta::new_readonly(c_else[0], false);
     assert_eq!(
         refused_resolve(&mut f, dcr2, resolve_data(&descriptor), metas).await,
         CL_MALFORMED,
         "the account's key is PDA(descriptor)"
     );
-    // **794, the DRB1 v2 block**, which the resolve decodes with the same call
-    // init does — so a block init would have refused reaches the resolve as
-    // 794 rather than being read.
-    for (at, bytes, label) in [
-        (4usize, 1u16.to_le_bytes().to_vec(), "a version"),
-        (149, vec![8u8], "a width the stop rule's cell cannot carry"),
-        (
-            150,
-            vec![DECISION_MODE],
-            "decision_flags bit 0 with option_count = 0",
-        ),
-    ] {
-        let mut doc = good_doc.clone();
-        doc[document::BINDING_AT_V8 + at..document::BINDING_AT_V8 + at + bytes.len()]
-            .copy_from_slice(&bytes);
-        f.ctx.set_account(&dcm2, &shared(owned(&f.program, doc)));
-        assert_eq!(
-            refused_resolve(&mut f, dcr2, resolve_data(&descriptor), base.clone()).await,
-            RUN_BINDING,
-            "a DRB1 v2 block with {label} is 794"
-        );
-    }
-    f.ctx
-        .set_account(&dcm2, &shared(owned(&f.program, good_doc)));
 
-    // **580 on DCR2**: a revision-7 DCR2 v5, a record shorter than the v6
-    // header, one longer than its own `count` allows, a wrong magic, a nonzero
-    // reserved run at 411, a header descriptor the account is not derived from,
-    // and a read-only meta.
     let good_res = f.account(dcr2).await;
     assert_eq!(
         good_res[4..6],
         6u16.to_le_bytes(),
         "the fixture's DCR2 is a v6"
     );
-    let mut v5 = good_res.clone();
-    v5[4..6].copy_from_slice(&5u16.to_le_bytes());
+    // A caller's read-only DCR2 meta, 580.
     assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, v5),
-            )
-            .await
-        ),
-        CL_MALFORMED,
-        "a DCR2 v5 is 580 at the reader split"
-    );
-    let mut short_res = good_res.clone();
-    short_res.truncate(result::HEADER_V6 - 1);
-    assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, short_res),
-            )
-            .await
-        ),
-        CL_MALFORMED,
-        "a DCR2 shorter than the v6 header is 580"
-    );
-    let mut long_res = good_res.clone();
-    long_res.push(0);
-    assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, long_res),
-            )
-            .await
-        ),
-        CL_MALFORMED,
-        "a DCR2 longer than its own count allows is 580"
-    );
-    let mut wrong_magic = good_res.clone();
-    wrong_magic[..4].copy_from_slice(b"XXXX");
-    assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, wrong_magic),
-            )
-            .await
-        ),
-        CL_MALFORMED,
-        "a wrong magic is 580"
-    );
-    let mut reserved = good_res.clone();
-    reserved[411] = 1;
-    assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, reserved),
-            )
-            .await
-        ),
-        CL_MALFORMED,
-        "a nonzero 411..416 is 580"
-    );
-    let mut wrong_desc = good_res.clone();
-    wrong_desc[8..40].copy_from_slice(&[9u8; 32]);
-    assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, wrong_desc),
-            )
-            .await
-        ),
-        CL_MALFORMED,
-        "a DCR2 for another document is 580"
-    );
-    // **796 on DCR2's state**, which is not a malformed record: closed, not
-    // PENDING, and a record the attest has not finished growing — the clause
-    // reads the whole bitmap, so a half-grown record has no answer.
-    let mut closed = good_res.clone();
-    closed[7] = 1;
-    assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, closed),
-            )
-            .await
-        ),
-        RESULT_STATE,
-        "a closed record is 796"
-    );
-    for status in [
-        result::STATUS_FINAL,
-        result::STATUS_REFUTED,
-        result::STATUS_SETTLED,
-    ] {
-        let mut settled = good_res.clone();
-        settled[6] = status;
-        assert_eq!(
-            custom(
-                send_fresh_with_account_override(
-                    &mut f.ctx,
-                    &f.signer,
-                    f.program,
-                    resolve_data(&descriptor),
-                    base.clone(),
-                    dcr2,
-                    owned(&f.program, settled),
-                )
-                .await
-            ),
-            RESULT_STATE,
-            "a record at status {status} is 796"
-        );
-    }
-    let mut partial = good_res.clone();
-    partial.truncate(partial.len() - 1);
-    assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, partial),
-            )
-            .await
-        ),
-        RESULT_STATE,
-        "a half-grown record is 796"
-    );
-    assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                vec![
-                    AccountMeta::new_readonly(dcm2, false),
-                    AccountMeta::new_readonly(dcr2, false)
-                ],
-                dcr2,
-                owned(&f.program, good_res.clone()),
-            )
-            .await
-        ),
+        refused_resolve(
+            &mut f,
+            dcr2,
+            resolve_data(&descriptor),
+            vec![
+                AccountMeta::new_readonly(dcm2, false),
+                AccountMeta::new_readonly(dcr2, false)
+            ]
+        )
+        .await,
         CL_MALFORMED,
         "a read-only DCR2 is 580 at view_v8"
     );
@@ -8955,11 +8550,80 @@ async fn rev8_resolve_refusals() {
         &f.signer,
         f.program,
         resolve_data(&descriptor),
-        base,
+        base.clone(),
     )
     .await
     .expect("the honest record resolves");
     assert_eq!(f.account(dcr2).await[6], result::STATUS_FINAL);
+    // A resolved record does not resolve again, for real: 796 at FINAL.
+    assert_eq!(
+        refused_resolve(&mut f, dcr2, resolve_data(&descriptor), pair(dcm2, dcr2)).await,
+        RESULT_STATE,
+        "a record at status FINAL is 796"
+    );
+    // PENDING-MIGRATION (T7): closed, REFUTED, SETTLED and half-grown records
+    // are reachable states still made by override here, until real close and
+    // conviction flows produce them.
+    // **796 on DCR2's state**, which is not a malformed record: closed, not
+    // PENDING, and a record the attest has not finished growing — the clause
+    // reads the whole bitmap, so a half-grown record has no answer.
+    let mut closed = good_res.clone();
+    closed[7] = 1;
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, closed),
+            )
+            .await
+        ),
+        RESULT_STATE,
+        "a closed record is 796"
+    );
+    for status in [result::STATUS_REFUTED, result::STATUS_SETTLED] {
+        let mut settled = good_res.clone();
+        settled[6] = status;
+        assert_eq!(
+            custom(
+                send_fresh_with_account_override(
+                    &mut f.ctx,
+                    &f.signer,
+                    f.program,
+                    resolve_data(&descriptor),
+                    base.clone(),
+                    dcr2,
+                    owned(&f.program, settled),
+                )
+                .await
+            ),
+            RESULT_STATE,
+            "a record at status {status} is 796"
+        );
+    }
+    let mut partial = good_res.clone();
+    partial.truncate(partial.len() - 1);
+    assert_eq!(
+        custom(
+            send_fresh_with_account_override(
+                &mut f.ctx,
+                &f.signer,
+                f.program,
+                resolve_data(&descriptor),
+                base.clone(),
+                dcr2,
+                owned(&f.program, partial),
+            )
+            .await
+        ),
+        RESULT_STATE,
+        "a half-grown record is 796"
+    );
+
 }
 
 /// **The skip the close needs, over real accounts.** A document that a separate

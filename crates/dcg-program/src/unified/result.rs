@@ -2496,9 +2496,25 @@ mod reader_gate_tests {
         assert_eq!(read_dcm2(&program, key, wrong_kind), Err(no(CL_MALFORMED)), "wrong kind");
         let other = address::document(&program, &OTHER).0;
         assert_eq!(read_dcm2(&program, other, honest.clone()), Err(no(CL_MALFORMED)), "second instance");
-        let mut stale = honest;
+        let mut stale = honest.clone();
         stale[d::DCM2_BUMP_AT] = stale[d::DCM2_BUMP_AT].wrapping_add(1);
         assert_eq!(read_dcm2(&program, key, stale), Err(no(CL_MALFORMED)), "stale bump");
+        // The rest of the record checks the resolve and close read through.
+        let mut v6 = honest.clone();
+        v6[4..6].copy_from_slice(&6u16.to_le_bytes());
+        assert_eq!(read_dcm2(&program, key, v6), Err(no(CL_MALFORMED)), "a revision-6 version");
+        let mut wrong_header = honest.clone();
+        wrong_header[8..40].copy_from_slice(&OTHER);
+        assert_eq!(read_dcm2(&program, key, wrong_header), Err(no(CL_MALFORMED)), "a header descriptor the key is not derived from");
+        let mut cleared = honest.clone();
+        cleared[6..8].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(read_dcm2(&program, key, cleared), Err(no(CL_MALFORMED)), "ROOT_ONLY and SEALED cleared");
+        let mut short = honest.clone();
+        short.truncate(d::OPTION_REGION_AT - 1);
+        assert_eq!(read_dcm2(&program, key, short), Err(no(CL_MALFORMED)), "a truncated record");
+        let mut reserved = honest;
+        reserved[d::PDA_BUMPS_RESERVED_AT] = 1;
+        assert_eq!(read_dcm2(&program, key, reserved), Err(no(CL_MALFORMED)), "a nonzero reserved bump byte");
     }
 
     #[test]
@@ -2530,8 +2546,51 @@ mod reader_gate_tests {
         assert_eq!(read_dcr2(&program, key, wrong_kind), Err(no(CL_MALFORMED)), "wrong kind");
         let other = address::result(&program, &OTHER).0;
         assert_eq!(read_dcr2(&program, other, honest.clone()), Err(no(CL_MALFORMED)), "second instance");
-        let mut stale = honest;
+        let mut stale = honest.clone();
         stale[RESULT_PDA_BUMP_AT_V6] = stale[RESULT_PDA_BUMP_AT_V6].wrapping_add(1);
         assert_eq!(read_dcr2(&program, key, stale), Err(no(CL_MALFORMED)), "stale bump");
+        // The record checks the resolve reads through.
+        let mut v5 = honest.clone();
+        v5[4..6].copy_from_slice(&5u16.to_le_bytes());
+        assert_eq!(read_dcr2(&program, key, v5), Err(no(CL_MALFORMED)), "a revision-7 DCR2 v5");
+        let mut short = honest.clone();
+        short.truncate(HEADER_V6 - 1);
+        assert_eq!(read_dcr2(&program, key, short), Err(no(CL_MALFORMED)), "shorter than the v6 header");
+        let mut long = honest.clone();
+        long.resize(bytes_v8(1, 16).unwrap() + 1, 0);
+        assert_eq!(read_dcr2(&program, key, long), Err(no(CL_MALFORMED)), "longer than its own count allows");
+        let mut reserved = honest.clone();
+        reserved[411] = 1;
+        assert_eq!(read_dcr2(&program, key, reserved), Err(no(CL_MALFORMED)), "a nonzero reserved run at 411");
+        let mut wrong_header = honest.clone();
+        wrong_header[8..40].copy_from_slice(&OTHER);
+        assert_eq!(read_dcr2(&program, key, wrong_header), Err(no(CL_MALFORMED)), "a header descriptor the key is not derived from");
+        let mut retention = honest;
+        retention[RETENTION_START_AT_V6..RETENTION_START_AT_V6 + 8].copy_from_slice(&5u64.to_le_bytes());
+        assert_eq!(read_dcr2(&program, key, retention), Err(no(CL_MALFORMED)), "a retention start without its deadline");
+    }
+
+    /// The stop-rule conviction's `challenger_wins + 1` is checked: at
+    /// `u32::MAX` it refuses 598 and writes nothing (a counter no chain can
+    /// reach, so a unit test rather than a patched bank).
+    #[test]
+    fn the_conviction_count_is_a_checked_add_and_writes_nothing_on_overflow() {
+        let program = Pubkey::new_unique();
+        let key = address::document(&program, &DESCRIPTOR).0;
+        for (wins, want) in [(u32::MAX - 1, Ok(STATUS_REFUTED)), (u32::MAX, Err(no(CL_OVERFLOW)))] {
+            let mut data = dcm2(&program, &DESCRIPTOR);
+            data[132..136].copy_from_slice(&wins.to_le_bytes());
+            let before = data.clone();
+            let mut lamports = 1u64;
+            let info = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &program, false, 0);
+            assert_eq!(conviction(&info), want, "challenger_wins = {wins}");
+            drop(info);
+            if want.is_ok() {
+                assert_eq!(u32::from_le_bytes(data[132..136].try_into().unwrap()), u32::MAX);
+                assert_ne!(u16::from_le_bytes([data[6], data[7]]) & FLAG_REFUTED, 0);
+            } else {
+                assert_eq!(data, before, "a refused conviction writes nothing");
+            }
+        }
     }
 }
