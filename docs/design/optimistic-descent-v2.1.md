@@ -864,6 +864,43 @@ each caught.
 - **Not yet:** template closes (a template records no payer, and runs still
   read it).
 
+**Independent review fixes (2026-10-03).** From the first independent review
+of tag 227 at bc4e391:
+- **F1, moot beats timeout.** On a refuted run, any ruling of a dispute
+  opened after the lowest challenger win (by claim or timeout) is moot: the
+  challenger's bond returns and the executor gains nothing. Before, the
+  executor could time out a later dispute whose challenger had stopped
+  playing and take its bond.
+- **F2, STEP kernels.** A manifest kernel replays a STEP claim only if it
+  advertises `MODE_STEP_V21` (`"STEP"` v1, `kernel.rs`). The Python registry
+  is keyed by (id, semantic version, ABI version), as the program resolves
+  it. Applications must mirror each kernel's limits exactly and check at plan
+  time that every step fits them (Basanos form 4 does).
+- **F3, LOG state.** The program judges SMALL state only. STATE and STEP
+  claims on a LOG-state step are ruled moot (neutral) until LOG is
+  implemented on chain. `tests/golden/dcg/disputes_v21/log_neutral_scenarios.json`
+  (from `scripts/disputes_v21_log_neutral_scenarios.py`) checks this.
+- **F4, flooding.** Templates need nonzero executor and challenger bonds. The
+  load extension (§8.3) is built: a phase the executor owes gets the phase
+  window times the run's open disputes, capped at the maximum window.
+- **F5, run address and cancel.** The run PDA is `["dcg21run", run_id,
+  payer]`, so a cancelled run cannot be re-initialized at the same address by
+  someone else. `init_run` sets a commit deadline (the init slot plus the
+  challenge window); a later commit is refused, and the payer may cancel only
+  after it. The run id itself is unchanged.
+- **F9, kernel ids.** Built-in and reduction kernels resolve only from the
+  exact `name/v1` id, NUL-padded with nothing after the padding, in the
+  program and in Python. Invalid UTF-8 is an unknown kernel in Python, not a
+  crash.
+- **Not changed:** F6 (buffers an executor created before bc4e391 refund the
+  challenger; testnet only), F7 (receipt offsets differ from a live run;
+  status stays at byte 4, and the Python client now checks the magic), F8 (a
+  close needs a payee account that can hold the payment), F10 (staging bytes
+  share the program id; buffers start with `D21S`, which no other handler
+  accepts, but other handlers were not audited), F11 (a cheating executor can
+  recover the slasher share through a puppet dispute; the payer's remainder is
+  the deterrent).
+
 - These are new tags. Tags 220–226 are not reused, and the v2.0 handlers
   stay under `graph-v2-experimental` until they are removed.
 - The trace-committed path (209–218) remains for small graphs. A template's

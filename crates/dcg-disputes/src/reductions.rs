@@ -43,14 +43,20 @@ impl Replay {
 }
 
 /// (name, state bytes, arity)
+/// The reduction named by an exact `name/v1` kernel id, NUL-padded with
+/// nothing after the padding (review 10-03, F9: the Python referee applies
+/// the same rule).
 pub fn lookup(kernel_id: &[u8]) -> Option<(&'static str, usize, usize)> {
-    let end = kernel_id.iter().position(|&b| b == b'/' || b == 0).unwrap_or(kernel_id.len());
+    let end = kernel_id.iter().position(|&b| b == 0).unwrap_or(kernel_id.len());
+    if kernel_id[end..].iter().any(|&b| b != 0) {
+        return None;
+    }
     match &kernel_id[..end] {
-        b"sumchunk_i32" => Some(("sumchunk_i32", 8, 1)),
-        b"argmax_i32c" => Some(("argmax_i32c", 12, 2)),
-        b"scan_i32c" => Some(("scan_i32c", 8, 3)),
-        b"head_i32" => Some(("head_i32", 0, 1)),
-        b"rowdot_i32c" => Some(("rowdot_i32c", MAX_STATE, 3)),
+        b"sumchunk_i32/v1" => Some(("sumchunk_i32", 8, 1)),
+        b"argmax_i32c/v1" => Some(("argmax_i32c", 12, 2)),
+        b"scan_i32c/v1" => Some(("scan_i32c", 8, 3)),
+        b"head_i32/v1" => Some(("head_i32", 0, 1)),
+        b"rowdot_i32c/v1" => Some(("rowdot_i32c", MAX_STATE, 3)),
         _ => None,
     }
 }
@@ -153,4 +159,27 @@ pub fn replay(kernel_id: &[u8], inputs: &[&[u8]], prior: Option<&[u8]>) -> Optio
         _ => return None,
     }
     Some(r)
+}
+
+#[cfg(test)]
+mod kernel_id_tests {
+    use super::lookup;
+
+    fn pad(raw: &[u8]) -> [u8; 16] {
+        let mut id = [0u8; 16];
+        id[..raw.len()].copy_from_slice(raw);
+        id
+    }
+
+    /// Exact `name/v1` ids only, as the Python referee (review 10-03, F9).
+    #[test]
+    fn reduction_ids_must_be_exact() {
+        assert!(lookup(&pad(b"sumchunk_i32/v1")).is_some());
+        for bad in [&b"sumchunk_i32"[..], b"sumchunk_i32/v7", b"sumchunk_i32/v1x"] {
+            assert!(lookup(&pad(bad)).is_none(), "{bad:?}");
+        }
+        let mut interior = pad(b"sumchunk_i32/v1");
+        interior[15] = b'x';
+        assert!(lookup(&interior).is_none(), "bytes after the padding");
+    }
 }

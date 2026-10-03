@@ -99,7 +99,7 @@ async fn replay(s: &serde_json::Value) -> u8 {
         flat.extend_from_slice(r);
     }
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &[0u8; 32], &(refs.len() as u32).to_le_bytes(), &flat, e.pubkey().as_ref()]);
-    let run = Pubkey::find_program_address(&[b"dcg21run", &run_id], &PROGRAM).0;
+    let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
     send(&mut ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
 
     // E's commitment.

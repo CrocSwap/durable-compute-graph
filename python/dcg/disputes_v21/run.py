@@ -110,12 +110,26 @@ def run_root(raw: bytes) -> bytes:
 
 # --- kernels ----------------------------------------------------------------------------------
 
+def canonical_kernel_name(kernel_id: bytes) -> str | None:
+    """A kernel id's name: the bytes before its NUL padding, which must be
+    valid UTF-8 and followed only by NULs (the program's rule). None otherwise."""
+    raw = bytes(kernel_id)
+    name = raw.rstrip(b"\x00")
+    if b"\x00" in name:
+        return None
+    try:
+        return name.decode()
+    except UnicodeDecodeError:
+        return None
+
+
 def replay(kernel_id: bytes, inputs: list[bytes]) -> list[bytes] | None:
-    """Host replay of the registered kernels on i32 cells; None on a kernel refusal."""
+    """Host replay of the registered kernels on i32 cells; None on a kernel
+    refusal or an unknown id. The id must be exactly `name/v<semantic>`."""
     from dcg import kernels
 
-    name = kernel_id.rstrip(b"\x00").decode().split("/")[0]
-    spec = next((k for k in kernels.REGISTRY.values() if k.name == name), None)
+    name = canonical_kernel_name(kernel_id)
+    spec = next((k for k in kernels.REGISTRY.values() if f"{k.name}/v{k.semantic_version}" == name), None)
     if spec is None or len(inputs) != spec.arity or any(len(v) != 4 for v in inputs):
         return None
     try:
@@ -125,15 +139,18 @@ def replay(kernel_id: bytes, inputs: list[bytes]) -> list[bytes] | None:
     return [struct.pack("<i", out)]
 
 
-def replay_step(kernel_id: bytes, inputs: list[bytes], prior: bytes | None) -> tuple[list[bytes], bytes | None] | None:
-    """Replay one step: (outputs by port order, next state or None); None on refusal."""
+def replay_step(kernel_id: bytes, inputs: list[bytes], prior: bytes | None, semantic_version: int = 1,
+                abi_version: int = 1) -> tuple[list[bytes], bytes | None] | None:
+    """Replay one step: (outputs by port order, next state or None); None on
+    refusal. Application kernels resolve by (id, semantic, ABI) exactly, as
+    the program resolves them from the image's manifest."""
     from . import appkernels, reductions
 
     k = reductions.lookup(kernel_id)
     if k is None:
         if prior is not None:
             return None
-        app = appkernels.REGISTRY.get(bytes(kernel_id))
+        app = appkernels.REGISTRY.get((bytes(kernel_id), semantic_version, abi_version))
         if app is not None:
             try:
                 return app(inputs), None
@@ -357,7 +374,8 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
         if d["state_scheme"] == 2:
             result = replay_log_step(d, in_values, prior)
         else:
-            result = replay_step(d["kernel_id"], in_values, prior)
+            result = replay_step(d["kernel_id"], in_values, prior,
+                                 d["semantic_version"], d["abi_version"])
         if result is None:
             raise ValueError(f"step {ordinal} refused by its kernel")
         outs, nxt = result

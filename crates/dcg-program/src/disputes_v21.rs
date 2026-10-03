@@ -320,7 +320,8 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
 
 // Run "D21R": magic(4) status(1) pad(3) template(32) payer(32) executor(32)
 // run_id(32) commit_slot(8) deadline(8) open_disputes(4) n_ext(4)
-// run_root_bytes(176) then external refs (52 each).
+// run_root_bytes(176) then external refs (52 each). PDA ["dcg21run", run_id,
+// payer]. Before commit, `deadline` is the commit deadline.
 const R_STATUS: usize = 4;
 const R_TEMPLATE: usize = 8;
 const R_PAYER: usize = 40;
@@ -348,7 +349,7 @@ fn run_checked(program_id: &Pubkey, run: &AccountInfo, template: &AccountInfo) -
     if d.len() < R_REFS || &d[0..4] != b"D21R" || d[R_TEMPLATE..R_TEMPLATE + 32] != template.key.to_bytes() {
         return Err(err(5));
     }
-    derived(program_id, run, &[b"dcg21run", &d[R_RUN_ID..R_RUN_ID + 32]])
+    derived(program_id, run, &[b"dcg21run", &d[R_RUN_ID..R_RUN_ID + 32], &d[R_PAYER..R_PAYER + 32]])
 }
 
 // Dispute "D21D": magic(4) phase(1) kind(1) ruling(1) depth(1) level(4)
@@ -431,6 +432,10 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         || total_steps == 0
         || total_steps > 1 << 40
         || u16_at(data, 89)? >= 10_000
+        // Nonzero bonds (review 10-03, F4): the remainder deterrent (§10.3)
+        // and the price of opening a dispute need both.
+        || u64_at(data, 33)? == 0
+        || u64_at(data, 41)? == 0
     {
         return Err(err(6));
     }
@@ -487,7 +492,6 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         return Err(ProgramError::MissingRequiredSignature);
     }
     let t = template(program_id, tmpl)?;
-    let _ = t;
     let n = u32_at(data, 64)? as usize;
     let refs = data.get(68..68 + n * 52).ok_or(err(1))?;
     if data.len() != 68 + n * 52 {
@@ -507,7 +511,9 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     }
     let template_id = key32(&tmpl.try_borrow_data()?, 96)?;
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &data[0..32], &(n as u32).to_le_bytes(), refs, &data[32..64]]);
-    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id], R_REFS + refs.len())?;
+    // The payer is part of the run's address (review 10-03, F5): a cancelled
+    // run cannot be re-initialized at the same address by someone else.
+    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], R_REFS + refs.len())?;
     let mut d = run.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"D21R");
     d[R_TEMPLATE..R_TEMPLATE + 32].copy_from_slice(tmpl.key.as_ref());
@@ -516,6 +522,10 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     d[R_RUN_ID..R_RUN_ID + 32].copy_from_slice(&run_id);
     d[R_NEXT..R_NEXT + 4].copy_from_slice(&(n as u32).to_le_bytes());
     d[R_BEST..R_BEST + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    // Until commit, the deadline is the commit deadline: the executor commits
+    // within the template's challenge window; after it, the payer may cancel.
+    let commit_deadline = now()?.checked_add(t.challenge_window).ok_or(err(8))?;
+    d[R_DEADLINE..R_DEADLINE + 8].copy_from_slice(&commit_deadline.to_le_bytes());
     d[R_REFS..].copy_from_slice(refs);
     Ok(())
 }
@@ -533,6 +543,7 @@ fn commit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
             return Err(ProgramError::MissingRequiredSignature);
         }
         if d[R_STATUS] != RUN_OPEN
+            || now()? > u64_at(&d, R_DEADLINE)?
             || rr.run_id() != &d[R_RUN_ID..R_RUN_ID + 32]
             || rr.plan_id() != t.plan_id
             || rr.spec_root() != t.spec_root
@@ -600,7 +611,7 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     d[D_KIND] = kind;
     d[D_DEPTH] = t.depth as u8;
     d[D_LEVEL..D_LEVEL + 4].copy_from_slice(&level.to_le_bytes());
-    let deadline = now()?.checked_add(t.phase_window).ok_or(err(8))?;
+    let deadline = now()?.checked_add(executor_window(&t, run)?).ok_or(err(8))?;
     d[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&deadline.to_le_bytes());
     d[D_CHALLENGER..D_CHALLENGER + 32].copy_from_slice(challenger.key.as_ref());
     d[D_RUN..D_RUN + 32].copy_from_slice(run.key.as_ref());
@@ -638,6 +649,14 @@ fn expect_phase(d: &[u8], phase: u8) -> ProgramResult {
         return Err(err(13));
     }
     Ok(())
+}
+
+/// The window for a phase the executor owes (NODES, LEAF): the template's
+/// phase window times the run's open disputes (the load extension, §8.3;
+/// review 10-03, F4), so concurrent disputes cannot outrun one executor.
+fn executor_window(t: &Template, run: &AccountInfo) -> Result<u64, ProgramError> {
+    let open = u32_at(&run.try_borrow_data()?, R_OPEN)?.max(1) as u64;
+    Ok(t.phase_window.saturating_mul(open).min(MAX_WINDOW))
 }
 
 fn next_phase(d: &mut [u8], phase: u8, window: u64) -> ProgramResult {
@@ -778,7 +797,8 @@ fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     d[D_LEVEL..D_LEVEL + 4].copy_from_slice(&new_level.to_le_bytes());
     d[D_POSITION..D_POSITION + 8].copy_from_slice(&((position << depth) + index).to_le_bytes());
     d[D_CURRENT..D_CURRENT + 32].copy_from_slice(&chosen);
-    next_phase(&mut d, if new_level == 0 { PH_LEAF } else { PH_NODES }, c.t.phase_window)
+    let window = executor_window(&c.t, c.run)?;
+    next_phase(&mut d, if new_level == 0 { PH_LEAF } else { PH_NODES }, window)
 }
 
 // 14: [challenger(s,w), run, template, dispute, buffer(w), system] role:u8 size:u32
@@ -987,6 +1007,7 @@ fn claim(
     let name = *data.first().ok_or(err(1))?;
     let index = *data.get(1).ok_or(err(1))? as usize;
     let mut at = 2;
+    let mut neutral = false;
     let winner_is_challenger = if kind == KIND_OUT_DESCEND {
         // OUT(j): the spec's OutSpec(j), then the producer leaf.
         let (_t, record) = spec_record(&c.t, data, &mut at, out_spec_leaf_index(&c.t, position)?)?;
@@ -1032,6 +1053,12 @@ fn claim(
             return Err(err(17));
         }
         let gated = block.kind == 2 && it >= 1;
+        // The program judges SMALL state only. A STATE or STEP claim on any
+        // other scheme (LOG) is ruled neutral until LOG is implemented here
+        // (review 10-03, F3); the Python referee already models LOG.
+        if present && matches!(name, CLAIM_STATE | CLAIM_STEP) && spec.state_scheme() > 1 {
+            neutral = true;
+        }
         if !present {
             // Empty is a violation unless the step is gated; then GATE decides.
             if !gated {
@@ -1049,6 +1076,8 @@ fn claim(
                     CLAIM_GATE => gated && k.gate_says(&mut at, bi, &block, it, true)?,
                     CLAIM_SHAPE => D::shape_wrong(&leaf, &spec, D::RunRoot(&root).plan_id(), D::RunRoot(&root).run_id(), ordinal),
                     CLAIM_EDGE => k.edge(&mut at, &leaf, &spec, index)?,
+                    // Neutral claims are not evaluated.
+                    CLAIM_STATE | CLAIM_STEP if neutral => false,
                     CLAIM_STATE => k.state(&mut at, &leaf, &spec)?,
                     CLAIM_STEP => k.step(&mut at, &leaf, &spec)?,
                     _ => return Err(err(19)),
@@ -1057,7 +1086,7 @@ fn claim(
         }
     };
     drop(refs_buf);
-    rule(&c, executor_acct, challenger, winner_is_challenger)
+    rule(&c, executor_acct, challenger, if neutral { Outcome::Neutral } else { winner_is_challenger.into() })
 }
 
 /// The claim rules (§7.3) over one claim's data. Each returns whether C
@@ -1258,7 +1287,13 @@ impl<'a> Referee<'a> {
         // An application kernel, resolved by id and versions from the
         // embedding image's manifest: one output, stateless (this slice).
         let id = crate::kernel::KernelId(spec.kernel_id().try_into().unwrap());
-        if let Some(kernel) = self.manifest.resolve(id, spec.semantic_version(), spec.abi_version()) {
+        // Only a kernel that advertises the v2.1 STEP mode replays a step
+        // (review 10-03, F2): other manifest kernels are unknown here.
+        let step_kernel = self
+            .manifest
+            .resolve(id, spec.semantic_version(), spec.abi_version())
+            .filter(|k| k.manifest().modes.contains(&crate::kernel::MODE_STEP_V21));
+        if let Some(kernel) = step_kernel {
             let m = kernel.manifest();
             let spans: Vec<crate::kernel::AccountSpan> = ins[..n]
                 .iter()
@@ -1292,6 +1327,9 @@ impl<'a> Referee<'a> {
 /// without its NUL padding (for example `identity_i32/v1`).
 fn kernel_code(id: &[u8]) -> Option<u16> {
     let end = id.iter().position(|b| *b == 0).unwrap_or(id.len());
+    if id[end..].iter().any(|b| *b != 0) {
+        return None; // an interior NUL is not a kernel name (review 10-03, F9)
+    }
     let name = &id[..end];
     (1..=255u16).find(|k| dcg_kernels::info(*k).is_some_and(|i| i.name.as_bytes() == name))
 }
@@ -1300,7 +1338,34 @@ fn out_spec_leaf_index(t: &Template, j: u64) -> Result<u64, ProgramError> {
     t.out_spec_base.checked_add(j).ok_or(err(8))
 }
 
-fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, challenger_wins: bool) -> ProgramResult {
+/// What a claim or timeout decides. `Neutral` is a moot ruling: the
+/// challenger's bond returns and nobody is convicted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Executor,
+    Challenger,
+    Neutral,
+}
+
+impl From<bool> for Outcome {
+    fn from(challenger_wins: bool) -> Self {
+        if challenger_wins { Outcome::Challenger } else { Outcome::Executor }
+    }
+}
+
+fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, outcome: impl Into<Outcome>) -> ProgramResult {
+    let mut outcome = outcome.into();
+    {
+        // A dispute opened after the run's lowest challenger win is moot
+        // (§10.1), whatever its own claim or timeout would decide: neither
+        // party can take the other's bond through it (review 10-03, F1).
+        let r = c.run.try_borrow_data()?;
+        let d = c.dispute.try_borrow_data()?;
+        if r[R_STATUS] == RUN_REFUTED && u64_at(&d, D_SEQ)? > u64_at(&r, R_BEST)? {
+            outcome = Outcome::Neutral;
+        }
+    }
+    let challenger_wins = outcome == Outcome::Challenger;
     let seq = {
         let mut d = c.dispute.try_borrow_mut_data()?;
         if d[D_RULING] != RULING_OPEN {
@@ -1310,7 +1375,11 @@ fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, challenger_wi
             return Err(err(22));
         }
         d[D_PHASE] = PH_RULED;
-        d[D_RULING] = if challenger_wins { RULING_CHALLENGER } else { RULING_EXECUTOR };
+        d[D_RULING] = match outcome {
+            Outcome::Challenger => RULING_CHALLENGER,
+            Outcome::Executor => RULING_EXECUTOR,
+            Outcome::Neutral => RULING_MOOT,
+        };
         u64_at(&d, D_SEQ)?
     };
     {
@@ -1332,11 +1401,11 @@ fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, challenger_wi
             }
         }
     }
-    // The challenger's bond: back to a winning challenger, to E otherwise.
-    if challenger_wins {
-        move_all(c.dispute, challenger)
-    } else {
+    // The challenger's bond: back to a winning or neutral challenger, to E otherwise.
+    if outcome == Outcome::Executor {
         move_all(c.dispute, executor)
+    } else {
+        move_all(c.dispute, challenger)
     }
 }
 
@@ -1553,6 +1622,10 @@ fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             if !caller.is_signer || caller.key != payer.key {
                 return Err(ProgramError::MissingRequiredSignature);
             }
+            // Cancel only after the commit deadline (design §9 CANCEL_RUN).
+            if now()? <= u64_at(&r, R_DEADLINE)? {
+                return Err(err(37));
+            }
         } else if !settled(&r) || u32_at(&r, R_OPEN)? != 0 || u32_at(&r, R_CLOSED)? as u64 != u64_at(&r, R_SEQ)? {
             return Err(err(37));
         }
@@ -1597,7 +1670,7 @@ fn close_cache(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         if !receipt && (r.len() < R_REFS || &r[0..4] != b"D21R") {
             return Err(err(5));
         }
-        derived(program_id, run, &[b"dcg21run", &r[R_RUN_ID..R_RUN_ID + 32]])?;
+        derived(program_id, run, &[b"dcg21run", &r[R_RUN_ID..R_RUN_ID + 32], &r[R_PAYER..R_PAYER + 32]])?;
         if !receipt && (!settled(&r) || u32_at(&r, R_OPEN)? != 0) {
             return Err(err(38));
         }

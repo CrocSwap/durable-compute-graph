@@ -85,7 +85,7 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
     let flat: Vec<u8> = refs.concat();
     init.extend_from_slice(&flat);
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &nonce, &(refs.len() as u32).to_le_bytes(), &flat, e.pubkey().as_ref()]);
-    let run = Pubkey::find_program_address(&[b"dcg21run", &run_id], &PROGRAM).0;
+    let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
     tx.send(ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter])
         .await
         .unwrap_or_else(|err| panic!("{name}: init: {err:?}"));
@@ -200,6 +200,7 @@ async fn chunked_kernels_rule_as_the_python_oracle() {
         let want = match s["ruling"].as_str().unwrap() {
             "C" => V::RULING_CHALLENGER,
             "E" => V::RULING_EXECUTOR,
+            "moot" => V::RULING_MOOT,
             _ => V::RULING_OPEN,
         };
         let got = replay(&mut ctx, &mut tx, s).await;

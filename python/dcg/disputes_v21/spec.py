@@ -112,6 +112,7 @@ def decode_step_spec(raw: bytes) -> dict:
             "state_size": struct.unpack_from("<Q", raw, 128)[0], "state_predecessor": raw[136:160],
             "state_initial": raw[160:184], "segment": segment, "node": node, "kernel_step": kernel_step,
             "kernel_id": raw[20:36], "semantic_version": struct.unpack_from("<H", raw, 36)[0],
+            "abi_version": struct.unpack_from("<H", raw, 38)[0],
             "max_cu": struct.unpack_from("<Q", raw, 48)[0], "parameter_digest": raw[56:88],
             "port_shapes_digest": raw[88:120], "state_scheme": raw[120], "inputs": ins, "outputs": outs}
 

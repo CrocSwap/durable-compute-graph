@@ -330,7 +330,7 @@ class Dispute:
             if state_witness is None or R.small_state_digest(state_witness) != leaf.prior:
                 raise Refused("state witness does not match the prior digest")
             prior = state_witness
-        result = R.replay_step(d["kernel_id"], witness, prior)
+        result = R.replay_step(d["kernel_id"], witness, prior, d["semantic_version"], d["abi_version"])
         if result is None:
             return "C"  # a refused step cannot carry committed outputs
         outs, nxt = result

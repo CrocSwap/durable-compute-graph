@@ -179,7 +179,7 @@ impl Chain {
             refs.extend_from_slice(r);
         }
         let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &[0u8; 32], &2u32.to_le_bytes(), &refs, executor.as_ref()]);
-        let run = Pubkey::find_program_address(&[b"dcg21run", &run_id], &PROGRAM).0;
+        let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
         send(&mut ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
         Chain { ctx, template, run, run_id, g, spec_levels }
     }
@@ -579,10 +579,11 @@ async fn a_forged_dispute_record_is_refused() {
 async fn admission_refuses_bad_templates_and_runs() {
     let mut ch = Chain::new(1_000).await;
     let admitter = kp(0xA1);
-    // Depth 5 (review B3) and a phase window under the 750-slot floor.
-    for (depth, phase) in [(5u8, 750u64), (4, 749)] {
+    // Depth 5 (review B3), a phase window under the 750-slot floor, and a
+    // zero executor or challenger bond (review 10-03, F4).
+    for (depth, phase, eb, cb) in [(5u8, 750u64, EXECUTOR_BOND, CHALLENGER_BOND), (4, 749, EXECUTOR_BOND, CHALLENGER_BOND), (4, 750, 0, CHALLENGER_BOND), (4, 750, EXECUTOR_BOND, 0)] {
         let mut data = vec![depth];
-        for x in [2u64, 1, 1_000, phase, EXECUTOR_BOND, CHALLENGER_BOND] {
+        for x in [2u64, 1, 1_000, phase, eb, cb] {
             data.extend_from_slice(&x.to_le_bytes());
         }
         data.extend_from_slice(&OUT_BASE.to_le_bytes());
@@ -593,7 +594,7 @@ async fn admission_refuses_bad_templates_and_runs() {
         let id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
         let t = Pubkey::find_program_address(&[b"dcg21tmpl", &id], &PROGRAM).0;
         let i = ix(V::SUB_CREATE_TEMPLATE, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(t, false), AccountMeta::new_readonly(SYSTEM, false)]);
-        assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err(), "depth {depth} phase {phase}");
+        assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err(), "depth {depth} phase {phase} bonds {eb} {cb}");
     }
     // Unsorted external refs (review B2), and a payer naming itself executor.
     let init = |executor: &Pubkey, refs: &[&Vec<u8>]| {
@@ -808,14 +809,92 @@ async fn a_refuted_run_closes_after_the_pot_and_buffers_refund_their_creator() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_uncommitted_run_closes_for_its_payer_only() {
+async fn an_uncommitted_run_cancels_for_its_payer_after_the_commit_deadline() {
+    // The commit deadline is the init slot plus the challenge window (30).
     let mut ch = Chain::new(30).await;
+    assert!(ch.close_run(0xA1).await.is_err(), "not before the commit deadline");
+    ch.ctx.warp_to_slot(100).unwrap();
+    // A late commit is refused (review 10-03, F5).
+    let c = ch.honest();
+    let e = kp(0xE1);
+    let commit = |run: Pubkey, template: Pubkey| ix(V::SUB_COMMIT, &c.root_bytes, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert!(send(&mut ch.ctx, commit(ch.run, ch.template), &[&e]).await.is_err(), "past the commit deadline");
     assert!(ch.close_run(0xE1).await.is_err(), "only the payer cancels");
     ch.close_run(0xA1).await.unwrap();
     assert!(ch.gone(ch.run).await, "a cancelled run leaves no receipt");
-    // Its executor can no longer commit to it.
-    let c = ch.honest();
+    // Someone else re-initializing the same run id gets a different address:
+    // the payer is part of it, so the executor's commit cannot be redirected.
+    let other = kp(0xC1);
+    let mut init = vec![0u8; 32];
+    init.extend_from_slice(e.pubkey().as_ref());
+    init.extend_from_slice(&2u32.to_le_bytes());
+    for r in &ch.g.refs {
+        init.extend_from_slice(r);
+    }
+    let theirs = Pubkey::find_program_address(&[b"dcg21run", &ch.run_id, other.pubkey().as_ref()], &PROGRAM).0;
+    assert_ne!(theirs, ch.run);
+    let i = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(other.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert!(send(&mut ch.ctx, i, &[&other]).await.is_err(), "the payer's address is not theirs");
+    let i = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(other.pubkey(), true), AccountMeta::new(theirs, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    send(&mut ch.ctx, i, &[&other]).await.unwrap();
+    assert!(send(&mut ch.ctx, commit(ch.run, ch.template), &[&e]).await.is_err(), "the cancelled address is gone");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timeout_after_the_best_win_is_moot_and_keeps_the_challengers_bond() {
+    let mut ch = Chain::new(1_000).await;
+    let h = ch.honest();
+    let mut l = h.leaves[1].clone().unwrap();
+    let n = l.len();
+    l[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
+    let c = commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(l)], h.outs.clone());
+    ch.commit(&c).await;
+    let d0 = ch.open(70, V::KIND_STEP_DESCEND).await; // sequence 0
+    let d1 = ch.open(71, V::KIND_STEP_DESCEND).await; // sequence 1
+    // E answers d1's first reveal, so d1 waits on its challenger's pick.
     let e = kp(0xE1);
-    let i = ix(V::SUB_COMMIT, &c.root_bytes, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
-    assert!(send(&mut ch.ctx, i, &[&e]).await.is_err());
+    let mut nodes = Vec::new();
+    nodes.extend_from_slice(&c.step[0][0]);
+    nodes.extend_from_slice(&c.step[0][1]);
+    let i = ix(V::SUB_REVEAL_NODES, &nodes, ch.party(0xE1, d1));
+    send(&mut ch.ctx, i, &[&e]).await.unwrap();
+    ch.win_by_step(d0, &c).await;
+    assert_eq!(ch.run_status().await, V::RUN_REFUTED);
+    // d1's challenger stops playing (d1 is after the best win). Its timeout
+    // would rule for E, but the dispute is moot instead (review 10-03, F1).
+    ch.ctx.warp_to_slot(5_000).unwrap();
+    let (e_before, c_before) = (ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap(), ch.ctx.banks_client.get_balance(kp(0xC1).pubkey()).await.unwrap());
+    let caller = kp(0xA1);
+    let accounts = vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d1, false), AccountMeta::new(e.pubkey(), false), AccountMeta::new(kp(0xC1).pubkey(), false)];
+    send(&mut ch.ctx, ix(V::SUB_TIMEOUT, &[], accounts), &[&caller]).await.unwrap();
+    assert_eq!(ch.ruling(d1).await, V::RULING_MOOT);
+    assert_eq!(ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap(), e_before, "E gains nothing");
+    assert_eq!(ch.ctx.banks_client.get_balance(kp(0xC1).pubkey()).await.unwrap(), c_before + CHALLENGER_BOND, "C's bond returns");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_executors_deadlines_grow_with_open_disputes() {
+    let mut ch = Chain::new(1_000).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let deadline = |a: &solana_account::Account| u64::from_le_bytes(a.data[24..32].try_into().unwrap());
+    let slot = ch.ctx.banks_client.get_root_slot().await.unwrap();
+    let d0 = ch.open(80, V::KIND_STEP_DESCEND).await;
+    let first = deadline(&ch.ctx.banks_client.get_account(d0).await.unwrap().unwrap());
+    let d1 = ch.open(81, V::KIND_STEP_DESCEND).await;
+    let second = deadline(&ch.ctx.banks_client.get_account(d1).await.unwrap().unwrap());
+    let d2 = ch.open(82, V::KIND_STEP_DESCEND).await;
+    let third = deadline(&ch.ctx.banks_client.get_account(d2).await.unwrap().unwrap());
+    // Phase window 750: one, two and three open disputes (§8.3, review 10-03, F4).
+    assert!(first <= slot + 750 + 5, "{first} vs {slot}");
+    assert!(second >= slot + 1_500 && third >= slot + 2_250, "{second} {third} vs {slot}");
+    // C's own phases keep the plain window: after E's reveal, d0 waits on C.
+    let e = kp(0xE1);
+    let mut nodes = Vec::new();
+    nodes.extend_from_slice(&c.step[0][0]);
+    nodes.extend_from_slice(&c.step[0][1]);
+    let i = ix(V::SUB_REVEAL_NODES, &nodes, ch.party(0xE1, d0));
+    send(&mut ch.ctx, i, &[&e]).await.unwrap();
+    let pick = deadline(&ch.ctx.banks_client.get_account(d0).await.unwrap().unwrap());
+    assert!(pick <= slot + 750 + 10, "{pick} vs {slot}");
 }

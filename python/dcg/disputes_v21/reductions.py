@@ -143,9 +143,18 @@ def kernel_id(name: str) -> bytes:
     return raw + bytes(16 - len(raw))
 
 
+def _registered(kernel: bytes) -> str | None:
+    """The registry name of an exact `name/v1` id (NUL-padded), else None:
+    the program's rule (review 10-03, F9)."""
+    from .run import canonical_kernel_name
+
+    name = canonical_kernel_name(kernel)
+    return name[:-3] if name is not None and name.endswith("/v1") else None
+
+
 def lookup(kernel: bytes) -> StatefulKernel | None:
-    return REGISTRY.get(kernel.rstrip(b"\x00").decode(errors="replace").split("/")[0])
+    return REGISTRY.get(_registered(kernel) or "")
 
 
 def lookup_log(kernel: bytes) -> LogKernel | None:
-    return LOG_REGISTRY.get(kernel.rstrip(b"\x00").decode(errors="replace").split("/")[0])
+    return LOG_REGISTRY.get(_registered(kernel) or "")

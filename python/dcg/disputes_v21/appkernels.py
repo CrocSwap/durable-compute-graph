@@ -20,6 +20,8 @@ def _sha256_concat(inputs: list[bytes]) -> list[bytes]:
     return [hashlib.sha256(b"".join(inputs)).digest()]
 
 
-REGISTRY: dict[bytes, Callable[[list[bytes]], list[bytes]]] = {
-    b"dcg-test-sha-v1\x00": _sha256_concat,
+# Keyed by (16-byte kernel id, semantic version, ABI version), exactly as the
+# program resolves a manifest kernel (review 10-03, F2).
+REGISTRY: dict[tuple[bytes, int, int], Callable[[list[bytes]], list[bytes]]] = {
+    (b"dcg-test-sha-v1\x00", 1, 1): _sha256_concat,
 }

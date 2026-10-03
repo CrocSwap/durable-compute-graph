@@ -59,6 +59,10 @@ pub const MAX_TRANSACTION_COMPUTE_UNITS: u64 = 1_400_000;
 pub const MAX_DECLARED_KERNEL_COMPUTE_UNITS: u64 =
     MAX_TRANSACTION_COMPUTE_UNITS - APP_REPLAY_MEASURED_OVERHEAD_CU - APP_REPLAY_CU_MARGIN;
 
+/// The mode a kernel advertises to replay a DCG v2.1 STEP claim (tag 227):
+/// `"STEP"`, version 1. A manifest kernel without it is not a STEP kernel.
+pub const MODE_STEP_V21: ModeId = VersionedId { id: 0x5354_4550, version: 1 };
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelManifest {
     pub id: KernelId,
@@ -1483,8 +1487,9 @@ pub mod test_kernel {
             max_operations: 1,
             max_compute_units: 100_000,
         },
-        modes: &MODES,
+        modes: &SHA_MODES,
     };
+    static SHA_MODES: [ModeId; 1] = [MODE_STEP_V21];
 
     impl Kernel for Sha256Concat {
         fn manifest(&self) -> &'static KernelManifest {

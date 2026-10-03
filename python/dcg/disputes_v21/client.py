@@ -115,7 +115,7 @@ class DisputeClient:
         flat = b"".join(refs)
         run_id = hashlib.sha256(b"dcg.run.id.v2.1\x00" + template_id + nonce + struct.pack("<I", len(refs)) + flat
                                 + bytes(executor)).digest()
-        run = self.pda(b"dcg21run", run_id)
+        run = self.pda(b"dcg21run", run_id, bytes(payer.pubkey()))
         body = nonce + bytes(executor) + struct.pack("<I", len(refs)) + flat
         self._send("init_run", body, [AccountMeta(payer.pubkey(), True, True), AccountMeta(run, False, True),
                                       AccountMeta(template, False, False), AccountMeta(SYSTEM, False, False)], [payer])
@@ -184,7 +184,11 @@ class DisputeClient:
                 "dispute": str(dispute)}
 
     def run_status(self, run: Pubkey) -> int:
-        return self.gc.account(run)[4]
+        """A live run's or a receipt's status byte (both keep it at byte 4)."""
+        data = self.gc.account(run)
+        if data is None or data[:4] not in (b"D21R", b"D21P"):
+            raise ValueError(f"{run} is not a v2.1 run or receipt")
+        return data[4]
 
     # --- settlement and rent reclaim ------------------------------------------------
     def _caller(self) -> AccountMeta:
