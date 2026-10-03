@@ -5446,7 +5446,7 @@ fn f48_honest_body(
     table: &[u8],
     wrong_gather_write_digest: bool,
     position_root_at: &mut [u8; 32],
-) -> (Vec<u8>, [u8; 32]) {
+) -> (Vec<u8>, [u8; 32], F47TargetOpen) {
     use std::collections::BTreeMap;
 
     let gather = x.entry(position, gather_index).unwrap();
@@ -5804,7 +5804,32 @@ fn f48_honest_body(
     for (offset, section) in section_offsets.iter().zip(&read_sections) {
         body[*offset..*offset + section.len()].copy_from_slice(section);
     }
-    (body, target_leaf)
+    // What a real tag-166 open on the gather leaf carries: its path in its
+    // segment tree and the SPP1 to the position root committed above.
+    let gather_ordinal = segment_ordinals[&gather_at.segment];
+    let (gather_path, _) = f47_tree_path(
+        descriptor,
+        1,
+        position,
+        &segment_leaves[&gather_at.segment],
+        gather_at.local as usize,
+    );
+    let (spp_path, _) = f47_tree_path(descriptor, 2, position, &outer_roots, gather_ordinal);
+    let mut spp1 = (gather_ordinal as u16).to_le_bytes().to_vec();
+    spp1.push(spp_path.len() as u8);
+    spp1.push(0);
+    spp1.extend_from_slice(&table_root);
+    for sibling in &spp_path {
+        spp1.extend_from_slice(sibling);
+    }
+    let open = F47TargetOpen {
+        segment: gather_at.segment,
+        local: gather_at.local,
+        path: gather_path,
+        spp1,
+        preimage: target_preimage.clone(),
+    };
+    (body, target_leaf, open)
 }
 
 async fn f47_measured_send(f: &mut Fix, data: Vec<u8>, metas: Vec<AccountMeta>, case: &str) -> u64 {
@@ -6383,7 +6408,6 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
         Some(decision_entry)
     );
     let gather_index = f47_gather_before(&x, position, decision_entry);
-    let gather_at = x.coordinate(position, gather_index).unwrap();
     let mut samples = Vec::new();
 
     for (variant, k) in [1u8, 2, 47, 48, 64, 80]
@@ -6409,7 +6433,7 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
         binding.option_table_sha256 = sha256(&[&options]);
         let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
         let mut position_root = [0u8; 32];
-        let (body, target_leaf) = f48_honest_body(
+        let (body, target_leaf, open) = f48_honest_body(
             &x,
             &routes,
             &descriptor,
@@ -6425,50 +6449,13 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
             .await;
         f.finalize(&descriptor, created, position + 1).await;
 
-        let challenger = f.signer.pubkey();
+        // Real instructions only: the challenger opens the gather leaf (166)
+        // and the executor uploads the honest body (115-118).
         let nonce = 0x4800_0000 + variant as u32;
-        let (challenge_key, challenge_bump) =
-            address::challenge(&f.program, &descriptor, &challenger, nonce);
-        let (response_key, response_bump) =
-            dcg_program::closure_v2_response::address(&f.program, &challenge_key);
-        let mut state = vec![0u8; 8192];
-        state[..4].copy_from_slice(b"DCR1");
-        state[4] = 1;
-        f47_put_u16(&mut state, 6, 5);
-        state[8..40].copy_from_slice(challenger.as_ref());
-        state[40..72].copy_from_slice(f.executor.pubkey().as_ref());
-        state[72..104].copy_from_slice(&descriptor);
-        state[104..136].copy_from_slice(&target_leaf);
-        state[184..216].copy_from_slice(response_key.as_ref());
-        f47_put_u32(&mut state, 136, gather_at.local);
-        f47_put_u32(&mut state, 140, nonce);
-        state[144] = 1;
-        state[145] = registry::MACHINE_SELECTOR_A16;
-        state[146] = challenge_bump.value();
-        state[147] = 1;
-        state[181] = response_bump.value();
-        state[219] = response_bump.value();
-        f47_put_u64(&mut state, 148, u64::MAX);
-        f47_put_u32(&mut state, 156, position);
-        f47_put_u16(&mut state, 160, gather_at.segment);
-        f47_put_u32(&mut state, 170, gather_index);
-        f47_put_u16(&mut state, 174, decision::GATHER_FORM_ID);
-        f.ctx
-            .set_account(&challenge_key, &shared(owned(&f.program, state)));
-        let mut dru1 = vec![0u8; 128];
-        dru1[..4].copy_from_slice(b"DRU1");
-        f47_put_u16(&mut dru1, 4, 1);
-        f47_put_u16(&mut dru1, 6, 2);
-        dru1[8..40].copy_from_slice(challenge_key.as_ref());
-        dru1[40..72].copy_from_slice(f.executor.pubkey().as_ref());
-        f47_put_u32(&mut dru1, 72, body.len() as u32);
-        f47_put_u32(&mut dru1, 76, body.len() as u32);
-        dru1[80..112].copy_from_slice(&sha256(&[&body]));
-        f47_put_u64(&mut dru1, 112, u64::MAX);
-        dru1.extend_from_slice(&body);
-        f.ctx
-            .set_account(&response_key, &shared(owned(&f.program, dru1.clone())));
-
+        let (challenge_key, response_key) = f47_open_and_respond(
+            &mut f, created, &descriptor, position, target_leaf, &open, nonce, &body,
+        )
+        .await;
         let (pt2s, pt1s_index, routes_key, geometry_key, payloads_key) =
             (f.pt2s, f.pt1s_index, f.routes, f.geometry, f.payloads);
         let target_ix = Instruction {
@@ -6494,7 +6481,7 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
                 solana_compute_budget_interface::ComputeBudgetInstruction::request_heap_frame(
                     256 * 1024,
                 ),
-                target_ix,
+                target_ix.clone(),
             ],
             Some(&f.executor.pubkey()),
             &[&f.executor],
@@ -6564,14 +6551,23 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
             ] {
                 let mut malformed_body = body.clone();
                 malformed_body[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
-                let mut malformed_dru1 = dru1.clone();
-                f47_put_u32(&mut malformed_dru1, 72, malformed_body.len() as u32);
-                f47_put_u32(&mut malformed_dru1, 76, malformed_body.len() as u32);
-                malformed_dru1[80..112].copy_from_slice(&sha256(&[&malformed_body]));
-                malformed_dru1.truncate(128);
-                malformed_dru1.extend_from_slice(&malformed_body);
-                f.ctx
-                    .set_account(&response_key, &shared(owned(&f.program, malformed_dru1)));
+                // The executor may upload any bytes: a fresh real challenge
+                // answered with the malformed body, past tag 120 (whose target
+                // section is unchanged), refused at tag 121.
+                let bad_nonce = nonce.wrapping_add(0x0100_0000 + at as u32);
+                let (bad_challenge, bad_response) = f47_open_and_respond(
+                    &mut f, created, &descriptor, position, target_leaf, &open, bad_nonce, &malformed_body,
+                )
+                .await;
+                let mut bad_target = target_ix.clone();
+                bad_target.accounts[0] = AccountMeta::new(bad_challenge, false);
+                bad_target.accounts[1] = AccountMeta::new_readonly(bad_response, false);
+                send_fresh_with(&mut f.ctx, &f.executor, f.program, bad_target.data.clone(), bad_target.accounts.clone())
+                    .await
+                    .expect("tag 120 on the malformed body's challenge");
+                let mut ix = ix.clone();
+                ix.accounts[0] = AccountMeta::new(bad_challenge, false);
+                ix.accounts[1] = AccountMeta::new_readonly(bad_response, false);
                 let bad_blockhash = f.ctx.get_new_latest_blockhash().await.unwrap();
                 let bad_tx = Transaction::new_signed_with_payer(
                     &[
@@ -6609,7 +6605,7 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
                 let after_refusal = f
                     .ctx
                     .banks_client
-                    .get_account(challenge_key)
+                    .get_account(bad_challenge)
                     .await
                     .unwrap()
                     .unwrap()
@@ -6624,11 +6620,26 @@ async fn run_f48_gather_at_owner_boundaries(role_swapped: bool) {
                     &[0; 8],
                     "high read bitmap is atomic"
                 );
-                f.ctx
-                    .set_account(&response_key, &shared(owned(&f.program, dru1.clone())));
             }
         }
 
+        // Signed now: the real uploads above take enough slots that a hash
+        // fetched before them would have expired.
+        let blockhash = f.ctx.get_new_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[
+                solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+                    f47_compute_limit(),
+                ),
+                solana_compute_budget_interface::ComputeBudgetInstruction::request_heap_frame(
+                    256 * 1024,
+                ),
+                ix.clone(),
+            ],
+            Some(&f.executor.pubkey()),
+            &[&f.executor],
+            blockhash,
+        );
         let outcome = f
             .ctx
             .banks_client
