@@ -30,7 +30,23 @@ def build() -> dict:
                 "siblings": [proof.siblings[k].hex() for k in sorted(proof.siblings)],
                 "root": L.state_root(m, state).hex(),
             })
-    return {"slot_leaf_domain": L.SLOT_LEAF_DOMAIN.hex(), "cases": cases}
+    schedules = []
+    for positions, window in ((9, 3), (5, 2), (1, 4)):
+        tm = ToyMachine(positions_count=positions, window=window)
+        sch = L.Schedule(tm)
+        schedules.append({
+            "positions": positions,
+            "starts": sch.starts,
+            "checkpoints": {str(k): list(L.checkpoint_coordinates(sch, k)) for k in (1, 2, 3, 4, 7, 16)},
+        })
+    midpoints = []
+    for lo, hi, arity in ((0, 1, 16), (0, 2, 16), (3, 20, 16), (0, 16, 16), (0, 17, 16), (5, 1000, 16),
+                          (0, 7, 2), (10, 12_345_678, 16), (0, (1 << 40) + 3, 16), (2, 9, 3)):
+        d = L.Dispute.__new__(L.Dispute)
+        d.lo, d.hi, d.arity = lo, hi, arity
+        midpoints.append({"lo": lo, "hi": hi, "arity": arity, "coordinates": d.midpoint_coordinates()})
+    return {"slot_leaf_domain": L.SLOT_LEAF_DOMAIN.hex(), "cases": cases,
+            "schedules": schedules, "midpoints": midpoints}
 
 
 if __name__ == "__main__":

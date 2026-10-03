@@ -59,3 +59,36 @@ pub fn fold<H: Sha256>(h: &H, height: u16, nodes: &mut [(u64, Hash)], siblings: 
     }
     (next == siblings.len() && n == 1).then_some(nodes[0].1)
 }
+
+/// Checkpoint positions for `positions` positions every `k`: 0, k, 2k, ... and
+/// `positions`, without duplicates. Their coordinates are the schedule's
+/// position starts (design H2: derived, never executor-chosen).
+pub fn checkpoint_count(positions: u64, k: u64) -> Option<u64> {
+    (k >= 1).then(|| positions.div_ceil(k) + 1)
+}
+
+/// The `index`th checkpoint position, or `None` past the last.
+pub fn checkpoint_position(positions: u64, k: u64, index: u64) -> Option<u64> {
+    let count = checkpoint_count(positions, k)?;
+    (index < count).then(|| if index + 1 == count { positions } else { index * k })
+}
+
+/// The interior coordinates bisection asks the executor for over `[lo, hi)`:
+/// `min(arity, hi - lo) - 1` evenly spaced points, `lo + span * i / parts`.
+/// Writes them to `out` and returns how many; `None` if `hi <= lo`, `arity < 2`
+/// or `out` is too short.
+pub fn midpoint_coordinates(lo: u64, hi: u64, arity: u64, out: &mut [u64]) -> Option<usize> {
+    if hi <= lo || arity < 2 {
+        return None;
+    }
+    let span = hi - lo;
+    let parts = arity.min(span);
+    let n = (parts - 1) as usize;
+    if out.len() < n {
+        return None;
+    }
+    for i in 1..parts {
+        out[(i - 1) as usize] = lo + ((span as u128 * i as u128) / parts as u128) as u64;
+    }
+    Some(n)
+}

@@ -69,3 +69,47 @@ fn unsorted_or_out_of_range_slots_are_refused() {
     assert_eq!(fold(&Soft, 3, &mut [(8, leaf)], &[[0; 32]; 3]), None);
     assert_eq!(fold(&Soft, 3, &mut [], &[]), None);
 }
+
+fn golden() -> serde_json::Value {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/dcg/disputes_v21/lx.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn checkpoint_coordinates_match_python() {
+    use dcg_disputes::lx::{checkpoint_count, checkpoint_position};
+    let g = golden();
+    for s in g["schedules"].as_array().unwrap() {
+        let positions = s["positions"].as_u64().unwrap();
+        let starts: Vec<u64> = s["starts"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        for (k, want) in s["checkpoints"].as_object().unwrap() {
+            let k: u64 = k.parse().unwrap();
+            let want: Vec<u64> = want.as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+            let n = checkpoint_count(positions, k).unwrap();
+            let got: Vec<u64> = (0..n).map(|i| starts[checkpoint_position(positions, k, i).unwrap() as usize]).collect();
+            assert_eq!(got, want, "positions {positions} k {k}");
+            assert_eq!(checkpoint_position(positions, k, n), None);
+        }
+    }
+    assert_eq!(checkpoint_count(9, 0), None);
+}
+
+#[test]
+fn midpoint_coordinates_match_python() {
+    use dcg_disputes::lx::midpoint_coordinates;
+    let g = golden();
+    for m in g["midpoints"].as_array().unwrap() {
+        let (lo, hi, arity) = (m["lo"].as_u64().unwrap(), m["hi"].as_u64().unwrap(), m["arity"].as_u64().unwrap());
+        let want: Vec<u64> = m["coordinates"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        let mut out = [0u64; 16];
+        let n = midpoint_coordinates(lo, hi, arity, &mut out).unwrap();
+        assert_eq!(&out[..n], &want[..], "lo {lo} hi {hi} arity {arity}");
+        if n > 0 {
+            assert_eq!(midpoint_coordinates(lo, hi, arity, &mut out[..n - 1]), None);
+        }
+    }
+    let mut out = [0u64; 16];
+    assert_eq!(midpoint_coordinates(5, 5, 16, &mut out), None);
+    assert_eq!(midpoint_coordinates(6, 5, 16, &mut out), None);
+    assert_eq!(midpoint_coordinates(0, 9, 1, &mut out), None);
+}
