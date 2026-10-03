@@ -79,7 +79,58 @@ def build() -> dict:
             return i
         d = L.play(tm, liar, honest, k, arity, pick=pick)
         plays.append({"fault": c, "k": k, "arity": arity, "rounds": rounds, "final": [d.lo, d.hi], "ruling": d.ruling})
-    return {"plays": plays, "slot_leaf_domain": L.SLOT_LEAF_DOMAIN.hex(), "cases": cases,
+    # Terminal replays and OUTPUT claims, for the Rust machine trait (tests/lx_goldens.rs).
+    replays, outputs = [], []
+
+    def bump(c):
+        def fault(coord, state, c=c):
+            if coord == c:
+                state = dict(state)
+                state[tm.H] = (int.from_bytes(state[tm.H], "little", signed=True) + 1).to_bytes(8, "little", signed=True)
+            return state
+        return fault
+
+    def opening_record(d, proof, ruling):
+        return {
+            "coordinate": d.lo,
+            "opened": [[s, None if proof.values[s] is None else proof.values[s].hex()] for s in sorted(proof.values)],
+            "siblings": [proof.siblings[k].hex() for k in sorted(proof.siblings)],
+            "root_lo": d.root_lo.hex(), "root_hi": d.root_hi.hex(), "ruling": ruling,
+        }
+
+    for c, k, arity in chosen:
+        liar = L.execute(tm, bump(c))
+        for executor, challenger in ((liar, honest), (honest, liar)):
+            commitment = L.commit(executor, k)
+            pair = L.first_disputed_pair(commitment, challenger)
+            if pair is None:
+                continue
+            d = L.Dispute(tm, commitment, arity)
+            d.open(pair)
+            while d.phase == L.PH_MIDPOINTS:
+                d.commit_midpoints(L.executor_midpoints(executor, d))
+                d.pick(L.challenger_pick(challenger, d))
+            proof = L.executor_opening(executor, d)
+            replays.append(opening_record(d, proof, d.submit_opening(proof)))
+    for lie in (False, True):
+        final = honest.states[-1]
+        proof = L.prove(tm, final, list(tm.output_slots()))
+        claimed = {s: final.get(s) for s in tm.output_slots()}
+        if lie:
+            claimed[tm.H] = (12345).to_bytes(8, "little", signed=True)
+        d = L.Dispute(tm, L.commit(honest, 4, claimed), 16)
+        outputs.append({
+            "output_slots": list(tm.output_slots()),
+            "opened": [[s, None if proof.values[s] is None else proof.values[s].hex()] for s in sorted(proof.values)],
+            "siblings": [proof.siblings[k].hex() for k in sorted(proof.siblings)],
+            "root_t": d.commitment.roots[-1].hex(),
+            "claimed": [None if claimed[s] is None else claimed[s].hex() for s in tm.output_slots()],
+            "ruling": d.claim_output(proof),
+        })
+    return {"replays": replays, "outputs": outputs,
+            "toy": {"positions": tm.positions_count, "window": tm.window, "h0": tm.h0, "height": L.height(tm),
+                    "total": L.Schedule(tm).total},
+            "plays": plays, "slot_leaf_domain": L.SLOT_LEAF_DOMAIN.hex(), "cases": cases,
             "schedules": schedules, "midpoints": midpoints}
 
 
