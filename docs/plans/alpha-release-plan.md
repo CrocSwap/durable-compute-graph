@@ -6,9 +6,24 @@ Nothing here is measured yet unless it says so.
 ## What the alpha is
 
 The alpha is the first release that people outside the project can use on
-Fogo testnet. They write a computation, run it on the shared DCG program, and
-get optimistic disputes, with a clear statement of what is guaranteed and
-what is not.
+Fogo testnet. DCG runs computations too big for one transaction, in two
+modes, and the chain stays the source of truth in both:
+
+- **Consensus mode:** the computation runs entirely on chain, split across
+  as many transactions as it needs. DCG keeps durable state between
+  transactions, applies each step exactly once and in order, and sequences
+  the transactions. Doom runs this way. Nobody has to be trusted or watched;
+  the cost is throughput and fees.
+- **Optimistic mode (v2.1):** an executor runs the computation off chain and
+  commits to every step. Anyone can dispute the first wrong step, and the
+  chain judges only that step. It suits work far too large to run on chain,
+  such as model inference. It needs an honest watcher and a challenge window.
+
+Each mode is first-class in the alpha. The long-term design mixes them per
+region of a graph (`docs/design/`, the modes and compiler design).
+
+The alpha comes with a clear statement of what is guaranteed in each mode
+and what is not.
 
 It is not a mainnet release. It also does not depend on Basanos moving its
 documents to v2.1. Basanos's own mainnet switchover runs separately and in
@@ -18,8 +33,9 @@ parallel; it is useful evidence, but it does not gate the alpha.
 
 | In the alpha | Out of the alpha |
 |---|---|
-| **v2.1 optimistic disputes (tag 227):** templates, runs, first-divergence descent, the claims, chunked kernels, committed constants, list inputs, application kernels by manifest, rent reclaim | **The v2.0 trace path (tags 208–226):** superseded by v2.1. It stays behind its feature flag and is not documented for users. |
-| **Stateful sessions** (what Doom runs on) | **Sampling, Freivalds and ZK modes:** not started |
+| **Consensus mode, stateful sessions (v3):** sessions, stateful kernels, cursor and phase discipline, views and their phased publication, resources, closes | **The v2.0 trace path (tags 208–226):** superseded by v2.1. It stays behind its feature flag and is not documented for users. |
+| **The sequencer** (`dcg.sequencer`): ordered lanes, batching, resend and journal, multi-node sends | **Sampling, Freivalds and ZK modes:** not started |
+| **v2.1 optimistic disputes (tag 227):** templates, runs, first-divergence descent, the claims, chunked kernels, committed constants, list inputs, application kernels by manifest, rent reclaim | **The revision-8 document lifecycle as a user API:** it stays in DCG core because Basanos runs on it in production, but it is Basanos-shaped (positions, PT2P), and outside users get v2.1 instead (owner decision) |
 | **The Python tracing frontend, client and sequencer** | **LOG-state templates:** refused until LOG is on chain (re-review condition) |
 | **`explain()` for v2.1 templates** | **TypeScript:** a thin layer after the alpha |
 
@@ -31,7 +47,8 @@ parallel; it is useful evidence, but it does not gate the alpha.
 - The run-level dispute fuzzer: several disputes per run, random interleavings, invariants checked after every step.
 
 **R2. Review the whole surface.** Only tag 227 has had an independent review.
-- Stateful sessions, admission, the template lifecycle, and every other handler the shared program exposes each get an independent adversarial review (Basanos project rule 10).
+- Stateful sessions (v3) get the same treatment tag 227 had, including a run-level fuzzer of their own: random interleavings of steps, resends, failed and duplicated transactions, view publications and closes, with invariants (each step applied once and in order, state digests match a host replay, lamports conserved) checked after every step.
+- Admission, the template lifecycle, and every other handler the shared program exposes each get an independent adversarial review (Basanos project rule 10).
 - That includes the staging-buffer question from finding F10: does any handler accept an account by owner and magic alone?
 
 **R3. Put the reviewed image on the shared testnet program.** It runs `7b04f8d5` today, which is pre-review.
@@ -84,18 +101,33 @@ DCG keeps no model code (owner decision, 09-26).
 - "Your first custom kernel", using E2.
 - A guarantees page built on `explain()`.
 
-**E8. `explain()` for v2.1 templates:** modes, kernels and their STEP mode, the dispute path, windows, bonds, and the open limits.
+**E8. `explain()` for both modes:** for v2.1 templates, the kernels and their STEP mode, the dispute path, windows, bonds and open limits; for sessions, the consensus guarantee, the kernel, and the per-step compute and transaction bounds.
+
+### Consensus mode
+
+**C1. A session quickstart.** Write a stateful kernel (`StatefulKernel`: initial state, transition, optional views), register it in an application image, open a session from Python, drive it to completion with the sequencer, and read the result. The existing `python-session.md` and `sequencer.md` become its basis.
+
+**C2. The sequencer as a product.**
+- A documented, stable Python API: lanes, batching, resend and recovery from the journal, multi-node sends, and pacing.
+- What it guarantees, and what it does not.
+- Measured throughput guidance per workload shape (Doom's numbers are the first data point).
+
+**C3. Stateful kernel kit.** The E2 conformance harness extended to stateful kernels: the Rust transition and its host reference agree on generated inputs, including state at its size limits and every refusal.
+
+**C4. Lanes (throughput).** Lanes (`docs/design/stateful-session-lanes-v1.md`, owner decisions recorded) let independent parts of a session advance in parallel. They are consensus mode's main throughput lever and Doom's path to 3 frames/s. Whether lanes gate the alpha is an owner decision below.
+
+**C5. A tutorial:** "a multi-transaction state machine", from an empty repo to a session running on the shared program, with costs (transactions, compute, rent) shown at each step.
 
 ## Order of work (estimated)
 
 | Phase | Work | Estimate |
 |---|---|---|
 | 1 | R1 (hardening), E5 (named errors), E4 (lifecycle in the client) | about 1 week |
-| 2 | E1 (v2.1 lowering), E2 (kernel kit), E8 (`explain()`), R4 (repo boundary) | about 1–2 weeks |
-| 3 | E3 (executor and watchtower), R2 (reviews of the whole surface) | about 1–2 weeks, partly parallel with phase 2 |
-| 4 | R3 (shared program upgrade), E6 (`dcg dev`, `dcg build`), E7 (docs), R5 (terms) | about 1 week |
+| 2 | E1 (v2.1 lowering), E2 and C3 (kernel kits), E8 (`explain()`), C1 and C2 (session quickstart, sequencer API), R4 (repo boundary) | about 2 weeks |
+| 3 | E3 (executor and watchtower), R2 (reviews, including the sessions fuzzer) | about 1–2 weeks, partly parallel with phase 2 |
+| 4 | R3 (shared program upgrade), E6 (`dcg dev`, `dcg build`), E7 and C5 (docs and tutorials), R5 (terms) | about 1 week |
 
-**Estimated total: about 4–6 weeks** at the current pace, with phases 2 and 3 overlapping. Doom lanes (milestone 5) are not on this path. If they land in time, Doom ships at 3 frames/s as the alpha's showcase; if not, it ships as the slower demo it is today.
+**Estimated total: about 5–7 weeks** at the current pace, with phases 2 and 3 overlapping. Lanes (C4) are not on this path unless the owner makes them a gate. If they land in time, Doom ships at 3 frames/s as the alpha's showcase; if not, it ships as the slower demo it is today.
 
 ## Exit criteria
 
@@ -104,17 +136,15 @@ The alpha ships when all of these hold:
 1. **Independent reviews:** every handler in the alpha surface has one, and every finding is fixed or written up as a known limit.
 2. **Fuzzer:** it runs clean, natively and on SBF, over the agreed number of interleavings.
 3. **Public program:** the shared testnet program runs the reviewed image, and the hash is published.
-4. **A newcomer test,** with no help from the authors. Starting from the docs, someone who did not build DCG:
-   - traces a v2.1 graph;
-   - runs it on the shared program;
-   - watches the watchtower convict a planted lie;
-   - gets their rent back.
+4. **A newcomer test in each mode,** with no help from the authors. Starting from the docs, someone who did not build DCG:
+   - **Optimistic:** traces a v2.1 graph, runs it on the shared program, watches the watchtower convict a planted lie, and gets their rent back.
+   - **Consensus:** writes a stateful kernel, runs a session of a few thousand transactions to completion with the sequencer (including a resend after a dropped transaction), reads the result, and closes the session.
 5. **A custom kernel** passes the kernel kit's conformance harness and wins an honest dispute on testnet.
 6. **Release terms** are published.
 
 ## Decisions for the owner
 
-1. The alpha surface (the table above): in particular, leave out the v2.0 trace path, and include stateful sessions.
+1. The alpha surface (the table above): consensus mode (sessions and the sequencer) and optimistic mode (v2.1) both first-class; the v2.0 trace path left out; the revision-8 lifecycle kept in core for Basanos but not offered as a user API.
 2. The license for the alpha (GPL-3, or a change before first release).
-3. Whether Doom at today's speed is an acceptable alpha showcase, or lanes become a gate.
+3. Whether lanes (C4) gate the alpha. Doom at today's 1.65 frames/s is the alternative showcase.
 4. Who answers the security contact, and how breaking changes are announced.
