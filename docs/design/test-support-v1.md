@@ -82,3 +82,26 @@ versions.
   parsing function.
 - **How far down the stages to go before migrating.** The plan is the stages
   the inventory shows tests actually need, nothing speculative.
+
+## Owner decisions at the inventory checkpoint (2026-10-02)
+
+The inventory (Basanos `out/runs/test-harness-2026-10-02/inventory-sites.md`)
+found 301 direct account writes: 102 phase skips, 98 corruptions, 31
+environment, 19 fixture installs, 19 legacy, 18 other and 10 side-effect
+patches. 43 of the Basanos document tests are identical copies of DCG tests.
+
+1. **Snapshots of expensive real states are allowed.** A state that is slow
+   to reach (a K=10,240 admission, 10,240 attestations) is produced once by
+   the builder's real flow and saved. Tests load the saved accounts. A
+   regeneration check rebuilds each snapshot and requires byte equality, so
+   a snapshot can never drift from what the program produces.
+2. **Revision-7 compatibility tests are dropped.** They covered how the
+   revision-8 program treats revision-7 records. No legacy revision-7 mode is
+   built.
+3. **Corruptions:** the ones an attacker can actually produce on chain (a
+   stale record, a second copy, another template's record, a wrong account in
+   a slot) become integration tests with real accounts from the builder.
+   Corruptions only the program could write (wrong magic, truncation,
+   counters at their maximum, forged FINAL records, inconsistent bitmaps)
+   become unit tests of the reader for that record. Integration tests focus
+   on what an attacker can do.
