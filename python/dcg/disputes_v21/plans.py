@@ -291,10 +291,9 @@ class PlanBuilder:
             S.check_list_element_budget(list_element_counts)
             # Each STEP value is length-prefixed. Include the claim's spec
             # opening so the whole instruction fits C's 128 KiB buffer.
-            witness_size = 1 + sum(4 + (sum(e.length for e in self.lists[S.decode_producer(prod)[1]])
-                                          + 4 * len(self.lists[S.decode_producer(prod)[1]])
-                                          if S.decode_producer(prod)[0] == S.PRODUCER_LIST
-                                          else struct.unpack_from("<I", header, 19)[0])
+            witness_size = 1 + sum((sum(4 + e.length for e in self.lists[S.decode_producer(prod)[1]])
+                                    if S.decode_producer(prod)[0] == S.PRODUCER_LIST
+                                    else 4 + struct.unpack_from("<I", header, 19)[0])
                                    for header, prod, _ in d["inputs"])
             if d["state_scheme"]:
                 witness_size += 4 + d["state_size"]

@@ -621,6 +621,13 @@ async fn admission_refuses_bad_templates_and_runs() {
         let i = ix(V::SUB_CREATE_TEMPLATE, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(t, false), AccountMeta::new_readonly(SYSTEM, false)]);
         assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err(), "depth {depth} phase {phase} bonds {eb} {cb}");
     }
+    // An ignored trailer used to alias one semantic template under 2^32 IDs.
+    let mut data = template_body(&ch.g, 1_000);
+    data.extend_from_slice(&[0, 0, 0, 0]);
+    let id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
+    let t = Pubkey::find_program_address(&[b"dcg21tmpl", &id, admitter.pubkey().as_ref()], &PROGRAM).0;
+    let i = ix(V::SUB_CREATE_TEMPLATE, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(t, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err());
     // Unsorted external refs (review B2), and a payer naming itself executor.
     let init = |executor: &Pubkey, refs: &[&Vec<u8>]| {
         let mut d = vec![9u8; 32];
@@ -1175,7 +1182,10 @@ async fn a_front_runner_cannot_squat_on_another_payers_template() {
         AccountMeta::new(front_runner.pubkey(), true), AccountMeta::new(squat, false),
         AccountMeta::new_readonly(SYSTEM, false),
     ]), &[&front_runner]).await.unwrap();
-    assert!(ch.ctx.banks_client.get_account(ch.template).await.unwrap().is_none());
+    send(&mut ch.ctx, ix(V::SUB_RETIRE_TEMPLATE, &[], vec![
+        AccountMeta::new(front_runner.pubkey(), true), AccountMeta::new(squat, false),
+    ]), &[&front_runner]).await.unwrap();
+    assert!(ch.gone(ch.template).await);
     let admitter = kp(0xA1);
     send(&mut ch.ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![
         AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(ch.template, false),
@@ -1183,9 +1193,23 @@ async fn a_front_runner_cannot_squat_on_another_payers_template() {
     ]), &[&admitter]).await.unwrap();
     assert!(ch.ctx.banks_client.get_account(ch.template).await.unwrap().is_some());
     assert!(ch.ctx.banks_client.get_account(squat).await.unwrap().is_some());
+    let nonce = [9u8; 32];
+    let executor = kp(0xE1).pubkey();
+    let mut refs = ch.g.refs[0].clone();
+    refs.extend_from_slice(&ch.g.refs[1]);
+    let mut init = nonce.to_vec();
+    init.extend_from_slice(executor.as_ref());
+    init.extend_from_slice(&2u32.to_le_bytes());
+    init.extend_from_slice(&refs);
+    let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &nonce, &2u32.to_le_bytes(), &refs, executor.as_ref()]);
+    let honest_run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
+    send(&mut ch.ctx, ix(V::SUB_INIT_RUN, &init, vec![
+        AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(honest_run, false),
+        AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false),
+    ]), &[&admitter]).await.unwrap();
+    assert!(ch.ctx.banks_client.get_account(honest_run).await.unwrap().is_some());
     assert!(ch.close_template_by(0xB1).await.is_err());
-    ch.close_template().await.unwrap();
-    assert!(ch.gone(ch.template).await);
+    assert!(ch.close_template().await.is_err(), "an active honest run prevents close");
     assert!(ch.ctx.banks_client.get_account(squat).await.unwrap().is_some());
 }
 
