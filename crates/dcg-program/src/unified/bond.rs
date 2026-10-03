@@ -1073,3 +1073,46 @@ mod settlement_reader_tests {
         assert_eq!(read(&program, key, t).map(|_| ()), malformed, "a withheld tombstone with a winner");
     }
 }
+
+/// The STANDARD split the close (and tag 131) applies to a convicted pot,
+/// on constructed accounts. The close's case with a recorded winner and the
+/// bond still held is defensive (owner, 2026-10-03), so it is tested here
+/// rather than reached through a hand-built document.
+#[cfg(test)]
+mod standard_split_tests {
+    use super::*;
+
+    const POT: u64 = 50_000_000;
+    const FLOOR: u64 = 890_880;
+
+    fn split(winner_lamports: u64) -> ((u64, u64, u64), [u64; 4]) {
+        let program = Pubkey::new_unique();
+        let system = solana_program::system_program::ID;
+        let keys = [Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()];
+        let mut lamports = [10_000_000 + POT, winner_lamports, FLOOR, 1];
+        let [l0, l1, l2, l3] = &mut lamports;
+        let (mut d0, mut d1, mut d2, mut d3) = (vec![0u8; 8], vec![], vec![], vec![]);
+        let from = AccountInfo::new(&keys[0], false, true, l0, &mut d0, &program, false, 0);
+        let winner = AccountInfo::new(&keys[1], false, true, l1, &mut d1, &system, false, 0);
+        let remainder = AccountInfo::new(&keys[2], false, true, l2, &mut d2, &system, false, 0);
+        let burn = AccountInfo::new(&keys[3], false, true, l3, &mut d3, &system, false, 0);
+        let out = standard_payout(&from, &winner, &remainder, &burn, POT, 1, true).unwrap();
+        let after = [from.lamports(), winner.lamports(), remainder.lamports(), burn.lamports()];
+        (out, after)
+    }
+
+    #[test]
+    fn a_recorded_winner_holding_nothing_is_skipped_and_the_remainder_takes_the_pot() {
+        let ((paid_winner, paid_remainder, burned), after) = split(0);
+        assert_eq!((paid_winner, paid_remainder, burned), (0, POT, 0));
+        assert_eq!(after, [10_000_000, 0, FLOOR + POT, 1], "the skipped share joins the remainder");
+    }
+
+    #[test]
+    fn a_funded_recorded_winner_is_paid_the_slasher_share() {
+        let (slasher, rest) = terms::bond_split(POT, 1, true);
+        let ((paid_winner, paid_remainder, burned), after) = split(FLOOR);
+        assert_eq!((paid_winner, paid_remainder, burned), (slasher, rest, 0));
+        assert_eq!(after, [10_000_000, FLOOR + slasher, FLOOR + rest, 1]);
+    }
+}

@@ -2636,4 +2636,48 @@ mod reader_gate_tests {
         assert_eq!(resolve_state_gate(&view(closed), full), Err(no(RESULT_STATE)), "closed");
         assert_eq!(resolve_state_gate(&view(honest.clone()), honest.len()), Err(no(RESULT_STATE)), "half-grown");
     }
+
+    /// The close's STANDARD disposition names its winner destination before it
+    /// moves anything: with a winner recorded the meta must be that winner,
+    /// with none it must be the incinerator; anything else is 582.
+    #[test]
+    fn the_close_split_must_be_handed_the_recorded_winner() {
+        use super::super::terms::BOND_POLICY_STANDARD;
+        let program = Pubkey::new_unique();
+        let system = solana_program::system_program::ID;
+        let remainder = Pubkey::new_unique();
+        let terms = Terms2 {
+            challenge_window_slots: 90_000,
+            response_window_slots: 45_000,
+            challenger_bond_lamports: 1_000_000,
+            executor_bond_lamports: 50_000_000,
+            executor_reward_bps: 0,
+            bond_policy_kind: BOND_POLICY_STANDARD,
+            bond_slasher_bps: 1,
+            settlement_program: [0; 32],
+            custom_settle_window_slots: 0,
+            result_retention_slots: 2_592_000,
+            bond_remainder: remainder.to_bytes(),
+            abandon_after_slots: 5_184_000,
+        };
+        let winner = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+        let doc_key = address::document(&program, &DESCRIPTOR).0;
+        for (recorded, aux_key) in [(winner.to_bytes(), stranger), ([0u8; 32], winner)] {
+            let mut doc = dcm2(&program, &DESCRIPTOR);
+            let (mut l0, mut l1, mut l2, mut l3) = (10_000_000u64, 0u64, 890_880u64, 1u64);
+            let (mut d1, mut d2, mut d3): (Vec<u8>, Vec<u8>, Vec<u8>) = (vec![], vec![], vec![]);
+            let dcm2_info = AccountInfo::new(&doc_key, false, true, &mut l0, &mut doc, &program, false, 0);
+            let aux = AccountInfo::new(&aux_key, false, true, &mut l1, &mut d1, &system, false, 0);
+            let tail = AccountInfo::new(&remainder, false, true, &mut l2, &mut d2, &system, false, 0);
+            let burn = AccountInfo::new(&incinerator::ID, false, true, &mut l3, &mut d3, &system, false, 0);
+            assert_eq!(
+                dispose_bond(&program, &dcm2_info, &aux, &tail, &burn, &terms, BOND_HELD, recorded, CAUSE_CONVICTION, 0)
+                    .map(|_| ()),
+                Err(no(super::super::CL_AUTHORITY)),
+                "recorded {:?}: a destination other than the recorded winner (or the incinerator)",
+                recorded == [0; 32]
+            );
+        }
+    }
 }
