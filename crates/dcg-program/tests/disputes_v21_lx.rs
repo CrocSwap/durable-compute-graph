@@ -498,3 +498,140 @@ async fn a_silent_output_claimant_loses_its_bond() {
     assert_eq!(ch.account(d).await.data[6], V::RULING_EXECUTOR);
     assert_eq!(ch.lamports(kp(0xE1).pubkey()).await - e0, CHALLENGER_BOND);
 }
+
+// --- every ending: settlement and closes through the shared v2.1 paths -------------------
+
+impl Chain {
+    fn caller_ix(&self, sub: u8, extra: Vec<AccountMeta>) -> Instruction {
+        let mut a = vec![AccountMeta::new_readonly(kp(0xB1).pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false)];
+        a.extend(extra);
+        ix(sub, &[], a)
+    }
+
+    async fn by_bystander(&mut self, i: Instruction) -> Result<(), TransactionError> {
+        send(&mut self.ctx, i, &[&kp(0xB1)]).await
+    }
+
+    async fn play(&mut self, nonce: u8, p: &serde_json::Value) -> Pubkey {
+        let body = self.state_body(&p["commitment"], p["pair"].as_u64().unwrap() as usize);
+        let d = self.open_raw(nonce, &body).await.unwrap();
+        self.drive(d, p).await;
+        d
+    }
+
+    async fn drive(&mut self, d: Pubkey, p: &serde_json::Value) {
+        for r in p["rounds"].as_array().unwrap() {
+            let mids: Vec<u8> = r["midpoints"].as_array().unwrap().iter().flat_map(h32).collect();
+            self.midpoints(d, &mids).await.unwrap();
+            self.pick(d, r["pick"].as_u64().unwrap() as u8).await.unwrap();
+        }
+        self.stage(d, V::ROLE_EXECUTOR, &encode_opening(&p["opening"])).await;
+        self.opening(d).await.unwrap();
+    }
+
+    async fn close_dispute(&mut self, d: Pubkey) -> Result<(), TransactionError> {
+        let (be, bc) = (self.buffer(d, V::ROLE_EXECUTOR), self.buffer(d, V::ROLE_CHALLENGER));
+        let i = self.caller_ix(V::SUB_CLOSE_DISPUTE, vec![AccountMeta::new(d, false), AccountMeta::new(kp(0xC1).pubkey(), false), AccountMeta::new(kp(0xE1).pubkey(), false), AccountMeta::new(be, false), AccountMeta::new(bc, false)]);
+        self.by_bystander(i).await
+    }
+
+    async fn close_run(&mut self) -> Result<(), TransactionError> {
+        let s = kp(0xB1);
+        let i = ix(V::SUB_CLOSE_RUN, &[], vec![AccountMeta::new(s.pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new(self.template, false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+        send(&mut self.ctx, i, &[&s]).await
+    }
+
+    async fn close_template(&mut self) -> Result<(), TransactionError> {
+        let a = kp(0xA1);
+        let i = ix(V::SUB_CLOSE_TEMPLATE, &[], vec![AccountMeta::new(a.pubkey(), true), AccountMeta::new(self.template, false)]);
+        send(&mut self.ctx, i, &[&a]).await
+    }
+
+    async fn balances(&mut self, keys: &[Pubkey]) -> Vec<u64> {
+        let mut v = Vec::new();
+        for k in keys {
+            v.push(self.lamports(*k).await);
+        }
+        v
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lying_executor_is_convicted_later_disputes_are_moot_and_every_account_closes() {
+    let g = golden();
+    let p = g["plays"].as_array().unwrap().iter().find(|p| p["ruling"] == "C").unwrap();
+    let mut ch = Chain::new(p["arity"].as_u64().unwrap() as u8, 100_000).await;
+    ch.commit(&p["commitment"]).await.unwrap();
+    let parties = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), kp(0xB1).pubkey()];
+    let mut tracked: Vec<Pubkey> = parties.to_vec();
+    tracked.extend([ch.run, ch.template]);
+    let before = ch.balances(&parties).await;
+    let total_before: u64 = ch.balances(&tracked).await.iter().sum();
+    // Two disputes on the same lie: sequence 0 wins; sequence 1 is then moot.
+    let body = ch.state_body(&p["commitment"], p["pair"].as_u64().unwrap() as usize);
+    let d_first = ch.open_raw(1, &body).await.unwrap();
+    let d_late = ch.open_raw(2, &body).await.unwrap();
+    ch.drive(d_first, p).await;
+    assert_eq!(ch.account(d_first).await.data[6], V::RULING_CHALLENGER);
+    assert!(ch.open_raw(3, &body).await.is_err(), "no new opens on a refuted run");
+    // The later dispute is moot: anyone may rule it, the challenger's bond returns.
+    let i = ch.caller_ix(V::SUB_MOOT, vec![AccountMeta::new(d_late, false), AccountMeta::new(kp(0xC1).pubkey(), false)]);
+    ch.by_bystander(i).await.unwrap();
+    assert_eq!(ch.account(d_late).await.data[6], V::RULING_MOOT);
+    for d in [d_first, d_late] {
+        let i = ch.caller_ix(V::SUB_ADVANCE, vec![AccountMeta::new_readonly(d, false)]);
+        ch.by_bystander(i).await.unwrap();
+    }
+    assert!(ch.close_dispute(d_first).await.is_err(), "the best win closes only after the pot");
+    let i = ch.caller_ix(V::SUB_PAY_POT, vec![AccountMeta::new_readonly(d_first, false), AccountMeta::new(kp(0xC1).pubkey(), false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+    ch.by_bystander(i).await.unwrap();
+    let i = ch.caller_ix(V::SUB_PAY_POT, vec![AccountMeta::new_readonly(d_first, false), AccountMeta::new(kp(0xC1).pubkey(), false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+    assert!(ch.by_bystander(i).await.is_err(), "the pot pays once");
+    for d in [d_first, d_late] {
+        ch.close_dispute(d).await.unwrap();
+        assert!(ch.close_dispute(d).await.is_err(), "a second close");
+    }
+    ch.close_run().await.unwrap();
+    ch.close_template().await.unwrap();
+    let after = ch.balances(&parties).await;
+    let total_after: u64 = ch.balances(&tracked).await.iter().sum::<u64>() - ch.lamports(ch.run).await;
+    let receipt = ch.lamports(ch.run).await;
+    // Conservation: everything that left the tracked accounts is the receipt's rent.
+    assert_eq!(total_before, total_after + receipt, "lamports conserved");
+    let share = EXECUTOR_BOND / 2; // slasher_bps 5,000
+    assert_eq!(after[2], before[2] + share, "the honest challenger gains the slasher share, all rent back");
+    assert_eq!(after[1], before[1], "the lying executor's bond was already in the run");
+    assert_eq!(after[3], before[3], "the bystander gains nothing");
+    // The payer started the window owning the run and template balances (their
+    // rent plus the executor's bond); it ends with them, less the receipt's rent
+    // and the challenger's slasher share.
+    let held = total_before - before.iter().sum::<u64>();
+    assert_eq!(after[0] + receipt + share, before[0] + held, "the payer gets the remainder and all rent but the receipt's");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_honest_executor_beats_a_false_challenge_finalizes_and_closes() {
+    let g = golden();
+    let p = g["plays"].as_array().unwrap().iter().find(|p| p["ruling"] == "E").unwrap();
+    let mut ch = Chain::new(p["arity"].as_u64().unwrap() as u8, 3_000).await;
+    ch.commit(&p["commitment"]).await.unwrap();
+    let parties = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), kp(0xB1).pubkey()];
+    let before = ch.balances(&parties).await;
+    let d = ch.play(1, p).await;
+    assert_eq!(ch.account(d).await.data[6], V::RULING_EXECUTOR);
+    let fin = |ch: &Chain| ch.caller_ix(V::SUB_FINALIZE, vec![AccountMeta::new(kp(0xE1).pubkey(), false)]);
+    let i = fin(&ch);
+    assert!(ch.by_bystander(i).await.is_err(), "not before the challenge window ends");
+    ch.warp(3_100).await;
+    let i = fin(&ch);
+    ch.by_bystander(i).await.unwrap();
+    assert_eq!(ch.account(ch.run).await.data[4], V::RUN_FINAL);
+    let i = ch.caller_ix(V::SUB_ADVANCE, vec![AccountMeta::new_readonly(d, false)]);
+    ch.by_bystander(i).await.unwrap();
+    ch.close_dispute(d).await.unwrap();
+    ch.close_run().await.unwrap();
+    let after = ch.balances(&parties).await;
+    assert_eq!(after[1], before[1] + EXECUTOR_BOND + CHALLENGER_BOND, "the honest executor gets its bond back and the challenger's");
+    assert_eq!(before[2] - after[2], CHALLENGER_BOND, "the false challenger loses exactly its bond; all rent back");
+    assert_eq!(after[3], before[3], "the bystander gains nothing");
+}

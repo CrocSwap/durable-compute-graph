@@ -57,6 +57,10 @@ const D_LX_ROOT_HI: usize = D_LEAF + 8;
 
 pub const PARAMS_DOMAIN: &[u8] = b"dcg.lx.params.v1\x00";
 
+/// The mode an LX1 machine kernel advertises; resolution requires it, as STEP
+/// replay requires `MODE_STEP_V21` (review F2).
+pub const MODE_LX1_V1: crate::kernel::ModeId = crate::kernel::VersionedId { id: 0x4c58_3156, version: 1 };
+
 /// An application's LX1 machine, registered through its kernel manifest.
 pub trait LxFactory: Sync {
     /// Bind a run's machine parameters, or `None` if they are malformed.
@@ -128,6 +132,7 @@ fn bind(
     }
     let factory = manifest
         .resolve(crate::kernel::KernelId(lx.kernel), lx.semantic, lx.abi)
+        .filter(|k| k.manifest().modes.contains(&MODE_LX1_V1))
         .and_then(|k| k.lx_machine())
         .ok_or(err(43))?;
     let machine = factory.bind(params).ok_or(err(42))?;
@@ -643,7 +648,7 @@ pub mod toy {
     /// The toy as a manifest kernel; it is only an LX1 machine.
     pub struct ToyKernel;
 
-    static TOY_MODES: [ModeId; 0] = [];
+    static TOY_MODES: [ModeId; 1] = [MODE_LX1_V1];
     pub static TOY_MANIFEST: KernelManifest = KernelManifest {
         id: KernelId(*b"dcg-lx-toy-v1\0\0\0"),
         semantic_version: 1,
