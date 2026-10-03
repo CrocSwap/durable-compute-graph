@@ -118,7 +118,21 @@ def test_client_plays_a_recorded_list_dispute_through_staging():
     assert executor_buffer in [meta.pubkey for meta in reveal[2]]
     assert executor_buffer == claim[2][-1].pubkey and claim[3] == LIST_HEAP_FRAME
     assert any(call[0] == 14 for call in gc.calls)
-    assert any(call[0] == 15 for call in gc.calls)
+    writes = [(int.from_bytes(body[:4], "little"), body[4:]) for sub, body, metas, _ in gc.calls
+              if sub == 15 and metas[-1].pubkey == executor_buffer]
+    assert writes
+    staged = bytearray(len(bytes.fromhex(transcript["leaf"])))
+    for offset, piece in writes:
+        staged[offset:offset + len(piece)] = piece
+    assert bytes(staged) == bytes.fromhex(transcript["leaf"])
+    challenger_buffer = client.pda(b"dcg21stg", bytes(dispute), bytes([2]))
+    assert claim[1] == b"\xff" and claim[2][-2].pubkey == challenger_buffer
+    claim_bytes = bytearray(len(bytes.fromhex(transcript["claim"])))
+    for sub, body, metas, _ in gc.calls:
+        if sub == 15 and metas[-1].pubkey == challenger_buffer:
+            offset = int.from_bytes(body[:4], "little")
+            claim_bytes[offset:offset + len(body) - 4] = body[4:]
+    assert bytes(claim_bytes) == bytes.fromhex(transcript["claim"])
 
 
 def test_template_address_is_scoped_to_its_payer():
