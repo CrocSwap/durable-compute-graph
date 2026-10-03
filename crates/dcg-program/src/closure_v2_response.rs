@@ -85,6 +85,16 @@ fn challenge<'a>(
     challenge: &'a AccountInfo,
     executor: &AccountInfo,
 ) -> Result<Ref<'a, [u8]>, ProgramError> {
+    challenge_at(program, challenge, executor, Clock::get()?.slot)
+}
+/// `challenge` at slot `now` (the clock is a parameter so the record gate can
+/// be unit-tested on constructed accounts; behavior is unchanged).
+fn challenge_at<'a>(
+    program: &Pubkey,
+    challenge: &'a AccountInfo,
+    executor: &AccountInfo,
+    now: u64,
+) -> Result<Ref<'a, [u8]>, ProgramError> {
     if challenge.owner != program || !executor.is_signer || challenge.is_writable {
         return Err(no(AUTH));
     }
@@ -94,7 +104,7 @@ fn challenge<'a>(
         || (cfg!(feature = "revision-8") && !matches!(u16::from_le_bytes([raw[6], raw[7]]), 5 | 6))
         || !matches!(raw[4], 1 | 2)
         || raw[40..72] != executor.key.to_bytes()
-        || Clock::get()?.slot > u64_at(&raw, 148)?
+        || now > u64_at(&raw, 148)?
     {
         return Err(no(DEADLINE));
     }
@@ -136,9 +146,20 @@ fn account<'a>(
     executor: &AccountInfo,
     phase: u16,
 ) -> Result<Ref<'a, [u8]>, ProgramError> {
+    account_at(program, response, challenge_account, executor, phase, Clock::get()?.slot)
+}
+/// `account` at slot `now` (see `challenge_at`).
+fn account_at<'a>(
+    program: &Pubkey,
+    response: &'a AccountInfo,
+    challenge_account: &AccountInfo,
+    executor: &AccountInfo,
+    phase: u16,
+    now: u64,
+) -> Result<Ref<'a, [u8]>, ProgramError> {
     #[cfg(feature = "revision-8")]
     {
-        let challenge_raw = challenge(program, challenge_account, executor)?;
+        let challenge_raw = challenge_at(program, challenge_account, executor, now)?;
         expect_derived_with_bump(
             response,
             program,
@@ -175,7 +196,7 @@ fn account<'a>(
         || u32_at(&raw, 72)? == 0
         || u32_at(&raw, 72)? as usize > MAX_BODY
         || u32_at(&raw, 76)? > u32_at(&raw, 72)?
-        || Clock::get()?.slot > u64_at(&raw, 112)?
+        || now > u64_at(&raw, 112)?
     {
         return Err(no(STATE));
     }
@@ -437,4 +458,120 @@ pub fn sealed_view<'a>(
         return Err(no(STATE));
     }
     Ok(Ref::map(raw, |data| &data[HEADER..]))
+}
+
+/// The DCR1 and DRU1 record gates on constructed accounts. These are the
+/// states only a bug in the program could write (a wrong kind, a record at
+/// another instance's address, a stale bump, a response bound to another
+/// challenge), so they are reader unit tests rather than integration tests
+/// that patch a bank (owner decision 2026-10-02).
+#[cfg(all(test, feature = "revision-8"))]
+mod record_gate_tests {
+    use super::*;
+    use crate::unified::{address, challenge as ch};
+
+    const NOW: u64 = 500;
+    const DEADLINE_SLOT: u64 = 1_000;
+
+    struct Fixture {
+        program: Pubkey,
+        executor: Pubkey,
+        record: Pubkey,
+        dcr1: Vec<u8>,
+        response: Pubkey,
+        dru1: Vec<u8>,
+    }
+
+    fn fixture() -> Fixture {
+        let program = Pubkey::new_unique();
+        let executor = Pubkey::new_unique();
+        let challenger = Pubkey::new_unique();
+        let descriptor = [7u8; 32];
+        let nonce = 11u32;
+        let (record, record_bump) = address::challenge(&program, &descriptor, &challenger, nonce);
+        let (response, response_bump) = super::address(&program, &record);
+        let mut dcr1 = vec![0u8; 8192];
+        dcr1[..4].copy_from_slice(b"DCR1");
+        dcr1[4] = ch::PHASE_RESPOND;
+        dcr1[6..8].copy_from_slice(&5u16.to_le_bytes());
+        dcr1[8..40].copy_from_slice(challenger.as_ref());
+        dcr1[40..72].copy_from_slice(executor.as_ref());
+        dcr1[72..104].copy_from_slice(&descriptor);
+        dcr1[140..144].copy_from_slice(&nonce.to_le_bytes());
+        dcr1[ch::RECORD_BUMP_AT] = record_bump.value();
+        dcr1[ch::RECORD_BUMP_MARKER_AT] = 1;
+        dcr1[148..156].copy_from_slice(&DEADLINE_SLOT.to_le_bytes());
+        dcr1[ch::RESPONSE_BUMP_AT] = response_bump.value();
+        let mut dru1 = vec![0u8; HEADER + 3];
+        dru1[..4].copy_from_slice(b"DRU1");
+        dru1[4..6].copy_from_slice(&1u16.to_le_bytes());
+        dru1[6..8].copy_from_slice(&1u16.to_le_bytes());
+        dru1[8..40].copy_from_slice(record.as_ref());
+        dru1[40..72].copy_from_slice(executor.as_ref());
+        dru1[72..76].copy_from_slice(&3u32.to_le_bytes());
+        dru1[112..120].copy_from_slice(&DEADLINE_SLOT.to_le_bytes());
+        Fixture { program, executor, record, dcr1, response, dru1 }
+    }
+
+    /// `challenge_at` over (record key, DCR1 bytes).
+    fn gate_dcr1(f: &Fixture, record: Pubkey, mut dcr1: Vec<u8>, now: u64) -> Result<(), ProgramError> {
+        let (mut l1, mut l2) = (1u64, 1u64);
+        let mut empty: [u8; 0] = [];
+        let system = Pubkey::default();
+        let challenge = AccountInfo::new(&record, false, false, &mut l1, &mut dcr1, &f.program, false, 0);
+        let executor = AccountInfo::new(&f.executor, true, true, &mut l2, &mut empty, &system, false, 0);
+        challenge_at(&f.program, &challenge, &executor, now).map(|_| ())
+    }
+
+    /// `account_at` over (response key, DRU1 bytes) with the honest DCR1.
+    fn gate_dru1(f: &Fixture, response: Pubkey, mut dru1: Vec<u8>) -> Result<(), ProgramError> {
+        let (mut l1, mut l2, mut l3) = (1u64, 1u64, 1u64);
+        let mut dcr1 = f.dcr1.clone();
+        let mut empty: [u8; 0] = [];
+        let system = Pubkey::default();
+        let resp = AccountInfo::new(&response, false, true, &mut l1, &mut dru1, &f.program, false, 0);
+        let challenge = AccountInfo::new(&f.record, false, false, &mut l2, &mut dcr1, &f.program, false, 0);
+        let executor = AccountInfo::new(&f.executor, true, true, &mut l3, &mut empty, &system, false, 0);
+        account_at(&f.program, &resp, &challenge, &executor, 1, NOW).map(|_| ())
+    }
+
+    #[test]
+    fn the_honest_records_pass_both_gates() {
+        let f = fixture();
+        assert_eq!(gate_dcr1(&f, f.record, f.dcr1.clone(), NOW), Ok(()));
+        assert_eq!(gate_dru1(&f, f.response, f.dru1.clone()), Ok(()));
+    }
+
+    #[test]
+    fn the_dcr1_gate_refuses_what_only_a_program_bug_could_write() {
+        let f = fixture();
+        let mut wrong_kind = f.dcr1.clone();
+        wrong_kind[..4].copy_from_slice(b"XXXX");
+        assert_eq!(gate_dcr1(&f, f.record, wrong_kind, NOW), Err(no(DEADLINE)), "a same-sized wrong-kind DCR1");
+        let other_nonce = address::challenge(&f.program, &[7u8; 32], &Pubkey::new_unique(), 12).0;
+        assert_eq!(gate_dcr1(&f, other_nonce, f.dcr1.clone(), NOW), Err(no(AUTH)), "the image at a second instance's address");
+        let mut stale = f.dcr1.clone();
+        stale[ch::RECORD_BUMP_AT] = stale[ch::RECORD_BUMP_AT].wrapping_sub(1);
+        assert_eq!(gate_dcr1(&f, f.record, stale, NOW), Err(no(AUTH)), "a stale or non-canonical stored bump");
+        let mut unmarked = f.dcr1.clone();
+        unmarked[ch::RECORD_BUMP_MARKER_AT] = 0;
+        assert_eq!(gate_dcr1(&f, f.record, unmarked, NOW), Err(no(AUTH)), "no stored-bump marker");
+        assert_eq!(gate_dcr1(&f, f.record, f.dcr1.clone(), DEADLINE_SLOT + 1), Err(no(DEADLINE)), "past the response deadline");
+    }
+
+    #[test]
+    fn the_dru1_gate_refuses_what_only_a_program_bug_could_write() {
+        let f = fixture();
+        let mut wrong_kind = f.dru1.clone();
+        wrong_kind[..4].copy_from_slice(b"XXXX");
+        assert_eq!(gate_dru1(&f, f.response, wrong_kind), Err(no(AUTH)), "a same-sized wrong-kind DRU1");
+        let second = super::address(&f.program, &Pubkey::new_unique()).0;
+        assert_eq!(gate_dru1(&f, second, f.dru1.clone()), Err(no(AUTH)), "the image at another record's response address");
+        let mut stale = f.dru1.clone();
+        stale[8..40].copy_from_slice(Pubkey::new_unique().as_ref());
+        assert_eq!(gate_dru1(&f, f.response, stale), Err(no(STATE)), "a DRU1 bound to another challenge");
+        let mut other_executor = f.dru1.clone();
+        other_executor[40..72].copy_from_slice(Pubkey::new_unique().as_ref());
+        assert_eq!(gate_dru1(&f, f.response, other_executor), Err(no(STATE)), "a DRU1 naming another executor");
+    }
 }

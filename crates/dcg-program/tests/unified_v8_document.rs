@@ -13456,106 +13456,32 @@ async fn rev8_honest_leaf_challenge_uses_v7_document_reader_and_refuses_a_cheati
     assert_eq!(u32_at(&dcr1, 140), 11, "the v8 record keeps the open nonce");
     assert_eq!(u32_at(&f.account(created[0]).await, 128), 1);
 
-    // The compatibility response tags 115–118 still read this revision-8
-    // DCR1 and its DRU1. Exercise both record gates with wrong-kind, second
-    // instance, and stale/non-canonical identity images through the dispatcher.
+    // The compatibility response tags 115-118 read this revision-8 DCR1 and
+    // its DRU1: the executor's honest upload, by real instructions. The record
+    // gates' wrong-kind, second-instance and stale-identity refusals are
+    // states only a program bug could write, so they are unit tests of the
+    // readers (closure_v2_response::record_gate_tests; owner decision
+    // 2026-10-02).
     let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
-    let response_for =
-        |target: Pubkey| dcg_program::closure_v2_response::address(&f.program, &target).0;
     let executor = f.executor.pubkey();
     let body = [1u8, 2, 3];
     let mut begin = vec![dcg_program::closure_v2_response::TAG_BEGIN];
     begin.extend_from_slice(&(body.len() as u32).to_le_bytes());
     begin.extend_from_slice(&sha256(&[&body]));
-    let begin_accounts = |response_key, record_key| {
-        vec![
-            AccountMeta::new(response_key, false),
-            AccountMeta::new(executor, true),
-            AccountMeta::new_readonly(record_key, false),
-            AccountMeta::new_readonly(SYSTEM, false),
-        ]
-    };
-    let challenge_original = f
-        .ctx
-        .banks_client
-        .get_account(record)
-        .await
-        .unwrap()
-        .expect("the real tag-166 DCR1");
-    let mut wrong_kind = challenge_original.clone();
-    wrong_kind.data[..4].copy_from_slice(b"XXXX");
-    f.ctx
-        .set_account(&record, &AccountSharedData::from(wrong_kind));
-    assert_eq!(
-        custom(
-            send_fresh_with(
-                &mut f.ctx,
-                &f.executor,
-                f.program,
-                begin.clone(),
-                begin_accounts(response, record),
-            )
-            .await
-        ),
-        736,
-        "tag 115 refuses a same-sized wrong-kind DCR1 before allocation"
-    );
-    f.ctx.set_account(
-        &record,
-        &AccountSharedData::from(challenge_original.clone()),
-    );
-    let second_nonce = 12;
-    let second_record =
-        address::challenge(&f.program, &descriptor, &f.signer.pubkey(), second_nonce).0;
-    f.ctx.set_account(
-        &second_record,
-        &AccountSharedData::from(challenge_original.clone()),
-    );
-    assert_eq!(
-        custom(
-            send_fresh_with(
-                &mut f.ctx,
-                &f.executor,
-                f.program,
-                begin.clone(),
-                begin_accounts(response, second_record),
-            )
-            .await
-        ),
-        731,
-        "tag 115 refuses a second DCR1 instance"
-    );
-    let mut stale_challenge = challenge_original.clone();
-    stale_challenge.data[challenge::RECORD_BUMP_AT] =
-        stale_challenge.data[challenge::RECORD_BUMP_AT].wrapping_add(1);
-    f.ctx
-        .set_account(&record, &AccountSharedData::from(stale_challenge));
-    assert_eq!(
-        custom(
-            send_fresh_with(
-                &mut f.ctx,
-                &f.executor,
-                f.program,
-                begin.clone(),
-                begin_accounts(response, record),
-            )
-            .await
-        ),
-        731,
-        "tag 115 refuses a stale/non-canonical-bump DCR1"
-    );
-    f.ctx
-        .set_account(&record, &AccountSharedData::from(challenge_original));
-
     send_fresh_with(
         &mut f.ctx,
         &f.executor,
         f.program,
         begin,
-        begin_accounts(response, record),
+        vec![
+            AccountMeta::new(response, false),
+            AccountMeta::new(executor, true),
+            AccountMeta::new_readonly(record, false),
+            AccountMeta::new_readonly(SYSTEM, false),
+        ],
     )
     .await
-    .expect("tag 115 creates the honest DRU1 response");
+    .expect("tag 115 begins the honest DRU1 response");
     let write = [dcg_program::closure_v2_response::TAG_WRITE, 0, 0, 0, 0]
         .into_iter()
         .chain(body)
@@ -13565,76 +13491,6 @@ async fn rev8_honest_leaf_challenge_uses_v7_document_reader_and_refuses_a_cheati
         AccountMeta::new(executor, true),
         AccountMeta::new_readonly(record, false),
     ];
-    let response_original = f
-        .ctx
-        .banks_client
-        .get_account(response)
-        .await
-        .unwrap()
-        .expect("the real tag-115 DRU1");
-    let mut wrong_kind = response_original.clone();
-    wrong_kind.data[..4].copy_from_slice(b"XXXX");
-    f.ctx
-        .set_account(&response, &AccountSharedData::from(wrong_kind));
-    assert_eq!(
-        custom(
-            send_fresh_with(
-                &mut f.ctx,
-                &f.executor,
-                f.program,
-                vec![dcg_program::closure_v2_response::TAG_GROW],
-                response_metas.clone(),
-            )
-            .await
-        ),
-        731,
-        "tag 116 refuses a same-sized wrong-kind DRU1"
-    );
-    f.ctx.set_account(
-        &response,
-        &AccountSharedData::from(response_original.clone()),
-    );
-    let second_response = response_for(second_record);
-    f.ctx.set_account(
-        &second_response,
-        &AccountSharedData::from(response_original.clone()),
-    );
-    let mut second_response_metas = response_metas.clone();
-    second_response_metas[0] = AccountMeta::new(second_response, false);
-    assert_eq!(
-        custom(
-            send_fresh_with(
-                &mut f.ctx,
-                &f.executor,
-                f.program,
-                vec![dcg_program::closure_v2_response::TAG_GROW],
-                second_response_metas,
-            )
-            .await
-        ),
-        731,
-        "tag 116 refuses a second DRU1 instance"
-    );
-    let mut stale_response = response_original.clone();
-    stale_response.data[8..40].copy_from_slice(second_record.as_ref());
-    f.ctx
-        .set_account(&response, &AccountSharedData::from(stale_response));
-    assert_eq!(
-        custom(
-            send_fresh_with(
-                &mut f.ctx,
-                &f.executor,
-                f.program,
-                vec![dcg_program::closure_v2_response::TAG_GROW],
-                response_metas.clone(),
-            )
-            .await
-        ),
-        733,
-        "tag 116 refuses a stale DRU1 bound to another challenge"
-    );
-    f.ctx
-        .set_account(&response, &AccountSharedData::from(response_original));
     send_fresh_with(
         &mut f.ctx,
         &f.executor,
