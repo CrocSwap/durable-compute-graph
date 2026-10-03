@@ -1179,10 +1179,17 @@ async fn a_front_runner_creates_the_same_content_address_and_becomes_its_payer()
 #[tokio::test(flavor = "multi_thread")]
 async fn the_shared_test_kernel_image_does_not_dispatch_legacy_create_subtype_250() {
     let mut ch = Chain::new(30).await;
-    let admitter = kp(0xA1);
-    let i = ix(250, &[], vec![
-        AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(ch.template, false),
+    ch.ctx.warp_to_slot(10_000).unwrap();
+    ch.close_run(0xA1).await.unwrap();
+    ch.close_template().await.unwrap();
+    assert!(ch.gone(ch.template).await);
+
+    let attacker = kp(0xB1);
+    let data = template_body(&ch.g, 30);
+    let i = ix(250, &data, vec![
+        AccountMeta::new(attacker.pubkey(), true), AccountMeta::new(ch.template, false),
         AccountMeta::new_readonly(SYSTEM, false),
     ]);
-    assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err());
+    assert!(send(&mut ch.ctx, i, &[&attacker]).await.is_err());
+    assert!(ch.gone(ch.template).await, "the shared image cannot recreate it through subtype 250");
 }
