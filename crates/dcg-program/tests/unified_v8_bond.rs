@@ -1682,113 +1682,11 @@ async fn every_retry_refusal() {
             "a substituted {what}"
         );
     }
-    // 599: the record. A settled pot, an unclosed document, a STANDARD document
-    // (`settlement_program = 0`) and a revision-7 DCR2 are all "there is nothing
-    // to settle", and a **v1** tombstone reads as "no settlement block, refused
-    // 599" -- §1.5's reader split.
-    let mut paid = dcr2.clone();
-    paid[result::BOND_STATE_AT_V6] = BOND_PAID;
-    install(&mut f, paid);
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        CL_CLOSE,
-        "a STANDARD seizure leaves nothing to settle"
-    );
-    let mut open = dcr2.clone();
-    open[7] = 0;
-    install(&mut f, open);
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        CL_CLOSE,
-        "a document that has not been closed"
-    );
-    let t_standard = standard(f.ids.remainder, 2_500);
-    let on_standard = dcr2_v6(
-        &d,
-        &f.ids.executor,
-        &t_standard,
-        bond::CAUSE_CONVICTION,
-        Some(f.ids.challenger),
-        result::STATUS_REFUTED,
-    );
-    install(&mut f, on_standard);
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        CL_CLOSE,
-        "a STANDARD document: settlement_program = 0"
-    );
-    let mut v5 = dcr2.clone();
-    v5[4..6].copy_from_slice(&5u16.to_le_bytes());
-    v5[209..216].copy_from_slice(&[0; 7]);
-    install(&mut f, v5);
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        CL_CLOSE,
-        "a revision-7 DCR2 is never reinterpreted"
-    );
-    let mut v1 = vec![0u8; result::TOMBSTONE_BYTES];
-    v1[..4].copy_from_slice(b"DCRZ");
-    v1[4..6].copy_from_slice(&1u16.to_le_bytes());
-    v1[8..40].copy_from_slice(&d);
-    v1[40..72].copy_from_slice(f.ids.executor.as_ref());
-    f.install_result(v1, rent_exempt(result::TOMBSTONE_BYTES));
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        CL_CLOSE,
-        "a DCRZ v1 carries no settlement block"
-    );
-    let fake_result = f.ids.impostor;
-    f.install_at(
-        fake_result,
-        owned(&f.ids.program, dcr2.clone(), rent_exempt(418)),
-    );
-    let mut fake_result_metas = good.clone();
-    fake_result_metas[6] = AccountMeta::new(fake_result, false);
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], fake_result_metas).await,
-        CL_MALFORMED,
-        "a DCR2 v6 at a non-derived address"
-    );
-    // 580: a record of one of the two live shapes whose own fields are malformed.
-    // A live escrow always has a cause, and a withheld document never has a
-    // winner -- it was never convicted.
-    let mut no_cause = dcr2.clone();
-    no_cause[result::BOND_CAUSE_AT_V6] = 0;
-    install(&mut f, no_cause);
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        CL_MALFORMED,
-        "bond_cause = 0 on a live escrow"
-    );
-    let withheld_with_winner = dcr2_v6(
-        &d,
-        &f.ids.executor,
-        &t,
-        bond::CAUSE_WITHHELD,
-        Some(f.ids.challenger),
-        result::STATUS_WITHHELD,
-    );
-    install(&mut f, withheld_with_winner);
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        CL_MALFORMED,
-        "a withheld document with a recorded winner"
-    );
-    let mut bad_dcrz = dcrz_v2(
-        &d,
-        &f.ids.executor,
-        &t,
-        bond::CAUSE_CONVICTION,
-        Some(f.ids.challenger),
-        result::STATUS_REFUTED,
-    );
-    bad_dcrz[100] = 1;
-    f.install_result(bad_dcrz, rent_exempt(result::TOMBSTONE_V2_BYTES));
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        CL_CLOSE,
-        "a tombstone with nonzero padding is not a v2 settlement block"
-    );
+    // The record's non-live and malformed shapes (a paid bond, an unclosed
+    // document, a STANDARD document, a revision-7 DCR2 v5, a DCRZ v1, a DCR2 at
+    // a non-derived key, cause 0, a withheld record with a winner, tombstone
+    // padding) are states only a program bug could write: tag 187's reader
+    // unit test (bond::settlement_reader_tests; owner decision 2026-10-02).
     // A DCG-owned 200-byte account elsewhere (for example, a descriptor-upload
     // chunk) cannot impersonate the derived DCRZ v2 address. The old reader
     // accepted this valid-looking tombstone and would have settled the victim's

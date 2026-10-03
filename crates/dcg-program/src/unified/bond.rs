@@ -955,3 +955,121 @@ mod escrow_gate_tests {
         );
     }
 }
+
+/// Tag 187's record reader on constructed accounts: the two live shapes (a
+/// closed, escrowed DCR2 v6 and a DCRZ v2 tombstone) are read; every
+/// malformed or non-live image the retry tests used to install is refused.
+/// Those images are states only a program bug could write (owner decision
+/// 2026-10-02).
+#[cfg(all(test, feature = "revision-8"))]
+mod settlement_reader_tests {
+    use super::*;
+    use crate::unified::terms::BOND_POLICY_CUSTOM;
+
+    const DESCRIPTOR: [u8; 32] = [0x7A; 32];
+
+    fn terms(settlement_program: [u8; 32]) -> Terms2 {
+        Terms2 {
+            challenge_window_slots: 90_000,
+            response_window_slots: 45_000,
+            challenger_bond_lamports: 1_000_000,
+            executor_bond_lamports: 890_880,
+            executor_reward_bps: 0,
+            bond_policy_kind: if settlement_program == [0; 32] { 1 } else { BOND_POLICY_CUSTOM },
+            bond_slasher_bps: 0,
+            settlement_program,
+            custom_settle_window_slots: if settlement_program == [0; 32] { 0 } else { 604_800 },
+            result_retention_slots: 2_592_000,
+            bond_remainder: [8u8; 32],
+            abandon_after_slots: 5_184_000,
+        }
+    }
+
+    /// A DCR2 v6 the close left: closed, escrowed, convicted, with a winner.
+    fn closed_dcr2(program: &Pubkey, t: &Terms2) -> Vec<u8> {
+        let mut raw = vec![0u8; result::bytes_v8(1, 16).unwrap()];
+        raw[..4].copy_from_slice(b"DCR2");
+        raw[4..6].copy_from_slice(&result::VERSION_V6.to_le_bytes());
+        raw[7] = 1;
+        raw[8..40].copy_from_slice(&DESCRIPTOR);
+        raw[196..200].copy_from_slice(&1u32.to_le_bytes());
+        raw[208] = 16;
+        raw[RESULT_TERMS_AT_V6..RESULT_TERMS_AT_V6 + TERMS_BYTES_V2].copy_from_slice(&t.encode());
+        raw[result::RETENTION_SLOTS_AT_V6..result::RETENTION_SLOTS_AT_V6 + 8]
+            .copy_from_slice(&t.result_retention_slots.to_le_bytes());
+        raw[result::RETENTION_START_AT_V6..result::RETENTION_START_AT_V6 + 8].copy_from_slice(&10u64.to_le_bytes());
+        raw[result::RETENTION_DEADLINE_AT_V6..result::RETENTION_DEADLINE_AT_V6 + 8]
+            .copy_from_slice(&(10 + t.result_retention_slots).to_le_bytes());
+        raw[WINNER_AT_V6..WINNER_AT_V6 + 32].copy_from_slice(&[9u8; 32]);
+        raw[BOND_STATE_AT_V6] = BOND_ESCROWED;
+        raw[BOND_CAUSE_AT_V6] = CAUSE_CONVICTION;
+        raw[result::RESULT_PDA_BUMP_AT_V6] = address::result(program, &DESCRIPTOR).1.value();
+        raw
+    }
+
+    /// The DCRZ v2 tombstone the retention close leaves for a live escrow.
+    fn tombstone() -> Vec<u8> {
+        let mut raw = vec![0u8; TOMBSTONE_V2_BYTES];
+        raw[..4].copy_from_slice(b"DCRZ");
+        raw[4..6].copy_from_slice(&2u16.to_le_bytes());
+        raw[7] = 1;
+        raw[8..40].copy_from_slice(&DESCRIPTOR);
+        raw[TOMBSTONE_V2_CAUSE_AT] = CAUSE_CONVICTION;
+        raw[TOMBSTONE_V2_PROGRAM_AT..TOMBSTONE_V2_PROGRAM_AT + 32].copy_from_slice(&[7u8; 32]);
+        raw[TOMBSTONE_V2_REMAINDER_AT..TOMBSTONE_V2_REMAINDER_AT + 32].copy_from_slice(&[8u8; 32]);
+        raw[TOMBSTONE_V2_WINNER_AT..TOMBSTONE_V2_WINNER_AT + 32].copy_from_slice(&[9u8; 32]);
+        raw
+    }
+
+    fn read(program: &Pubkey, key: Pubkey, mut data: Vec<u8>) -> Result<Settlement, ProgramError> {
+        let mut lamports = 1u64;
+        let info = AccountInfo::new(&key, false, true, &mut lamports, &mut data, program, false, 0);
+        read_settlement(program, &info)
+    }
+
+    #[test]
+    fn the_retry_reads_only_the_two_live_shapes() {
+        let program = Pubkey::new_unique();
+        let key = address::result(&program, &DESCRIPTOR).0;
+        let custom = terms([7u8; 32]);
+        let good = closed_dcr2(&program, &custom);
+        let s = read(&program, key, good.clone()).expect("a closed, escrowed DCR2 v6");
+        assert_eq!((s.cause, s.tombstone, s.conviction_winner), (CAUSE_CONVICTION, false, [9u8; 32]));
+        let s = read(&program, key, tombstone()).expect("a DCRZ v2 tombstone");
+        assert_eq!((s.cause, s.tombstone), (CAUSE_CONVICTION, true));
+
+        let not_live = Err(no(CL_CLOSE));
+        let malformed = Err(no(CL_MALFORMED));
+        let mut v = good.clone();
+        v[BOND_STATE_AT_V6] = 2; // BOND_PAID
+        assert_eq!(read(&program, key, v).map(|_| ()), not_live, "a paid bond beside a live escrow");
+        let mut v = good.clone();
+        v[7] = 0;
+        assert_eq!(read(&program, key, v).map(|_| ()), not_live, "a record not closed while escrowed");
+        let mut v = good.clone();
+        v[4..6].copy_from_slice(&5u16.to_le_bytes());
+        assert_eq!(read(&program, key, v).map(|_| ()), not_live, "a revision-7 DCR2 v5");
+        let standard = closed_dcr2(&program, &terms([0; 32]));
+        assert_eq!(read(&program, key, standard).map(|_| ()), not_live, "a STANDARD document has nothing to retry");
+        let mut v = good.clone();
+        v[BOND_CAUSE_AT_V6] = 0;
+        assert_eq!(read(&program, key, v).map(|_| ()), malformed, "cause 0");
+        let mut v = good.clone();
+        v[BOND_CAUSE_AT_V6] = CAUSE_WITHHELD;
+        assert_eq!(read(&program, key, v).map(|_| ()), malformed, "WITHHELD with a recorded winner");
+        assert_eq!(
+            read(&program, Pubkey::new_unique(), good).map(|_| ()),
+            malformed,
+            "a valid DCR2 at an unrelated key"
+        );
+        let mut t = tombstone();
+        t[100] = 1;
+        assert_eq!(read(&program, key, t).map(|_| ()), not_live, "a DCRZ v2 with nonzero padding");
+        let mut t = tombstone();
+        t[4..6].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(read(&program, key, t).map(|_| ()), not_live, "a DCRZ v1 has no settlement block");
+        let mut t = tombstone();
+        t[TOMBSTONE_V2_CAUSE_AT] = CAUSE_WITHHELD;
+        assert_eq!(read(&program, key, t).map(|_| ()), malformed, "a withheld tombstone with a winner");
+    }
+}
