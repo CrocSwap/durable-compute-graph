@@ -12,6 +12,9 @@ pub(crate) use crate::closure_v2_accounts::*;
 pub use crate::closure_v2_tree::*;
 #[cfg(not(feature = "sbf-real-lifecycle-test"))]
 pub(crate) use crate::closure_v2_tree::*;
+/// The leaf and node hashing a prover needs to build a real attestation
+/// (used by `dcg-test-support`); public in every build.
+pub use crate::closure_v2_tree::{hash, write_digest, Coordinate};
 
 /// Typed producer and finalized-leaf proof helpers used by the revision-8
 /// application dispute adapter. These helpers validate every program-owned

@@ -93,9 +93,13 @@ impl Snapshot {
             raw.extend_from_slice(&a.data);
         }
         std::fs::create_dir_all(dir()).unwrap();
-        let tmp = path(&self.key).with_extension("tmp");
+        // Concurrent tests may save the same key at once: write a private
+        // temporary file and rename it (atomic; the content is identical).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path(&self.key).with_extension(format!("tmp.{}.{n}", std::process::id()));
         std::fs::write(&tmp, raw).unwrap();
-        std::fs::rename(tmp, path(&self.key)).unwrap();
+        std::fs::rename(&tmp, path(&self.key)).unwrap();
     }
 
     /// Account-level differences from another capture of the same key set:
