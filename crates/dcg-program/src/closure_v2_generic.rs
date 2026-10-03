@@ -130,16 +130,10 @@ fn live(
         return Err(no(STATE));
     }
     if version != challenge::VERSION {
-        if !cfg!(feature = "legacy-hclosure-handlers") {
-            return Err(no(LEGACY_DCR1_DISABLED));
-        }
-        let descriptor: [u8; 32] = raw[72..104].try_into().map_err(|_| no(STATE))?;
-        let challenger = Pubkey::new_from_array(raw[8..40].try_into().map_err(|_| no(STATE))?);
-        let nonce = u32_at(&raw, 140)?;
-        let expected = address::challenge(program, &descriptor, &challenger, nonce).0;
-        if record.owner != program || *record.key != expected {
-            return Err(no(AUTH));
-        }
+        // Legacy DCR1 v2/v4 records were never created at a derivable address,
+        // and no DCG image can create them, so they are refused outright
+        // (provenance audit 2026-10-03; review Low 2).
+        return Err(no(LEGACY_DCR1_DISABLED));
     }
     if !manifest
         .dispute_hooks()
@@ -2099,15 +2093,9 @@ fn execute(
             return Err(no(PROOF));
         }
     } else {
-        if !honest {
-            let mut doc = accounts[2].try_borrow_mut_data()?;
-            let wins = u32_at(&doc, 132)?.checked_add(1).ok_or(no(STATE))?;
-            doc[132..136].copy_from_slice(&wins.to_le_bytes());
-            let flags = u16_at(&doc, 6)? | 4;
-            doc[6..8].copy_from_slice(&flags.to_le_bytes());
-        }
-        state[4] = 3;
-        state[5] = if honest { 1 } else { 2 };
+        // Unreachable: `live` refuses every legacy version.
+        let _ = (honest, &mut *state);
+        return Err(no(LEGACY_DCR1_DISABLED));
     }
     Ok(())
 }
