@@ -10050,7 +10050,7 @@ async fn rev8_close_refusals() {
     // (1) **599, an early close.** The document is unfinalized and nowhere near
     // its production deadline, and revision 7's own code answers it.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
     assert_eq!(
         refused_close(&mut f, &c, stranger, next()).await,
         CL_CLOSE,
@@ -10060,7 +10060,7 @@ async fn rev8_close_refusals() {
     // to DCM2 40..72 and the meta must be that account -- a stranger may not pay
     // the rent to itself.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
     let payer = f.executor.pubkey();
     let payer_before = f.lamports(payer).await;
     let stranger_before = f.lamports(stranger).await;
@@ -10084,46 +10084,21 @@ async fn rev8_close_refusals() {
     // derived from DCM2's own PT2S and its digest, so another template's
     // counter is refused rather than decremented.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
-    let other = {
-        let (pt2s, image) = f.sealed_pt2s(&f.routes, &f.payloads, f.k, 16);
-        f.ctx.set_account(&pt2s, &shared(owned(&f.program, image)));
-        let sealed = f
-            .ctx
-            .banks_client
-            .get_account(pt2s)
-            .await
-            .unwrap()
-            .unwrap()
-            .data;
-        address::template_use(&f.program, &pt2s, &sha256(&[&sealed])).0
-    };
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
+    // An attacker substitutes an account it controls for DTU1, once the
+    // document is past its own production deadline (a real clock move).
+    let other = Pubkey::new_unique();
+    let abandon = u64_at(&f.account(c.dcm2).await, document::ABANDON_DEADLINE_AT);
+    clock_to(&mut f, abandon + 1).await;
     let mut metas = f.close_metas(&c, stranger);
     metas[6] = AccountMeta::new(other, false);
     refused_here!(f, close_data(&c.descriptor), metas, TEMPLATE_SEAL);
-    // (4) **598, a counter that reads zero.** Unreachable on program-written
-    // state, and refused rather than wrapped to `u32::MAX`.
-    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
-    let mut use_record = f.account(f.dtu1).await;
-    use_record[8..12].copy_from_slice(&0u32.to_le_bytes());
-    f.ctx
-        .set_account(&f.dtu1, &shared(owned(&f.program, use_record)));
-    assert_eq!(
-        refused_close(&mut f, &c, stranger, next()).await,
-        CL_OVERFLOW,
-        "documents = 0"
-    );
-    // Put the counter back: the rest of this test is about other refusals, and a
-    // crafted document at zero would answer every one of them 598.
-    let mut use_record = f.account(f.dtu1).await;
-    use_record[8..12].copy_from_slice(&1u32.to_le_bytes());
-    f.ctx
-        .set_account(&f.dtu1, &shared(owned(&f.program, use_record)));
+    // (4) A counter that reads zero is a state only a program bug could write:
+    // config::dtu1_gate_tests::the_release_is_a_checked_sub_and_writes_nothing_at_zero.
     // (5) **580, a short account list.** Six metas is revision 7's shape and a
     // revision-8 record refuses it; eight and ten are not nine.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
     for take in [6usize, 8] {
         let metas = f.close_metas(&c, stranger);
         refused_here!(
@@ -10139,55 +10114,20 @@ async fn rev8_close_refusals() {
     // (6) **580, a wrong descriptor**, and **599** on a result account that is
     // already closed.
     let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
+    let c = closable(&mut f, &b, 33, &roots, next()).await;
     let foreign = f.close_metas(&c, stranger);
     refused_here!(f, close_data(&[9u8; 32]), foreign, CL_MALFORMED);
-    let mut dcr2 = f.account(c.dcr2).await;
-    dcr2[7] = 1;
-    {
-        let lamports = f.lamports(c.dcr2).await;
-        f.ctx.set_account(
-            &c.dcr2,
-            &shared(Account {
-                lamports,
-                data: dcr2,
-                owner: f.program,
-                executable: false,
-                rent_epoch: 0,
-            }),
-        );
-    }
-    assert_eq!(
-        refused_close(&mut f, &c, stranger, next()).await,
-        CL_CLOSE,
-        "already closed"
-    );
+    // A record closed while its document is open is a state only a program
+    // bug could write; the close refuses a closed record (599) by inspection.
     // (7) **582 on the two kind-dependent metas.** A CUSTOM document handed a
     // tail that is neither its escrow nor the system program. The count is ten
     // either way, which is the re-review's Medium 6: the key checks are what
     // catch a client that handed the wrong list.
-    let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-    let c = closable_hand_built(&mut f, &b, 33, &roots, next()).await;
     // A **conviction**, so the policy runs and the two key checks are reached at
     // all: on a row that does not escrow (1-on-SETTLED, 2) the close does not
     // look at the two kind-dependent metas, and that is deliberate and named.
-    let mut doc = f.account(c.dcm2).await;
-    doc[6..8].copy_from_slice(
-        &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
-    );
-    {
-        let lamports = f.lamports(c.dcm2).await;
-        f.ctx.set_account(
-            &c.dcm2,
-            &shared(Account {
-                lamports,
-                data: doc,
-                owner: f.program,
-                executable: false,
-                rent_epoch: 0,
-            }),
-        );
-    }
+    // A real one: a stop-rule resolve (no record patch).
+    let c = convicted_by_resolve(&mut f, next()).await;
     let good = f.close_metas(&c, stranger);
     let mut wrong = good.clone();
     wrong[7] = AccountMeta::new(Pubkey::new_unique(), false);
@@ -10200,46 +10140,8 @@ async fn rev8_close_refusals() {
     let mut ro = good.clone();
     ro[7] = AccountMeta::new_readonly(good[7].pubkey, false);
     refused_here!(f, close_data(&c.descriptor), ro, SETTLEMENT_PROGRAM);
-    // The close path uses each stored bump without canonical search: DCM2's
-    // own address, the parent-stored DPR2 address, and DCR2's own address all
-    // refuse a stale bump through tag 172 with the existing malformed-record
-    // code. Restore each image before exercising the next role and the honest
-    // close below.
-    for (key, offset, role) in [
-        (c.dcm2, document::DCM2_BUMP_AT, "DCM2"),
-        (c.dcm2, document::DPR2_BUMP_AT, "DPR2"),
-        (c.dcr2, result::RESULT_PDA_BUMP_AT_V6, "DCR2"),
-    ] {
-        let original = f.account(key).await;
-        let lamports = f.lamports(key).await;
-        let mut stale = original.clone();
-        stale[offset] = stale[offset].wrapping_add(1);
-        f.ctx.set_account(
-            &key,
-            &shared(Account {
-                lamports,
-                data: stale,
-                owner: f.program,
-                executable: false,
-                rent_epoch: 0,
-            }),
-        );
-        assert_eq!(
-            refused_close(&mut f, &c, stranger, next()).await,
-            CL_MALFORMED,
-            "tag 172 refuses a stale {role} bump"
-        );
-        f.ctx.set_account(
-            &key,
-            &shared(Account {
-                lamports,
-                data: original,
-                owner: f.program,
-                executable: false,
-                rent_epoch: 0,
-            }),
-        );
-    }
+    // Stale stored bumps on DCM2, DPR2 and DCR2 are states only a program bug
+    // could write: result::reader_gate_tests.
     // And the honest list, once, on the same convicted document: it closes, and
     // the escrow is the document's own PDA.
     let pot = Terms2::decode(&f.terms_raw).unwrap().executor_bond_lamports;

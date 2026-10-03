@@ -1556,4 +1556,28 @@ mod dtu1_gate_tests {
             Err(no(super::super::CL_OVERFLOW))
         );
     }
+
+    /// The close's release (`documents - 1`) is a checked subtraction: a
+    /// counter that reads 0 for a live document is 598 and writes nothing.
+    /// No program-written state reaches it, so it is a unit test.
+    #[test]
+    fn the_release_is_a_checked_sub_and_writes_nothing_at_zero() {
+        let program = Pubkey::new_unique();
+        let pt2s = Pubkey::new_unique();
+        let key = address::template_use(&program, &pt2s, &DIGEST).0;
+        for (documents, want) in [(1u32, Ok(0u32)), (0, Err(no(super::super::CL_OVERFLOW)))] {
+            let mut data = honest(&program, &pt2s);
+            data[DTU1_DOCUMENTS_AT..DTU1_DOCUMENTS_AT + 4].copy_from_slice(&documents.to_le_bytes());
+            let before = data.clone();
+            let mut lamports = 1u64;
+            let info = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &program, false, 0);
+            assert_eq!(template_release(&program, &info, &pt2s, &DIGEST), want, "documents = {documents}");
+            drop(info);
+            if want.is_err() {
+                assert_eq!(data, before, "a refused release writes nothing");
+            } else {
+                assert_eq!(data[DTU1_DOCUMENTS_AT..DTU1_DOCUMENTS_AT + 4], 0u32.to_le_bytes());
+            }
+        }
+    }
 }
