@@ -43,13 +43,18 @@ independently reviewed yet.
 
 ## Next, in order
 
-1. The independent v2.1 review; fix its findings.
+1. The independent v2.1 review: done 10-03; F1–F5 and F9 fixed (0862470).
 2. List inputs and template closes in the program (in progress).
-3. LOG state in the crate and program.
-4. The attention decomposition, chosen from the 10-03 measurement.
-5. A v2.1 Basanos document template (one repeated block per position), end to end on testnet.
-6. Lanes in the program, for Doom.
-7. Sampling and Freivalds as v2.1 region modes.
+3. A run-level dispute model in the Python reference (several disputes, ruled
+   prefix, best win, bonds), fuzzed against the program with random
+   interleavings and per-step invariant checks: conservation, no bond to the
+   executor after the best win, every dispute ends. It follows the F1 bond
+   theft, which the per-dispute oracle could not see.
+4. LOG state in the crate and program.
+5. The attention decomposition, chosen from the 10-03 measurement.
+6. A v2.1 Basanos document template (one repeated block per position), end to end on testnet.
+7. Lanes in the program, for Doom.
+8. Sampling and Freivalds as v2.1 region modes.
 
 ## Original sequence (kickoff estimates)
 
