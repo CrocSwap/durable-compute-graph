@@ -105,6 +105,10 @@ DCG keeps no model code (owner decision, 09-26).
 
 ### Consensus mode
 
+**C0. The embedding contract.**
+- A documented way to embed the stateful runtime in an application program: a template app program, its build, and its deploy.
+- A runtime version marker readable on chain or from the image, so apps and users can check which DCG runtime a program embeds, and SECURITY advisories can say which versions are affected.
+
 **C1. A session quickstart.** Write a stateful kernel (`StatefulKernel`: initial state, transition, optional views), register it in an application image, open a session from Python, drive it to completion with the sequencer, and read the result. The existing `python-session.md` and `sequencer.md` become its basis.
 
 **C2. The sequencer as a product.**
@@ -161,3 +165,11 @@ The alpha ships when all of these hold:
    disclosure window. Breaking changes follow `SECURITY.md`'s companion
    policy: a changelog, GitHub releases, and at least one week's notice
    before the shared program is upgraded.
+5. **Consensus mode is embedded:** DCG's stateful runtime is a library. An
+   app compiles it, with its own kernels, into its own program, as Doom does
+   today. The app owns its session accounts and its upgrade key. The alpha
+   makes this easy with the kernel kit (C3), `dcg build`, a template app
+   program, and a runtime version check, so an app can tell which DCG
+   runtime it embeds and whether a security fix applies to it. A hosted
+   option (sessions on a shared DCG program, with app kernels in their own
+   programs, called once per step) is post-alpha.
