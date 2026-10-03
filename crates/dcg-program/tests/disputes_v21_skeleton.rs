@@ -661,6 +661,235 @@ async fn total_lamports(ctx: &mut ProgramTestContext, keys: &[Pubkey]) -> u128 {
     t
 }
 
+// L6: the same real-instruction state builder is used in native and SBF
+// ProgramTest (V21_SBF=1).  "truth" describes the committed computation;
+// the party that misses a move is culpable even when its preceding data was
+// correct.  The four timeout rows cover every owed phase.
+#[derive(Clone, Copy, Debug)]
+enum Ending { Proof, NodesTimeout, PickTimeout, LeafTimeout, ClaimTimeout, Moot }
+
+async fn matrix_balance(ch: &mut Chain, key: Pubkey) -> u64 {
+    ch.ctx.banks_client.get_balance(key).await.unwrap()
+}
+
+async fn matrix_timeout(ch: &mut Chain, d: Pubkey) {
+    let caller = kp(0xA1);
+    let i = ix(V::SUB_TIMEOUT, &[], vec![
+        AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false),
+        AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false),
+        AccountMeta::new(kp(0xE1).pubkey(), false), AccountMeta::new(kp(0xC1).pubkey(), false),
+    ]);
+    assert!(send(&mut ch.ctx, i.clone(), &[&caller]).await.is_err(), "early timeout");
+    ch.ctx.warp_to_slot(5_000).unwrap();
+    send(&mut ch.ctx, i, &[&caller]).await.unwrap();
+}
+
+async fn matrix_nodes(ch: &mut Chain, d: Pubkey, c: &Commit) {
+    let mut nodes = Vec::new();
+    nodes.extend_from_slice(&c.step[0][0]);
+    nodes.extend_from_slice(&c.step[0][1]);
+    let mut accounts = ch.party(0xE1, d);
+    accounts[0] = AccountMeta::new(kp(0xE1).pubkey(), true); // pays cache rent
+    let cache = matrix_cache(ch);
+    accounts.push(AccountMeta::new(cache, false));
+    accounts.push(AccountMeta::new_readonly(SYSTEM, false));
+    send(&mut ch.ctx, ix(V::SUB_REVEAL_NODES, &nodes, accounts.clone()), &[&kp(0xE1)]).await.unwrap();
+    let before = matrix_wait(ch).await;
+    assert!(send(&mut ch.ctx, ix(V::SUB_REVEAL_NODES, &nodes, accounts), &[&kp(0xE1)]).await.is_err(),
+        "executor cannot answer again while the challenger owes PICK");
+    assert_eq!(matrix_wait(ch).await, before, "executor cannot bank an extension on the challenger's turn");
+}
+
+fn matrix_cache(ch: &Chain) -> Pubkey {
+    Pubkey::find_program_address(&[b"dcg21rc", ch.run.as_ref(), &[V::KIND_STEP_DESCEND], &1u32.to_le_bytes(), &0u64.to_le_bytes()], &PROGRAM).0
+}
+
+async fn matrix_pick(ch: &mut Chain, d: Pubkey) {
+    let accounts = ch.party(0xC1, d);
+    send(&mut ch.ctx, ix(V::SUB_PICK, &[1], accounts), &[&kp(0xC1)]).await.unwrap();
+}
+
+async fn matrix_leaf(ch: &mut Chain, d: Pubkey, c: &Commit) {
+    let mut leaf = vec![1];
+    leaf.extend_from_slice(c.leaves[1].as_ref().unwrap());
+    let accounts = ch.party(0xE1, d);
+    send(&mut ch.ctx, ix(V::SUB_REVEAL_LEAF, &leaf, accounts), &[&kp(0xE1)]).await.unwrap();
+}
+
+async fn matrix_wait(ch: &mut Chain) -> (u32, u64) {
+    let run = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
+    let tail = &run.data[run.data.len() - 12..];
+    (u32::from_le_bytes(tail[..4].try_into().unwrap()), u64::from_le_bytes(tail[4..].try_into().unwrap()))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l6_endings_matrix_native_and_sbf() {
+    let rows = [Ending::Proof, Ending::NodesTimeout, Ending::PickTimeout,
+        Ending::LeafTimeout, Ending::ClaimTimeout, Ending::Moot];
+    for executor_truthful in [true, false] {
+        for ending in rows {
+            // A moot dispute requires an earlier challenger proof win.  A
+            // truthful E cannot supply that state while still answering all
+            // owed moves, so this logical cell has no honest role order.
+            if executor_truthful && matches!(ending, Ending::Moot) { continue; }
+            let cell = format!("{ending:?}/executor_truthful={executor_truthful}");
+            let mut ch = Chain::new(30).await;
+            let h = ch.honest();
+            let c = if executor_truthful { h } else {
+                let mut leaf = h.leaves[1].clone().unwrap();
+                let n = leaf.len();
+                leaf[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
+                commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(leaf)], h.outs)
+            };
+            let d = ch.dispute(201);
+            let d_moot = ch.dispute(202);
+            let cache = matrix_cache(&ch);
+            let keys = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(),
+                ch.run, ch.template, d, d_moot, cache];
+            let before = total_lamports(&mut ch.ctx, &keys).await;
+            let payer_before = matrix_balance(&mut ch, kp(0xA1).pubkey()).await;
+            let (run_key, template_key) = (ch.run, ch.template);
+            let run_rent = matrix_balance(&mut ch, run_key).await;
+            let template_rent = matrix_balance(&mut ch, template_key).await;
+            let e_before = matrix_balance(&mut ch, kp(0xE1).pubkey()).await;
+            let c_before = matrix_balance(&mut ch, kp(0xC1).pubkey()).await;
+            ch.commit(&c).await;
+            assert_eq!(ch.open(201, V::KIND_STEP_DESCEND).await, d);
+            if matches!(ending, Ending::Moot) { ch.open(202, V::KIND_STEP_DESCEND).await; }
+            if !matches!(ending, Ending::NodesTimeout) { matrix_nodes(&mut ch, d, &c).await; }
+            if !matches!(ending, Ending::NodesTimeout | Ending::PickTimeout) { matrix_pick(&mut ch, d).await; }
+            if !matches!(ending, Ending::NodesTimeout | Ending::PickTimeout | Ending::LeafTimeout) {
+                matrix_leaf(&mut ch, d, &c).await;
+            }
+            let winner = match ending {
+                Ending::NodesTimeout | Ending::LeafTimeout => { matrix_timeout(&mut ch, d).await; V::RULING_CHALLENGER }
+                Ending::PickTimeout | Ending::ClaimTimeout => { matrix_timeout(&mut ch, d).await; V::RULING_EXECUTOR }
+                Ending::Proof | Ending::Moot => {
+                    let mut body = vec![if executor_truthful { V::CLAIM_EDGE } else { V::CLAIM_STEP }, 0];
+                    body.extend(ch.spec_opening(STEP_BASE as usize + 1));
+                    if executor_truthful { body.extend(ch.step_opening(&c, 0)); }
+                    else {
+                        body.push(1);
+                        body.extend_from_slice(&4u32.to_le_bytes());
+                        body.extend_from_slice(&42i32.to_le_bytes());
+                    }
+                    ch.claim(d, body).await.unwrap();
+                    if executor_truthful { V::RULING_EXECUTOR } else { V::RULING_CHALLENGER }
+                }
+            };
+            assert_eq!(ch.ruling(d).await, winner, "{cell}: ruling");
+            // A terminal dispute never accepts another claim, timeout, reveal,
+            // pick, or open.  Advance and settlement are its permitted closes.
+            assert!(matrix_timeout_after_ruling(&mut ch, d).await.is_err(), "{cell}: second timeout");
+            let accounts = ch.party(0xC1, d);
+            assert!(send(&mut ch.ctx, ix(V::SUB_PICK, &[1], accounts), &[&kp(0xC1)]).await.is_err(), "{cell}: pick after ruling");
+            if matches!(ending, Ending::Moot) {
+                // A later dispute is moot only when this first claim refutes E.
+                if winner == V::RULING_CHALLENGER {
+                    let before_wait = matrix_wait(&mut ch).await;
+                    let caller = kp(0xA1);
+                    send(&mut ch.ctx, ix(V::SUB_MOOT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d_moot, false), AccountMeta::new(kp(0xC1).pubkey(), false)]), &[&caller]).await.unwrap();
+                    assert_eq!(ch.ruling(d_moot).await, V::RULING_MOOT, "{cell}");
+                    assert_eq!(matrix_wait(&mut ch).await.1, before_wait.1, "{cell}: challenger wait banked E time");
+                }
+            }
+            ch.advance(d).await.unwrap();
+            if matches!(ending, Ending::Moot) { ch.advance(d_moot).await.unwrap(); }
+            let caller = kp(0xA1);
+            if ch.run_status().await == V::RUN_REFUTED {
+                let best = if winner == V::RULING_CHALLENGER { d } else { d_moot };
+                let pay = ix(V::SUB_PAY_POT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(best, false), AccountMeta::new(kp(0xC1).pubkey(), false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+                send(&mut ch.ctx, pay.clone(), &[&caller]).await.unwrap();
+                assert!(send(&mut ch.ctx, pay, &[&caller]).await.is_err(), "{cell}: second pot");
+            }
+            ch.close_dispute(d).await.unwrap();
+            assert!(ch.close_dispute(d).await.is_err(), "{cell}: second dispute close");
+            if matches!(ending, Ending::Moot) { ch.close_dispute(d_moot).await.unwrap(); }
+            if ch.run_status().await == V::RUN_COMMITTED {
+                ch.ctx.warp_to_slot(10_000).unwrap();
+                let fin = ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(kp(0xE1).pubkey(), false)]);
+                send(&mut ch.ctx, fin.clone(), &[&caller]).await.unwrap();
+                assert!(send(&mut ch.ctx, fin, &[&caller]).await.is_err(), "{cell}: second executor bond");
+            }
+            if !matches!(ending, Ending::NodesTimeout) {
+                let cache_rent = matrix_balance(&mut ch, cache).await;
+                let e_pre_close = matrix_balance(&mut ch, kp(0xE1).pubkey()).await;
+                assert!(ch.close_cache(cache, kp(0xC1).pubkey()).await.is_err(), "{cell}: cache rent to nonpayer");
+                // The cache was created by E's NODES reveal and records E.
+                // It cannot exist in the NODES-timeout row.
+                ch.close_cache(cache, kp(0xE1).pubkey()).await.unwrap();
+                assert_eq!(matrix_balance(&mut ch, kp(0xE1).pubkey()).await, e_pre_close + cache_rent, "{cell}: cache rent refund");
+                assert!(ch.close_cache(cache, kp(0xE1).pubkey()).await.is_err(), "{cell}: second cache close");
+            }
+            ch.close_run(0xB1).await.unwrap();
+            assert!(ch.close_run(0xB1).await.is_err(), "{cell}: second run close");
+            ch.close_template().await.unwrap();
+            assert!(ch.close_template().await.is_err(), "{cell}: second template close");
+            assert_eq!(total_lamports(&mut ch.ctx, &keys).await, before, "{cell}: lamports");
+            let receipt_rent = matrix_balance(&mut ch, run_key).await;
+            let payer_share = if ch.run_status().await == V::RUN_REFUTED {
+                EXECUTOR_BOND - EXECUTOR_BOND * SLASHER_BPS as u64 / 10_000
+            } else { 0 };
+            assert_eq!(matrix_balance(&mut ch, kp(0xA1).pubkey()).await,
+                payer_before + run_rent + template_rent - receipt_rent + payer_share,
+                "{cell}: recorded payer's rent and pot remainder");
+            // Only a party that performed its owed moves is labelled honest
+            // in a timeout cell.  C's bond is held until close, so compare
+            // after every rent refund has landed.
+            if !executor_truthful && !matches!(ending, Ending::PickTimeout | Ending::ClaimTimeout) {
+                assert!(matrix_balance(&mut ch, kp(0xC1).pubkey()).await >= c_before, "{cell}: honest C net negative");
+            }
+            if executor_truthful && !matches!(ending, Ending::NodesTimeout | Ending::LeafTimeout) {
+                assert!(matrix_balance(&mut ch, kp(0xE1).pubkey()).await >= e_before, "{cell}: honest E net negative");
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "finding: SUB_STAGE_CREATE, SUB_STAGE_WRITE and SUB_STAGE_GROW accept challenger staging after a proof ruling"]
+async fn l6_finding_staging_after_proof_ruling() {
+    let mut ch = Chain::new(30).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let d = ch.open(221, V::KIND_STEP_DESCEND).await;
+    ch.step(d, &c, 1).await;
+    let mut body = vec![V::CLAIM_EDGE, 0];
+    body.extend(ch.spec_opening(STEP_BASE as usize + 1));
+    body.extend(ch.step_opening(&c, 0));
+    ch.claim(d, body).await.unwrap();
+    assert_eq!(ch.ruling(d).await, V::RULING_EXECUTOR);
+    let challenger = kp(0xC1);
+    let mut data = vec![V::ROLE_CHALLENGER];
+    data.extend_from_slice(&1u32.to_le_bytes());
+    let buffer = ch.buffer(d, V::ROLE_CHALLENGER);
+    let create = ix(V::SUB_STAGE_CREATE, &data, vec![
+        AccountMeta::new(challenger.pubkey(), true), AccountMeta::new(ch.run, false),
+        AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false),
+        AccountMeta::new(buffer, false), AccountMeta::new_readonly(SYSTEM, false),
+    ]);
+    let create_result = send(&mut ch.ctx, create, &[&challenger]).await;
+    let write = ix(V::SUB_STAGE_WRITE, &[0, 0, 0, 0, 0xAA], vec![
+        AccountMeta::new_readonly(challenger.pubkey(), true), AccountMeta::new(ch.run, false),
+        AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false),
+        AccountMeta::new(buffer, false),
+    ]);
+    let write_result = send(&mut ch.ctx, write, &[&challenger]).await;
+    let grow = ix(V::SUB_STAGE_GROW, &1u32.to_le_bytes(), vec![
+        AccountMeta::new(challenger.pubkey(), true), AccountMeta::new(ch.run, false),
+        AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false),
+        AccountMeta::new(buffer, false), AccountMeta::new_readonly(SYSTEM, false),
+    ]);
+    let grow_result = send(&mut ch.ctx, grow, &[&challenger]).await;
+    assert!(create_result.is_err() && write_result.is_err() && grow_result.is_err(),
+        "post-proof staging succeeded: create={create_result:?}, write={write_result:?}, grow={grow_result:?}");
+}
+
+async fn matrix_timeout_after_ruling(ch: &mut Chain, d: Pubkey) -> Result<(), TransactionError> {
+    let caller = kp(0xB1);
+    send(&mut ch.ctx, ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false), AccountMeta::new(kp(0xE1).pubkey(), false), AccountMeta::new(kp(0xC1).pubkey(), false)]), &[&caller]).await
+}
+
 fn template_body(g: &Golden, challenge_window: u64) -> Vec<u8> {
     let mut data = vec![4u8];
     for x in [2u64, 1, challenge_window, 750, EXECUTOR_BOND, CHALLENGER_BOND] {
