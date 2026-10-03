@@ -57,6 +57,7 @@ zeroize = "=1.8.1"
 zeroize_derive = "=1.4.3"
 
 [dev-dependencies]
+dcg-test-support = { path = "../dcg-test-support" }
 bincode = "=1.3.3"
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 solana-account = "=2.2.1"

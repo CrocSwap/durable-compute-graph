@@ -1093,6 +1093,7 @@ dependencies = [
  "blake3",
  "dcg-disputes",
  "dcg-kernels",
+ "dcg-test-support",
  "dcg-wire",
  "ed25519-dalek",
  "indexmap",
@@ -1117,6 +1118,25 @@ dependencies = [
  "tokio",
  "zeroize",
  "zeroize_derive",
+]
+
+[[package]]
+name = "dcg-test-support"
+version = "0.1.0"
+dependencies = [
+ "dcg-program",
+ "serde_json",
+ "solana-account",
+ "solana-compute-budget-interface",
+ "solana-hash",
+ "solana-instruction",
+ "solana-keypair",
+ "solana-program",
+ "solana-program-test",
+ "solana-pubkey",
+ "solana-signer",
+ "solana-transaction",
+ "solana-transaction-error",
 ]
 
 [[package]]
