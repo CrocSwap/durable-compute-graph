@@ -730,6 +730,529 @@ async fn matrix_wait(ch: &mut Chain) -> (u32, u64) {
     (u32::from_le_bytes(tail.try_into().unwrap()), 0)
 }
 
+async fn matrix_deadline(ch: &mut Chain, d: Pubkey) -> u64 {
+    let a = ch.ctx.banks_client.get_account(d).await.unwrap().unwrap();
+    u64::from_le_bytes(a.data[24..32].try_into().unwrap())
+}
+
+// Snapshot all accounts that can hold lamports in a matrix cell.  The test
+// transaction payer is intentionally outside this ledger (it pays fees).
+async fn matrix_ledger(ch: &mut Chain, disputes: &[Pubkey]) -> u128 {
+    let mut keys = vec![kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), ch.run, ch.template,
+        matrix_cache(ch)];
+    for &d in disputes {
+        keys.extend([d, ch.buffer(d, V::ROLE_EXECUTOR), ch.buffer(d, V::ROLE_CHALLENGER)]);
+    }
+    total_lamports(&mut ch.ctx, &keys).await
+}
+
+/// Complete a cell through the receipt and check the common settlement laws.
+/// The caller supplies disputes in sequence order, including any puppets.
+async fn matrix_settle(ch: &mut Chain, disputes: &[Pubkey], before: u128, honest: u8) {
+    ch.ctx.warp_to_slot(20_000).unwrap();
+    for &d in disputes {
+        if ch.ruling(d).await == V::RULING_OPEN {
+            let caller = kp(0xA1);
+            let i = ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true),
+                AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+                AccountMeta::new(d, false), AccountMeta::new(kp(0xE1).pubkey(), false),
+                AccountMeta::new(kp(0xC1).pubkey(), false)]);
+            send(&mut ch.ctx, i, &[&caller]).await.unwrap();
+        }
+        assert!(matrix_timeout_after_ruling(ch, d).await.is_err(), "only closes after RULED");
+        let challenger = kp(0xC1);
+        let pick = ix(V::SUB_PICK, &[0], ch.party(0xC1, d));
+        assert!(send(&mut ch.ctx, pick, &[&challenger]).await.is_err(), "pick after RULED");
+        let executor = kp(0xE1);
+        let reveal = ix(V::SUB_REVEAL_LEAF, &[0], ch.party(0xE1, d));
+        assert!(send(&mut ch.ctx, reveal, &[&executor]).await.is_err(), "reveal after RULED");
+        let claim = ix(V::SUB_CLAIM, &[V::CLAIM_SHAPE, 0], vec![
+            AccountMeta::new_readonly(challenger.pubkey(), true), AccountMeta::new(ch.run, false),
+            AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false),
+            AccountMeta::new(executor.pubkey(), false), AccountMeta::new(challenger.pubkey(), false)]);
+        assert!(send(&mut ch.ctx, claim, &[&challenger]).await.is_err(), "claim after RULED");
+        ch.advance(d).await.unwrap();
+        assert!(ch.advance(d).await.is_err(), "ruled prefix advances once");
+    }
+    assert_eq!(matrix_wait(ch).await.0, 0, "every executor wait ended once");
+    let caller = kp(0xA1);
+    if ch.run_status().await == V::RUN_REFUTED {
+        let mut best = None;
+        for &d in disputes {
+            if ch.ruling(d).await == V::RULING_CHALLENGER { best = Some(d); break; }
+        }
+        let best = best.unwrap();
+        let pot = ix(V::SUB_PAY_POT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+            AccountMeta::new_readonly(best, false), AccountMeta::new(kp(0xC1).pubkey(), false),
+            AccountMeta::new(kp(0xA1).pubkey(), false)]);
+        send(&mut ch.ctx, pot.clone(), &[&caller]).await.unwrap();
+        assert!(send(&mut ch.ctx, pot, &[&caller]).await.is_err(), "executor pot paid once");
+    }
+    for &d in disputes {
+        let c_before = matrix_balance(ch, kp(0xC1).pubkey()).await;
+        let e_before = matrix_balance(ch, kp(0xE1).pubkey()).await;
+        let dispute_rent = matrix_balance(ch, d).await;
+        let buffer_e = ch.buffer(d, V::ROLE_EXECUTOR);
+        let buffer_c = ch.buffer(d, V::ROLE_CHALLENGER);
+        let e_rent = matrix_balance(ch, buffer_e).await;
+        let c_rent = matrix_balance(ch, buffer_c).await;
+        let e_creator = ch.ctx.banks_client.get_account(ch.buffer(d, V::ROLE_EXECUTOR)).await.unwrap()
+            .is_some_and(|a| a.data.get(5) == Some(&1));
+        ch.close_dispute(d).await.unwrap();
+        assert!(ch.close_dispute(d).await.is_err(), "dispute rent paid once");
+        assert_eq!(matrix_balance(ch, kp(0xC1).pubkey()).await,
+            c_before + dispute_rent + c_rent + if e_creator { 0 } else { e_rent }, "recorded challenger rent payer");
+        assert_eq!(matrix_balance(ch, kp(0xE1).pubkey()).await,
+            e_before + if e_creator { e_rent } else { 0 }, "recorded executor buffer creator");
+    }
+    if ch.run_status().await == V::RUN_COMMITTED {
+        let fin = ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+            AccountMeta::new(kp(0xE1).pubkey(), false)]);
+        send(&mut ch.ctx, fin.clone(), &[&caller]).await.unwrap();
+        assert!(send(&mut ch.ctx, fin, &[&caller]).await.is_err(), "executor bond paid once");
+    }
+    let cache = matrix_cache(ch);
+    let cache_rent = matrix_balance(ch, cache).await;
+    if cache_rent > 0 {
+        let e_before = matrix_balance(ch, kp(0xE1).pubkey()).await;
+        ch.close_cache(cache, kp(0xE1).pubkey()).await.unwrap();
+        assert_eq!(matrix_balance(ch, kp(0xE1).pubkey()).await, e_before + cache_rent, "cache creator refund");
+        assert!(ch.close_cache(cache, kp(0xE1).pubkey()).await.is_err());
+    }
+    ch.close_run(0xB1).await.unwrap();
+    assert!(ch.close_run(0xB1).await.is_err(), "run rent paid once");
+    ch.close_template().await.unwrap();
+    assert!(ch.close_template().await.is_err(), "template rent paid once");
+    let run = ch.run;
+    let receipt_rent = matrix_balance(ch, run).await;
+    let payer_share = if ch.run_status().await == V::RUN_REFUTED {
+        EXECUTOR_BOND - EXECUTOR_BOND * SLASHER_BPS as u64 / 10_000
+    } else { 0 };
+    assert_eq!(matrix_balance(ch, kp(0xA1).pubkey()).await,
+        10_000_000_000 + payer_share - receipt_rent, "recorded run and template payer");
+    assert_eq!(matrix_ledger(ch, disputes).await, before, "lamport conservation");
+    // The caller labels only the side that made its owed moves honestly.
+    assert!(matrix_balance(ch, kp(honest).pubkey()).await >= 10_000_000_000,
+        "honest party net negative");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_expired_phase_survives_later_open_and_pick_in_both_orders() {
+    for executor_first in [true, false] {
+        let mut ch = Chain::new(5_000).await;
+        let c = ch.honest();
+        let ds = [ch.dispute(90), ch.dispute(91)];
+        let before = matrix_ledger(&mut ch, &ds).await;
+        ch.commit(&c).await;
+        let expired = ch.open(90, V::KIND_STEP_DESCEND).await;
+        let deadline = matrix_deadline(&mut ch, expired).await;
+        if executor_first {
+            ch.ctx.warp_to_slot(deadline - 100).unwrap();
+            let puppet = ch.open(91, V::KIND_STEP_DESCEND).await;
+            matrix_nodes(&mut ch, puppet, &c).await;
+        }
+        ch.ctx.warp_to_slot(deadline + 1).unwrap();
+        if executor_first { matrix_pick(&mut ch, ds[1]).await; }
+        else {
+            let puppet = ch.open(91, V::KIND_STEP_DESCEND).await;
+            matrix_nodes(&mut ch, puppet, &c).await;
+            matrix_pick(&mut ch, puppet).await;
+        }
+        // Later OPEN and PICK cannot revive the already expired E phase.
+        let caller = kp(0xA1);
+        let i = ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+            AccountMeta::new(expired, false), AccountMeta::new(kp(0xE1).pubkey(), false),
+            AccountMeta::new(kp(0xC1).pubkey(), false)]);
+        send(&mut ch.ctx, i, &[&caller]).await.unwrap();
+        assert_eq!(ch.ruling(expired).await, V::RULING_CHALLENGER);
+        matrix_settle(&mut ch, &ds, before, 0xC1).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_ended_puppets_reset_the_next_phase_window_in_both_orders() {
+    for executor_first in [true, false] {
+        let mut ch = Chain::new(5_000).await;
+        let c = ch.honest();
+        let ds = [ch.dispute(92), ch.dispute(93), ch.dispute(94)];
+        let before = matrix_ledger(&mut ch, &ds).await;
+        ch.commit(&c).await;
+        ch.open(92, V::KIND_STEP_DESCEND).await;
+        ch.open(93, V::KIND_STEP_DESCEND).await;
+        for d in if executor_first { [ds[0], ds[1]] } else { [ds[1], ds[0]] } {
+            matrix_nodes(&mut ch, d, &c).await;
+        }
+        let end = matrix_deadline(&mut ch, ds[0]).await.max(matrix_deadline(&mut ch, ds[1]).await);
+        ch.ctx.warp_to_slot(end + 1).unwrap();
+        for d in if executor_first { [ds[1], ds[0]] } else { [ds[0], ds[1]] } {
+            let caller = kp(0xA1);
+            let i = ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true),
+                AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+                AccountMeta::new(d, false), AccountMeta::new(kp(0xE1).pubkey(), false),
+                AccountMeta::new(kp(0xC1).pubkey(), false)]);
+            send(&mut ch.ctx, i, &[&caller]).await.unwrap();
+            assert_eq!(ch.ruling(d).await, V::RULING_EXECUTOR);
+        }
+        assert_eq!(matrix_wait(&mut ch).await.0, 0);
+        let start = ch.ctx.banks_client.get_root_slot().await.unwrap();
+        ch.open(94, V::KIND_STEP_DESCEND).await;
+        assert_eq!(matrix_deadline(&mut ch, ds[2]).await, start + 750,
+            "fresh phase gets base window and zero current extension");
+        matrix_nodes(&mut ch, ds[2], &c).await;
+        matrix_settle(&mut ch, &ds, before, 0xE1).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_challenger_owed_anchor_and_pick_cannot_change_honest_deadline() {
+    for executor_first in [true, false] {
+        let mut ch = Chain::new(5_000).await;
+        let c = ch.honest();
+        let ds = [ch.dispute(95), ch.dispute(96), ch.dispute(97)];
+        let before = matrix_ledger(&mut ch, &ds).await;
+        ch.commit(&c).await;
+        ch.open(95, V::KIND_STEP_DESCEND).await;
+        ch.open(96, V::KIND_STEP_DESCEND).await;
+        ch.open(97, V::KIND_STEP_DESCEND).await;
+        // 95 is the puppet anchor, parked waiting for its challenger.
+        matrix_nodes(&mut ch, ds[0], &c).await;
+        let honest_deadline = matrix_deadline(&mut ch, ds[1]).await;
+        matrix_nodes(&mut ch, ds[2], &c).await;
+        if executor_first {
+            matrix_nodes(&mut ch, ds[1], &c).await;
+            let pick_phase_deadline = matrix_deadline(&mut ch, ds[1]).await;
+            matrix_pick(&mut ch, ds[2]).await;
+            assert_eq!(matrix_deadline(&mut ch, ds[1]).await, pick_phase_deadline);
+        } else {
+            matrix_pick(&mut ch, ds[2]).await;
+            assert_eq!(matrix_deadline(&mut ch, ds[1]).await, honest_deadline);
+            matrix_nodes(&mut ch, ds[1], &c).await;
+        }
+        matrix_leaf(&mut ch, ds[2], &c).await;
+        matrix_settle(&mut ch, &ds, before, 0xE1).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_leaf_timeout_and_leaf_moot_in_both_orders() {
+    for (executor_first, explicit_moot) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut ch = Chain::new(5_000).await;
+        let h = ch.honest();
+        let mut leaf = h.leaves[1].clone().unwrap();
+        let n = leaf.len();
+        leaf[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
+        let c = commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(leaf)], h.outs);
+        let ds = [ch.dispute(98), ch.dispute(99)];
+        let before = matrix_ledger(&mut ch, &ds).await;
+        ch.commit(&c).await;
+        ch.open(98, V::KIND_STEP_DESCEND).await;
+        ch.open(99, V::KIND_STEP_DESCEND).await;
+        if executor_first {
+            matrix_nodes(&mut ch, ds[1], &c).await; matrix_pick(&mut ch, ds[1]).await;
+            ch.win_by_step(ds[0], &c).await;
+        } else {
+            ch.win_by_step(ds[0], &c).await;
+            // A post-refutation reveal is permitted for an already open dispute.
+            matrix_nodes(&mut ch, ds[1], &c).await; matrix_pick(&mut ch, ds[1]).await;
+        }
+        assert_eq!(ch.ruling(ds[0]).await, V::RULING_CHALLENGER);
+        assert_eq!(ch.ctx.banks_client.get_account(ds[1]).await.unwrap().unwrap().data[4], 3, "LEAF phase");
+        let caller = kp(0xA1);
+        let i = if explicit_moot {
+            ix(V::SUB_MOOT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true),
+                AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+                AccountMeta::new(ds[1], false), AccountMeta::new(kp(0xC1).pubkey(), false)])
+        } else {
+            let deadline = matrix_deadline(&mut ch, ds[1]).await;
+            ch.ctx.warp_to_slot(deadline + 1).unwrap();
+            ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true),
+                AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+                AccountMeta::new(ds[1], false), AccountMeta::new(kp(0xE1).pubkey(), false),
+                AccountMeta::new(kp(0xC1).pubkey(), false)])
+        };
+        send(&mut ch.ctx, i, &[&caller]).await.unwrap();
+        assert_eq!(ch.ruling(ds[1]).await, V::RULING_MOOT, "F1 beats LEAF timeout");
+        matrix_settle(&mut ch, &ds, before, 0xC1).await;
+    }
+    for executor_first in [true, false] {
+        let mut ch = Chain::new(5_000).await;
+        let c = ch.honest();
+        let ds = [ch.dispute(100), ch.dispute(101)];
+        let before = matrix_ledger(&mut ch, &ds).await;
+        ch.commit(&c).await;
+        ch.open(100, V::KIND_STEP_DESCEND).await;
+        ch.open(101, V::KIND_STEP_DESCEND).await;
+        for d in if executor_first { ds } else { [ds[1], ds[0]] } {
+            matrix_nodes(&mut ch, d, &c).await;
+            matrix_pick(&mut ch, d).await;
+        }
+        let deadline = matrix_deadline(&mut ch, ds[0]).await;
+        ch.ctx.warp_to_slot(deadline + 1).unwrap();
+        let caller = kp(0xA1);
+        let i = ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+            AccountMeta::new(ds[0], false), AccountMeta::new(kp(0xE1).pubkey(), false),
+            AccountMeta::new(kp(0xC1).pubkey(), false)]);
+        send(&mut ch.ctx, i, &[&caller]).await.unwrap();
+        assert_eq!(ch.ruling(ds[0]).await, V::RULING_CHALLENGER, "LEAF timeout rules against E");
+        matrix_settle(&mut ch, &ds, before, 0xC1).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_cache_answer_decrements_wait_exactly_once_in_both_orders() {
+    for executor_first in [true, false] {
+        let mut ch = Chain::new(5_000).await;
+        let c = ch.honest();
+        let ds = [ch.dispute(102), ch.dispute(103)];
+        let before = matrix_ledger(&mut ch, &ds).await;
+        ch.commit(&c).await;
+        ch.open(102, V::KIND_STEP_DESCEND).await;
+        ch.open(103, V::KIND_STEP_DESCEND).await;
+        let source = if executor_first { ds[0] } else { ds[1] };
+        let target = if executor_first { ds[1] } else { ds[0] };
+        matrix_nodes(&mut ch, source, &c).await;
+        assert_eq!(matrix_wait(&mut ch).await.0, 1);
+        let challenger = kp(0xC1);
+        let i = ix(V::SUB_CACHE_ANSWER, &[], vec![AccountMeta::new_readonly(challenger.pubkey(), true),
+            AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+            AccountMeta::new(target, false), AccountMeta::new_readonly(matrix_cache(&ch), false)]);
+        send(&mut ch.ctx, i.clone(), &[&challenger]).await.unwrap();
+        assert_eq!(matrix_wait(&mut ch).await.0, 0);
+        assert!(send(&mut ch.ctx, i, &[&challenger]).await.is_err(), "cache answer twice");
+        assert_eq!(matrix_wait(&mut ch).await.0, 0);
+        matrix_settle(&mut ch, &ds, before, 0xE1).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_f1_moot_beats_executor_phase_timeout_in_both_orders() {
+    for executor_first in [true, false] {
+        let mut ch = Chain::new(5_000).await;
+        let h = ch.honest();
+        let mut leaf = h.leaves[1].clone().unwrap();
+        let n = leaf.len();
+        leaf[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
+        let c = commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(leaf)], h.outs);
+        let ds = [ch.dispute(104), ch.dispute(105)];
+        let before = matrix_ledger(&mut ch, &ds).await;
+        ch.commit(&c).await;
+        ch.open(104, V::KIND_STEP_DESCEND).await;
+        ch.open(105, V::KIND_STEP_DESCEND).await;
+        if executor_first { matrix_nodes(&mut ch, ds[1], &c).await; matrix_pick(&mut ch, ds[1]).await; }
+        ch.win_by_step(ds[0], &c).await;
+        if !executor_first { matrix_nodes(&mut ch, ds[1], &c).await; matrix_pick(&mut ch, ds[1]).await; }
+        let deadline = matrix_deadline(&mut ch, ds[1]).await;
+        ch.ctx.warp_to_slot(deadline + 1).unwrap();
+        let caller = kp(0xA1);
+        let i = ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true),
+            AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+            AccountMeta::new(ds[1], false), AccountMeta::new(kp(0xE1).pubkey(), false),
+            AccountMeta::new(kp(0xC1).pubkey(), false)]);
+        send(&mut ch.ctx, i, &[&caller]).await.unwrap();
+        assert_eq!(ch.ruling(ds[1]).await, V::RULING_MOOT);
+        matrix_settle(&mut ch, &ds, before, 0xC1).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_staging_on_both_buffers_is_refused_after_rule_in_both_orders() {
+    for executor_first in [true, false] {
+        let mut ch = Chain::new(5_000).await;
+        let c = ch.honest();
+        let ds = [ch.dispute(106), ch.dispute(107)];
+        let before = matrix_ledger(&mut ch, &ds).await;
+        ch.commit(&c).await;
+        ch.open(106, V::KIND_STEP_DESCEND).await; // no buffers: test create refusal
+        ch.open(107, V::KIND_STEP_DESCEND).await; // both buffers: test write/grow refusal
+        for role in if executor_first { [V::ROLE_EXECUTOR, V::ROLE_CHALLENGER] }
+                    else { [V::ROLE_CHALLENGER, V::ROLE_EXECUTOR] } {
+            let creator = if role == V::ROLE_EXECUTOR { kp(0xE1) } else { kp(0xC1) };
+            let mut data = vec![role];
+            data.extend_from_slice(&1u32.to_le_bytes());
+            let i = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(creator.pubkey(), true),
+                AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+                AccountMeta::new_readonly(ds[1], false), AccountMeta::new(ch.buffer(ds[1], role), false),
+                AccountMeta::new_readonly(SYSTEM, false)]);
+            send(&mut ch.ctx, i, &[&creator]).await.unwrap();
+        }
+        for d in if executor_first { ds } else { [ds[1], ds[0]] } {
+            ch.step(d, &c, 1).await;
+            let mut body = vec![V::CLAIM_EDGE, 0];
+            body.extend(ch.spec_opening(STEP_BASE as usize + 1));
+            body.extend(ch.step_opening(&c, 0));
+            ch.claim(d, body).await.unwrap();
+            assert_eq!(ch.ruling(d).await, V::RULING_EXECUTOR);
+        }
+        for role in [V::ROLE_EXECUTOR, V::ROLE_CHALLENGER] {
+            let creator = if role == V::ROLE_EXECUTOR { kp(0xE1) } else { kp(0xC1) };
+            let mut data = vec![role];
+            data.extend_from_slice(&1u32.to_le_bytes());
+            let create = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(creator.pubkey(), true),
+                AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+                AccountMeta::new_readonly(ds[0], false), AccountMeta::new(ch.buffer(ds[0], role), false),
+                AccountMeta::new_readonly(SYSTEM, false)]);
+            assert!(send(&mut ch.ctx, create, &[&creator]).await.is_err(), "create after RULED");
+            let buffer = ch.buffer(ds[1], role);
+            let balance = matrix_balance(&mut ch, buffer).await;
+            let raw = ch.ctx.banks_client.get_account(buffer).await.unwrap().unwrap().data;
+            let write = ix(V::SUB_STAGE_WRITE, &[0, 0, 0, 0, 0xAA], vec![
+                AccountMeta::new_readonly(creator.pubkey(), true), AccountMeta::new_readonly(ch.run, false),
+                AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(ds[1], false),
+                AccountMeta::new(buffer, false)]);
+            assert!(send(&mut ch.ctx, write, &[&creator]).await.is_err(), "write after RULED");
+            let grow = ix(V::SUB_STAGE_GROW, &1u32.to_le_bytes(), vec![
+                AccountMeta::new(creator.pubkey(), true), AccountMeta::new_readonly(ch.run, false),
+                AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(ds[1], false),
+                AccountMeta::new(buffer, false), AccountMeta::new_readonly(SYSTEM, false)]);
+            assert!(send(&mut ch.ctx, grow, &[&creator]).await.is_err(), "grow after RULED");
+            assert_eq!(matrix_balance(&mut ch, buffer).await, balance, "refusal preserves lamports");
+            assert_eq!(ch.ctx.banks_client.get_account(buffer).await.unwrap().unwrap().data, raw,
+                "refusal preserves bytes");
+        }
+        matrix_settle(&mut ch, &ds, before, 0xE1).await;
+    }
+}
+
+async fn matrix_log_fixture(s: &serde_json::Value) -> Chain {
+    let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
+    let mut test = ProgramTest::default();
+    test.prefer_bpf(sbf);
+    if sbf { test.add_program("dcg_program", PROGRAM, None); }
+    else { test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction)); }
+    for b in [0xA1u8, 0xE1, 0xC1, 0xB1] {
+        test.add_account(kp(b).pubkey(), Account { lamports: 10_000_000_000, data: vec![],
+            owner: SYSTEM, executable: false, rent_epoch: 0 });
+    }
+    let mut ctx = test.start_with_context().await;
+    let admitter = kp(0xA1);
+    let tdata = hex(s["template_data"].as_str().unwrap());
+    let template_id = sha256(&[V::TEMPLATE_DOMAIN, &tdata]);
+    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, admitter.pubkey().as_ref()], &PROGRAM).0;
+    send(&mut ctx, ix(V::SUB_CREATE_TEMPLATE, &tdata, vec![AccountMeta::new(admitter.pubkey(), true),
+        AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
+    let nonce = hex(s["nonce"].as_str().unwrap());
+    let refs: Vec<Vec<u8>> = s["refs"].as_array().unwrap().iter().map(|r| hex(r.as_str().unwrap())).collect();
+    let flat = refs.concat();
+    let mut init = nonce.clone();
+    init.extend_from_slice(kp(0xE1).pubkey().as_ref());
+    init.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+    init.extend_from_slice(&flat);
+    let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &nonce,
+        &(refs.len() as u32).to_le_bytes(), &flat, kp(0xE1).pubkey().as_ref()]);
+    let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
+    send(&mut ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true),
+        AccountMeta::new(run, false), AccountMeta::new(template, false),
+        AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
+    Chain { ctx, template, run, run_id, g: golden(), spec_levels: vec![], legacy_template: false }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_log_step_and_empty_predecessor_are_neutral_in_both_orders() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/dcg/disputes_v21/log_neutral_scenarios.json");
+    let scenarios: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    // The output lie is a well-formed LOG leaf with malformed computation;
+    // the first STATE has the initial (empty) predecessor.
+    for name in ["log-k2-output-lie-STEP", "log-k0-honest-STATE"] {
+        let s = scenarios.iter().find(|s| s["name"] == name).unwrap();
+        assert_eq!(s["ruling"], "moot");
+        for executor_first in [true, false] {
+            let mut ch = matrix_log_fixture(s).await;
+            let ds = [ch.dispute(108), ch.dispute(109)];
+            let before = matrix_ledger(&mut ch, &ds).await;
+            let root = hex(s["root_bytes"].as_str().unwrap());
+            assert_eq!(&root[32..64], &ch.run_id);
+            let executor = kp(0xE1);
+            send(&mut ch.ctx, ix(V::SUB_COMMIT, &root, vec![AccountMeta::new(executor.pubkey(), true),
+                AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+                AccountMeta::new_readonly(SYSTEM, false)]), &[&executor]).await.unwrap();
+            for nonce in [108, 109] { ch.open(nonce, V::KIND_STEP_DESCEND).await; }
+            let round = &s["rounds"][0];
+            let reveal = hex(round["reveal"].as_str().unwrap());
+            let leaf = hex(s["leaf"].as_str().unwrap());
+            let claim = hex(s["claim"].as_str().unwrap());
+            for d in if executor_first { ds } else { [ds[1], ds[0]] } {
+                let accounts = ch.party(0xE1, d);
+                send(&mut ch.ctx, ix(V::SUB_REVEAL_NODES, &reveal, accounts), &[&executor]).await.unwrap();
+                let challenger = kp(0xC1);
+                let accounts = ch.party(0xC1, d);
+                send(&mut ch.ctx, ix(V::SUB_PICK, &[round["pick"].as_u64().unwrap() as u8],
+                    accounts), &[&challenger]).await.unwrap();
+                let accounts = ch.party(0xE1, d);
+                send(&mut ch.ctx, ix(V::SUB_REVEAL_LEAF, &leaf, accounts), &[&executor]).await.unwrap();
+                let mut accounts = vec![AccountMeta::new_readonly(challenger.pubkey(), true),
+                    AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+                    AccountMeta::new(d, false), AccountMeta::new(executor.pubkey(), false),
+                    AccountMeta::new(challenger.pubkey(), false)];
+                let body = if claim.len() > 700 {
+                    ch.stage(d, V::ROLE_CHALLENGER, claim.len() as u32, &claim, 400).await;
+                    accounts.push(AccountMeta::new_readonly(ch.buffer(d, V::ROLE_CHALLENGER), false));
+                    vec![V::FROM_STAGING]
+                } else { claim.clone() };
+                send(&mut ch.ctx, ix(V::SUB_CLAIM, &body, accounts), &[&challenger]).await.unwrap();
+                assert_eq!(ch.ruling(d).await, V::RULING_MOOT, "{name}: neutral current rule");
+            }
+            matrix_settle(&mut ch, &ds, before, 0xE1).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "finding: structurally malformed committed LOG leaf rules CHALLENGER before STEP neutrality"]
+async fn matrix_structurally_malformed_log_leaf_step_is_neutral_in_both_orders() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/dcg/disputes_v21/log_neutral_scenarios.json");
+    let scenarios: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let s = scenarios.iter().find(|s| s["name"] == "log-k0-honest-STEP").unwrap();
+    let mut observed = Vec::new();
+    for executor_first in [true, false] {
+        let mut ch = matrix_log_fixture(s).await;
+        let d = ch.dispute(110);
+        let before = matrix_ledger(&mut ch, &[d]).await;
+        let mut leaf = hex(s["leaf"].as_str().unwrap());
+        assert_eq!(leaf[0], 1);
+        leaf.truncate(2); // present, but too short to parse as a leaf; committed by E
+        let round = &s["rounds"][0];
+        let mut hashes: Vec<D::Hash> = hex(round["reveal"].as_str().unwrap())
+            .chunks_exact(32).map(|h| h.try_into().unwrap()).collect();
+        assert_eq!(hashes.len(), 4);
+        hashes[0] = D::leaf_hash(&Soft, Some(&leaf[1..]));
+        let left = D::node(&Soft, D::Tree::Step, 0, &hashes[0], &hashes[1]);
+        let right = D::node(&Soft, D::Tree::Step, 0, &hashes[2], &hashes[3]);
+        let root_hash = D::node(&Soft, D::Tree::Step, 1, &left, &right);
+        let mut root = hex(s["root_bytes"].as_str().unwrap());
+        root[104..136].copy_from_slice(&root_hash);
+        let reveal: Vec<u8> = hashes.iter().flat_map(|h| h.iter().copied()).collect();
+        let claim = hex(s["claim"].as_str().unwrap());
+        let executor = kp(0xE1);
+        send(&mut ch.ctx, ix(V::SUB_COMMIT, &root, vec![AccountMeta::new(executor.pubkey(), true),
+            AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false),
+            AccountMeta::new_readonly(SYSTEM, false)]), &[&executor]).await.unwrap();
+        ch.open(110, V::KIND_STEP_DESCEND).await;
+        if !executor_first { ch.stage(d, V::ROLE_CHALLENGER, claim.len() as u32, &claim, 400).await; }
+        let accounts = ch.party(0xE1, d);
+        send(&mut ch.ctx, ix(V::SUB_REVEAL_NODES, &reveal, accounts), &[&executor]).await.unwrap();
+        if executor_first { ch.stage(d, V::ROLE_CHALLENGER, claim.len() as u32, &claim, 400).await; }
+        let challenger = kp(0xC1);
+        let accounts = ch.party(0xC1, d);
+        send(&mut ch.ctx, ix(V::SUB_PICK, &[0], accounts), &[&challenger]).await.unwrap();
+        let accounts = ch.party(0xE1, d);
+        send(&mut ch.ctx, ix(V::SUB_REVEAL_LEAF, &leaf, accounts), &[&executor]).await.unwrap();
+        let claim_ix = ix(V::SUB_CLAIM, &[V::FROM_STAGING], vec![
+            AccountMeta::new_readonly(challenger.pubkey(), true), AccountMeta::new(ch.run, false),
+            AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false),
+            AccountMeta::new(executor.pubkey(), false), AccountMeta::new(challenger.pubkey(), false),
+            AccountMeta::new_readonly(ch.buffer(d, V::ROLE_CHALLENGER), false)]);
+        send(&mut ch.ctx, claim_ix, &[&challenger]).await.unwrap();
+        let ruling = ch.ruling(d).await;
+        matrix_settle(&mut ch, &[d], before, 0xC1).await;
+        observed.push(ruling);
+    }
+    assert_eq!(observed, [V::RULING_MOOT; 2], "malformed committed LOG leaf should be neutral");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn l6_endings_matrix_native_and_sbf() {
     let rows = [Ending::Proof, Ending::NodesTimeout, Ending::PickTimeout,
