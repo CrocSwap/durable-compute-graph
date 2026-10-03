@@ -83,7 +83,7 @@ impl Chain {
             Transaction::new_signed_with_payer(&all, Some(&payer.pubkey()), &signers, blockhash)
         };
         let mut outcome = self.ctx.banks_client.process_transaction_with_metadata(make(self.blockhash.unwrap())).await;
-        if matches!(&outcome, Err(e) if matches!(e.clone().unwrap(), TransactionError::BlockhashNotFound))
+        if matches!(&outcome, Err(e) if matches!(e.unwrap(), TransactionError::BlockhashNotFound))
             || matches!(&outcome, Ok(inner) if matches!(inner.result, Err(TransactionError::BlockhashNotFound)))
         {
             self.refresh().await;

@@ -1649,31 +1649,9 @@ async fn every_retry_refusal() {
         CL_CLOSE,
         "an escrow derived for a different descriptor"
     );
-    // The expected address still has to be a writable, empty, System-owned
-    // account. These two same-key substitutions exercise its owner and data
-    // checks separately from the key check above.
-    let escrow_key = f.escrow();
-    f.install_at(escrow_key, owned(&f.ids.program, vec![], ESCROW_FLOOR));
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        SETTLEMENT_PROGRAM,
-        "the expected escrow has the wrong owner"
-    );
-    f.install_at(
-        escrow_key,
-        Account {
-            lamports: ESCROW_FLOOR,
-            data: vec![1],
-            owner: SYSTEM,
-            executable: false,
-            rent_epoch: 0,
-        },
-    );
-    assert_eq!(
-        refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
-        SETTLEMENT_PROGRAM,
-        "the expected escrow is not empty"
-    );
+    // A DCG-owned or non-empty escrow at the expected address is a state no
+    // caller can make (only DCG signs for the PDA): the escrow validator's
+    // unit test (bond::escrow_gate_tests; owner decision 2026-10-02).
     f.install_escrow(0);
     assert_eq!(
         refuse(&mut f, vec![TAG_RETRY_BOND_SETTLEMENT], good.clone()).await,
@@ -2011,49 +1989,8 @@ async fn every_settle_refusal_on_a_revision_eight_document() {
         CL_CLOSE,
         "CUSTOM tag 131 refuses a second document's escrow"
     );
-    g.install_at(escrow_key, owned(&g.ids.program, vec![], ESCROW_FLOOR));
-    let metas = g.settle_metas(escrow_key, SYSTEM);
-    assert_eq!(
-        settle_refuse(&mut g, metas).await,
-        SETTLEMENT_PROGRAM,
-        "CUSTOM tag 131 refuses an escrow with the wrong owner"
-    );
-    g.install_at(
-        escrow_key,
-        Account {
-            lamports: ESCROW_FLOOR,
-            data: vec![1],
-            owner: SYSTEM,
-            executable: false,
-            rent_epoch: 0,
-        },
-    );
-    let metas = g.settle_metas(escrow_key, SYSTEM);
-    assert_eq!(
-        settle_refuse(&mut g, metas).await,
-        SETTLEMENT_PROGRAM,
-        "CUSTOM tag 131 refuses an escrow with data"
-    );
-    let document_key = g.dcm2();
-    let original_dcm2 = g.data(document_key).await;
-    let dcm2_lamports = g.lamports(document_key).await;
-    let mut stale_escrow_bump = original_dcm2.clone();
-    stale_escrow_bump[document::BOND_ESCROW_BUMP_AT] =
-        stale_escrow_bump[document::BOND_ESCROW_BUMP_AT].wrapping_add(1);
-    g.install_at(
-        document_key,
-        owned(&g.ids.program, stale_escrow_bump, dcm2_lamports),
-    );
-    let metas = g.settle_metas(escrow_key, SYSTEM);
-    assert_eq!(
-        settle_refuse(&mut g, metas).await,
-        CL_CLOSE,
-        "CUSTOM tag 131 refuses a stale stored escrow bump"
-    );
-    g.install_at(
-        document_key,
-        owned(&g.ids.program, original_dcm2, dcm2_lamports),
-    );
+    // A DCG-owned or non-empty escrow, and a stale stored escrow bump, are
+    // states no caller can make: bond::escrow_gate_tests.
     // 733: the record is not in phase 3.
     let mut h = build().await;
     let t3 = standard(h.ids.remainder, 2_500);

@@ -907,3 +907,51 @@ mod tests {
         assert_eq!(doc[529], BOND_PAID);
     }
 }
+
+/// The escrow validators on constructed accounts. A DCG-owned escrow, one
+/// with data, and a stale stored bump are states no caller can make (only DCG
+/// signs for the PDA), so they are unit tests rather than bank patches (owner
+/// decision 2026-10-02); a substituted or read-only escrow is the caller's.
+#[cfg(test)]
+mod escrow_gate_tests {
+    use super::*;
+    use solana_program::system_program;
+
+    const DESCRIPTOR: [u8; 32] = [0x6E; 32];
+
+    fn check(
+        program: &Pubkey,
+        key: Pubkey,
+        owner: Pubkey,
+        mut data: Vec<u8>,
+        writable: bool,
+        bump: Option<u8>,
+    ) -> Result<(), ProgramError> {
+        let mut lamports = 890_880u64;
+        let info = AccountInfo::new(&key, false, writable, &mut lamports, &mut data, &owner, false, 0);
+        match bump {
+            None => validate_escrow(program, &info, &DESCRIPTOR).map(|_| ()),
+            Some(b) => validate_escrow_with_bump(program, &info, &DESCRIPTOR, b),
+        }
+    }
+
+    #[test]
+    fn the_escrow_must_be_the_writable_empty_system_account_at_its_pda() {
+        let program = Pubkey::new_unique();
+        let (key, bump) = address::bond_escrow(&program, &DESCRIPTOR);
+        let system = system_program::ID;
+        for b in [None, Some(bump)] {
+            assert_eq!(check(&program, key, system, vec![], true, b), Ok(()), "honest, bump {b:?}");
+            assert_eq!(check(&program, key, program, vec![], true, b), Err(no(SETTLEMENT_PROGRAM)), "DCG-owned");
+            assert_eq!(check(&program, key, system, vec![0], true, b), Err(no(SETTLEMENT_PROGRAM)), "with data");
+            assert_eq!(check(&program, key, system, vec![], false, b), Err(no(SETTLEMENT_PROGRAM)), "read-only");
+            let other = address::bond_escrow(&program, &[0x6F; 32]).0;
+            assert_eq!(check(&program, other, system, vec![], true, b), Err(no(CL_CLOSE)), "another document's escrow");
+        }
+        assert_eq!(
+            check(&program, key, system, vec![], true, Some(bump.wrapping_sub(1))),
+            Err(no(CL_CLOSE)),
+            "a stale stored bump"
+        );
+    }
+}
