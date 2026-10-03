@@ -347,6 +347,7 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
             fault: Callable[[int, list[bytes], bytes | None], tuple[list[bytes], bytes | None]] | None = None,
             input_fault: Callable[[int, int, bytes], bytes] | None = None,
             prior_fault: Callable[[int, bytes], bytes] | None = None,
+            prior_digest_fault: Callable[[int, bytes], bytes] | None = None,
             constants: dict[int, bytes] | None = None,
             list_fault: Callable[[int, int, int, bytes], bytes] | None = None) -> Commitment:
     """The honest execution H (or, with `fault`, an executor that corrupts one
@@ -354,7 +355,8 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
 
     `fault(ordinal, outputs, next_state)` may return altered results;
     `input_fault(ordinal, index, value)` an altered input value and
-    `prior_fault(ordinal, prior)` an altered prior state, both before replay;
+    `prior_fault(ordinal, prior)` an altered prior state before replay;
+    `prior_digest_fault(ordinal, digest)` a forged committed prior digest;
     `list_fault(ordinal, index, element, value)` an altered list element."""
     constants = spec.constant_values if constants is None else constants
     values: dict = {("ext", eid): v for eid, v in external_values.items()}
@@ -435,9 +437,12 @@ def execute(spec: S.Spec, plan_id: bytes, run: bytes, external_values: dict[int,
         if nxt is not None:
             states[ordinal] = nxt
         z = bytes(32)
+        prior_digest = state_digest(d, prior) if prior is not None else z
+        if prior_digest_fault is not None:
+            prior_digest = prior_digest_fault(ordinal, prior_digest)
         leaves[ordinal] = leaf_preimage(
             plan_id, run, d["region"], d["segment"], ordinal, d["node"], d["kernel_step"], in_refs, out_refs,
-            state_digest(d, prior) if prior is not None else z,
+            prior_digest,
             state_digest(d, nxt) if nxt is not None else z)
 
     for bi, blk in enumerate(spec.blocks):

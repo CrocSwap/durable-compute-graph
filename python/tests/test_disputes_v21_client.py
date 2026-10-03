@@ -66,6 +66,22 @@ def test_close_run_marks_the_tracked_template_writable():
     assert metas[3].pubkey == payer and metas[3].is_writable
 
 
+def test_close_cache_does_not_write_run():
+    class RecordingClient:
+        payer = Keypair()
+
+        def send(self, data, metas, signers, cu, heap_frame=None):
+            self.call = (data, metas)
+            return "sig"
+
+    gc = RecordingClient()
+    client = DisputeClient(gc)
+    client.close_cache(Pubkey.new_unique(), Pubkey.new_unique(), Pubkey.new_unique())
+    data, metas = gc.call
+    assert data == bytes([227, 20])
+    assert not metas[1].is_writable
+
+
 def test_client_plays_a_recorded_list_dispute_through_staging():
     import importlib.util
     from pathlib import Path
@@ -118,6 +134,9 @@ def test_client_plays_a_recorded_list_dispute_through_staging():
     assert executor_buffer in [meta.pubkey for meta in reveal[2]]
     assert executor_buffer == claim[2][-1].pubkey and claim[3] == LIST_HEAP_FRAME
     assert any(call[0] == 14 for call in gc.calls)
+    for sub, _body, metas, _ in gc.calls:
+        if sub in (14, 15, 17):
+            assert not metas[1].is_writable, f"stage sub {sub} needlessly writes run"
     writes = [(int.from_bytes(body[:4], "little"), body[4:]) for sub, body, metas, _ in gc.calls
               if sub == 15 and metas[-1].pubkey == executor_buffer]
     assert writes

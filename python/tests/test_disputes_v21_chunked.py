@@ -6,6 +6,7 @@ from __future__ import annotations
 import random
 import struct
 import unittest
+import pytest
 
 from dcg.disputes_v21 import game as G
 from dcg.disputes_v21 import plans as P
@@ -134,6 +135,55 @@ def kv_plan(n_chunks: int, capacity: int = 8):
     blk = b.repeated([step], n_chunks, (0, 1))
     b.output(S.producer(6, blk, 0, 0), 8)
     return b.build()
+
+
+def test_log_kind1_predecessor_must_keep_scheme_and_capacity():
+    # Review A1: changing capacity makes an honest predecessor digest differ.
+    for predecessor_log, capacity, accepted in ((True, 8, True), (True, 4, False), (False, 8, False)):
+        b = P.PlanBuilder()
+        b.chunked_input(0, 128, 6)
+        s0 = P.Step("logsum_i32l", (P.Input(S.producer(5, 0, 2, 0, 0), 64),),
+                    ((0, 8, False), (1, 4, True)), log=(4, 8)) if predecessor_log else P.Step(
+                        "sum_i32", (P.Input(S.producer(5, 0, 2, 0, 0), 64),),
+                        ((0, 8, False), (1, 4, True)), state_bytes=8, state_export=0)
+        s1 = P.Step("logsum_i32l", (P.Input(S.producer(5, 0, 2, 0, 1), 64),),
+                    ((0, 8, False), (1, 4, True)), state_predecessor=S.producer(1, 0),
+                    log=(4, capacity))
+        b.enumerated([s0, s1])
+        b.output(S.producer(1, 1, 0), 8)
+        if accepted:
+            sp = b.build()
+            assert S.decode_step_spec(sp.step_spec(1))["state_size"] == 8
+            refs, run, honest, committed = setup(sp, {0: words(list(range(1, 33)))})
+            assert play(sp, refs, run, honest, committed)[0] is None
+        else:
+            with pytest.raises(S.SpecError, match="same scheme and capacity"):
+                b.build()
+
+
+def test_log_to_small_chain_is_refused():
+    # Re-review of the fix round: a SMALL step whose kind-1 predecessor is LOG has
+    # no honest execution (the reference kernel refuses it), so the plan refuses it.
+    for small_bytes in (8, 16, 32):
+        b = P.PlanBuilder()
+        b.chunked_input(0, 128, 6)
+        s0 = P.Step("logsum_i32l", (P.Input(S.producer(5, 0, 2, 0, 0), 64),),
+                    ((0, 8, False), (1, 4, True)), log=(4, 4))
+        s1 = P.Step("sum_i32", (P.Input(S.producer(5, 0, 2, 0, 1), 64),),
+                    ((0, 8, False), (1, 4, True)), state_predecessor=S.producer(1, 0),
+                    state_bytes=small_bytes, state_export=0)
+        b.enumerated([s0, s1])
+        b.output(S.producer(1, 1, 0), 8)
+        with pytest.raises(S.SpecError, match="same scheme and capacity"):
+            b.build()
+
+
+def test_log_kind2_state_claim_stays_neutral():
+    step = {"state_scheme": 2, "state_predecessor": S.producer(2, 0)}
+    assert G.log_claim_neutral(step, "STATE")
+    assert G.log_claim_neutral(step, "STEP")
+    step["state_scheme"] = 3
+    assert G.log_claim_neutral(step, "STATE")
 
 
 def setup(sp: S.Spec, values: dict[int, bytes], fault=None, **faults):

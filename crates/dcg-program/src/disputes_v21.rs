@@ -29,8 +29,8 @@
 //!
 //! Rent reclaim: subs 18 to 20 close disputes (with their staging buffers), shrink settled runs to
 //! their receipts (or cancel uncommitted ones) and close reveal caches.
-//! Not yet: staging growth past one CPI creation (10 KiB), the leaf cache, the load extension, receipts, template closes, and the full v2.1
-//! template identity.
+//! Not yet: the leaf cache and the full v2.1 template identity. The bounded
+//! load extension uses c=1 and extend_slots=phase_window.
 
 use dcg_disputes as D;
 use dcg_disputes::blocks::{self, Block};
@@ -419,6 +419,8 @@ const R_PAID: usize = 184; // pot paid (u8)
 const R_CLOSED: usize = 188; // disputes closed (u32); a run closes when this reaches R_SEQ
 const R_ROOT: usize = 192;
 const R_REFS: usize = R_ROOT + D::RUN_ROOT_BYTES;
+// After the external refs: waiting_E:u32. Each dispute stores its own deadline.
+const R_LOAD_BYTES: usize = 4;
 
 pub const RUN_OPEN: u8 = 0;
 pub const RUN_COMMITTED: u8 = 1;
@@ -430,6 +432,16 @@ fn run_checked(program_id: &Pubkey, run: &AccountInfo, template: &AccountInfo) -
     if d.len() < R_REFS || &d[0..4] != b"D21R" || d[R_TEMPLATE..R_TEMPLATE + 32] != template.key.to_bytes() {
         return Err(err(5));
     }
+    let refs_end = R_REFS.checked_add((u32_at(&d, R_NEXT)? as usize).checked_mul(52).ok_or(err(8))?).ok_or(err(8))?;
+    if d.len() == refs_end {
+        // A run created before the 4-byte executor-wait trailer (DCG main
+        // before the follow-up B fix) cannot be served by this image. Upgrade
+        // in place only after every run is finalized or refuted, paid and
+        // closed (design §8.3, re-review M1).
+        solana_program::msg!("v2.1 run size {} predates the wait trailer; drain all runs before an in-place upgrade", d.len());
+        return Err(err(40));
+    }
+    if d.len() != refs_end.checked_add(R_LOAD_BYTES).ok_or(err(8))? { return Err(err(8)); }
     derived(program_id, run, &[b"dcg21run", &d[R_RUN_ID..R_RUN_ID + 32], &d[R_PAYER..R_PAYER + 32]])
 }
 
@@ -628,7 +640,7 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &data[0..32], &(n as u32).to_le_bytes(), refs, &data[32..64]]);
     // The payer is part of the run's address (review 10-03, F5): a cancelled
     // run cannot be re-initialized at the same address by someone else.
-    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], R_REFS + refs.len())?;
+    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], R_REFS + refs.len() + R_LOAD_BYTES)?;
     let mut d = run.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"D21R");
     d[R_TEMPLATE..R_TEMPLATE + 32].copy_from_slice(tmpl.key.as_ref());
@@ -641,7 +653,7 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     // within the template's challenge window; after it, the payer may cancel.
     let commit_deadline = now()?.checked_add(t.challenge_window).ok_or(err(8))?;
     d[R_DEADLINE..R_DEADLINE + 8].copy_from_slice(&commit_deadline.to_le_bytes());
-    d[R_REFS..].copy_from_slice(refs);
+    d[R_REFS..R_REFS + refs.len()].copy_from_slice(refs);
     drop(d);
     if let Some(next) = next_active_runs {
         let mut t = tmpl.try_borrow_mut_data()?;
@@ -717,13 +729,14 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     if t.challenger_bond > 0 {
         invoke(&system_instruction::transfer(challenger.key, dispute.key, t.challenger_bond), &[challenger.clone(), dispute.clone(), system.clone()])?;
     }
-    let sequence = {
+    let (sequence, deadline) = {
         let mut r = run.try_borrow_mut_data()?;
         let open = u32_at(&r, R_OPEN)?.checked_add(1).ok_or(err(8))?;
         r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
+        let deadline = begin_executor_wait(&mut r, &t)?;
         let seq = u64_at(&r, R_SEQ)?;
         r[R_SEQ..R_SEQ + 8].copy_from_slice(&seq.checked_add(1).ok_or(err(8))?.to_le_bytes());
-        seq
+        (seq, deadline)
     };
     let mut d = dispute.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"D21D");
@@ -731,7 +744,6 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     d[D_KIND] = kind;
     d[D_DEPTH] = t.depth as u8;
     d[D_LEVEL..D_LEVEL + 4].copy_from_slice(&level.to_le_bytes());
-    let deadline = now()?.checked_add(executor_window(&t, run)?).ok_or(err(8))?;
     d[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&deadline.to_le_bytes());
     d[D_CHALLENGER..D_CHALLENGER + 32].copy_from_slice(challenger.key.as_ref());
     d[D_RUN..D_RUN + 32].copy_from_slice(run.key.as_ref());
@@ -761,7 +773,7 @@ fn dispute_ctx<'a, 'b>(program_id: &Pubkey, run: &'a AccountInfo<'b>, tmpl: &Acc
     Ok(Ctx { t, run, dispute })
 }
 
-fn expect_phase(d: &[u8], phase: u8) -> ProgramResult {
+fn expect_phase(d: &[u8], phase: u8, _run: &AccountInfo) -> ProgramResult {
     if d[D_PHASE] != phase {
         return Err(err(12));
     }
@@ -771,12 +783,28 @@ fn expect_phase(d: &[u8], phase: u8) -> ProgramResult {
     Ok(())
 }
 
-/// The window for a phase the executor owes (NODES, LEAF): the template's
-/// phase window times the run's open disputes (the load extension, §8.3;
-/// review 10-03, F4), so concurrent disputes cannot outrun one executor.
-fn executor_window(t: &Template, run: &AccountInfo) -> Result<u64, ProgramError> {
-    let open = u32_at(&run.try_borrow_data()?, R_OPEN)?.max(1) as u64;
-    Ok(t.phase_window.saturating_mul(open).min(MAX_WINDOW))
+fn load_offset(r: &[u8]) -> Result<usize, ProgramError> {
+    let at = R_REFS.checked_add((u32_at(r, R_NEXT)? as usize).checked_mul(52).ok_or(err(8))?).ok_or(err(8))?;
+    if r.len() != at + R_LOAD_BYTES { return Err(err(8)); }
+    Ok(at)
+}
+
+fn begin_executor_wait(r: &mut [u8], t: &Template) -> Result<u64, ProgramError> {
+    let at = load_offset(r)?;
+    let waiting = u32_at(r, at)?;
+    // c=1, extend_slots=phase_window. Cap this phase's entire window.
+    let window = t.phase_window.checked_mul(u64::from(waiting).checked_add(1).ok_or(err(8))?)
+        .ok_or(err(8))?.min(MAX_WINDOW);
+    let deadline = now()?.checked_add(window).ok_or(err(8))?;
+    r[at..at + 4].copy_from_slice(&waiting.checked_add(1).ok_or(err(8))?.to_le_bytes());
+    Ok(deadline)
+}
+
+fn end_executor_wait(r: &mut [u8]) -> ProgramResult {
+    let at = load_offset(r)?;
+    let waiting = u32_at(r, at)?.checked_sub(1).ok_or(err(8))?;
+    r[at..at + 4].copy_from_slice(&waiting.to_le_bytes());
+    Ok(())
 }
 
 fn next_phase(d: &mut [u8], phase: u8, window: u64) -> ProgramResult {
@@ -814,13 +842,13 @@ fn tree_of(kind: u8) -> D::Tree {
     if kind == KIND_STEP_DESCEND { D::Tree::Step } else { D::Tree::Out }
 }
 
-// 5: [executor(s), run, template, dispute(w)] the pickable hashes, in position order.
+// 5: [executor(s), run(w), template, dispute(w)] the pickable hashes, in position order.
 fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     executor_signed(c.run, executor)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
-    expect_phase(&d, PH_NODES)?;
+    expect_phase(&d, PH_NODES, c.run)?;
     let level = u32_at(&d, D_LEVEL)?;
     let position = u64_at(&d, D_POSITION)?;
     let depth = (d[D_DEPTH] as u32).min(level);
@@ -868,16 +896,17 @@ fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
             k[CACHE_BYTES..CACHE_BYTES_V2].copy_from_slice(executor.key.as_ref());
         }
     }
+    end_executor_wait(&mut c.run.try_borrow_mut_data()?)?;
     next_phase(&mut d, PH_PICK, c.t.phase_window)
 }
 
-// 16: [anyone, run, template, dispute(w), cache] answer AWAIT_NODES from a
+// 16: [anyone, run(w), template, dispute(w), cache] answer AWAIT_NODES from a
 // cached, verified reveal of the same node.
 fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [_caller, run, tmpl, dispute, cache, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
-    expect_phase(&d, PH_NODES)?;
+    expect_phase(&d, PH_NODES, c.run)?;
     let k = cache.try_borrow_data()?;
     let level = u32_at(&d, D_LEVEL)?;
     let position = u64_at(&d, D_POSITION)?;
@@ -895,16 +924,17 @@ fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     let n = (0..1u64 << depth).filter(|i| pickable(&c.t, kind, level - depth, first + i)).count();
     d[D_REVEALED..D_REVEALED + 32 * 32].copy_from_slice(&k[56..CACHE_BYTES]);
     d[D_REVEALED_N..D_REVEALED_N + 2].copy_from_slice(&(n as u16).to_le_bytes());
+    end_executor_wait(&mut c.run.try_borrow_mut_data()?)?;
     next_phase(&mut d, PH_PICK, c.t.phase_window)
 }
 
-// 6: [challenger(s), run, template, dispute(w)] index:u8
+// 6: [challenger(s), run(w), template, dispute(w)] index:u8
 fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [challenger, run, tmpl, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
     challenger_signed(&d, challenger)?;
-    expect_phase(&d, PH_PICK)?;
+    expect_phase(&d, PH_PICK, c.run)?;
     let index = *data.first().ok_or(err(1))? as u64;
     let level = u32_at(&d, D_LEVEL)?;
     let depth = (d[D_DEPTH] as u32).min(level);
@@ -917,8 +947,10 @@ fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     d[D_LEVEL..D_LEVEL + 4].copy_from_slice(&new_level.to_le_bytes());
     d[D_POSITION..D_POSITION + 8].copy_from_slice(&((position << depth) + index).to_le_bytes());
     d[D_CURRENT..D_CURRENT + 32].copy_from_slice(&chosen);
-    let window = executor_window(&c.t, c.run)?;
-    next_phase(&mut d, if new_level == 0 { PH_LEAF } else { PH_NODES }, window)
+    let deadline = begin_executor_wait(&mut c.run.try_borrow_mut_data()?, &c.t)?;
+    d[D_PHASE] = if new_level == 0 { PH_LEAF } else { PH_NODES };
+    d[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&deadline.to_le_bytes());
+    Ok(())
 }
 
 // 14: [challenger(s,w), run, template, dispute, buffer(w), system] role:u8 size:u32
@@ -926,6 +958,7 @@ fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     let [challenger, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     let role = *data.first().ok_or(err(1))?;
+    if c.dispute.try_borrow_data()?[D_PHASE] == PH_RULED { return Err(err(37)); }
     // C funds both buffers; E may create its own if C has not (review).
     let by_challenger = challenger_signed(&c.dispute.try_borrow_data()?, challenger).is_ok();
     if !by_challenger && !(role == ROLE_EXECUTOR && executor_signed(c.run, challenger).is_ok()) {
@@ -993,7 +1026,8 @@ fn stage_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 /// digests and the staged reveal bytes become immutable for this dispute.
 /// C's buffer remains writable while making its claim.
 fn stage_mutable_for_role(dispute: &AccountInfo, role: u8) -> ProgramResult {
-    if role == ROLE_EXECUTOR && dispute.try_borrow_data()?[D_PHASE] >= PH_CLAIM {
+    let phase = dispute.try_borrow_data()?[D_PHASE];
+    if phase == PH_RULED || (role == ROLE_EXECUTOR && phase >= PH_CLAIM) {
         return Err(err(37));
     }
     Ok(())
@@ -1117,7 +1151,7 @@ fn staged_leaf_lists(
     validate_leaf_lists(present, body, lists, framed)
 }
 
-// 7: [executor(s), run, template, dispute(w)] present:u8 preimage
+// 7: [executor(s), run(w), template, dispute(w)] present:u8 preimage
 fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
@@ -1137,7 +1171,7 @@ fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         data
     };
     let mut d = c.dispute.try_borrow_mut_data()?;
-    expect_phase(&d, PH_LEAF)?;
+    expect_phase(&d, PH_LEAF, c.run)?;
     let (present, body, list_reveals, framed) = decode_leaf_reveal(data)?;
     if present > 1 || (present == 0 && !body.is_empty()) || body.len() > MAX_LEAF {
         return Err(err(16));
@@ -1166,6 +1200,7 @@ fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     d[D_LEAF_LEN..D_LEAF_LEN + 2].copy_from_slice(&(body.len() as u16).to_le_bytes());
     d[D_LEAF_PRESENT] = present;
     d[D_LEAF..D_LEAF + body.len()].copy_from_slice(body);
+    end_executor_wait(&mut c.run.try_borrow_mut_data()?)?;
     next_phase(&mut d, PH_CLAIM, c.t.phase_window)
 }
 
@@ -1251,7 +1286,7 @@ fn claim(
     let (kind, position, present, leaf_buf) = {
         let d = c.dispute.try_borrow_data()?;
         challenger_signed(&d, challenger)?;
-        expect_phase(&d, PH_CLAIM)?;
+        expect_phase(&d, PH_CLAIM, c.run)?;
         let len = u16_at(&d, D_LEAF_LEN)? as usize;
         let buf = d[D_LEAF..D_LEAF + len].to_vec();
         (d[D_KIND], u64_at(&d, D_POSITION)?, d[D_LEAF_PRESENT] == 1, (buf, len))
@@ -1272,7 +1307,8 @@ fn claim(
     };
     let root: [u8; D::RUN_ROOT_BYTES] = c.run.try_borrow_data()?[R_ROOT..R_REFS].try_into().unwrap();
     let refs_buf = c.run.try_borrow_data()?;
-    let refs = &refs_buf[R_REFS..];
+    let refs_end = load_offset(&refs_buf)?;
+    let refs = &refs_buf[R_REFS..refs_end];
     let k = Referee { t: &c.t, root: &root, refs, data, list_refs: &leaf_list_refs, manifest };
     let name = *data.first().ok_or(err(1))?;
     let index = *data.get(1).ok_or(err(1))? as usize;
@@ -1323,12 +1359,9 @@ fn claim(
             return Err(err(17));
         }
         let gated = block.kind == 2 && it >= 1;
-        // The program judges SMALL state only. A STATE or STEP claim on any
-        // other scheme (LOG) is ruled neutral until LOG is implemented here
-        // (review 10-03, F3); the Python referee already models LOG.
-        if present && matches!(name, CLAIM_STATE | CLAIM_STEP) && spec.state_scheme() > 1 {
-            neutral = true;
-        }
+        // Every LOG STATE and STEP claim is neutral (moot) until LOG is judged
+        // on chain: the program sees only the spec root, so it cannot refuse a
+        // LOG chain that changes scheme or capacity (re-review A1).
         if !present {
             // Empty is a violation unless the step is gated; then GATE decides.
             if !gated {
@@ -1342,7 +1375,14 @@ fn claim(
             match D::parse_leaf(leaf_bytes) {
                 // Malformed under E's own commitment: C wins.
                 None => true,
-                Some(leaf) => match name {
+                Some(leaf) => {
+                    if spec.state_scheme() > 1 {
+                        // Template creation commits only a spec root. It cannot
+                        // inspect the predecessor's scheme or capacity, so a
+                        // LOG STATE claim is unsafe to judge in this image.
+                        neutral = matches!(name, CLAIM_STEP | CLAIM_STATE);
+                    }
+                    match name {
                     CLAIM_GATE => gated && k.gate_says(&mut at, bi, &block, it, true)?,
                     CLAIM_SHAPE => D::shape_wrong(&leaf, &spec, D::RunRoot(&root).plan_id(), D::RunRoot(&root).run_id(), ordinal),
                     CLAIM_EDGE => k.edge(&mut at, &leaf, &spec, index)?,
@@ -1351,6 +1391,7 @@ fn claim(
                     CLAIM_STATE => k.state(&mut at, &leaf, &spec)?,
                     CLAIM_STEP => k.step(&mut at, &leaf, &spec)?,
                     _ => return Err(err(19)),
+                    }
                 },
             }
         }
@@ -1707,7 +1748,7 @@ fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, outcome: impl
         }
     }
     let challenger_wins = outcome == Outcome::Challenger;
-    let seq = {
+    let (seq, was_waiting) = {
         let mut d = c.dispute.try_borrow_mut_data()?;
         if d[D_RULING] != RULING_OPEN {
             return Err(err(25));
@@ -1715,13 +1756,14 @@ fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, outcome: impl
         if challenger.key.to_bytes() != d[D_CHALLENGER..D_CHALLENGER + 32] {
             return Err(err(22));
         }
+        let was_waiting = matches!(d[D_PHASE], PH_NODES | PH_LEAF);
         d[D_PHASE] = PH_RULED;
         d[D_RULING] = match outcome {
             Outcome::Challenger => RULING_CHALLENGER,
             Outcome::Executor => RULING_EXECUTOR,
             Outcome::Neutral => RULING_MOOT,
         };
-        u64_at(&d, D_SEQ)?
+        (u64_at(&d, D_SEQ)?, was_waiting)
     };
     {
         let mut r = c.run.try_borrow_mut_data()?;
@@ -1731,6 +1773,7 @@ fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, outcome: impl
         if r[R_STATUS] != RUN_COMMITTED && r[R_STATUS] != RUN_REFUTED {
             return Err(err(25));
         }
+        if was_waiting { end_executor_wait(&mut r)?; }
         let open = u32_at(&r, R_OPEN)?.checked_sub(1).ok_or(err(8))?;
         r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
         if challenger_wins {
@@ -1804,7 +1847,7 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 fn moot(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [_caller, run, tmpl, dispute, challenger, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
-    {
+    let was_waiting = {
         let mut d = c.dispute.try_borrow_mut_data()?;
         let r = c.run.try_borrow_data()?;
         if r[R_STATUS] != RUN_REFUTED
@@ -1814,11 +1857,14 @@ fn moot(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         {
             return Err(err(27));
         }
+        let was_waiting = matches!(d[D_PHASE], PH_NODES | PH_LEAF);
         d[D_PHASE] = PH_RULED;
         d[D_RULING] = RULING_MOOT;
-    }
+        was_waiting
+    };
     {
         let mut r = c.run.try_borrow_mut_data()?;
+        if was_waiting { end_executor_wait(&mut r)?; }
         let open = u32_at(&r, R_OPEN)?.checked_sub(1).ok_or(err(8))?;
         r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
     }

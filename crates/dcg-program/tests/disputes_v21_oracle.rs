@@ -130,7 +130,7 @@ async fn replay(s: &serde_json::Value) -> u8 {
     let mut open = vec![1u8; 32];
     open.push(kind);
     send(&mut ctx, ix(V::SUB_OPEN, &open, vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(dispute, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&c]).await.unwrap();
-    let party = |who: &Keypair| vec![AccountMeta::new_readonly(who.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(dispute, false)];
+    let party = |who: &Keypair| vec![AccountMeta::new_readonly(who.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(dispute, false)];
     let tree = if step_kind { &step } else { &out };
     let limit = if step_kind { leaves.len() } else { outs.len() };
     let depth = s["depth"].as_u64().unwrap() as usize;

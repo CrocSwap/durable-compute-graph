@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""LOG-state claims are neutral on chain (review 10-03, F3).
+"""LOG-state claims under the safe on-chain neutrality boundary.
 
-The program judges SMALL state only; until LOG is implemented there, a STATE
-or STEP claim on a LOG-state step is ruled moot (the challenger's bond
-returns, nobody is convicted). These scenarios use the Python reference's
-LOG plan (`kv_plan`) and record the program's expected ruling, "moot",
-instead of the Python referee's LOG ruling. Replayed by the chunked oracle
+The template instruction cannot inspect predecessor specs, so STATE and STEP
+claims stay neutral. Replayed by the chunked oracle
 test with CHUNKED_SCENARIOS=tests/golden/dcg/disputes_v21/log_neutral_scenarios.json.
 """
 from __future__ import annotations
@@ -22,13 +19,14 @@ _s.loader.exec_module(C)
 OUT = ROOT / "tests/golden/dcg/disputes_v21/log_neutral_scenarios.json"
 
 
-def _scenario(name, sp, values, k, fault=None):
+def _scenario(name, sp, values, k, fault=None, prior_digest_fault=None):
     """One claim at LOG step k. STEP bodies are re-encoded with an empty state
     witness: the program rules neutral after the spec opening and reads no
     further (the wire format has no LOG witness encoding yet)."""
     T, W = C.T, C.W
     n = C.next_nonce()
-    h, committed = C.execute(sp, values, n, **({"fault": fault} if fault else {}))
+    faults = {key: value for key, value in (("fault", fault), ("prior_digest_fault", prior_digest_fault)) if value}
+    h, committed = C.execute(sp, values, n, **faults)
     _tdata, refs, run = C.context(sp, values, n)
     record = C.G.RunRecord(C.PLAN_ID, run, sp, committed.root_bytes, refs)
     claims = dict(T.honest_claims(record, C.G.Executor(committed), committed, k))
@@ -38,7 +36,8 @@ def _scenario(name, sp, values, k, fault=None):
         kw = dict(claims["STEP"], state_witness=b"")
         s["claim"] = W.claim_body(sp, "STEP_DESCEND", sp.position_of(k), "STEP", kw).hex()
         s["claim_name"] = "STEP"
-    s["ruling"] = "moot"
+    step = C.S.decode_step_spec(sp.step_spec(k))
+    s["ruling"] = "moot" if C.G.log_claim_neutral(step, s["claim_name"]) else ("C" if prior_digest_fault else "E")
     return s
 
 
@@ -53,6 +52,8 @@ def build() -> list[dict]:
     # A LOG lie at step 2 (a wrong output): the STEP claim there is neutral too.
     lie = lambda o, outs, nxt: ([bytes([outs[0][0] ^ 1]) + outs[0][1:]] + outs[1:], nxt) if o == 2 else (outs, nxt)
     out.append(_scenario("output-lie-STEP", sp, values, 2, fault=lie))
+    bad_prior = lambda o, digest: bytes([digest[0] ^ 1]) + digest[1:] if o == 2 else digest
+    out.append(_scenario("false-prior-STATE", sp, values, 2, prior_digest_fault=bad_prior))
     return out
 
 

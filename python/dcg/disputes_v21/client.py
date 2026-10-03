@@ -146,7 +146,7 @@ class DisputeClient:
                     AccountMeta(SYSTEM, False, False)], [challenger])
 
         def party(who: Keypair) -> list[AccountMeta]:
-            return [AccountMeta(who.pubkey(), True, False), AccountMeta(run, False, False),
+            return [AccountMeta(who.pubkey(), True, False), AccountMeta(run, False, True),
                     AccountMeta(template, False, False), AccountMeta(dispute, False, True)]
 
         for rnd in transcript["rounds"]:

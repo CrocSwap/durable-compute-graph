@@ -407,7 +407,7 @@ async fn replay(
         }
         let accounts = vec![
             account(executor.pubkey(), false, true),
-            account(run, false, false),
+            account(run, true, false),
             account(template, false, false),
             account(dispute, true, false),
         ];
@@ -421,7 +421,7 @@ async fn replay(
         let selected = pick.as_u64().unwrap() as usize;
         let accounts = vec![
             account(challenger.pubkey(), false, true),
-            account(run, false, false),
+            account(run, true, false),
             account(template, false, false),
             account(dispute, true, false),
         ];
@@ -450,7 +450,7 @@ async fn replay(
             &[V::ROLE_EXECUTOR, 0, 0, 0, 0],
             vec![
                 account(executor.pubkey(), true, true),
-                account(run, false, false),
+                account(run, true, false),
                 account(template, false, false),
                 account(dispute, false, false),
                 account(executor_buffer, true, false),
@@ -480,7 +480,7 @@ async fn replay(
             &[V::FROM_STAGING],
             vec![
                 account(executor.pubkey(), false, true),
-                account(run, false, false),
+                account(run, true, false),
                 account(template, false, false),
                 account(dispute, true, false),
                 account(executor_buffer, false, false),
