@@ -237,7 +237,7 @@ impl Chain {
     }
 
     fn party(&self, who: u8, d: Pubkey) -> Vec<AccountMeta> {
-        vec![AccountMeta::new_readonly(kp(who).pubkey(), true), AccountMeta::new_readonly(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new(d, false)]
+        vec![AccountMeta::new_readonly(kp(who).pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new(d, false)]
     }
 
     async fn step(&mut self, d: Pubkey, c: &Commit, leaf_index: usize) {
@@ -480,13 +480,13 @@ impl Chain {
         let buf = self.buffer(d, role);
         let mut data = vec![role];
         data.extend_from_slice(&size.to_le_bytes());
-        let i = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new_readonly(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+        let i = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
         send(&mut self.ctx, i, &[&c]).await.unwrap();
         let writer = if role == V::ROLE_EXECUTOR { kp(0xE1) } else { kp(0xC1) };
         for (k, part) in bytes.chunks(chunk).enumerate() {
             let mut w = ((k * chunk) as u32).to_le_bytes().to_vec();
             w.extend_from_slice(part);
-            let i = ix(V::SUB_STAGE_WRITE, &w, vec![AccountMeta::new_readonly(writer.pubkey(), true), AccountMeta::new_readonly(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false)]);
+            let i = ix(V::SUB_STAGE_WRITE, &w, vec![AccountMeta::new_readonly(writer.pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false)]);
             send(&mut self.ctx, i, &[&writer]).await.unwrap();
         }
     }
@@ -536,7 +536,7 @@ async fn openings_and_witnesses_can_come_from_staging_buffers() {
     // C cannot write E's buffer.
     let mut w = 0u32.to_le_bytes().to_vec();
     w.push(9);
-    let i = ix(V::SUB_STAGE_WRITE, &w, vec![AccountMeta::new_readonly(cl.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(ch.buffer(d, V::ROLE_EXECUTOR), false)]);
+    let i = ix(V::SUB_STAGE_WRITE, &w, vec![AccountMeta::new_readonly(cl.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(ch.buffer(d, V::ROLE_EXECUTOR), false)]);
     assert!(send(&mut ch.ctx, i, &[&cl]).await.is_err());
     let mut right = base;
     right.push(AccountMeta::new_readonly(ch.buffer(d, V::ROLE_CHALLENGER), false));
@@ -558,14 +558,14 @@ async fn a_cached_reveal_answers_a_second_dispute_without_the_executor() {
     nodes.extend_from_slice(&c.step[0][0]);
     nodes.extend_from_slice(&c.step[0][1]);
     // The executor's signer pays the cache rent, so it is writable here.
-    let mut accounts = vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(a, false)];
+    let mut accounts = vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(a, false)];
     accounts.push(AccountMeta::new(cache, false));
     accounts.push(AccountMeta::new_readonly(SYSTEM, false));
     let i = ix(V::SUB_REVEAL_NODES, &nodes, accounts);
     send(&mut ch.ctx, i, &[&e]).await.unwrap();
     // Dispute B is answered from the cache by its own challenger.
     let cl = kp(0xC1);
-    let answer = |d: Pubkey, run: Pubkey, template: Pubkey, k: Pubkey| ix(V::SUB_CACHE_ANSWER, &[], vec![AccountMeta::new_readonly(cl.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(d, false), AccountMeta::new_readonly(k, false)]);
+    let answer = |d: Pubkey, run: Pubkey, template: Pubkey, k: Pubkey| ix(V::SUB_CACHE_ANSWER, &[], vec![AccountMeta::new_readonly(cl.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(d, false), AccountMeta::new_readonly(k, false)]);
     send(&mut ch.ctx, answer(b, ch.run, ch.template, cache), &[&cl]).await.unwrap();
     assert_eq!(ch.ctx.banks_client.get_account(b).await.unwrap().unwrap().data[4], 2, "B awaits a pick");
     // A forged cache (any program-owned account with the bytes) is refused.
@@ -723,7 +723,7 @@ impl Chain {
 
     async fn close_cache(&mut self, cache: Pubkey, executor: Pubkey) -> Result<(), TransactionError> {
         let caller = kp(0xA1);
-        let i = ix(V::SUB_CLOSE_CACHE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new_readonly(self.run, false), AccountMeta::new(cache, false), AccountMeta::new(executor, false)]);
+        let i = ix(V::SUB_CLOSE_CACHE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new(cache, false), AccountMeta::new(executor, false)]);
         send(&mut self.ctx, i, &[&caller]).await
     }
 
@@ -759,7 +759,7 @@ async fn an_honest_run_closes_every_account_and_returns_all_rent() {
     let mut nodes = Vec::new();
     nodes.extend_from_slice(&c.step[0][0]);
     nodes.extend_from_slice(&c.step[0][1]);
-    let i = ix(V::SUB_REVEAL_NODES, &nodes, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false), AccountMeta::new(cache, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    let i = ix(V::SUB_REVEAL_NODES, &nodes, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false), AccountMeta::new(cache, false), AccountMeta::new_readonly(SYSTEM, false)]);
     send(&mut ch.ctx, i, &[&e]).await.unwrap();
     assert_eq!(ch.ctx.banks_client.get_account(cache).await.unwrap().unwrap().data.len(), V::CACHE_BYTES_V2);
     let i = ix(V::SUB_PICK, &[1], ch.party(0xC1, d));
@@ -850,7 +850,7 @@ async fn a_refuted_run_closes_after_the_pot_and_buffers_refund_their_creator() {
     let buf = ch.buffer(d1, V::ROLE_EXECUTOR);
     let mut data = vec![V::ROLE_EXECUTOR];
     data.extend_from_slice(&0u32.to_le_bytes());
-    let i = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d1, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    let i = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d1, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
     send(&mut ch.ctx, i, &[&e]).await.unwrap();
     ch.win_by_step(d1, &c).await;
     ch.win_by_step(d0, &c).await; // the lowest sequence wins the pot
@@ -1052,7 +1052,7 @@ async fn a_timeout_after_the_best_win_is_moot_and_keeps_the_challengers_bond() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_executors_deadlines_grow_with_open_disputes() {
+async fn executor_wait_extension_is_additive_and_challenger_puppets_do_not_bank_it() {
     let mut ch = Chain::new(1_000).await;
     let c = ch.honest();
     ch.commit(&c).await;
@@ -1060,14 +1060,7 @@ async fn the_executors_deadlines_grow_with_open_disputes() {
     let slot = ch.ctx.banks_client.get_root_slot().await.unwrap();
     let d0 = ch.open(80, V::KIND_STEP_DESCEND).await;
     let first = deadline(&ch.ctx.banks_client.get_account(d0).await.unwrap().unwrap());
-    let d1 = ch.open(81, V::KIND_STEP_DESCEND).await;
-    let second = deadline(&ch.ctx.banks_client.get_account(d1).await.unwrap().unwrap());
-    let d2 = ch.open(82, V::KIND_STEP_DESCEND).await;
-    let third = deadline(&ch.ctx.banks_client.get_account(d2).await.unwrap().unwrap());
-    // Phase window 750: one, two and three open disputes (§8.3, review 10-03, F4).
-    assert!(first <= slot + 750 + 5, "{first} vs {slot}");
-    assert!(second >= slot + 1_500 && third >= slot + 2_250, "{second} {third} vs {slot}");
-    // C's own phases keep the plain window: after E's reveal, d0 waits on C.
+    // E answers d0, placing its puppet on the challenger side.
     let e = kp(0xE1);
     let mut nodes = Vec::new();
     nodes.extend_from_slice(&c.step[0][0]);
@@ -1075,7 +1068,26 @@ async fn the_executors_deadlines_grow_with_open_disputes() {
     let i = ix(V::SUB_REVEAL_NODES, &nodes, ch.party(0xE1, d0));
     send(&mut ch.ctx, i, &[&e]).await.unwrap();
     let pick = deadline(&ch.ctx.banks_client.get_account(d0).await.unwrap().unwrap());
+    let d1 = ch.open(81, V::KIND_STEP_DESCEND).await;
+    let second = deadline(&ch.ctx.banks_client.get_account(d1).await.unwrap().unwrap());
+    let d2 = ch.open(82, V::KIND_STEP_DESCEND).await;
+    let third = deadline(&ch.ctx.banks_client.get_account(d2).await.unwrap().unwrap());
+    // Stored deadlines are base deadlines. Only two active E waits have
+    // bought one additive window; d0's C deadline remains unchanged.
+    assert!(first <= slot + 750 + 5, "{first} vs {slot}");
+    assert!(second <= slot + 750 + 10 && third <= slot + 750 + 15, "{second} {third} vs {slot}");
     assert!(pick <= slot + 750 + 10, "{pick} vs {slot}");
+    let run = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
+    let tail = &run.data[run.data.len() - 12..];
+    assert_eq!(u32::from_le_bytes(tail[..4].try_into().unwrap()), 2);
+    assert_eq!(u64::from_le_bytes(tail[4..].try_into().unwrap()), 750);
+    ch.ctx.warp_to_slot(slot + 1_500).unwrap();
+    let caller = kp(0xA1);
+    let (run_key, template_key) = (ch.run, ch.template);
+    let timeout = |d| ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(run_key, false), AccountMeta::new_readonly(template_key, false), AccountMeta::new(d, false), AccountMeta::new(e.pubkey(), false), AccountMeta::new(kp(0xC1).pubkey(), false)]);
+    send(&mut ch.ctx, timeout(d0), &[&caller]).await.unwrap();
+    assert_eq!(ch.ruling(d0).await, V::RULING_EXECUTOR);
+    assert!(send(&mut ch.ctx, timeout(d1), &[&caller]).await.is_err(), "E's additive extension still protects its wait");
 }
 
 #[tokio::test(flavor = "multi_thread")]

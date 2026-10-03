@@ -946,9 +946,11 @@ of tag 227 at bc4e391:
   claims on a LOG-state step are ruled moot (neutral) until LOG is
   implemented on chain. `tests/golden/dcg/disputes_v21/log_neutral_scenarios.json`
   (from `scripts/disputes_v21_log_neutral_scenarios.py`) checks this.
+  Superseded for new runs by follow-up A below.
 - **F4, flooding.** Templates need nonzero executor and challenger bonds. The
   load extension (§8.3) is built: a phase the executor owes gets the phase
   window times the run's open disputes, capped at the maximum window.
+  Superseded for new runs by follow-up B below.
 - **F5, run address and cancel.** The run PDA is `["dcg21run", run_id,
   payer]`, so a cancelled run cannot be re-initialized at the same address by
   someone else. `init_run` sets a commit deadline (the init slot plus the
@@ -964,7 +966,7 @@ of tag 227 at bc4e391:
     dispute to a LOG step and get a free moot (no dispute cost, delayed
     finality), and a lie at a LOG step cannot be convicted. The program
     cannot enforce this, because it trusts the spec root.
-  - **Follow-up A (queued):** narrow F3 to keep judging the STATE
+- **Follow-up A (queued):** narrow F3 to keep judging the STATE
     predecessor check for producer kinds 1 and 2, which does not depend on
     the scheme.
   - **Follow-up B (queued):** the load extension counts every open dispute,
@@ -983,6 +985,36 @@ of tag 227 at bc4e391:
     across payers.
   - Follow-ups A and B change endings and get their own independent review
     (Basanos project rule 10).
+
+**Follow-ups A and B (implementation candidate, 2026-10-03; independent
+review pending).** For LOG state, a present, well-formed leaf's STATE claim
+judges predecessor kinds 1 and 2 using the authenticated predecessor leaf or
+the run's external ref. An initial/other predecessor STATE claim and every
+LOG STEP claim remain neutral. Empty or malformed executor leaves still lose.
+The bounded skeleton encodes `waiting_E:u32` and `extension_total:u64` after
+the run's external refs. It uses `c=1` and `extend_slots=phase_window` (the
+only timing parameter its current template admits). OPEN and PICK enter an
+executor wait; REVEAL_NODES, CACHE_ANSWER, and REVEAL_LEAF leave it. An entry
+when another executor wait exists adds one phase window to the run total.
+An executor phase times out only after its stored base deadline plus that
+total; a challenger phase times out after its unextended stored deadline.
+Ruling or mooting an executor wait decrements `waiting_E`. Arithmetic is
+checked; overflow refuses the instruction. The changed run account size
+requires fresh testnet runs for this skeleton.
+
+**Who profits by calling first?** OPEN is funded by its challenger; opening
+while another dispute waits on E extends E's deadline, but a puppet already
+waiting on C buys no extension. PICK can buy that extension only by ending
+its challenger's own wait and starting E's next wait. REVEAL_NODES,
+CACHE_ANSWER, and REVEAL_LEAF end an E wait, so a caller cannot bank future
+extension by answering first. CLAIM can now convict a false LOG predecessor
+of kind 1 or 2; the honest challenger receives its bond and, if earliest,
+the slasher share, while the payer receives the remainder. TIMEOUT respects
+the same effective deadline for E and the unchanged deadline for C. MOOT,
+CLOSE_DISPUTE, CLOSE_RUN, and CLOSE_TEMPLATE pay their recorded recipients;
+the permissionless caller, including a bystander, receives no rent or bond
+merely by calling first. For all these calls, the executor's only timing gain
+is the extension earned by genuine outstanding executor waits.
 - **Not changed:** F6 (buffers an executor created before bc4e391 refund the
   challenger; testnet only), F7 (receipt offsets differ from a live run;
   status stays at byte 4, and the Python client now checks the magic), F8 (a

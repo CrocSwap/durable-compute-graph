@@ -132,7 +132,7 @@ async fn stage_write(
         data.extend_from_slice(chunk);
         let accounts = vec![
             account(signer.pubkey(), false, true),
-            account(run, false, false),
+            account(run, true, false),
             account(template, false, false),
             account(dispute, false, false),
             account(buffer, true, false),
@@ -156,7 +156,7 @@ async fn try_stage_write(
     data.extend_from_slice(bytes);
     let accounts = vec![
         account(signer.pubkey(), false, true),
-        account(run, false, false),
+        account(run, true, false),
         account(template, false, false),
         account(dispute, false, false),
         account(buffer, true, false),
@@ -174,7 +174,7 @@ async fn grow_to(ctx: &mut ProgramTestContext, funder: &Keypair, run: Pubkey, te
         let add = (want - have).min(10_240) as u32;
         let accounts = vec![
             account(funder.pubkey(), true, true),
-            account(run, false, false),
+            account(run, true, false),
             account(template, false, false),
             account(dispute, false, false),
             account(buffer, true, false),
@@ -407,7 +407,7 @@ async fn replay(
         }
         let accounts = vec![
             account(executor.pubkey(), false, true),
-            account(run, false, false),
+            account(run, true, false),
             account(template, false, false),
             account(dispute, true, false),
         ];
@@ -421,7 +421,7 @@ async fn replay(
         let selected = pick.as_u64().unwrap() as usize;
         let accounts = vec![
             account(challenger.pubkey(), false, true),
-            account(run, false, false),
+            account(run, true, false),
             account(template, false, false),
             account(dispute, true, false),
         ];
@@ -450,7 +450,7 @@ async fn replay(
             &[V::ROLE_EXECUTOR, 0, 0, 0, 0],
             vec![
                 account(executor.pubkey(), true, true),
-                account(run, false, false),
+                account(run, true, false),
                 account(template, false, false),
                 account(dispute, false, false),
                 account(executor_buffer, true, false),
@@ -480,7 +480,7 @@ async fn replay(
             &[V::FROM_STAGING],
             vec![
                 account(executor.pubkey(), false, true),
-                account(run, false, false),
+                account(run, true, false),
                 account(template, false, false),
                 account(dispute, true, false),
                 account(executor_buffer, false, false),
@@ -496,7 +496,7 @@ async fn replay(
             .await.is_err(), "executor stage_write must be refused after reveal");
         let grow = ix(V::SUB_STAGE_GROW, &1u32.to_le_bytes(), vec![
             account(executor.pubkey(), true, true),
-            account(run, false, false),
+            account(run, true, false),
             account(template, false, false),
             account(dispute, false, false),
             account(executor_buffer, true, false),
@@ -521,7 +521,7 @@ async fn replay(
             &create_c,
             vec![
                 account(challenger.pubkey(), true, true),
-                account(run, false, false),
+                account(run, true, false),
                 account(template, false, false),
                 account(dispute, false, false),
                 account(challenger_buffer, true, false),

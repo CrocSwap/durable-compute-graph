@@ -24,6 +24,15 @@ class ExecutorRefused(Refused):
     C wins at E's deadline)."""
 
 
+def log_claim_neutral(step: dict, name: str) -> bool:
+    """On-chain LOG gap: only STEP and uncheckable initial STATE are neutral."""
+    if step["state_scheme"] != 2:
+        return False
+    if name == "STEP":
+        return True
+    return name == "STATE" and S.decode_producer(step["state_predecessor"])[0] not in (1, 2)
+
+
 @dataclass
 class RunRecord:
     """The on-chain facts a referee reads: ids, the committed root, external refs."""
@@ -159,7 +168,7 @@ class Dispute:
     def claim(self, name: str, *, spec_opening=None, index: int = 0, producer_opening=None,
               witness: list[bytes] | None = None, state_witness: bytes | None = None, t: int | None = None,
               gate_opening=None, gate_value: bytes | None = None, chunk_opening=None, const_opening=None,
-              element: int = 0, list_opening=None) -> str:
+              element: int = 0, list_opening=None, onchain: bool = False) -> str:
         if not self.leaf_revealed or self.ruling:
             raise Refused("no leaf to claim against")
         self.claimed = name if name != "EDGE" else f"EDGE{self._edge_kind(index)}"
@@ -181,6 +190,8 @@ class Dispute:
         leaf = R.parse_leaf(self.leaf)
         if leaf is None:  # malformed bytes under E's own commitment
             return self._rule("C")
+        if onchain and log_claim_neutral(d, name):
+            return self._rule("moot")
         if name == "GATE":
             if not sp.gated(k):
                 return self._rule("E")
