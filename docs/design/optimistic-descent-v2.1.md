@@ -1,7 +1,6 @@
 # Optimistic disputes v2.1: first-divergence disputes for graph runs (draft, revision 3.1)
 
-Status: **draft design, 2026-10-02, revision 3.1** (revision 3 plus the focused check's fixes, `review-dcg-disputes-v2.1-rev3-focused-2026-10-02.md`, cited R3-*). Nothing here is
-implemented. It replaces the root-committed descent of v2.0 (tags 220–226).
+Status: **draft design, 2026-10-02, revision 3.1** (revision 3 plus the focused check's fixes, `review-dcg-disputes-v2.1-rev3-focused-2026-10-02.md`, cited R3-*). Tag 227 implements selected slices of this design, described below; it is not a complete implementation. It replaces the root-committed descent of v2.0 (tags 220–226).
 
 Review history (reports in Basanos `out/runs/`):
 - `review-dcg-graph-v2-2026-10-02.md` found v2.0 unsound. Cited here as
@@ -892,6 +891,21 @@ recorded below with their implementation results.
   closure. The signature plus zero-count guard prevents another role from
   racing the payer to remove a reusable template. Concurrent initialization
   and closure serialize on the writable template account.
+
+  **Template-close validation (measured, 2026-10-03).** The v2.1 skeleton
+  suite passed 18 tests natively and 18 against the v1.51 SBF image. It
+  covers cancellation, final receipts, refuted receipts, claim and timeout
+  rulings, moot disputes, legacy read-only template accounts, and exact
+  lamport conservation. Three native guard mutations were each caught:
+  removing the active-run check fails
+  `an_uncommitted_run_cancels_for_its_payer_after_the_commit_deadline`,
+  removing the recorded-payer check fails
+  `an_honest_run_closes_every_account_and_returns_all_rent`, and skipping the
+  run-close decrement makes that same test fail at template closure. The
+  mutations were restored before the final native and SBF runs. Receipts
+  are under Basanos `out/runs/dcg-v21-lists-2026-10-03/`; the SBF image
+  SHA-256 is
+  `1a3cf788e6e36e01e2c45607a5753160cd38fd8f59e4844d34d6515896b81e9b`.
 
 **Independent review fixes (2026-10-03).** From the first independent review
 of tag 227 at bc4e391:
