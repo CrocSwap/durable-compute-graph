@@ -1,7 +1,7 @@
 # DCG alpha release plan
 
-**Status: draft for owner review (2026-10-03).** Durations are **estimates**.
-Nothing here is measured yet unless it says so.
+**Status: owner decisions recorded 2026-10-03 (below).** Durations are
+**estimates**. Nothing here is measured yet unless it says so.
 
 ## What the alpha is
 
@@ -114,7 +114,10 @@ DCG keeps no model code (owner decision, 09-26).
 
 **C3. Stateful kernel kit.** The E2 conformance harness extended to stateful kernels: the Rust transition and its host reference agree on generated inputs, including state at its size limits and every refusal.
 
-**C4. Lanes (throughput).** Lanes (`docs/design/stateful-session-lanes-v1.md`, owner decisions recorded) let independent parts of a session advance in parallel. They are consensus mode's main throughput lever and Doom's path to 3 frames/s. Whether lanes gate the alpha is an owner decision below.
+**C4. Lanes (throughput); an alpha gate.** Lanes (`docs/design/stateful-session-lanes-v1.md`, owner decisions recorded) let independent parts of a session advance in parallel. They are consensus mode's main throughput lever.
+- **The alpha's hook (owner, 2026-10-03):** Doom runs on DCG at 3.0 frames per second on the shared testnet program.
+- Lanes are on the critical path, together with whatever else that target needs: CoW views, inputs-in-step and TPU sends (DCG roadmap, the 10-01 owner goal).
+- Today's measured floor is about 0.32 s of serial execution plus about 0.25 s of visibility per frame. Reaching 3.0 frames per second means parallel render work per frame, not only faster sends.
 
 **C5. A tutorial:** "a multi-transaction state machine", from an empty repo to a session running on the shared program, with costs (transactions, compute, rent) shown at each step.
 
@@ -126,8 +129,9 @@ DCG keeps no model code (owner decision, 09-26).
 | 2 | E1 (v2.1 lowering), E2 and C3 (kernel kits), E8 (`explain()`), C1 and C2 (session quickstart, sequencer API), R4 (repo boundary) | about 2 weeks |
 | 3 | E3 (executor and watchtower), R2 (reviews, including the sessions fuzzer) | about 1–2 weeks, partly parallel with phase 2 |
 | 4 | R3 (shared program upgrade), E6 (`dcg dev`, `dcg build`), E7 and C5 (docs and tutorials), R5 (terms) | about 1 week |
+| L | C4: lanes in the program and sequencer, their review, and Doom at 3.0 frames/s on testnet | about 2–4 weeks, in parallel from phase 1 |
 
-**Estimated total: about 5–7 weeks** at the current pace, with phases 2 and 3 overlapping. Lanes (C4) are not on this path unless the owner makes them a gate. If they land in time, Doom ships at 3 frames/s as the alpha's showcase; if not, it ships as the slower demo it is today.
+**Estimated total: about 5–7 weeks** at the current pace if lanes (track L) keep pace. Track L is the riskiest item: the 3.0 frames/s target depends on chain visibility as well as our design, and it is the alpha's hook, so it starts now, in parallel.
 
 ## Exit criteria
 
@@ -141,10 +145,19 @@ The alpha ships when all of these hold:
    - **Consensus:** writes a stateful kernel, runs a session of a few thousand transactions to completion with the sequencer (including a resend after a dropped transaction), reads the result, and closes the session.
 5. **A custom kernel** passes the kernel kit's conformance harness and wins an honest dispute on testnet.
 6. **Release terms** are published.
+7. **Doom on DCG runs at 3.0 frames per second** on the shared testnet program (*measured*, sustained over a session of at least 1,000 frames), with lanes reviewed.
 
-## Decisions for the owner
+## Owner decisions (2026-10-03)
 
-1. The alpha surface (the table above): consensus mode (sessions and the sequencer) and optimistic mode (v2.1) both first-class; the v2.0 trace path left out; the revision-8 lifecycle kept in core for Basanos but not offered as a user API.
-2. The license for the alpha (GPL-3, or a change before first release).
-3. Whether lanes (C4) gate the alpha. Doom at today's 1.65 frames/s is the alternative showcase.
-4. Who answers the security contact, and how breaking changes are announced.
+1. **Surface:** consensus mode (sessions and the sequencer) and optimistic
+   mode (v2.1) are both first-class. The v2.0 trace path is out. The
+   revision-8 lifecycle question (internal, or moved to Basanos) is being
+   explained separately.
+2. **License:** GPL-3 for now; re-releasing under another license may be
+   considered later.
+3. **Lanes are in the alpha.** Doom runs on DCG at 3.0 frames per second in
+   the alpha; that is the hook (exit criterion 7).
+4. **Security contact:** security@crocodilelabs.io, with `SECURITY.md` and a
+   disclosure window. Breaking changes follow `SECURITY.md`'s companion
+   policy: a changelog, GitHub releases, and at least one week's notice
+   before the shared program is upgraded.
