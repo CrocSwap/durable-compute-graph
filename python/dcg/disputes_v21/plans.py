@@ -63,6 +63,7 @@ class PlanBuilder:
     constants: dict[int, tuple[bytes, int]] = field(default_factory=dict)  # id -> (value, chunk_log2)
     blocks: list[tuple] = field(default_factory=list)  # ("enum", [Step]) | ("rep", [Step], K, gate)
     outputs: list[tuple[bytes, int, bool]] = field(default_factory=list)  # (producer, length, scalar)
+    lists: dict[int, tuple[Input, ...]] = field(default_factory=dict)  # list id -> elements
     node_base: int = 1
 
     # --- declarations --------------------------------------------------------------
@@ -103,6 +104,14 @@ class PlanBuilder:
                     outputs=((0, kern.state_bytes, False), (1, 4, True)), state_bytes=kern.state_bytes,
                     state_predecessor=S.producer(4, 0, 0, 1), state_export=0)
         return self.repeated([step], len(value) // chunk_bytes, (0, 1))
+
+    def list_input(self, list_id: int, elements: tuple[Input, ...]) -> Input:
+        """A list input (producer kind 8): the ordered element producers
+        (kind 1, 2 or 3) as one step input. Its length is the elements' total."""
+        if not 1 <= len(elements) <= S.MAX_LIST_ELEMENTS:
+            raise S.SpecError("a list has 1..128 elements")
+        self.lists[list_id] = tuple(elements)
+        return Input(S.producer(S.PRODUCER_LIST, list_id), sum(e.length for e in elements))
 
     def enumerated(self, steps: list[Step]) -> int:
         self.blocks.append(("enum", steps))
@@ -205,16 +214,25 @@ class PlanBuilder:
         for b, records in zip(blocks, block_records):
             code = S.TYPE_STEP if b.kind == 1 else S.TYPE_BODY
             spec_records += [(code, r) for r in records]
+        # ListSpecs last, by list id: a spec without lists is unchanged.
+        first_list = len(spec_records)
+        list_ids = sorted(self.lists)
+        list_records = [S.list_spec(lid, [(scalar_header(0, 0, 0) if e.scalar else raw_header(0, 0, 0, e.length),
+                                           e.producer) for e in self.lists[lid]]) for lid in list_ids]
+        spec_records += [(S.TYPE_LIST, r) for r in list_records]
         sp = S.Spec(spec_records, blocks, block_records, dict(zip(in_ids, in_records)), out_records, total_steps,
                     len(out_records), height, first_out, dict(zip(const_ids, const_records)),
-                    {cid: self.constants[cid][0] for cid in const_ids})
+                    {cid: self.constants[cid][0] for cid in const_ids}, dict(zip(list_ids, list_records)), first_list)
         self._check(sp)
         return sp
 
     def _step_record(self, st: Step, magic: bytes, node: int, block: int) -> bytes:
         inputs = []
         for port, inp in enumerate(st.inputs):
-            header = scalar_header(node, 0, port) if inp.scalar else raw_header(node, 0, port, inp.length)
+            if inp.producer[0] == S.PRODUCER_LIST:
+                header = S.port_header(node, 0, port, S.LAYOUT_LIST, 1, SCHEME_ID, SCHEME_VERSION, inp.length)
+            else:
+                header = scalar_header(node, 0, port) if inp.scalar else raw_header(node, 0, port, inp.length)
             inputs.append(S.StepInput(header, inp.producer, inp.initial))
         outputs = tuple(scalar_header(node, 1, port) if scalar else raw_header(node, 1, port, length)
                         for port, length, scalar in st.outputs)
@@ -236,6 +254,17 @@ class PlanBuilder:
         for k in range(sp.total_steps):
             bi, b, i, _e = sp.locate(k)
             d = S.decode_step_spec(sp.step_spec(k))
+            if S.decode_producer(d["state_predecessor"])[0] == 1:
+                predecessor = S.decode_producer(d["state_predecessor"])[1]
+                prior = S.decode_step_spec(sp.step_spec(predecessor)) if predecessor < k else None
+                if d["state_scheme"] == 2 or (prior is not None and prior["state_scheme"] == 2):
+                    # A LOG link in either direction keeps one scheme and capacity
+                    # (re-review A1; LOG -> SMALL has no honest execution either).
+                    if prior is None:
+                        raise S.SpecError("LOG predecessor must be earlier")
+                    if prior["state_scheme"] != d["state_scheme"] or prior["state_size"] != d["state_size"]:
+                        raise S.SpecError("LOG predecessor must use the same scheme and capacity")
+            list_element_counts = []
             for header, prod, _init in d["inputs"]:
                 kind, a, pb, _c, dd = S.decode_producer(prod)
                 if kind == 1 and a >= k:
@@ -252,6 +281,36 @@ class PlanBuilder:
                         raise S.SpecError("chunk consumer reads a different length")
                 if kind == 2 and a not in self.inputs:
                     raise S.SpecError("unknown external input")
+                if kind == S.PRODUCER_LIST:
+                    elements = self.lists.get(a)
+                    if elements is None:
+                        raise S.SpecError("unknown list")
+                    list_element_counts.append(len(elements))
+                    if struct.unpack_from("<I", header, 19)[0] != sum(e.length for e in elements):
+                        raise S.SpecError("a list input reads its elements' total length")
+                    for e in elements:
+                        ek, ea, *_ = S.decode_producer(e.producer)
+                        if ek not in (1, 2, 3):
+                            raise S.SpecError("a list element is kind 1, 2 or 3")
+                        if ek == 1 and ea >= k:
+                            raise S.SpecError("a list element producer is not earlier")
+                        if ek == 2 and ea not in self.inputs:
+                            raise S.SpecError("unknown external input")
+                        if ek == 3 and ea not in self.constants:
+                            raise S.SpecError("unknown constant")
+            S.check_list_element_budget(list_element_counts)
+            # Each STEP value is length-prefixed. Include the claim's spec
+            # opening so the whole instruction fits C's 128 KiB buffer.
+            witness_size = 1 + sum((sum(4 + e.length for e in self.lists[S.decode_producer(prod)[1]])
+                                    if S.decode_producer(prod)[0] == S.PRODUCER_LIST
+                                    else 4 + struct.unpack_from("<I", header, 19)[0])
+                                   for header, prod, _ in d["inputs"])
+            if d["state_scheme"]:
+                witness_size += 4 + d["state_size"]
+            _, opening_record, opening_path = sp.opening(sp.step_leaf_index(k))
+            opening_size = 1 + 2 + len(opening_record) + 1 + 32 * len(opening_path)
+            if 2 + opening_size + witness_size > 128 * 1024:
+                raise S.SpecError("STEP claim exceeds the 128 KiB challenger staging buffer")
         if sp.address_height > 40:
             raise S.SpecError("step tree too tall")
         _ = trees  # tree shapes are fixed by place_blocks

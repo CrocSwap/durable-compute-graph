@@ -13,6 +13,10 @@ import struct
 from . import spec as S
 
 TEMPLATE_DOMAIN = b"dcg.template.id.v2.1-skeleton\x00"
+ROLE_EXECUTOR, ROLE_CHALLENGER = 1, 2
+FROM_STAGING = 0xFF
+MAX_STAGE = 128 * 1024
+MAX_STAGE_GROW = 10_240
 
 
 def template_data(sp: S.Spec, depth: int, plan_id: bytes, *, challenge_window: int = 1_000, phase_window: int = 750,
@@ -25,6 +29,8 @@ def template_data(sp: S.Spec, depth: int, plan_id: bytes, *, challenge_window: i
     data += struct.pack("<H", slasher_bps) + plan_id
     if with_blocks:
         data += bytes([len(sp.blocks)]) + b"".join(b.record() for b in sp.blocks)
+    # Spec openings identify ListSpecs by their authenticated record type/id;
+    # there is no separate caller-supplied first-list boundary in a template.
     return data
 
 
@@ -83,7 +89,18 @@ def claim_body(sp: S.Spec, kind: str, position: int, name: str, kw: dict) -> byt
     if name == "GATE":
         return body + step_opening(kw["gate_opening"]) + gate_value(kw.get("gate_value"))
     if name == "EDGE":
-        pk = S.decode_producer(d["inputs"][kw["index"]][1])[0]
+        producer = d["inputs"][kw["index"]][1]
+        pk, list_id, *_ = S.decode_producer(producer)
+        if pk == S.PRODUCER_LIST:
+            ek = S.decode_producer(S.decode_list_spec(sp.list_specs[list_id])[1][kw["element"]][1])[0]
+            out = bytes([kw["element"]]) + struct.pack("<I", sp.list_leaf_index(list_id))
+            out += spec_opening(kw["list_opening"])
+            if ek == 1:
+                out += step_opening(kw["producer_opening"])
+            elif ek == 3:
+                out += const_opening(sp, S.decode_list_spec(sp.list_specs[list_id])[1][kw["element"]][1],
+                                     kw["const_opening"])
+            return body + out
         if pk == 1:
             return body + step_opening(kw["producer_opening"])
         if pk == 3:
@@ -99,12 +116,59 @@ def claim_body(sp: S.Spec, kind: str, position: int, name: str, kw: dict) -> byt
         pk = S.decode_producer(d["state_predecessor"])[0]
         return body + (step_opening(kw["producer_opening"]) if pk == 1 else b"")
     if name == "STEP":
-        out = bytes([len(kw["witness"])]) + b"".join(struct.pack("<I", len(v)) + v for v in kw["witness"])
+        if len(kw["witness"]) != len(d["inputs"]):
+            raise ValueError("STEP witness count must match the step inputs")
+        out = bytes([len(kw["witness"])])
+        for (_header, producer, _initial), value in zip(d["inputs"], kw["witness"]):
+            values = value if S.decode_producer(producer)[0] == S.PRODUCER_LIST else [value]
+            for v in values:
+                out += struct.pack("<I", len(v)) + v
         if d["state_scheme"]:
             out += struct.pack("<I", len(kw["state_witness"])) + kw["state_witness"]
         return body + out
     raise ValueError(name)
 
 
-def leaf_body(preimage: bytes | None) -> bytes:
-    return bytes([preimage is not None]) + (preimage or b"")
+def leaf_body(preimage: bytes | None, lists: dict[int, list[bytes]] | None = None) -> bytes:
+    """Encode E's leaf reveal. List refs use a staged-only LVR1 envelope so
+    claims can reread and reauthenticate them without enlarging disputes."""
+    if lists is None:
+        return bytes([preimage is not None]) + (preimage or b"")
+    if preimage is None and lists:
+        raise ValueError("an absent leaf cannot reveal list refs")
+    leaf = preimage or b""
+    out = b"LVR1" + bytes([preimage is not None]) + struct.pack("<H", len(leaf)) + leaf
+    out += bytes([len(lists)])
+    for input_index, refs in sorted(lists.items()):
+        if not 0 <= input_index < 8 or not 1 <= len(refs) <= S.MAX_LIST_ELEMENTS:
+            raise ValueError("invalid list reveal")
+        if any(len(ref) != 55 for ref in refs):
+            raise ValueError("each list ref is 55 bytes")
+        out += bytes([input_index, len(refs)]) + b"".join(refs)
+    return out
+
+
+def stage_create_body(role: int, size: int = 0) -> bytes:
+    """Tag-227 SUB_STAGE_CREATE body. E's first allocation is fixed at 10 KiB;
+    C supplies its requested capacity in bytes."""
+    if role not in (ROLE_EXECUTOR, ROLE_CHALLENGER):
+        raise ValueError("unknown staging role")
+    if role == ROLE_EXECUTOR:
+        size = 0
+    elif not 1 <= size <= 10_192:
+        raise ValueError("challenger stage size must be 1..10192")
+    return bytes([role]) + struct.pack("<I", size)
+
+
+def stage_grow_body(add: int) -> bytes:
+    if not 1 <= add <= MAX_STAGE_GROW:
+        raise ValueError("stage growth must be 1..10240 bytes")
+    return struct.pack("<I", add)
+
+
+def stage_write_bodies(payload: bytes, chunk_bytes: int = 900) -> list[bytes]:
+    """Return offset-prefixed SUB_STAGE_WRITE bodies for one staged payload."""
+    if not 1 <= chunk_bytes <= 1_200 or len(payload) > MAX_STAGE:
+        raise ValueError("invalid staging payload or transaction chunk size")
+    return [struct.pack("<I", offset) + payload[offset:offset + chunk_bytes]
+            for offset in range(0, len(payload), chunk_bytes)]

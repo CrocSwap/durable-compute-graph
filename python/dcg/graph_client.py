@@ -68,13 +68,20 @@ class GraphClient:
         value = self.rpc("getAccountInfo", [str(key), {"encoding": "base64", "commitment": "confirmed"}])["value"]
         return None if value is None else base64.b64decode(value["data"][0])
 
-    def send(self, data: bytes, metas: list[AccountMeta], signers: list[Keypair] | None = None, cu: int = 400_000) -> str:
+    def send(self, data: bytes, metas: list[AccountMeta], signers: list[Keypair] | None = None, cu: int = 400_000,
+             heap_frame: int | None = None) -> str:
         signers = [self.payer] + [s for s in (signers or []) if s.pubkey() != self.payer.pubkey()]
         budget = Instruction(Pubkey.from_string("ComputeBudget111111111111111111111111111111"),
                              bytes([2]) + struct.pack("<I", cu), [])
         ix = Instruction(self.program_id, data, metas)
         blockhash = Hash.from_string(self.rpc("getLatestBlockhash", [{"commitment": "confirmed"}])["value"]["blockhash"])
-        tx = Transaction(signers, Message.new_with_blockhash([budget, ix], self.payer.pubkey(), blockhash), blockhash)
+        budget_ixs = [budget]
+        if heap_frame is not None:
+            if not 32 * 1024 <= heap_frame <= 256 * 1024:
+                raise ValueError("heap_frame must be between 32 KiB and 256 KiB")
+            budget_ixs.append(Instruction(Pubkey.from_string("ComputeBudget111111111111111111111111111111"),
+                                          bytes([1]) + struct.pack("<I", heap_frame), []))
+        tx = Transaction(signers, Message.new_with_blockhash([*budget_ixs, ix], self.payer.pubkey(), blockhash), blockhash)
         wire = base64.b64encode(bytes(tx)).decode()
         sig = str(tx.signatures[0])
         try:

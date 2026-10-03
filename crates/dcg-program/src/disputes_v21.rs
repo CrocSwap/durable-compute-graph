@@ -29,8 +29,8 @@
 //!
 //! Rent reclaim: subs 18 to 20 close disputes (with their staging buffers), shrink settled runs to
 //! their receipts (or cancel uncommitted ones) and close reveal caches.
-//! Not yet: staging growth past one CPI creation (10 KiB), the leaf cache, the load extension, receipts, template closes, and the full v2.1
-//! template identity.
+//! Not yet: the leaf cache and the full v2.1 template identity. The bounded
+//! load extension uses c=1 and extend_slots=phase_window.
 
 use dcg_disputes as D;
 use dcg_disputes::blocks::{self, Block};
@@ -89,6 +89,14 @@ pub const SUB_CLOSE_RUN: u8 = 19;
 pub const RECEIPT_BYTES: usize = 136 + D::RUN_ROOT_BYTES;
 /// Close a reveal cache once its run is settled with no open dispute, or gone.
 pub const SUB_CLOSE_CACHE: u8 = 20;
+/// Close a template with no live runs; its rent returns to its recorded payer.
+pub const SUB_CLOSE_TEMPLATE: u8 = 21;
+/// Retire a tracked template so no new runs can be initialized from it.
+pub const SUB_RETIRE_TEMPLATE: u8 = 22;
+/// Builds the pre-provenance template encoding for backwards-compatibility
+/// tests. This subtype is absent from non-test program builds.
+#[cfg(feature = "test-legacy-template-create")]
+pub const SUB_TEST_CREATE_LEGACY_TEMPLATE: u8 = 250;
 pub const FROM_STAGING: u8 = 0xFF;
 pub const SUB_CACHE_ANSWER: u8 = 16;
 
@@ -213,9 +221,11 @@ fn now() -> Result<u64, ProgramError> {
 // Template "D21T": magic(4) depth(1) pad(3) total_steps(8) total_outputs(8)
 // challenge_window(8) phase_window(8) executor_bond(8) challenger_bond(8)
 // out_spec_base(4) step_spec_base(4) spec_root(32) template_id(32)
-// slasher_bps(2) pad(6) plan_id(32) block_count(1) pad(7)
+// slasher_bps(2) pad(6) plan_id(32); byte 134 is the tracked-template
+// retired flag (old templates and newly-created templates start at zero).
+// block_count(1) pad(7)
 // blocks[104 x MAX_BLOCKS] = 1,008 bytes;
-// PDA ["dcg21tmpl", template_id]. The bases are the spec-tree leaf indices of
+// New PDA ["dcg21tmpl", template_id, payer]; old templates retain their original PDA. The bases are the spec-tree leaf indices of
 // OutSpec(0) and StepSpec(0) (2 + in_count, and BlockSpec.first_record).
 // Create data without blocks (the step-1 form) means one enumerated block of
 // `total_steps` at address 0; with blocks, it is followed by
@@ -224,6 +234,16 @@ fn now() -> Result<u64, ProgramError> {
 const T_FIXED: usize = 168;
 const T_BLOCKS: usize = T_FIXED + 8;
 const T_BYTES: usize = T_BLOCKS + Block::BYTES * MAX_BLOCKS;
+// New templates append provenance and a live-run count. Existing T_BYTES
+// templates remain readable and usable, but cannot be closed because their
+// payer and live-run count were never recorded.
+const T_TRACKING_BYTES: usize = 40;
+const T_BYTES_V2: usize = T_BYTES + T_TRACKING_BYTES;
+const T_TRACKING_MAGIC: &[u8; 4] = b"D21O";
+const T_TRACKING: usize = T_BYTES;
+const T_PAYER: usize = T_TRACKING + 4;
+const T_ACTIVE_RUNS: usize = T_PAYER + 32;
+const T_RETIRED: usize = 134;
 
 struct Template {
     depth: u32,
@@ -287,10 +307,23 @@ fn check_blocks(blocks: &[Block], total_steps: u64) -> Result<u32, ProgramError>
 
 fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, ProgramError> {
     let d = account.try_borrow_data()?;
-    if d.len() != T_BYTES || &d[0..4] != b"D21T" {
+    if (d.len() != T_BYTES && d.len() != T_BYTES_V2) || &d[0..4] != b"D21T" {
         return Err(err(4));
     }
-    derived(program_id, account, &[b"dcg21tmpl", &d[96..128]])?;
+    if d.len() == T_BYTES_V2
+        && (&d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
+            || d[T_PAYER..T_PAYER + 32] == [0; 32]
+            || d[T_RETIRED] > 1)
+    {
+        return Err(err(4));
+    }
+    let old_address = Pubkey::find_program_address(&[b"dcg21tmpl", &d[96..128]], program_id).0;
+    let new_address = (d.len() == T_BYTES_V2).then(|| Pubkey::find_program_address(
+        &[b"dcg21tmpl", &d[96..128], &d[T_PAYER..T_PAYER + 32]], program_id,
+    ).0);
+    if account.owner != program_id || (*account.key != old_address && new_address != Some(*account.key)) {
+        return Err(err(2));
+    }
     let block_count = d[T_FIXED] as usize;
     if !(1..=MAX_BLOCKS).contains(&block_count) {
         return Err(err(4));
@@ -318,6 +351,54 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
     })
 }
 
+/// Whether a template has the close-tracking extension. Old templates have
+/// no reliable payer or live-run count, so they are deliberately uncloseable.
+fn tracked_template(account: &AccountInfo) -> Result<Option<u32>, ProgramError> {
+    let d = account.try_borrow_data()?;
+    if d.len() == T_BYTES {
+        return Ok(None);
+    }
+    if d.len() != T_BYTES_V2
+        || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
+        || d[T_PAYER..T_PAYER + 32] == [0; 32]
+    {
+        return Err(err(4));
+    }
+    Ok(Some(u32_at(&d, T_ACTIVE_RUNS)?))
+}
+
+fn template_retired(account: &AccountInfo) -> Result<bool, ProgramError> {
+    let d = account.try_borrow_data()?;
+    if d.len() == T_BYTES {
+        return Ok(false);
+    }
+    if d.len() != T_BYTES_V2
+        || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
+        || d[T_RETIRED] > 1
+    {
+        return Err(err(4));
+    }
+    Ok(d[T_RETIRED] == 1)
+}
+
+fn change_template_run_count(template: &AccountInfo, delta: i8) -> ProgramResult {
+    if !template.is_writable {
+        return Err(err(35));
+    }
+    let mut d = template.try_borrow_mut_data()?;
+    if d.len() != T_BYTES_V2 || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC {
+        return Err(err(4));
+    }
+    let count = u32_at(&d, T_ACTIVE_RUNS)?;
+    let next = match delta {
+        1 => count.checked_add(1).ok_or(err(8))?,
+        -1 => count.checked_sub(1).ok_or(err(37))?,
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+    d[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&next.to_le_bytes());
+    Ok(())
+}
+
 // Run "D21R": magic(4) status(1) pad(3) template(32) payer(32) executor(32)
 // run_id(32) commit_slot(8) deadline(8) open_disputes(4) n_ext(4)
 // run_root_bytes(176) then external refs (52 each). PDA ["dcg21run", run_id,
@@ -338,6 +419,8 @@ const R_PAID: usize = 184; // pot paid (u8)
 const R_CLOSED: usize = 188; // disputes closed (u32); a run closes when this reaches R_SEQ
 const R_ROOT: usize = 192;
 const R_REFS: usize = R_ROOT + D::RUN_ROOT_BYTES;
+// After the external refs: waiting_E:u32. Each dispute stores its own deadline.
+const R_LOAD_BYTES: usize = 4;
 
 pub const RUN_OPEN: u8 = 0;
 pub const RUN_COMMITTED: u8 = 1;
@@ -349,6 +432,16 @@ fn run_checked(program_id: &Pubkey, run: &AccountInfo, template: &AccountInfo) -
     if d.len() < R_REFS || &d[0..4] != b"D21R" || d[R_TEMPLATE..R_TEMPLATE + 32] != template.key.to_bytes() {
         return Err(err(5));
     }
+    let refs_end = R_REFS.checked_add((u32_at(&d, R_NEXT)? as usize).checked_mul(52).ok_or(err(8))?).ok_or(err(8))?;
+    if d.len() == refs_end {
+        // A run created before the 4-byte executor-wait trailer (DCG main
+        // before the follow-up B fix) cannot be served by this image. Upgrade
+        // in place only after every run is finalized or refuted, paid and
+        // closed (design §8.3, re-review M1).
+        solana_program::msg!("v2.1 run size {} predates the wait trailer; drain all runs before an in-place upgrade", d.len());
+        return Err(err(40));
+    }
+    if d.len() != refs_end.checked_add(R_LOAD_BYTES).ok_or(err(8))? { return Err(err(8)); }
     derived(program_id, run, &[b"dcg21run", &d[R_RUN_ID..R_RUN_ID + 32], &d[R_PAYER..R_PAYER + 32]])
 }
 
@@ -390,6 +483,8 @@ pub fn process(
 ) -> ProgramResult {
     match data.get(1).copied().ok_or(ProgramError::InvalidInstructionData)? {
         SUB_CREATE_TEMPLATE => create_template(program_id, accounts, &data[2..]),
+        #[cfg(feature = "test-legacy-template-create")]
+        SUB_TEST_CREATE_LEGACY_TEMPLATE => create_template_inner(program_id, accounts, &data[2..], false),
         SUB_INIT_RUN => init_run(program_id, accounts, &data[2..]),
         SUB_COMMIT => commit(program_id, accounts, &data[2..]),
         SUB_OPEN => open(program_id, accounts, &data[2..]),
@@ -409,6 +504,8 @@ pub fn process(
         SUB_CLOSE_DISPUTE if data.len() == 2 => close_dispute(program_id, accounts),
         SUB_CLOSE_RUN if data.len() == 2 => close_run(program_id, accounts),
         SUB_CLOSE_CACHE if data.len() == 2 => close_cache(program_id, accounts),
+        SUB_CLOSE_TEMPLATE if data.len() == 2 => close_template(program_id, accounts),
+        SUB_RETIRE_TEMPLATE if data.len() == 2 => retire_template(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -418,6 +515,10 @@ pub fn process(
 // challenger_bond:u64 out_spec_base:u32 step_spec_base:u32 spec_root[32]
 // slasher_bps:u16 (< 10,000: the remainder deterrent, design §10.3) plan_id[32]
 fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    create_template_inner(program_id, accounts, data, true)
+}
+
+fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], track_close: bool) -> ProgramResult {
     let [admitter, tmpl, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     const FIXED: usize = 1 + 6 * 8 + 8 + 32 + 2 + 32;
     if !admitter.is_signer || data.len() < FIXED {
@@ -439,12 +540,19 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     {
         return Err(err(6));
     }
-    // The blocks: given after the fixed fields, or the step-1 default.
-    let list: Vec<Block> = if data.len() > FIXED {
+    // The blocks are optional. An ignored trailing word is not a distinct template.
+    let block_data_end = if data.len() == FIXED {
+        FIXED
+    } else {
         let count = data[FIXED] as usize;
-        if !(1..=MAX_BLOCKS).contains(&count) || data.len() != FIXED + 1 + Block::BYTES * count {
+        let end = FIXED + 1 + Block::BYTES * count;
+        if !(1..=MAX_BLOCKS).contains(&count) || data.len() != end {
             return Err(ProgramError::InvalidInstructionData);
         }
+        end
+    };
+    let blocks: Vec<Block> = if block_data_end > FIXED {
+        let count = data[FIXED] as usize;
         (0..count)
             .map(|i| Block::parse(&data[FIXED + 1 + Block::BYTES * i..FIXED + 1 + Block::BYTES * (i + 1)]))
             .collect::<Option<Vec<Block>>>()
@@ -452,14 +560,19 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     } else {
         vec![Block::parse(&default_block(total_steps, u32_at(data, 53)? as u64)).ok_or(err(6))?]
     };
-    let count = list.len();
-    check_blocks(&list, total_steps)?;
+    let count = blocks.len();
+    check_blocks(&blocks, total_steps)?;
     let template_id = sha256(&[TEMPLATE_DOMAIN, data]);
-    create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id], T_BYTES)?;
+    let template_bytes = if track_close { T_BYTES_V2 } else { T_BYTES };
+    if track_close {
+        create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id, admitter.key.as_ref()], template_bytes)?;
+    } else {
+        create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id], template_bytes)?;
+    }
     let mut d = tmpl.try_borrow_mut_data()?;
     d[T_FIXED] = count as u8;
-    if data.len() > FIXED {
-        d[T_BLOCKS..T_BLOCKS + Block::BYTES * count].copy_from_slice(&data[FIXED + 1..]);
+    if block_data_end > FIXED {
+        d[T_BLOCKS..T_BLOCKS + Block::BYTES * count].copy_from_slice(&data[FIXED + 1..block_data_end]);
     } else {
         d[T_BLOCKS..T_BLOCKS + Block::BYTES].copy_from_slice(&default_block(total_steps, u32_at(data, 53)? as u64));
     }
@@ -470,6 +583,12 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     d[128..130].copy_from_slice(&data[89..91]);
     d[136..168].copy_from_slice(&data[91..123]);
     d[96..128].copy_from_slice(&template_id);
+    if track_close {
+        d[T_TRACKING..T_TRACKING + 4].copy_from_slice(T_TRACKING_MAGIC);
+        d[T_PAYER..T_PAYER + 32].copy_from_slice(admitter.key.as_ref());
+        d[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&0u32.to_le_bytes());
+        d[T_RETIRED] = 0;
+    }
     Ok(())
 }
 
@@ -492,6 +611,14 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         return Err(ProgramError::MissingRequiredSignature);
     }
     let t = template(program_id, tmpl)?;
+    let active_runs = tracked_template(tmpl)?;
+    if template_retired(tmpl)? {
+        return Err(err(37));
+    }
+    if active_runs.is_some() && !tmpl.is_writable {
+        return Err(err(35));
+    }
+    let next_active_runs = active_runs.map(|n| n.checked_add(1).ok_or(err(8))).transpose()?;
     let n = u32_at(data, 64)? as usize;
     let refs = data.get(68..68 + n * 52).ok_or(err(1))?;
     if data.len() != 68 + n * 52 {
@@ -513,7 +640,7 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &data[0..32], &(n as u32).to_le_bytes(), refs, &data[32..64]]);
     // The payer is part of the run's address (review 10-03, F5): a cancelled
     // run cannot be re-initialized at the same address by someone else.
-    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], R_REFS + refs.len())?;
+    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], R_REFS + refs.len() + R_LOAD_BYTES)?;
     let mut d = run.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"D21R");
     d[R_TEMPLATE..R_TEMPLATE + 32].copy_from_slice(tmpl.key.as_ref());
@@ -526,7 +653,12 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     // within the template's challenge window; after it, the payer may cancel.
     let commit_deadline = now()?.checked_add(t.challenge_window).ok_or(err(8))?;
     d[R_DEADLINE..R_DEADLINE + 8].copy_from_slice(&commit_deadline.to_le_bytes());
-    d[R_REFS..].copy_from_slice(refs);
+    d[R_REFS..R_REFS + refs.len()].copy_from_slice(refs);
+    drop(d);
+    if let Some(next) = next_active_runs {
+        let mut t = tmpl.try_borrow_mut_data()?;
+        t[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&next.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -597,13 +729,14 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     if t.challenger_bond > 0 {
         invoke(&system_instruction::transfer(challenger.key, dispute.key, t.challenger_bond), &[challenger.clone(), dispute.clone(), system.clone()])?;
     }
-    let sequence = {
+    let (sequence, deadline) = {
         let mut r = run.try_borrow_mut_data()?;
         let open = u32_at(&r, R_OPEN)?.checked_add(1).ok_or(err(8))?;
         r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
+        let deadline = begin_executor_wait(&mut r, &t)?;
         let seq = u64_at(&r, R_SEQ)?;
         r[R_SEQ..R_SEQ + 8].copy_from_slice(&seq.checked_add(1).ok_or(err(8))?.to_le_bytes());
-        seq
+        (seq, deadline)
     };
     let mut d = dispute.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"D21D");
@@ -611,7 +744,6 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     d[D_KIND] = kind;
     d[D_DEPTH] = t.depth as u8;
     d[D_LEVEL..D_LEVEL + 4].copy_from_slice(&level.to_le_bytes());
-    let deadline = now()?.checked_add(executor_window(&t, run)?).ok_or(err(8))?;
     d[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&deadline.to_le_bytes());
     d[D_CHALLENGER..D_CHALLENGER + 32].copy_from_slice(challenger.key.as_ref());
     d[D_RUN..D_RUN + 32].copy_from_slice(run.key.as_ref());
@@ -641,7 +773,7 @@ fn dispute_ctx<'a, 'b>(program_id: &Pubkey, run: &'a AccountInfo<'b>, tmpl: &Acc
     Ok(Ctx { t, run, dispute })
 }
 
-fn expect_phase(d: &[u8], phase: u8) -> ProgramResult {
+fn expect_phase(d: &[u8], phase: u8, _run: &AccountInfo) -> ProgramResult {
     if d[D_PHASE] != phase {
         return Err(err(12));
     }
@@ -651,12 +783,28 @@ fn expect_phase(d: &[u8], phase: u8) -> ProgramResult {
     Ok(())
 }
 
-/// The window for a phase the executor owes (NODES, LEAF): the template's
-/// phase window times the run's open disputes (the load extension, §8.3;
-/// review 10-03, F4), so concurrent disputes cannot outrun one executor.
-fn executor_window(t: &Template, run: &AccountInfo) -> Result<u64, ProgramError> {
-    let open = u32_at(&run.try_borrow_data()?, R_OPEN)?.max(1) as u64;
-    Ok(t.phase_window.saturating_mul(open).min(MAX_WINDOW))
+fn load_offset(r: &[u8]) -> Result<usize, ProgramError> {
+    let at = R_REFS.checked_add((u32_at(r, R_NEXT)? as usize).checked_mul(52).ok_or(err(8))?).ok_or(err(8))?;
+    if r.len() != at + R_LOAD_BYTES { return Err(err(8)); }
+    Ok(at)
+}
+
+fn begin_executor_wait(r: &mut [u8], t: &Template) -> Result<u64, ProgramError> {
+    let at = load_offset(r)?;
+    let waiting = u32_at(r, at)?;
+    // c=1, extend_slots=phase_window. Cap this phase's entire window.
+    let window = t.phase_window.checked_mul(u64::from(waiting).checked_add(1).ok_or(err(8))?)
+        .ok_or(err(8))?.min(MAX_WINDOW);
+    let deadline = now()?.checked_add(window).ok_or(err(8))?;
+    r[at..at + 4].copy_from_slice(&waiting.checked_add(1).ok_or(err(8))?.to_le_bytes());
+    Ok(deadline)
+}
+
+fn end_executor_wait(r: &mut [u8]) -> ProgramResult {
+    let at = load_offset(r)?;
+    let waiting = u32_at(r, at)?.checked_sub(1).ok_or(err(8))?;
+    r[at..at + 4].copy_from_slice(&waiting.to_le_bytes());
+    Ok(())
 }
 
 fn next_phase(d: &mut [u8], phase: u8, window: u64) -> ProgramResult {
@@ -694,13 +842,13 @@ fn tree_of(kind: u8) -> D::Tree {
     if kind == KIND_STEP_DESCEND { D::Tree::Step } else { D::Tree::Out }
 }
 
-// 5: [executor(s), run, template, dispute(w)] the pickable hashes, in position order.
+// 5: [executor(s), run(w), template, dispute(w)] the pickable hashes, in position order.
 fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     executor_signed(c.run, executor)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
-    expect_phase(&d, PH_NODES)?;
+    expect_phase(&d, PH_NODES, c.run)?;
     let level = u32_at(&d, D_LEVEL)?;
     let position = u64_at(&d, D_POSITION)?;
     let depth = (d[D_DEPTH] as u32).min(level);
@@ -748,16 +896,17 @@ fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
             k[CACHE_BYTES..CACHE_BYTES_V2].copy_from_slice(executor.key.as_ref());
         }
     }
+    end_executor_wait(&mut c.run.try_borrow_mut_data()?)?;
     next_phase(&mut d, PH_PICK, c.t.phase_window)
 }
 
-// 16: [anyone, run, template, dispute(w), cache] answer AWAIT_NODES from a
+// 16: [anyone, run(w), template, dispute(w), cache] answer AWAIT_NODES from a
 // cached, verified reveal of the same node.
 fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [_caller, run, tmpl, dispute, cache, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
-    expect_phase(&d, PH_NODES)?;
+    expect_phase(&d, PH_NODES, c.run)?;
     let k = cache.try_borrow_data()?;
     let level = u32_at(&d, D_LEVEL)?;
     let position = u64_at(&d, D_POSITION)?;
@@ -775,16 +924,17 @@ fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     let n = (0..1u64 << depth).filter(|i| pickable(&c.t, kind, level - depth, first + i)).count();
     d[D_REVEALED..D_REVEALED + 32 * 32].copy_from_slice(&k[56..CACHE_BYTES]);
     d[D_REVEALED_N..D_REVEALED_N + 2].copy_from_slice(&(n as u16).to_le_bytes());
+    end_executor_wait(&mut c.run.try_borrow_mut_data()?)?;
     next_phase(&mut d, PH_PICK, c.t.phase_window)
 }
 
-// 6: [challenger(s), run, template, dispute(w)] index:u8
+// 6: [challenger(s), run(w), template, dispute(w)] index:u8
 fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [challenger, run, tmpl, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
     challenger_signed(&d, challenger)?;
-    expect_phase(&d, PH_PICK)?;
+    expect_phase(&d, PH_PICK, c.run)?;
     let index = *data.first().ok_or(err(1))? as u64;
     let level = u32_at(&d, D_LEVEL)?;
     let depth = (d[D_DEPTH] as u32).min(level);
@@ -797,8 +947,10 @@ fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     d[D_LEVEL..D_LEVEL + 4].copy_from_slice(&new_level.to_le_bytes());
     d[D_POSITION..D_POSITION + 8].copy_from_slice(&((position << depth) + index).to_le_bytes());
     d[D_CURRENT..D_CURRENT + 32].copy_from_slice(&chosen);
-    let window = executor_window(&c.t, c.run)?;
-    next_phase(&mut d, if new_level == 0 { PH_LEAF } else { PH_NODES }, window)
+    let deadline = begin_executor_wait(&mut c.run.try_borrow_mut_data()?, &c.t)?;
+    d[D_PHASE] = if new_level == 0 { PH_LEAF } else { PH_NODES };
+    d[D_DEADLINE..D_DEADLINE + 8].copy_from_slice(&deadline.to_le_bytes());
+    Ok(())
 }
 
 // 14: [challenger(s,w), run, template, dispute, buffer(w), system] role:u8 size:u32
@@ -806,6 +958,7 @@ fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     let [challenger, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     let role = *data.first().ok_or(err(1))?;
+    if c.dispute.try_borrow_data()?[D_PHASE] == PH_RULED { return Err(err(37)); }
     // C funds both buffers; E may create its own if C has not (review).
     let by_challenger = challenger_signed(&c.dispute.try_borrow_data()?, challenger).is_ok();
     if !by_challenger && !(role == ROLE_EXECUTOR && executor_signed(c.run, challenger).is_ok()) {
@@ -830,7 +983,8 @@ fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
 fn stage_grow(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [funder, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
-    staging_role(program_id, c.dispute, buffer)?;
+    let role = staging_role(program_id, c.dispute, buffer)?;
+    stage_mutable_for_role(c.dispute, role)?;
     let add = u32_at(data, 0)? as usize;
     let new_len = buffer.data_len().checked_add(add).ok_or(err(8))?;
     if !funder.is_signer || add == 0 || add > 10_240 || new_len > STAGE_HEADER + MAX_STAGE || data.len() != 4 {
@@ -849,6 +1003,7 @@ fn stage_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let [writer, run, tmpl, dispute, buffer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     let role = staging_role(program_id, c.dispute, buffer)?;
+    stage_mutable_for_role(c.dispute, role)?;
     if role == ROLE_EXECUTOR {
         executor_signed(c.run, writer)?;
     } else {
@@ -867,6 +1022,17 @@ fn stage_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     Ok(())
 }
 
+/// Once E reveals a leaf, its list refs are authenticated by that leaf's list
+/// digests and the staged reveal bytes become immutable for this dispute.
+/// C's buffer remains writable while making its claim.
+fn stage_mutable_for_role(dispute: &AccountInfo, role: u8) -> ProgramResult {
+    let phase = dispute.try_borrow_data()?[D_PHASE];
+    if phase == PH_RULED || (role == ROLE_EXECUTOR && phase >= PH_CLAIM) {
+        return Err(err(37));
+    }
+    Ok(())
+}
+
 fn staging_role(program_id: &Pubkey, dispute: &AccountInfo, buffer: &AccountInfo) -> Result<u8, ProgramError> {
     let b = buffer.try_borrow_data()?;
     if b.len() < STAGE_HEADER || &b[0..4] != b"D21S" || b[8..40] != dispute.key.to_bytes() {
@@ -877,29 +1043,150 @@ fn staging_role(program_id: &Pubkey, dispute: &AccountInfo, buffer: &AccountInfo
     Ok(role)
 }
 
-// 7: [executor(s), run, template, dispute(w)] present:u8 preimage
+const LIST_REVEAL_MAGIC: &[u8; 4] = b"LVR1";
+
+/// Staged list reveal: `LVR1 present:u8 leaf_len:u16 leaf list_count:u8`,
+/// then `(input_index:u8 count:u8 refs[55*count])*`. Legacy staged leaf
+/// reveals remain `[present:u8 leaf]` and cannot carry list inputs.
+fn decode_leaf_reveal(data: &[u8]) -> Result<(u8, &[u8], Vec<(usize, Vec<[u8; D::VALUE_REF_BYTES]>)>, bool), ProgramError> {
+    if data.starts_with(LIST_REVEAL_MAGIC) {
+        let present = *data.get(4).ok_or(err(1))?;
+        let len = u16_at(data, 5)? as usize;
+        let leaf_end = 7usize.checked_add(len).ok_or(err(8))?;
+        let body = data.get(7..leaf_end).ok_or(err(1))?;
+        let n = *data.get(leaf_end).ok_or(err(1))? as usize;
+        let mut at = leaf_end + 1;
+        let mut lists = Vec::with_capacity(n);
+        let mut previous = None;
+        for _ in 0..n {
+            let input = *data.get(at).ok_or(err(1))? as usize;
+            let count = *data.get(at + 1).ok_or(err(1))? as usize;
+            at += 2;
+            if count == 0 || count > D::MAX_LIST_ELEMENTS || previous.is_some_and(|p| p >= input) {
+                return Err(err(16));
+            }
+            previous = Some(input);
+            let bytes = count.checked_mul(D::VALUE_REF_BYTES).ok_or(err(8))?;
+            let raw = data.get(at..at + bytes).ok_or(err(1))?;
+            let refs = raw.chunks_exact(D::VALUE_REF_BYTES)
+                .map(|r| <[u8; D::VALUE_REF_BYTES]>::try_from(r).unwrap()).collect();
+            lists.push((input, refs));
+            at += bytes;
+        }
+        if at != data.len() {
+            return Err(err(16));
+        }
+        Ok((present, body, lists, true))
+    } else {
+        let present = *data.first().ok_or(err(1))?;
+        Ok((present, &data[1..], Vec::new(), false))
+    }
+}
+
+/// Validate list refs against the list-layout inputs in a step leaf. This is
+/// called both when E reveals and when C claims, so mutating E's staging
+/// buffer after reveal cannot change the authenticated refs.
+fn validate_leaf_lists(
+    present: u8,
+    body: &[u8],
+    lists: Vec<(usize, Vec<[u8; D::VALUE_REF_BYTES]>)>,
+    framed: bool,
+) -> Result<Vec<Vec<[u8; D::VALUE_REF_BYTES]>>, ProgramError> {
+    let Some(leaf) = (present == 1).then(|| D::parse_leaf(body)).flatten() else {
+        if !lists.is_empty() {
+            return Err(err(16));
+        }
+        return Ok(Vec::new());
+    };
+    let mut lists = lists.into_iter();
+    let mut result = Vec::with_capacity(leaf.input_count());
+    let mut total_elements = 0usize;
+    for i in 0..leaf.input_count() {
+        let r = leaf.input(i);
+        let layout = u32::from_le_bytes(r[7..11].try_into().unwrap());
+        if layout != D::LAYOUT_LIST {
+            result.push(Vec::new());
+            continue;
+        }
+        if !framed {
+            return Err(err(16));
+        }
+        let (index, refs) = lists.next().ok_or(err(16))?;
+        if index != i || refs.is_empty() || refs.len() > D::MAX_LIST_ELEMENTS {
+            return Err(err(16));
+        }
+        total_elements = total_elements.checked_add(refs.len()).ok_or(err(8))?;
+        if total_elements > D::MAX_LIST_ELEMENTS_PER_STEP {
+            return Err(err(16));
+        }
+        if D::list_digest_elements(&H, &refs).is_none_or(|digest| digest.as_slice() != &r[23..55]) {
+            return Err(err(16));
+        }
+        result.push(refs);
+    }
+    if lists.next().is_some() {
+        return Err(err(16));
+    }
+    Ok(result)
+}
+
+fn staged_leaf_lists(
+    program_id: &Pubkey,
+    dispute: &AccountInfo,
+    buffer: &AccountInfo,
+    expected_present: u8,
+    expected_leaf: &[u8],
+) -> Result<Vec<Vec<[u8; D::VALUE_REF_BYTES]>>, ProgramError> {
+    if staging_role(program_id, dispute, buffer)? != ROLE_EXECUTOR {
+        return Err(err(29));
+    }
+    let b = buffer.try_borrow_data()?;
+    let len = u32_at(&b, 40)? as usize;
+    let end = STAGE_HEADER.checked_add(len).ok_or(err(8))?;
+    let raw = b.get(STAGE_HEADER..end).ok_or(err(29))?;
+    let (present, body, lists, framed) = decode_leaf_reveal(raw)?;
+    if !framed || present != expected_present || body != expected_leaf {
+        return Err(err(29));
+    }
+    validate_leaf_lists(present, body, lists, framed)
+}
+
+// 7: [executor(s), run(w), template, dispute(w)] present:u8 preimage
 fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     executor_signed(c.run, executor)?;
     let staged;
-    let data: &[u8] = if data == [FROM_STAGING] {
+    let from_staging = data == [FROM_STAGING];
+    let data: &[u8] = if from_staging {
         let buffer = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
         if staging_role(program_id, c.dispute, buffer)? != ROLE_EXECUTOR {
             return Err(err(29));
         }
         staged = buffer.try_borrow_data()?;
         let len = u32_at(&staged, 40)? as usize;
-        &staged[STAGE_HEADER..STAGE_HEADER + len]
+        let end = STAGE_HEADER.checked_add(len).ok_or(err(8))?;
+        staged.get(STAGE_HEADER..end).ok_or(err(29))?
     } else {
         data
     };
     let mut d = c.dispute.try_borrow_mut_data()?;
-    expect_phase(&d, PH_LEAF)?;
-    let present = *data.first().ok_or(err(1))?;
-    let body = &data[1..];
+    expect_phase(&d, PH_LEAF, c.run)?;
+    let (present, body, list_reveals, framed) = decode_leaf_reveal(data)?;
     if present > 1 || (present == 0 && !body.is_empty()) || body.len() > MAX_LEAF {
         return Err(err(16));
+    }
+    if present == 1 {
+        validate_leaf_lists(present, body, list_reveals, framed)?;
+    } else if !list_reveals.is_empty() {
+        return Err(err(16));
+    }
+    if !from_staging && present == 1 {
+        if let Some(leaf) = D::parse_leaf(body) {
+            if (0..leaf.input_count()).any(|i| u32::from_le_bytes(leaf.input(i)[7..11].try_into().unwrap()) == D::LAYOUT_LIST) {
+                return Err(err(16));
+            }
+        }
     }
     let position = u64_at(&d, D_POSITION)?;
     let h = if d[D_KIND] == KIND_STEP_DESCEND {
@@ -913,6 +1200,7 @@ fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     d[D_LEAF_LEN..D_LEAF_LEN + 2].copy_from_slice(&(body.len() as u16).to_le_bytes());
     d[D_LEAF_PRESENT] = present;
     d[D_LEAF..D_LEAF + body.len()].copy_from_slice(body);
+    end_executor_wait(&mut c.run.try_borrow_mut_data()?)?;
     next_phase(&mut d, PH_CLAIM, c.t.phase_window)
 }
 
@@ -960,10 +1248,13 @@ fn step_opening<'a>(t: &Template, root: &[u8], data: &'a [u8], at: &mut usize, o
 // claim:u8 index:u8 spec_opening, then by claim (design §7.3):
 //   SHAPE  -
 //   EDGE   kind 1: step_opening(producer); kind 2, 7: -; kind 3: const_opening;
+//          kind 8: element:u8 list_spec_index:u32 list_spec_opening, then
+//                  kind 1: step_opening(producer), kind 3: const_opening;
 //          kind 5: [const_opening, from a constant] chunk_opening; kind 6: last_running(t)
 //   GATE   step_opening(gate leaf of iteration i-1) gate_value
 //   STATE  kind 1 predecessor: step_opening
-//   STEP   n:u8 (len:u32 bytes)* [len:u32 prior state, if stateful]
+//   STEP   n:u8; each ordinary input has one (len:u32 bytes), and a list
+//          input has one pair per element; then prior state if stateful.
 //   OUT    kind 1: step_opening(producer); kind 6: last_running(t)
 // step_opening = present:u8 len:u16 preimage path_len:u8 path;
 // chunk_opening = len:u16 chunk path_len:u8 path;
@@ -979,31 +1270,46 @@ fn claim(
 ) -> ProgramResult {
     let [challenger, run, tmpl, dispute, executor_acct, _challenger_acct, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    let claim_from_staging = data == [FROM_STAGING];
     let staged;
-    let data: &[u8] = if data == [FROM_STAGING] {
+    let data: &[u8] = if claim_from_staging {
         let buffer = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
         if staging_role(program_id, c.dispute, buffer)? != ROLE_CHALLENGER {
             return Err(err(29));
         }
         staged = buffer.try_borrow_data()?;
         let len = u32_at(&staged, 40)? as usize;
-        &staged[STAGE_HEADER..STAGE_HEADER + len]
+        staged.get(STAGE_HEADER..STAGE_HEADER.checked_add(len).ok_or(err(8))?).ok_or(err(1))?
     } else {
         data
     };
     let (kind, position, present, leaf_buf) = {
         let d = c.dispute.try_borrow_data()?;
         challenger_signed(&d, challenger)?;
-        expect_phase(&d, PH_CLAIM)?;
+        expect_phase(&d, PH_CLAIM, c.run)?;
         let len = u16_at(&d, D_LEAF_LEN)? as usize;
         let buf = d[D_LEAF..D_LEAF + len].to_vec();
         (d[D_KIND], u64_at(&d, D_POSITION)?, d[D_LEAF_PRESENT] == 1, (buf, len))
     };
     let leaf_bytes = &leaf_buf.0[..];
+    let leaf_list_refs = if let Some(leaf) = D::parse_leaf(leaf_bytes) {
+        let has_lists = (0..leaf.input_count()).any(|i| {
+            u32::from_le_bytes(leaf.input(i)[7..11].try_into().unwrap()) == D::LAYOUT_LIST
+        });
+        if has_lists {
+            let executor_buffer = rest.get(if claim_from_staging { 1 } else { 0 }).ok_or(ProgramError::NotEnoughAccountKeys)?;
+            staged_leaf_lists(program_id, c.dispute, executor_buffer, 1, leaf_bytes)?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     let root: [u8; D::RUN_ROOT_BYTES] = c.run.try_borrow_data()?[R_ROOT..R_REFS].try_into().unwrap();
     let refs_buf = c.run.try_borrow_data()?;
-    let refs = &refs_buf[R_REFS..];
-    let k = Referee { t: &c.t, root: &root, refs, data, manifest };
+    let refs_end = load_offset(&refs_buf)?;
+    let refs = &refs_buf[R_REFS..refs_end];
+    let k = Referee { t: &c.t, root: &root, refs, data, list_refs: &leaf_list_refs, manifest };
     let name = *data.first().ok_or(err(1))?;
     let index = *data.get(1).ok_or(err(1))? as usize;
     let mut at = 2;
@@ -1053,12 +1359,9 @@ fn claim(
             return Err(err(17));
         }
         let gated = block.kind == 2 && it >= 1;
-        // The program judges SMALL state only. A STATE or STEP claim on any
-        // other scheme (LOG) is ruled neutral until LOG is implemented here
-        // (review 10-03, F3); the Python referee already models LOG.
-        if present && matches!(name, CLAIM_STATE | CLAIM_STEP) && spec.state_scheme() > 1 {
-            neutral = true;
-        }
+        // Every LOG STATE and STEP claim is neutral (moot) until LOG is judged
+        // on chain: the program sees only the spec root, so it cannot refuse a
+        // LOG chain that changes scheme or capacity (re-review A1).
         if !present {
             // Empty is a violation unless the step is gated; then GATE decides.
             if !gated {
@@ -1072,7 +1375,14 @@ fn claim(
             match D::parse_leaf(leaf_bytes) {
                 // Malformed under E's own commitment: C wins.
                 None => true,
-                Some(leaf) => match name {
+                Some(leaf) => {
+                    if spec.state_scheme() > 1 {
+                        // Template creation commits only a spec root. It cannot
+                        // inspect the predecessor's scheme or capacity, so a
+                        // LOG STATE claim is unsafe to judge in this image.
+                        neutral = matches!(name, CLAIM_STEP | CLAIM_STATE);
+                    }
+                    match name {
                     CLAIM_GATE => gated && k.gate_says(&mut at, bi, &block, it, true)?,
                     CLAIM_SHAPE => D::shape_wrong(&leaf, &spec, D::RunRoot(&root).plan_id(), D::RunRoot(&root).run_id(), ordinal),
                     CLAIM_EDGE => k.edge(&mut at, &leaf, &spec, index)?,
@@ -1081,6 +1391,7 @@ fn claim(
                     CLAIM_STATE => k.state(&mut at, &leaf, &spec)?,
                     CLAIM_STEP => k.step(&mut at, &leaf, &spec)?,
                     _ => return Err(err(19)),
+                    }
                 },
             }
         }
@@ -1096,6 +1407,7 @@ struct Referee<'a> {
     root: &'a [u8; D::RUN_ROOT_BYTES],
     refs: &'a [u8],
     data: &'a [u8],
+    list_refs: &'a [Vec<[u8; D::VALUE_REF_BYTES]>],
     manifest: &'static crate::kernel::ApplicationManifest,
 }
 
@@ -1191,6 +1503,9 @@ impl<'a> Referee<'a> {
         let got = leaf.input(index);
         let header = spec.input_header(index);
         let (pk, a, b, c, d) = spec.input_producer(index);
+        if pk == D::PRODUCER_LIST {
+            return self.list_edge(at, index, a);
+        }
         Ok(match pk {
             // The spec names an input the run never posted: C wins.
             2 => self.external_ref(a).is_none_or(|r| got[7..55] != r[4..52]),
@@ -1228,6 +1543,48 @@ impl<'a> Referee<'a> {
         })
     }
 
+    /// EDGE(i,j) opens the committed ListSpec and checks one E-revealed ref
+    /// against its element header and one ordinary producer opening.
+    fn list_edge(&self, at: &mut usize, input: usize, list_id: u64) -> Result<bool, ProgramError> {
+        let element = *self.data.get(*at).ok_or(err(1))? as usize;
+        *at += 1;
+        let index = u32_at(self.data, *at)? as u64;
+        *at += 4;
+        if list_id > u32::MAX as u64 {
+            return Err(err(17));
+        }
+        let (type_code, record) = spec_record(self.t, self.data, at, index)?;
+        let list = D::ListSpec(record);
+        if type_code != D::TYPE_LIST || !list.valid() || list.id() as u64 != list_id {
+            return Err(err(17));
+        }
+        if element >= list.count() {
+            return Err(err(19));
+        }
+        let Some(input_refs) = self.list_refs.get(input) else { return Ok(true) };
+        if input_refs.len() != list.count() {
+            return Ok(true);
+        }
+        let got = &input_refs[element];
+        let header = list.element_header(element);
+        if got[..D::PORT_HEADER_BYTES] != *header {
+            return Ok(true);
+        }
+        let (pk, a, b, _c, _d) = list.element_producer(element);
+        Ok(match pk {
+            1 => match self.opening(at, a)?.and_then(D::parse_leaf) {
+                None => true,
+                Some(prod) => prod.output_port(b as u16).is_none_or(|o| got[7..55] != o[7..55]),
+            },
+            2 => self.external_ref(a).is_none_or(|r| got[7..55] != r[4..52]),
+            3 => {
+                let c = self.constant(at, a)?;
+                got[7..23] != c[15..31] || got[23..55] != c[40..72]
+            }
+            _ => return Err(err(19)),
+        })
+    }
+
     fn state(&self, at: &mut usize, leaf: &D::Leaf, spec: &D::StepSpec) -> Result<bool, ProgramError> {
         if spec.state_scheme() == 0 {
             return Ok(false);
@@ -1250,18 +1607,43 @@ impl<'a> Referee<'a> {
     fn step(&self, at: &mut usize, leaf: &D::Leaf, spec: &D::StepSpec) -> Result<bool, ProgramError> {
         let n = *self.data.get(*at).ok_or(err(1))? as usize;
         *at += 1;
-        if n != leaf.input_count() || n > 8 {
+        if n != leaf.input_count() || n != spec.input_count() || n > 8 {
             return Err(err(20));
         }
-        let mut ins: [&[u8]; 8] = [&[]; 8];
-        for (i, slot) in ins.iter_mut().enumerate().take(n) {
-            let len = u32_at(self.data, *at)? as usize;
-            let v = self.data.get(*at + 4..*at + 4 + len).ok_or(err(1))?;
-            *at += 4 + len;
-            if D::value_digest(&H, v) != leaf.input(i)[23..55] {
-                return Err(err(20));
+        let list_capacity: usize = self.list_refs.iter().map(Vec::len).sum();
+        let mut ins = Vec::with_capacity(n + list_capacity.min(D::MAX_LIST_ELEMENTS_PER_STEP));
+        let mut total_list_elements = 0usize;
+        for i in 0..n {
+            let (kind, _, _, _, _) = spec.input_producer(i);
+            if kind == D::PRODUCER_LIST {
+                let refs = self.list_refs.get(i).ok_or(err(20))?;
+                if refs.is_empty() || refs.len() > D::MAX_LIST_ELEMENTS {
+                    return Err(err(20));
+                }
+                total_list_elements = total_list_elements.checked_add(refs.len()).ok_or(err(8))?;
+                if total_list_elements > D::MAX_LIST_ELEMENTS_PER_STEP {
+                    return Err(err(20));
+                }
+                for r in refs {
+                    let len = u32_at(self.data, *at)? as usize;
+                    let end = (*at).checked_add(4).and_then(|x| x.checked_add(len)).ok_or(err(8))?;
+                    let v = self.data.get(*at + 4..end).ok_or(err(1))?;
+                    *at = end;
+                    if D::value_digest(&H, v) != r[23..55] {
+                        return Err(err(20));
+                    }
+                    ins.push(v);
+                }
+            } else {
+                let len = u32_at(self.data, *at)? as usize;
+                let end = (*at).checked_add(4).and_then(|x| x.checked_add(len)).ok_or(err(8))?;
+                let v = self.data.get(*at + 4..end).ok_or(err(1))?;
+                *at = end;
+                if D::value_digest(&H, v) != leaf.input(i)[23..55] {
+                    return Err(err(20));
+                }
+                ins.push(v);
             }
-            *slot = v;
         }
         let prior = if spec.state_scheme() != 0 {
             let len = u32_at(self.data, *at)? as usize;
@@ -1276,7 +1658,7 @@ impl<'a> Referee<'a> {
         };
         if D::reductions::lookup(spec.kernel_id()).is_some() {
             // A refused replay cannot carry committed outputs: C wins.
-            let Some(r) = D::reductions::replay(spec.kernel_id(), &ins[..n], prior) else { return Ok(true) };
+            let Some(r) = D::reductions::replay(spec.kernel_id(), &ins, prior) else { return Ok(true) };
             return Ok(r.output_count != leaf.output_count()
                 || (0..r.output_count).any(|i| D::value_digest(&H, r.output(i)) != leaf.output(i)[23..55])
                 || r.next().is_some_and(|nx| D::value_digest(&H, nx) != *leaf.next));
@@ -1295,7 +1677,7 @@ impl<'a> Referee<'a> {
             .filter(|k| k.manifest().modes.contains(&crate::kernel::MODE_STEP_V21));
         if let Some(kernel) = step_kernel {
             let m = kernel.manifest();
-            let spans: Vec<crate::kernel::AccountSpan> = ins[..n]
+            let spans: Vec<crate::kernel::AccountSpan> = ins
                 .iter()
                 .map(|v| crate::kernel::AccountSpan {
                     key: [0; 32],
@@ -1316,7 +1698,7 @@ impl<'a> Referee<'a> {
         let mut out = [0u8; 4];
         // An unknown kernel cannot replay any output (as in the Python
         // referee): it rules for C.
-        Ok(match kernel_code(spec.kernel_id()).ok_or(0u16).and_then(|code| dcg_kernels::execute(code, &ins[..n], &mut out)) {
+        Ok(match kernel_code(spec.kernel_id()).ok_or(0u16).and_then(|code| dcg_kernels::execute(code, &ins, &mut out)) {
             Err(_) => true,
             Ok(_) => leaf.output_count() != 1 || D::value_digest(&H, &out) != leaf.output(0)[23..55],
         })
@@ -1366,7 +1748,7 @@ fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, outcome: impl
         }
     }
     let challenger_wins = outcome == Outcome::Challenger;
-    let seq = {
+    let (seq, was_waiting) = {
         let mut d = c.dispute.try_borrow_mut_data()?;
         if d[D_RULING] != RULING_OPEN {
             return Err(err(25));
@@ -1374,13 +1756,14 @@ fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, outcome: impl
         if challenger.key.to_bytes() != d[D_CHALLENGER..D_CHALLENGER + 32] {
             return Err(err(22));
         }
+        let was_waiting = matches!(d[D_PHASE], PH_NODES | PH_LEAF);
         d[D_PHASE] = PH_RULED;
         d[D_RULING] = match outcome {
             Outcome::Challenger => RULING_CHALLENGER,
             Outcome::Executor => RULING_EXECUTOR,
             Outcome::Neutral => RULING_MOOT,
         };
-        u64_at(&d, D_SEQ)?
+        (u64_at(&d, D_SEQ)?, was_waiting)
     };
     {
         let mut r = c.run.try_borrow_mut_data()?;
@@ -1390,6 +1773,7 @@ fn rule(c: &Ctx, executor: &AccountInfo, challenger: &AccountInfo, outcome: impl
         if r[R_STATUS] != RUN_COMMITTED && r[R_STATUS] != RUN_REFUTED {
             return Err(err(25));
         }
+        if was_waiting { end_executor_wait(&mut r)?; }
         let open = u32_at(&r, R_OPEN)?.checked_sub(1).ok_or(err(8))?;
         r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
         if challenger_wins {
@@ -1463,7 +1847,7 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 fn moot(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [_caller, run, tmpl, dispute, challenger, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
-    {
+    let was_waiting = {
         let mut d = c.dispute.try_borrow_mut_data()?;
         let r = c.run.try_borrow_data()?;
         if r[R_STATUS] != RUN_REFUTED
@@ -1473,11 +1857,14 @@ fn moot(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         {
             return Err(err(27));
         }
+        let was_waiting = matches!(d[D_PHASE], PH_NODES | PH_LEAF);
         d[D_PHASE] = PH_RULED;
         d[D_RULING] = RULING_MOOT;
-    }
+        was_waiting
+    };
     {
         let mut r = c.run.try_borrow_mut_data()?;
+        if was_waiting { end_executor_wait(&mut r)?; }
         let open = u32_at(&r, R_OPEN)?.checked_sub(1).ok_or(err(8))?;
         r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
     }
@@ -1533,7 +1920,7 @@ fn finalize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 }
 
 // ---------------------------------------------------------------------------
-// Rent reclaim (2026-10-03). Each close moves every lamport of a program
+// Rent reclaim (tag 227 subs 18-22, 2026-10-03). Each close moves every lamport of a program
 // account to the party that paid its rent, empties it and returns it to the
 // system program. Bonds have already moved by then (rule, moot, pay_pot,
 // finalize); a close never decides who is owed a bond.
@@ -1605,25 +1992,35 @@ fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     close_into(c.dispute, challenger)
 }
 
-// 19: [caller(s), run(w), template, payer(w)]. A settled run whose disputes
+// 19: [caller(s), run(w), template(w for tracked templates), payer(w)]. A settled run whose disputes
 // are all closed shrinks to its receipt (design §6.4) at the same address, so
 // consumers can still read its final status and root at the run's address
 // (consumers identify a run by its address: the run id alone is not unique
 // across payers); anyone may send it. An uncommitted run is cancelled (closed
-// whole) by its payer only. Freed rent goes to the run's payer.
+// whole) by anyone after the commit deadline. Freed rent always goes to the
+// run's payer.
 fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [caller, run, tmpl, payer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     run_checked(program_id, run, tmpl)?;
+    template(program_id, tmpl)?;
+    let active_runs = tracked_template(tmpl)?;
+    if let Some(count) = active_runs {
+        if count == 0 || !tmpl.is_writable {
+            return Err(err(37));
+        }
+    }
     let status = {
         let r = run.try_borrow_data()?;
         if payer.key.to_bytes() != r[R_PAYER..R_PAYER + 32] {
             return Err(err(22));
         }
         if r[R_STATUS] == RUN_OPEN {
-            if !caller.is_signer || caller.key != payer.key {
+            if !caller.is_signer {
                 return Err(ProgramError::MissingRequiredSignature);
             }
-            // Cancel only after the commit deadline (design §9 CANCEL_RUN).
+            // Anyone can release an expired uncommitted run. Rent is still
+            // returned to its payer, so the caller's benefit is only freeing
+            // the template's run slot and allowing template close.
             if now()? <= u64_at(&r, R_DEADLINE)? {
                 return Err(err(37));
             }
@@ -1632,6 +2029,11 @@ fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         }
         r[R_STATUS]
     };
+    if active_runs.is_some() {
+        // This instruction is atomic: a later close/refund failure rolls the
+        // count change back with the run mutation.
+        change_template_run_count(tmpl, -1)?;
+    }
     if status == RUN_OPEN {
         return close_into(run, payer);
     }
@@ -1647,6 +2049,48 @@ fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(err(35));
     }
     move_lamports(run, payer, extra)
+}
+
+// 21: [recorded payer(s,w), template(w)]. Closing is payer-authorized to
+// avoid griefing a reusable template by an executor, challenger or bystander.
+// A zero active-run count means no run or dispute still needs the template.
+fn close_template(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [payer, tmpl, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    template(program_id, tmpl)?;
+    let Some(active_runs) = tracked_template(tmpl)? else {
+        return Err(err(37));
+    };
+    let recorded_payer = {
+        let d = tmpl.try_borrow_data()?;
+        Pubkey::new_from_array(d[T_PAYER..T_PAYER + 32].try_into().unwrap())
+    };
+    if payer.key != &recorded_payer || active_runs != 0 {
+        return Err(err(37));
+    }
+    close_into(tmpl, payer)
+}
+
+// 22: [recorded payer(s,w), template(w)]. Stop future runs while existing
+// runs settle or expire. A zero-count template may be retired and then closed
+// immediately by its payer.
+fn retire_template(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [payer, tmpl, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    template(program_id, tmpl)?;
+    if tracked_template(tmpl)?.is_none() || !tmpl.is_writable {
+        return Err(err(37));
+    }
+    let mut d = tmpl.try_borrow_mut_data()?;
+    if d[T_PAYER..T_PAYER + 32] != payer.key.to_bytes() || d[T_RETIRED] != 0 {
+        return Err(err(37));
+    }
+    d[T_RETIRED] = 1;
+    Ok(())
 }
 
 // 20: [anyone, run, cache(w), executor(w)]. A reveal cache closes once its

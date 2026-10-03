@@ -75,8 +75,13 @@ async fn send(ctx: &mut ProgramTestContext, i: Instruction, signers: &[&Keypair]
 
 async fn replay(s: &serde_json::Value) -> u8 {
     let mut test = ProgramTest::default();
-    test.prefer_bpf(false);
-    test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction));
+    let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
+    test.prefer_bpf(sbf);
+    if sbf {
+        test.add_program("dcg_program", PROGRAM, None);
+    } else {
+        test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction));
+    }
     for b in [0xA1u8, 0xE1, 0xC1] {
         test.add_account(kp(b).pubkey(), Account { lamports: 10_000_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 });
     }
@@ -84,7 +89,7 @@ async fn replay(s: &serde_json::Value) -> u8 {
     let (admitter, e, c) = (kp(0xA1), kp(0xE1), kp(0xC1));
     let tdata = hex(s["template_data"].as_str().unwrap());
     let template_id = sha256(&[V::TEMPLATE_DOMAIN, &tdata]);
-    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
+    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, admitter.pubkey().as_ref()], &PROGRAM).0;
     send(&mut ctx, ix(V::SUB_CREATE_TEMPLATE, &tdata, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
 
     let refs: Vec<Vec<u8>> = s["refs"].as_array().unwrap().iter().map(|r| hex(r.as_str().unwrap())).collect();
@@ -100,7 +105,7 @@ async fn replay(s: &serde_json::Value) -> u8 {
     }
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &[0u8; 32], &(refs.len() as u32).to_le_bytes(), &flat, e.pubkey().as_ref()]);
     let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
-    send(&mut ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
+    send(&mut ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
 
     // E's commitment.
     let leaves: Vec<Option<Vec<u8>>> = s["leaves"].as_array().unwrap().iter().map(|x| x.as_str().map(hex)).collect();
@@ -125,7 +130,7 @@ async fn replay(s: &serde_json::Value) -> u8 {
     let mut open = vec![1u8; 32];
     open.push(kind);
     send(&mut ctx, ix(V::SUB_OPEN, &open, vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(dispute, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&c]).await.unwrap();
-    let party = |who: &Keypair| vec![AccountMeta::new_readonly(who.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(dispute, false)];
+    let party = |who: &Keypair| vec![AccountMeta::new_readonly(who.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new(dispute, false)];
     let tree = if step_kind { &step } else { &out };
     let limit = if step_kind { leaves.len() } else { outs.len() };
     let depth = s["depth"].as_u64().unwrap() as usize;

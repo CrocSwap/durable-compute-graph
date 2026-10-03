@@ -37,6 +37,7 @@ parallel; it is useful evidence, but it does not gate the alpha.
 | **The sequencer** (`dcg.sequencer`): ordered lanes, batching, resend and journal, multi-node sends | **Sampling, Freivalds and ZK modes:** not started |
 | **v2.1 optimistic disputes (tag 227):** templates, runs, first-divergence descent, the claims, chunked kernels, committed constants, list inputs, application kernels by manifest, rent reclaim | **The revision-8 document lifecycle as a user API:** it stays in DCG core because Basanos runs on it in production, but it is Basanos-shaped (positions, PT2P), and outside users get v2.1 instead (owner decision) |
 | **The Python tracing frontend, client and sequencer** | **LOG-state templates:** refused until LOG is on chain (re-review condition) |
+| **LX1 checkpointed state chains** (`docs/design/v2.1-lazy-expansion.md`): a v2.1 commitment kind for long, repeated computations. A run commits a state root every `k` positions; a dispute bisects one flattened schedule and replays one finest transition against a multi-proof. Applications register their machine as code (`LxMachine`). | |
 | **`explain()` for v2.1 templates** | **TypeScript:** a thin layer after the alpha |
 
 ## Readiness work
@@ -45,6 +46,12 @@ parallel; it is useful evidence, but it does not gate the alpha.
 - List inputs and template closes land: in progress, and template closes get their own review.
 - Follow-ups A and B from the 10-03 re-review: narrow the LOG neutrality; implement the design's additive load extension, counted only while disputes wait on the executor.
 - The run-level dispute fuzzer: several disputes per run, random interleavings, invariants checked after every step.
+
+**R1b. Finish LX1 (owner, 2026-10-03: in the alpha).**
+- Done: the Python reference; the pure Rust core in `dcg-disputes` (state tree, multi-proof fold, coordinates, `pick_interval`, the machine trait, terminal replay, the OUTPUT claim), checked against played Python disputes.
+- Next, on the host: the tag 227 LX subcodes (open, midpoints, pick, opening, output) and timeouts; the every-ending matrix; the toy machine as the DCG example; then the independent review (rule 10).
+- Basanos's 4B model as an LX1 machine is the first real application and its testnet requalification; it lives in Basanos.
+- Alpha bar: LX1 handlers are covered by R2's review and the fuzzer, by `explain()` (E8), and by a newcomer walkthrough (E7) using the toy machine.
 
 **R2. Review the whole surface.** Only tag 227 has had an independent review.
 - Stateful sessions (v3) get the same treatment tag 227 had, including a run-level fuzzer of their own: random interleavings of steps, resends, failed and duplicated transactions, view publications and closes, with invariants (each step applied once and in order, state digests match a host replay, lamports conserved) checked after every step.
@@ -129,7 +136,7 @@ DCG keeps no model code (owner decision, 09-26).
 
 | Phase | Work | Estimate |
 |---|---|---|
-| 1 | R1 (hardening), E5 (named errors), E4 (lifecycle in the client) | about 1 week |
+| 1 | R1 (hardening), R1b (LX1 in the program), E5 (named errors), E4 (lifecycle in the client) | about 1–2 weeks |
 | 2 | E1 (v2.1 lowering), E2 and C3 (kernel kits), E8 (`explain()`), C1 and C2 (session quickstart, sequencer API), R4 (repo boundary) | about 2 weeks |
 | 3 | E3 (executor and watchtower), R2 (reviews, including the sessions fuzzer) | about 1–2 weeks, partly parallel with phase 2 |
 | 4 | R3 (shared program upgrade), E6 (`dcg dev`, `dcg build`), E7 and C5 (docs and tutorials), R5 (terms) | about 1 week |
@@ -173,3 +180,13 @@ The alpha ships when all of these hold:
    runtime it embeds and whether a security fix applies to it. A hosted
    option (sessions on a shared DCG program, with app kernels in their own
    programs, called once per step) is post-alpha.
+6. **LX1 is in the alpha** (evening): "We're finishing it, so let's package
+   it." It carries the full alpha bar: independent review, fuzzer coverage,
+   `explain()` and a newcomer walkthrough.
+7. **Parallel work stays narrow** (evening): worker rounds have cost more
+   than host work in cold builds, full suites, ramp-up, review rounds and
+   integration. Only long-running work runs in parallel, such as fuzzer
+   campaigns, long test sweeps and testnet waits, and only when it merges
+   back cleanly: built on the real-flow test harness and a stable base, with
+   no large hand-written fixtures. Design, program changes and fix rounds are
+   done serially on the host.

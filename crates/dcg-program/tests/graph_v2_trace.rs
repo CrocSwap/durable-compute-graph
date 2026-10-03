@@ -13,7 +13,7 @@ use dcg_program::hash::sha256;
 use solana_account::Account;
 use solana_instruction::{account_meta::AccountMeta, Instruction};
 use solana_keypair::Keypair;
-use solana_program::{instruction::InstructionError, rent::Rent, system_program};
+use solana_program::{instruction::InstructionError, rent::Rent, system_instruction, system_program};
 use solana_program_test::{processor, ProgramTest, ProgramTestContext};
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -317,6 +317,50 @@ async fn a_forged_blob_is_refused_at_admission() {
                                  AccountMeta::new_readonly(table, false), AccountMeta::new_readonly(SYSTEM, false)],
                             &[&admitter]).await;
     assert_eq!(result, Err(custom(2)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_writers_refuse_a_copied_non_pda_account() {
+    let mut chain = Chain::start(vec![]).await;
+    let writer = kp(0xA1);
+    let body = [0u8; 1];
+    let id = sha256(&[GRAPH_DOMAIN, &body]);
+    let real = pda(&[b"dcg2blob", &[1], &id]);
+    let mut create = vec![210, 1];
+    create.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    create.extend_from_slice(&id);
+    chain.send(create,
+        vec![AccountMeta::new(writer.pubkey(), true), AccountMeta::new(real, false), AccountMeta::new_readonly(SYSTEM, false)],
+        &[&writer]).await.unwrap();
+    let copy = chain.account(real).await.unwrap();
+    let forged = kp(0xB8);
+    let mut chain = Chain::start(vec![(forged.pubkey(), copy)]).await;
+    let mut write = vec![211];
+    write.extend_from_slice(&0u32.to_le_bytes());
+    write.push(0);
+    let metas = || vec![AccountMeta::new_readonly(writer.pubkey(), true), AccountMeta::new(forged.pubkey(), false)];
+    assert_eq!(chain.send(write, metas(), &[&writer]).await, Err(custom(2)));
+    assert_eq!(chain.send(vec![212], metas(), &[&writer]).await, Err(custom(2)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_write_refuses_a_short_program_owned_account_without_panicking() {
+    let writer = kp(0xA1);
+    let short = kp(0xB9);
+    let mut chain = Chain::start(vec![]).await;
+    let ix = system_instruction::create_account(
+        &writer.pubkey(), &short.pubkey(), Rent::default().minimum_balance(4), 4, &PROGRAM,
+    );
+    let blockhash = chain.ctx.get_new_latest_blockhash().await.unwrap();
+    let tx = Transaction::new(&[&chain.ctx.payer, &writer, &short],
+        solana_message::Message::new(&[ix], Some(&chain.ctx.payer.pubkey())), blockhash);
+    chain.ctx.banks_client.process_transaction(tx).await.unwrap();
+    let mut write = vec![211];
+    write.extend_from_slice(&0u32.to_le_bytes());
+    write.push(0);
+    assert_eq!(chain.send(write,
+        vec![AccountMeta::new_readonly(writer.pubkey(), true), AccountMeta::new(short.pubkey(), false)],
+        &[&writer]).await, Err(custom(6)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
