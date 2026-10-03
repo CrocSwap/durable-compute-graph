@@ -5063,6 +5063,9 @@ struct F47TargetOpen {
     local: u32,
     path: Vec<[u8; 32]>,
     spp1: Vec<u8>,
+    /// The target leaf's DCL2 preimage (an attestation's tail is its suffix
+    /// after the domain, descriptor and coordinate).
+    preimage: Vec<u8>,
 }
 
 fn f47_honest_body(
@@ -5348,6 +5351,7 @@ fn f47_honest_body(
         local: target_at.local,
         path: target_path,
         spp1: target_spp1,
+        preimage: target_preimage.clone(),
     };
 
     let mut producer_proof = Vec::new();
@@ -8265,103 +8269,90 @@ async fn rev8_resolve_honours_the_opt_out_and_the_l_equals_count_escape() {
     );
 }
 
-/// **The decision document resolves FINAL at `L = 1 + option_count`**, over a
-/// crafted record because the only sealed template in this tree has no 4-byte
-/// write lane (the file header says so, and C1 measured it). Everything the
-/// resolve reads is the program's own: the DRB1 v2 block, `positions_complete`,
-/// the DCR2 v6 header, the five 4-byte cells and the five bitmap bits.
+/// **The decision document resolves FINAL at `L = 1 + option_count`**, on the
+/// F47 template (4-byte decision lanes), with every cell attested for real.
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_resolve_is_final_on_a_decision_document() {
-    let Some(mut f) = build().await else { return };
+    // On the F47 template, whose decision entry has 4-byte lanes: every record
+    // is written by real instructions (init, land, finalize, attest of each
+    // of the 1 + K cells), so nothing is crafted (rule 6).
+    let Some(mut f) = build_f47().await else { return };
     f.terms_raw = f.terms_window(1);
-    for k in [1u8, 4, 8, 80] {
-        // `n = 30` is `first = 29` plus one, the smallest prompt this template's
-        // own output lane can be a decision over; `L = 1 + K` does not move it.
-        let n = 30u32;
-        let (binding, options) = decision_binding(&f.executor.pubkey().to_bytes(), n, k);
+    let (routes, geometry, payloads, pwr1, _) = f47_artifacts().unwrap();
+    let x = Pt2p::new(&routes, &geometry, &payloads, None, pt2p::Program::decode(&pwr1).unwrap()).unwrap();
+    let position = f47_position();
+    let decision_entry = x.entry_count(position).unwrap() - 1;
+    let base_decision_entry = x.base_entries - 1;
+    for (variant, k) in [1u8, 4, 8, 80].into_iter().enumerate() {
+        let n = position + 1;
+        let (mut binding, _) =
+            decision_binding_at(&f.executor.pubkey().to_bytes(), n, k, base_decision_entry);
+        binding.request_id = [200 + variant as u8; 32];
+        let options: Vec<u32> = (0..k as u32).collect();
+        let table: Vec<u8> = options.iter().flat_map(|t| t.to_le_bytes()).collect();
+        binding.option_table_sha256 = sha256(&[&table]);
         let l = binding.output_span(n);
         assert_eq!(l, 1 + k as u32, "L = 1 + option_count for a decision");
         assert_eq!(binding.output_count, l, "and count = L by 816");
         let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
-        let roots = f.position_roots[..n as usize].to_vec();
-        let c = f
-            .craft_hand_built(&binding, n, &roots, 1, descriptor, &options)
-            .await;
-        // **A real `FinalizeDocumentV5`**, because the resolve's FINAL branch
-        // reads DCM2 flag 2 and a crafted record does not carry it. 816's
-        // decision branch is therefore exercised here too, over the real
-        // handler: `n = prompt_positions`, `first = n - 1`, `count = 1 + K`.
-        let fin = f.fin_metas(&c);
-        send(
-            &mut f.ctx,
-            &f.executor,
-            f.program,
-            finalize_data(&descriptor, n, &f.family_roots),
-            fin,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("a decision finalize at K = {k}: {e:?}"));
-        assert_eq!(
-            u16_at(&f.account(c.dcm2).await, 6) as u16,
-            FLAG_ARMED | FLAG_FINAL | FLAG_ROOT_ONLY | FLAG_SEALED,
-            "flag 2 at K = {k}"
+        let logits: Vec<i64> = (0..k as usize).map(|i| ((k as i64) - i as i64) * 4096).collect();
+        let mut position_root = [0u8; 32];
+        let (_, _, target_leaf, _, claimed, open) = f47_honest_body(
+            &x, &descriptor, position, decision_entry, &table, &logits, false, false, false, &mut position_root,
         );
-        // **The five cells, the five bits and the counter**, written the way
-        // `attest_v8` writes them. A decision's cells are 4-byte
-        // fixed-point values, so there is no token field in them at all and
-        // the stop rule has nothing to read — which is why it is not run.
-        let mut res = f.account(c.dcr2).await;
+        let roots = f47_document_roots(&f, position, position_root);
+        let (descriptor, created) = f.run_document_with_roots_and_options(&binding, &roots, &table).await;
+        f.finalize(&descriptor, created, n).await;
+        // The attestation of output i: the committed target leaf's write
+        // lane i, its tail, its segment path and SPP1.
+        let tail_from = LEAF_DOMAIN.len() + 32 + 10;
+        assert_eq!(sha256(&[&open.preimage]), target_leaf);
+        let tail = &open.preimage[tail_from..];
+        let attest = |i: u32| {
+            let mut data = vec![TAG_ATTEST_OUTPUT];
+            data.extend_from_slice(&descriptor);
+            data.extend_from_slice(&i.to_le_bytes());
+            data.extend_from_slice(&claimed[4 * i as usize..4 * i as usize + 4]);
+            data.extend_from_slice(&(tail.len() as u16).to_le_bytes());
+            data.extend_from_slice(tail);
+            data.push(open.path.len() as u8);
+            for s in &open.path {
+                data.extend_from_slice(s);
+            }
+            data.extend_from_slice(&open.spp1);
+            data
+        };
+        let metas = attest_metas(f.signer.pubkey(), (f.pt2s, f.routes, f.geometry), created);
+        for i in 0..l - 1 {
+            send_fresh(&mut f.ctx, &f.signer, f.program, attest(i), metas.clone())
+                .await
+                .unwrap_or_else(|e| panic!("attest output {i} at K = {k}: {e:?}"));
+        }
         assert_eq!(
-            res.len(),
+            f.account(created[3]).await.len(),
             result::bytes_v8(binding.output_count, DECISION_WIDTH).unwrap(),
             "416 + 4(1+K) + ceil((1+K)/8)"
         );
-        for i in 0..l {
-            let at = result::HEADER_V6 + i as usize * DECISION_WIDTH as usize;
-            res[at..at + 4].copy_from_slice(&(1_000_000u32 + i).to_le_bytes());
-            res[result::HEADER_V6
-                + binding.output_count as usize * DECISION_WIDTH as usize
-                + i as usize / 8] |= 1 << (i % 8);
-        }
-        res[204..208].copy_from_slice(&l.to_le_bytes());
-        f.ctx.set_account(&c.dcr2, &shared(owned(&f.program, res)));
-        past_deadline(&mut f, c.dcm2).await;
-        let metas = pair(c.dcm2, c.dcr2);
-        send_fresh(
-            &mut f.ctx,
-            &f.signer,
-            f.program,
-            resolve_data(&descriptor),
-            metas,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("a decision at K = {k} resolves: {e:?}"));
-        let res = f.account(c.dcr2).await;
+        past_deadline(&mut f, created[0]).await;
+        // **One output short is a refusal, not a conviction**, for real: a
+        // decision has no clause to fall through to, so an incomplete one is
+        // 796.
         assert_eq!(
-            res[6],
-            result::STATUS_FINAL,
-            "a decision at K = {k} is FINAL at L = {l}"
-        );
-        // **One output short is a refusal, not a conviction.** A decision has
-        // no clause to fall through to, so an incomplete one is 796.
-        let mut res = f.account(c.dcr2).await;
-        res[204..208].copy_from_slice(&(l - 1).to_le_bytes());
-        f.ctx.set_account(&c.dcr2, &shared(owned(&f.program, res)));
-        assert_eq!(
-            custom(
-                send_fresh(
-                    &mut f.ctx,
-                    &f.signer,
-                    f.program,
-                    resolve_data(&descriptor),
-                    pair(c.dcm2, c.dcr2)
-                )
-                .await
-            ),
+            refused_resolve(&mut f, created[3], resolve_data(&descriptor), pair(created[0], created[3])).await,
             RESULT_STATE,
             "a decision with L-1 outputs attested is 796"
         );
-        let _ = c;
+        send_fresh(&mut f.ctx, &f.signer, f.program, attest(l - 1), metas.clone())
+            .await
+            .unwrap_or_else(|e| panic!("attest the last output at K = {k}: {e:?}"));
+        send_fresh(&mut f.ctx, &f.signer, f.program, resolve_data(&descriptor), pair(created[0], created[3]))
+            .await
+            .unwrap_or_else(|e| panic!("a decision at K = {k} resolves: {e:?}"));
+        assert_eq!(
+            f.account(created[3]).await[6],
+            result::STATUS_FINAL,
+            "a decision at K = {k} is FINAL at L = {l}"
+        );
     }
 }
 
