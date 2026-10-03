@@ -1201,8 +1201,10 @@ async fn matrix_log_step_and_empty_predecessor_are_neutral_in_both_orders() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "finding: structurally malformed committed LOG leaf rules CHALLENGER before STEP neutrality"]
-async fn matrix_structurally_malformed_log_leaf_step_is_neutral_in_both_orders() {
+// A structurally malformed committed leaf convicts the executor before LOG
+// neutrality applies, in both orders (laws §1; the follow-up re-review
+// confirmed this is intended: on main a SHAPE claim already won it).
+async fn matrix_structurally_malformed_log_leaf_convicts_the_executor_in_both_orders() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/dcg/disputes_v21/log_neutral_scenarios.json");
     let scenarios: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let s = scenarios.iter().find(|s| s["name"] == "log-k0-honest-STEP").unwrap();
@@ -1250,7 +1252,7 @@ async fn matrix_structurally_malformed_log_leaf_step_is_neutral_in_both_orders()
         matrix_settle(&mut ch, &[d], before, 0xC1).await;
         observed.push(ruling);
     }
-    assert_eq!(observed, [V::RULING_MOOT; 2], "malformed committed LOG leaf should be neutral");
+    assert_eq!(observed, [V::RULING_CHALLENGER; 2], "a malformed committed LOG leaf convicts the executor");
 }
 
 #[tokio::test(flavor = "multi_thread")]
