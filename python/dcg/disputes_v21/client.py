@@ -23,7 +23,10 @@ from . import wire as W
 
 TAG = 227
 SUB = {"create_template": 1, "init_run": 2, "commit": 3, "open": 4, "reveal_nodes": 5, "pick": 6,
-       "reveal_leaf": 7, "claim": 8, "stage_create": 14, "stage_write": 15, "stage_grow": 17}
+       "reveal_leaf": 7, "claim": 8, "finalize": 10, "advance": 11, "pay_pot": 13, "stage_create": 14,
+       "stage_write": 15, "stage_grow": 17, "close_dispute": 18, "close_run": 19, "close_cache": 20}
+RUN_COMMITTED, RUN_FINAL, RUN_REFUTED = 1, 2, 3
+RECEIPT_BYTES = 136 + 176  # a closed run: its first 136 bytes, then its root
 KIND = {"STEP_DESCEND": 1, "OUT_DESCEND": 2}
 ROLE_EXECUTOR, ROLE_CHALLENGER, FROM_STAGING = 1, 2, 0xFF
 DIRECT_LIMIT = 700
@@ -182,3 +185,51 @@ class DisputeClient:
 
     def run_status(self, run: Pubkey) -> int:
         return self.gc.account(run)[4]
+
+    # --- settlement and rent reclaim ------------------------------------------------
+    def _caller(self) -> AccountMeta:
+        return AccountMeta(self.gc.payer.pubkey(), True, False)
+
+    def advance(self, run: Pubkey, template: Pubkey, dispute: Pubkey) -> None:
+        self._send("advance", b"", [self._caller(), AccountMeta(run, False, True), AccountMeta(template, False, False),
+                                    AccountMeta(dispute, False, False)], [])
+
+    def finalize(self, run: Pubkey, template: Pubkey, executor: Pubkey) -> None:
+        self._send("finalize", b"", [self._caller(), AccountMeta(run, False, True), AccountMeta(template, False, False),
+                                     AccountMeta(executor, False, True)], [])
+
+    def pay_pot(self, run: Pubkey, template: Pubkey, dispute: Pubkey, challenger: Pubkey, payer: Pubkey) -> None:
+        self._send("pay_pot", b"", [self._caller(), AccountMeta(run, False, True), AccountMeta(template, False, False),
+                                    AccountMeta(dispute, False, False), AccountMeta(challenger, False, True),
+                                    AccountMeta(payer, False, True)], [])
+
+    def close_dispute(self, run: Pubkey, template: Pubkey, dispute: Pubkey, challenger: Pubkey,
+                      executor: Pubkey) -> None:
+        """Close a ruled dispute the ruled prefix has passed, with its staging
+        buffers: buffer rent to its creator, dispute rent to the challenger."""
+        buffers = [self.pda(b"dcg21stg", bytes(dispute), bytes([role])) for role in (ROLE_EXECUTOR, ROLE_CHALLENGER)]
+        self._send("close_dispute", b"", [self._caller(), AccountMeta(run, False, True),
+                                          AccountMeta(template, False, False), AccountMeta(dispute, False, True),
+                                          AccountMeta(challenger, False, True), AccountMeta(executor, False, True)]
+                   + [AccountMeta(b, False, True) for b in buffers], [])
+
+    def close_run(self, run: Pubkey, template: Pubkey, payer: Pubkey) -> None:
+        """Shrink a settled run whose disputes are all closed to its receipt
+        (anyone; the freed rent goes to `payer`, the run's payer). For an
+        uncommitted run this cancels it, and the client's payer must be the
+        run's payer."""
+        self._send("close_run", b"", [self._caller(), AccountMeta(run, False, True), AccountMeta(template, False, False),
+                                      AccountMeta(payer, False, True)], [])
+
+    def close_cache(self, run: Pubkey, cache: Pubkey, executor: Pubkey) -> None:
+        self._send("close_cache", b"", [self._caller(), AccountMeta(run, False, False), AccountMeta(cache, False, True),
+                                        AccountMeta(executor, False, True)], [])
+
+    def settle_dispute(self, run: Pubkey, template: Pubkey, dispute: Pubkey, challenger: Pubkey,
+                       executor: Pubkey, payer: Pubkey) -> None:
+        """After a ruling on a run's only open dispute: advance the ruled
+        prefix, pay the pot if the challenger won, and close the dispute."""
+        self.advance(run, template, dispute)
+        if self.run_status(run) == RUN_REFUTED:
+            self.pay_pot(run, template, dispute, challenger, payer)
+        self.close_dispute(run, template, dispute, challenger, executor)

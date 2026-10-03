@@ -134,9 +134,16 @@ fn ix(sub: u8, data: &[u8], accounts: Vec<AccountMeta>) -> Instruction {
 
 impl Chain {
     async fn new(challenge_window: u64) -> Self {
+        // V21_SBF=1 (with BPF_OUT_DIR naming a graph-v21 image) runs the SBF
+        // program; otherwise native.
+        let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
         let mut test = ProgramTest::default();
-        test.prefer_bpf(false);
-        test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction));
+        test.prefer_bpf(sbf);
+        if sbf {
+            test.add_program("dcg_program", PROGRAM, None);
+        } else {
+            test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction));
+        }
         for b in [0xA1u8, 0xE1, 0xC1] {
             test.add_account(kp(b).pubkey(), Account { lamports: 10_000_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 });
         }
@@ -619,4 +626,196 @@ async fn total_lamports(ctx: &mut ProgramTestContext, keys: &[Pubkey]) -> u128 {
         t += ctx.banks_client.get_balance(*k).await.unwrap() as u128;
     }
     t
+}
+
+// --- rent reclaim (subs 18 to 20) ------------------------------------------------------
+
+impl Chain {
+    fn close_dispute_ix(&self, d: Pubkey, buffer_e: Pubkey, buffer_c: Pubkey) -> Instruction {
+        ix(V::SUB_CLOSE_DISPUTE, &[], vec![AccountMeta::new_readonly(kp(0xA1).pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new(d, false), AccountMeta::new(kp(0xC1).pubkey(), false), AccountMeta::new(kp(0xE1).pubkey(), false), AccountMeta::new(buffer_e, false), AccountMeta::new(buffer_c, false)])
+    }
+
+    async fn close_dispute(&mut self, d: Pubkey) -> Result<(), TransactionError> {
+        let i = self.close_dispute_ix(d, self.buffer(d, V::ROLE_EXECUTOR), self.buffer(d, V::ROLE_CHALLENGER));
+        send(&mut self.ctx, i, &[&kp(0xA1)]).await
+    }
+
+    /// Sub 19 sent by `signer`, naming `payer` as the run's payer.
+    async fn close_run_by(&mut self, signer: u8, payer: u8) -> Result<(), TransactionError> {
+        let s = kp(signer);
+        let i = ix(V::SUB_CLOSE_RUN, &[], vec![AccountMeta::new(s.pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new(kp(payer).pubkey(), false)]);
+        send(&mut self.ctx, i, &[&s]).await
+    }
+
+    async fn close_run(&mut self, signer: u8) -> Result<(), TransactionError> {
+        self.close_run_by(signer, 0xA1).await
+    }
+
+    /// The receipt left at the run's address: magic, status, root.
+    async fn receipt(&mut self) -> (Vec<u8>, u8, Vec<u8>) {
+        let a = self.ctx.banks_client.get_account(self.run).await.unwrap().unwrap();
+        assert_eq!(a.data.len(), V::RECEIPT_BYTES);
+        (a.data[0..4].to_vec(), a.data[4], a.data[136..].to_vec())
+    }
+
+    async fn close_cache(&mut self, cache: Pubkey, executor: Pubkey) -> Result<(), TransactionError> {
+        let caller = kp(0xA1);
+        let i = ix(V::SUB_CLOSE_CACHE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new_readonly(self.run, false), AccountMeta::new(cache, false), AccountMeta::new(executor, false)]);
+        send(&mut self.ctx, i, &[&caller]).await
+    }
+
+    async fn advance(&mut self, d: Pubkey) -> Result<(), TransactionError> {
+        let caller = kp(0xA1);
+        let i = ix(V::SUB_ADVANCE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new_readonly(d, false)]);
+        send(&mut self.ctx, i, &[&caller]).await
+    }
+
+    async fn gone(&mut self, k: Pubkey) -> bool {
+        self.ctx.banks_client.get_account(k).await.unwrap().is_none()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_honest_run_closes_every_account_and_returns_all_rent() {
+    let mut ch = Chain::new(30).await;
+    let c = ch.honest();
+    let d = ch.dispute(50);
+    let cache = Pubkey::find_program_address(&[b"dcg21rc", ch.run.as_ref(), &[V::KIND_STEP_DESCEND], &1u32.to_le_bytes(), &0u64.to_le_bytes()], &PROGRAM).0;
+    let (buf_e, buf_c) = (ch.buffer(d, V::ROLE_EXECUTOR), ch.buffer(d, V::ROLE_CHALLENGER));
+    // Fees come from the test payer, so these balances must sum exactly.
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), ch.run, ch.template, d, cache, buf_e, buf_c];
+    let before = total_lamports(&mut ch.ctx, &tracked).await;
+    let template_before = ch.ctx.banks_client.get_balance(ch.template).await.unwrap();
+    let payer_before = ch.ctx.banks_client.get_balance(kp(0xA1).pubkey()).await.unwrap();
+    let run_rent = ch.ctx.banks_client.get_balance(ch.run).await.unwrap(); // paid by A1 at init
+    ch.commit(&c).await;
+    ch.open(50, V::KIND_STEP_DESCEND).await;
+    // E reveals the root's children and records them in a reveal cache.
+    let e = kp(0xE1);
+    let mut nodes = Vec::new();
+    nodes.extend_from_slice(&c.step[0][0]);
+    nodes.extend_from_slice(&c.step[0][1]);
+    let i = ix(V::SUB_REVEAL_NODES, &nodes, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false), AccountMeta::new(cache, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    send(&mut ch.ctx, i, &[&e]).await.unwrap();
+    assert_eq!(ch.ctx.banks_client.get_account(cache).await.unwrap().unwrap().data.len(), V::CACHE_BYTES_V2);
+    let i = ix(V::SUB_PICK, &[1], ch.party(0xC1, d));
+    send(&mut ch.ctx, i, &[&kp(0xC1)]).await.unwrap();
+    // E's leaf from a staging buffer that C created; C's buffer is never created.
+    let mut leaf = vec![1u8];
+    leaf.extend_from_slice(c.leaves[1].as_ref().unwrap());
+    ch.stage(d, V::ROLE_EXECUTOR, 2_000, &leaf, 300).await;
+    let mut accounts = ch.party(0xE1, d);
+    accounts.push(AccountMeta::new_readonly(buf_e, false));
+    send(&mut ch.ctx, ix(V::SUB_REVEAL_LEAF, &[V::FROM_STAGING], accounts), &[&e]).await.unwrap();
+    // Nothing closes while the dispute is open.
+    assert!(ch.close_dispute(d).await.is_err(), "open dispute");
+    let mut body = vec![V::CLAIM_EDGE, 0];
+    body.extend(ch.spec_opening(STEP_BASE as usize + 1));
+    body.extend(ch.step_opening(&c, 0));
+    ch.claim(d, body).await.unwrap();
+    assert_eq!(ch.ruling(d).await, V::RULING_EXECUTOR);
+    assert!(ch.close_dispute(d).await.is_err(), "the ruled prefix has not passed it");
+    ch.advance(d).await.unwrap();
+    // The buffers must be the dispute's own derived addresses.
+    let i = ch.close_dispute_ix(d, buf_c, buf_e);
+    assert!(send(&mut ch.ctx, i, &[&kp(0xA1)]).await.is_err(), "buffers swapped");
+    assert!(ch.close_cache(cache, e.pubkey()).await.is_err(), "the run is not settled");
+    assert!(ch.close_run(0xA1).await.is_err(), "the run is not settled");
+    let c_before = ch.ctx.banks_client.get_balance(kp(0xC1).pubkey()).await.unwrap();
+    let rent_d = ch.ctx.banks_client.get_balance(d).await.unwrap();
+    let rent_b = ch.ctx.banks_client.get_balance(buf_e).await.unwrap();
+    ch.close_dispute(d).await.unwrap();
+    assert!(ch.gone(d).await && ch.gone(buf_e).await && ch.gone(buf_c).await);
+    assert_eq!(ch.ctx.banks_client.get_balance(kp(0xC1).pubkey()).await.unwrap(), c_before + rent_d + rent_b, "C created the buffer");
+    assert!(ch.close_dispute(d).await.is_err(), "closed once");
+    assert!(ch.close_run(0xC1).await.is_err(), "every dispute is closed, but the run is not final yet");
+    // Finalize, then the payer (only) closes the run.
+    ch.ctx.warp_to_slot(100).unwrap();
+    let caller = kp(0xA1);
+    send(&mut ch.ctx, ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(e.pubkey(), false)]), &[&caller]).await.unwrap();
+    assert!(ch.close_cache(cache, kp(0xC1).pubkey()).await.is_err(), "rent goes to the recorded executor only");
+    assert!(ch.close_run_by(0xC1, 0xC1).await.is_err(), "the freed rent goes to the run's payer only");
+    let receipt_rent = ch.ctx.banks_client.get_rent().await.unwrap().minimum_balance(V::RECEIPT_BYTES);
+    ch.close_run(0xC1).await.unwrap(); // anyone may shrink a settled run
+    let (magic, status, root) = ch.receipt().await;
+    assert_eq!((magic.as_slice(), status, root.as_slice()), (&b"D21P"[..], V::RUN_FINAL, &c.root_bytes[..]));
+    assert_eq!(ch.ctx.banks_client.get_balance(ch.run).await.unwrap(), receipt_rent);
+    assert!(ch.close_run(0xC1).await.is_err(), "a receipt is not a run");
+    // The run id stays single-use: the same run cannot be initialized again.
+    let mut init = vec![0u8; 32];
+    init.extend_from_slice(e.pubkey().as_ref());
+    init.extend_from_slice(&2u32.to_le_bytes());
+    for r in &ch.g.refs {
+        init.extend_from_slice(r);
+    }
+    let i = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert!(send(&mut ch.ctx, i, &[&caller]).await.is_err(), "run id reused");
+    // The cache records its executor, so it still closes after the run.
+    let e_before = ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap();
+    let rent_k = ch.ctx.banks_client.get_balance(cache).await.unwrap();
+    ch.close_cache(cache, e.pubkey()).await.unwrap();
+    assert!(ch.gone(cache).await);
+    assert_eq!(ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap(), e_before + rent_k);
+    assert_eq!(total_lamports(&mut ch.ctx, &tracked).await, before, "lamports are conserved");
+    // The payer has its run rent back less the receipt; the template keeps its rent (templates do not close yet).
+    assert_eq!(ch.ctx.banks_client.get_balance(ch.template).await.unwrap(), template_before);
+    assert_eq!(ch.ctx.banks_client.get_balance(kp(0xA1).pubkey()).await.unwrap(), payer_before + run_rent - receipt_rent);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refuted_run_closes_after_the_pot_and_buffers_refund_their_creator() {
+    let mut ch = Chain::new(1_000).await;
+    let h = ch.honest();
+    let mut l = h.leaves[1].clone().unwrap();
+    let n = l.len();
+    l[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
+    let c = commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(l)], h.outs.clone());
+    let (d0, d1) = (ch.dispute(60), ch.dispute(61));
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), ch.run, d0, d1, ch.buffer(d1, V::ROLE_EXECUTOR)];
+    let before = total_lamports(&mut ch.ctx, &tracked).await;
+    ch.commit(&c).await;
+    ch.open(60, V::KIND_STEP_DESCEND).await; // sequence 0
+    ch.open(61, V::KIND_STEP_DESCEND).await; // sequence 1
+    // On d1, E creates its own staging buffer (it pays that rent).
+    let e = kp(0xE1);
+    let buf = ch.buffer(d1, V::ROLE_EXECUTOR);
+    let mut data = vec![V::ROLE_EXECUTOR];
+    data.extend_from_slice(&0u32.to_le_bytes());
+    let i = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d1, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    send(&mut ch.ctx, i, &[&e]).await.unwrap();
+    ch.win_by_step(d1, &c).await;
+    ch.win_by_step(d0, &c).await; // the lowest sequence wins the pot
+    ch.advance(d0).await.unwrap();
+    assert!(ch.close_dispute(d0).await.is_err(), "the best win waits for the pot");
+    assert!(ch.close_dispute(d1).await.is_err(), "the ruled prefix has not passed d1");
+    ch.advance(d1).await.unwrap();
+    let e_before = ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap();
+    let rent_b = ch.ctx.banks_client.get_balance(buf).await.unwrap();
+    ch.close_dispute(d1).await.unwrap();
+    assert_eq!(ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap(), e_before + rent_b, "E created that buffer");
+    assert!(ch.close_run(0xA1).await.is_err(), "the pot is unpaid and d0 is open");
+    let caller = kp(0xA1);
+    let i = ix(V::SUB_PAY_POT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d0, false), AccountMeta::new(kp(0xC1).pubkey(), false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+    send(&mut ch.ctx, i, &[&caller]).await.unwrap();
+    assert!(ch.close_run(0xA1).await.is_err(), "d0 is not closed");
+    ch.close_dispute(d0).await.unwrap();
+    ch.close_run(0xE1).await.unwrap();
+    assert_eq!(ch.receipt().await.1, V::RUN_REFUTED, "the receipt keeps the refutation");
+    for k in [d0, d1, buf] {
+        assert!(ch.gone(k).await);
+    }
+    assert_eq!(total_lamports(&mut ch.ctx, &tracked).await, before, "lamports are conserved");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uncommitted_run_closes_for_its_payer_only() {
+    let mut ch = Chain::new(30).await;
+    assert!(ch.close_run(0xE1).await.is_err(), "only the payer cancels");
+    ch.close_run(0xA1).await.unwrap();
+    assert!(ch.gone(ch.run).await, "a cancelled run leaves no receipt");
+    // Its executor can no longer commit to it.
+    let c = ch.honest();
+    let e = kp(0xE1);
+    let i = ix(V::SUB_COMMIT, &c.root_bytes, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert!(send(&mut ch.ctx, i, &[&e]).await.is_err());
 }

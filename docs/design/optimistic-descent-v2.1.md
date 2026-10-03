@@ -836,6 +836,34 @@ write_rate) × write_slots`.
 | `CANCEL_RUN` | the payer, while `now > commit_deadline` with no commit |
 | `CLOSE_DISPUTE` (only after `ruled_prefix > sequence`, R2-S8), `CLOSE_STAGING`, `CLOSE_RUN` (leaves the receipt), `CLOSE_CACHE` | anyone; rent goes to the recorded payers |
 
+**Rent reclaim as implemented (2026-10-03, tag 227 subs 18–20).** Measured
+by the v2.1 skeleton suite, natively and on SBF; nine planted guard bugs are
+each caught.
+- **`CLOSE_DISPUTE` (18), anyone.** Allowed for a ruled or moot dispute once
+  the ruled prefix has passed it; the run's lowest challenger win must also
+  wait until the pot is paid. It closes the dispute's two staging buffers in
+  the same instruction (so there is no separate `CLOSE_STAGING`). Each
+  buffer's rent goes to the party that created it, recorded in byte 5 of its
+  header; growth funders are not recorded and are refunded through the
+  creator. The dispute's rent goes to the challenger. The run counts closed
+  disputes in a former pad field.
+- **`CLOSE_RUN` (19).** A settled run (final, or refuted with the pot paid)
+  whose disputes are all closed shrinks to its receipt, and anyone may send
+  it. **The receipt stays at the run's own address**
+  (`["dcg21run", run_id]`, magic `D21P`, 312 bytes: the run's first 136
+  bytes, then its root) instead of a separate `["dcg2rcpt", run_id]`
+  account. Keeping the address occupied keeps the run id single-use, so the
+  same run cannot be initialized and committed a second time. The freed
+  rent goes to the run's payer. An uncommitted run is cancelled (closed
+  whole) by its payer only, as `CANCEL_RUN` would be.
+- **`CLOSE_CACHE` (20), anyone.** Allowed once the run is settled with no
+  open dispute, or is a receipt or cancelled. New caches record the
+  executor that paid their rent (32 bytes after the revealed nodes, 1,112
+  bytes in all); `cache_answer` accepts both sizes. A cache from before this
+  change closes only while its run or receipt can name the executor.
+- **Not yet:** template closes (a template records no payer, and runs still
+  read it).
+
 - These are new tags. Tags 220–226 are not reused, and the v2.0 handlers
   stay under `graph-v2-experimental` until they are removed.
 - The trace-committed path (209–218) remains for small graphs. A template's

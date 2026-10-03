@@ -27,7 +27,9 @@
 //! - a run-level reveal cache: a verified reveal may be recorded, and any
 //!   other dispute at the same node is answered from it by anyone (§8.3).
 //!
-//! Not yet: staging growth past one CPI creation (10 KiB), the leaf cache, the load extension, receipts, closes, and the full v2.1
+//! Rent reclaim: subs 18 to 20 close disputes (with their staging buffers), shrink settled runs to
+//! their receipts (or cancel uncommitted ones) and close reveal caches.
+//! Not yet: staging growth past one CPI creation (10 KiB), the leaf cache, the load extension, receipts, template closes, and the full v2.1
 //! template identity.
 
 use dcg_disputes as D;
@@ -77,6 +79,16 @@ pub const STAGE_HEADER: usize = 48;
 pub const CREATE_STAGE: usize = 10_240 - STAGE_HEADER;
 pub const MAX_STAGE: usize = 128 * 1024;
 pub const SUB_STAGE_GROW: u8 = 17;
+/// Rent reclaim (2026-10-03). Close a ruled dispute and its staging buffers.
+pub const SUB_CLOSE_DISPUTE: u8 = 18;
+/// Shrink a settled run to its receipt once every dispute is closed (anyone),
+/// or cancel an uncommitted run (its payer).
+pub const SUB_CLOSE_RUN: u8 = 19;
+/// Run receipt "D21P": the run's first 136 bytes (magic, status, template,
+/// payer, executor, run id) then its 176-byte root, at the run's own address.
+pub const RECEIPT_BYTES: usize = 136 + D::RUN_ROOT_BYTES;
+/// Close a reveal cache once its run is settled with no open dispute, or gone.
+pub const SUB_CLOSE_CACHE: u8 = 20;
 pub const FROM_STAGING: u8 = 0xFF;
 pub const SUB_CACHE_ANSWER: u8 = 16;
 
@@ -86,6 +98,10 @@ pub const SUB_CACHE_ANSWER: u8 = 16;
 /// reveal, keyed by the node it answers; any dispute at that node can then
 /// be answered from it by anyone.
 pub const CACHE_BYTES: usize = 56 + 32 * 32;
+/// Caches created since rent reclaim also record the executor that paid
+/// their rent (32 bytes after the revealed nodes), so a cache can be closed
+/// after its run. `cache_answer` accepts both sizes.
+pub const CACHE_BYTES_V2: usize = CACHE_BYTES + 32;
 
 pub const RULING_OPEN: u8 = 0;
 pub const RULING_EXECUTOR: u8 = 1;
@@ -317,7 +333,8 @@ const R_NEXT: usize = 156; // external ref count
 const R_SEQ: usize = 160; // next dispute sequence
 const R_PREFIX: usize = 168; // ruled prefix: smallest sequence not yet ruled
 const R_BEST: usize = 176; // lowest-sequence challenger win (u64::MAX: none)
-const R_PAID: usize = 184; // pot paid
+const R_PAID: usize = 184; // pot paid (u8)
+const R_CLOSED: usize = 188; // disputes closed (u32); a run closes when this reaches R_SEQ
 const R_ROOT: usize = 192;
 const R_REFS: usize = R_ROOT + D::RUN_ROOT_BYTES;
 
@@ -388,6 +405,9 @@ pub fn process(
         SUB_STAGE_WRITE => stage_write(program_id, accounts, &data[2..]),
         SUB_CACHE_ANSWER => cache_answer(program_id, accounts),
         SUB_STAGE_GROW => stage_grow(program_id, accounts, &data[2..]),
+        SUB_CLOSE_DISPUTE if data.len() == 2 => close_dispute(program_id, accounts),
+        SUB_CLOSE_RUN if data.len() == 2 => close_run(program_id, accounts),
+        SUB_CLOSE_CACHE if data.len() == 2 => close_cache(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -697,7 +717,7 @@ fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
         let pos_b = position.to_le_bytes();
         let seeds: [&[u8]; 5] = [b"dcg21rc", c.run.key.as_ref(), &[kind], &level_b, &pos_b];
         if cache.data_is_empty() {
-            create_pda(program_id, executor, cache, system, &seeds, CACHE_BYTES)?;
+            create_pda(program_id, executor, cache, system, &seeds, CACHE_BYTES_V2)?;
             let mut k = cache.try_borrow_mut_data()?;
             k[0..4].copy_from_slice(b"D21C");
             k[4] = kind;
@@ -705,7 +725,8 @@ fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
             k[8..12].copy_from_slice(&level_b);
             k[16..24].copy_from_slice(&pos_b);
             k[24..56].copy_from_slice(&d[D_CURRENT..D_CURRENT + 32]);
-            k[56..].copy_from_slice(&d[D_REVEALED..D_REVEALED + 32 * 32]);
+            k[56..CACHE_BYTES].copy_from_slice(&d[D_REVEALED..D_REVEALED + 32 * 32]);
+            k[CACHE_BYTES..CACHE_BYTES_V2].copy_from_slice(executor.key.as_ref());
         }
     }
     next_phase(&mut d, PH_PICK, c.t.phase_window)
@@ -722,7 +743,7 @@ fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     let level = u32_at(&d, D_LEVEL)?;
     let position = u64_at(&d, D_POSITION)?;
     let kind = d[D_KIND];
-    if k.len() != CACHE_BYTES || &k[0..4] != b"D21C" {
+    if (k.len() != CACHE_BYTES && k.len() != CACHE_BYTES_V2) || &k[0..4] != b"D21C" {
         return Err(err(30));
     }
     derived(program_id, cache, &[b"dcg21rc", c.run.key.as_ref(), &[kind], &level.to_le_bytes(), &position.to_le_bytes()])?;
@@ -733,7 +754,7 @@ fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     let depth = k[5] as u32;
     let first = position << depth;
     let n = (0..1u64 << depth).filter(|i| pickable(&c.t, kind, level - depth, first + i)).count();
-    d[D_REVEALED..D_REVEALED + 32 * 32].copy_from_slice(&k[56..]);
+    d[D_REVEALED..D_REVEALED + 32 * 32].copy_from_slice(&k[56..CACHE_BYTES]);
     d[D_REVEALED_N..D_REVEALED_N + 2].copy_from_slice(&(n as u16).to_le_bytes());
     next_phase(&mut d, PH_PICK, c.t.phase_window)
 }
@@ -778,6 +799,8 @@ fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     let mut b = buffer.try_borrow_mut_data()?;
     b[0..4].copy_from_slice(b"D21S");
     b[4] = role;
+    // Who paid the creation rent, for the close: 0 the challenger, 1 the executor.
+    b[5] = u8::from(!by_challenger);
     b[8..40].copy_from_slice(c.dispute.key.as_ref());
     Ok(())
 }
@@ -1438,4 +1461,154 @@ fn finalize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         move_lamports(run, executor, t.executor_bond)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rent reclaim (2026-10-03). Each close moves every lamport of a program
+// account to the party that paid its rent, empties it and returns it to the
+// system program. Bonds have already moved by then (rule, moot, pay_pot,
+// finalize); a close never decides who is owed a bond.
+
+/// Drain `account` to `to` and close it.
+fn close_into(account: &AccountInfo, to: &AccountInfo) -> ProgramResult {
+    if !account.is_writable || !to.is_writable || account.key == to.key {
+        return Err(err(35));
+    }
+    let all = account.lamports();
+    move_lamports(account, to, all)?;
+    account.resize(0)?;
+    account.assign(&solana_program::system_program::id());
+    Ok(())
+}
+
+/// The run is settled: final, or refuted with the pot paid. No dispute can
+/// open on it again, and its bond has moved.
+fn settled(r: &[u8]) -> bool {
+    r[R_STATUS] == RUN_FINAL || (r[R_STATUS] == RUN_REFUTED && r[R_PAID] != 0)
+}
+
+// 18: [anyone, run(w), template, dispute(w), challenger(w), executor(w),
+// executor buffer(w), challenger buffer(w)]. A ruled or moot dispute whose
+// sequence the ruled prefix has passed (so `advance` no longer needs it), and,
+// if it is the run's lowest challenger win, after the pot is paid. Closes both
+// staging buffers if they exist (their rent to the party that created them)
+// and the dispute (its rent to the challenger).
+fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [_caller, run, tmpl, dispute, challenger, executor, buffer_e, buffer_c, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    {
+        let d = c.dispute.try_borrow_data()?;
+        let r = c.run.try_borrow_data()?;
+        let seq = u64_at(&d, D_SEQ)?;
+        if d[D_RULING] == RULING_OPEN
+            || seq >= u64_at(&r, R_PREFIX)?
+            || (r[R_STATUS] == RUN_REFUTED && seq == u64_at(&r, R_BEST)? && r[R_PAID] == 0)
+            || challenger.key.to_bytes() != d[D_CHALLENGER..D_CHALLENGER + 32]
+            || executor.key.to_bytes() != r[R_EXECUTOR..R_EXECUTOR + 32]
+        {
+            return Err(err(36));
+        }
+    }
+    for (role, buffer) in [(ROLE_EXECUTOR, buffer_e), (ROLE_CHALLENGER, buffer_c)] {
+        // The derived address, whether or not the buffer was ever created.
+        if Pubkey::find_program_address(&[b"dcg21stg", c.dispute.key.as_ref(), &[role]], program_id).0 != *buffer.key {
+            return Err(err(2));
+        }
+        if buffer.owner != program_id {
+            continue; // never created
+        }
+        let creator = {
+            let b = buffer.try_borrow_data()?;
+            if b.len() < STAGE_HEADER || &b[0..4] != b"D21S" || b[4] != role || b[8..40] != c.dispute.key.to_bytes() {
+                return Err(err(29));
+            }
+            b[5]
+        };
+        close_into(buffer, if creator == 1 { executor } else { challenger })?;
+    }
+    {
+        let mut r = c.run.try_borrow_mut_data()?;
+        let closed = u32_at(&r, R_CLOSED)?.checked_add(1).ok_or(err(8))?;
+        r[R_CLOSED..R_CLOSED + 4].copy_from_slice(&closed.to_le_bytes());
+    }
+    close_into(c.dispute, challenger)
+}
+
+// 19: [caller(s), run(w), template, payer(w)]. A settled run whose disputes
+// are all closed shrinks to its receipt (design §6.4) at the same address, so
+// consumers can still read its final status and root and the run id stays
+// single-use; anyone may send it. An uncommitted run is cancelled (closed
+// whole) by its payer only. Freed rent goes to the run's payer.
+fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [caller, run, tmpl, payer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    run_checked(program_id, run, tmpl)?;
+    let status = {
+        let r = run.try_borrow_data()?;
+        if payer.key.to_bytes() != r[R_PAYER..R_PAYER + 32] {
+            return Err(err(22));
+        }
+        if r[R_STATUS] == RUN_OPEN {
+            if !caller.is_signer || caller.key != payer.key {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
+        } else if !settled(&r) || u32_at(&r, R_OPEN)? != 0 || u32_at(&r, R_CLOSED)? as u64 != u64_at(&r, R_SEQ)? {
+            return Err(err(37));
+        }
+        r[R_STATUS]
+    };
+    if status == RUN_OPEN {
+        return close_into(run, payer);
+    }
+    {
+        let mut r = run.try_borrow_mut_data()?;
+        r.copy_within(R_ROOT..R_REFS, 136);
+        r[0..4].copy_from_slice(b"D21P");
+    }
+    run.resize(RECEIPT_BYTES)?;
+    let floor = Rent::get()?.minimum_balance(RECEIPT_BYTES);
+    let extra = run.lamports().checked_sub(floor).ok_or(err(8))?;
+    if !payer.is_writable {
+        return Err(err(35));
+    }
+    move_lamports(run, payer, extra)
+}
+
+// 20: [anyone, run, cache(w), executor(w)]. A reveal cache closes once its
+// run is settled with no open dispute (so no dispute can read it again), or
+// once the run is closed. Its rent goes to the executor: the one the cache
+// records, or, for a cache from before rent reclaim, the live run's executor.
+fn close_cache(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [_caller, run, cache, executor, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let recorded = {
+        let k = cache.try_borrow_data()?;
+        if cache.owner != program_id || (k.len() != CACHE_BYTES && k.len() != CACHE_BYTES_V2) || &k[0..4] != b"D21C" {
+            return Err(err(30));
+        }
+        derived(program_id, cache, &[b"dcg21rc", run.key.as_ref(), &[k[4]], &k[8..12], &k[16..24]])?;
+        (k.len() == CACHE_BYTES_V2).then(|| <[u8; 32]>::try_from(&k[CACHE_BYTES..CACHE_BYTES_V2]).unwrap())
+    };
+    let live = run.owner == program_id && !run.data_is_empty();
+    let payee = if live {
+        // A live run (settled, no open dispute) or its receipt.
+        let r = run.try_borrow_data()?;
+        let receipt = r.len() == RECEIPT_BYTES && &r[0..4] == b"D21P";
+        if !receipt && (r.len() < R_REFS || &r[0..4] != b"D21R") {
+            return Err(err(5));
+        }
+        derived(program_id, run, &[b"dcg21run", &r[R_RUN_ID..R_RUN_ID + 32]])?;
+        if !receipt && (!settled(&r) || u32_at(&r, R_OPEN)? != 0) {
+            return Err(err(38));
+        }
+        recorded.unwrap_or_else(|| r[R_EXECUTOR..R_EXECUTOR + 32].try_into().unwrap())
+    } else {
+        // A cancelled run: only a cache that records its executor can close
+        // (an uncommitted run has no disputes, so it has no caches).
+        recorded.ok_or(err(38))?
+    };
+    if executor.key.to_bytes() != payee {
+        return Err(err(22));
+    }
+    close_into(cache, executor)
 }
