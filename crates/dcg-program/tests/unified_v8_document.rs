@@ -6872,212 +6872,73 @@ async fn rev8_dtu1_malformed_inputs() {
     assert_eq!(use_record.len(), config::DTU1_BYTES);
     assert_eq!(use_record[6], config::DTU1_STATE_LIVE);
     assert_eq!(u32_at(&use_record, 8), 1, "documents + 1 at init");
-    // Every variant below is a *different* document, because `init` refuses and
-    // a second init on the same descriptor would collide on the PDAs.
-    let executor_key = f.executor.pubkey().to_bytes();
-    let registry_key = f.drp2.to_bytes();
-    let template_image = f.account(f.dtu1).await;
-    // The five limits at 88 are written here too, because init compares the
-    // document's windows against them (checks 17-20) **before** the counter's
-    // increment, and a zero-limit record would answer 791 where this test wants
-    // the code each variant is about.
-    let good = |state: u8, documents: u32| {
-        let mut out = template_image.clone();
-        out[..4].copy_from_slice(b"DTU1");
-        out[4..6].copy_from_slice(&config::DTU1_VERSION.to_le_bytes());
-        out[6] = state;
-        out[8..12].copy_from_slice(&documents.to_le_bytes());
-        out[16..48].copy_from_slice(&executor_key);
-        out[48..80].copy_from_slice(&registry_key);
-        out[80..88].copy_from_slice(&1u64.to_le_bytes());
-        for (i, limit) in [
-            EXAMPLE_LIMITS.max_challenge_window_slots,
-            EXAMPLE_LIMITS.max_response_window_slots,
-            EXAMPLE_LIMITS.max_document_lifetime_slots,
-            EXAMPLE_LIMITS.max_abandon_after_slots,
-            EXAMPLE_LIMITS.min_abandon_after_slots,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let at = config::DTU1_MAX_CHALLENGE_AT + 8 * i;
-            out[at..at + 8].copy_from_slice(&limit.to_le_bytes());
-        }
-        out
-    };
-    let mut variant = 0u8;
-    macro_rules! expect_init {
-        ($f:ident, $image:expr, $want:expr, $what:expr) => {{
-            #[allow(unused_mut)]
-            let mut f = &mut $f;
-            let image = $image;
-            variant += 1;
-            let binding = Binding2 {
-                request_id: [variant; 32],
-                ..f.binding(29, 50)
-            };
-            let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
-            let created = [
-                address::document(&f.program, &descriptor).0,
-                address::positions(&f.program, &descriptor).0,
-                address::family_slots(&f.program, &descriptor).0,
-                address::result(&f.program, &descriptor).0,
-            ];
-            f.ctx
-                .set_account(&f.dtu1, &shared(owned(&f.program, image)));
-            let metas = f.init_metas(created);
-            let data = init_data(
-                &f.terms_raw,
-                &binding.encode(),
-                &[[1u8; 32], [2u8; 32], [3u8; 32]],
-                16,
-                &f.family_body,
-                &[],
-            );
-            // One slot per attempt, so each transaction is a new one and not a
-            // duplicate of the message the banks client already processed.
-            let slot = f
-                .ctx
-                .banks_client
-                .get_sysvar::<solana_program::clock::Clock>()
-                .await
-                .unwrap()
-                .slot;
-            f.ctx.warp_to_slot(slot + 1).unwrap();
-            let code = match send(&mut f.ctx, &f.executor, f.program, data, metas).await {
-                Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => code,
-                other => panic!("{}: expected a custom refusal, got {other:?}", $what),
-            };
-            assert_eq!(code, $want, "{}", $what);
-        }};
-    }
-    // A record that is not DTU1 at all.
-    let mut wrong_magic = good(config::DTU1_STATE_LIVE, 0);
-    wrong_magic[..4].copy_from_slice(b"DTU2");
-    expect_init!(f, wrong_magic, TEMPLATE_SEAL, "a wrong magic is 793");
-    // A version the program does not know.
-    let mut wrong_version = good(config::DTU1_STATE_LIVE, 0);
-    wrong_version[4..6].copy_from_slice(&config::DTU1_VERSION.wrapping_add(1).to_le_bytes());
-    expect_init!(f, wrong_version, TEMPLATE_SEAL, "version 2 is 793");
-    // The stored use bump at 7 and the reserved run at 12..16 are checked.
-    let mut reserved7 = good(config::DTU1_STATE_LIVE, 0);
-    reserved7[7] ^= 1;
-    expect_init!(
-        f,
-        reserved7,
-        TEMPLATE_SEAL,
-        "a wrong stored use bump is 793"
-    );
-    let mut reserved12 = good(config::DTU1_STATE_LIVE, 0);
-    reserved12[15] = 1;
-    expect_init!(f, reserved12, TEMPLATE_SEAL, "reserved 12..16 is 793");
-    // A short and a long record.
-    let mut short = good(config::DTU1_STATE_LIVE, 0);
-    short.truncate(80);
-    expect_init!(f, short, TEMPLATE_SEAL, "a short record is 793");
-    let mut long = good(config::DTU1_STATE_LIVE, 0);
-    long.push(0);
-    expect_init!(f, long, TEMPLATE_SEAL, "a long record is 793");
-    // State 3 is outside the live/retired/revoked DTU1 vocabulary.
-    let mut invalid_state = good(config::DTU1_STATE_LIVE, 0);
-    invalid_state[6] = 3;
-    expect_init!(f, invalid_state, TEMPLATE_SEAL, "state 3 is malformed, 793");
-    let mut bad_state = good(config::DTU1_STATE_LIVE, 0);
-    bad_state[6] = 4;
-    expect_init!(
-        f,
-        bad_state,
-        TEMPLATE_SEAL,
-        "state 4 is not in the DTU1 vocabulary, 793"
-    );
-    // Retired and revoked: no new document, 793, the DTA1 view's own code.
-    for (state, name) in [
-        (config::DTU1_STATE_RETIRED, "retired"),
-        (config::DTU1_STATE_REVOKED, "revoked"),
-    ] {
-        expect_init!(
-            f,
-            good(state, 0),
-            TEMPLATE_SEAL,
-            if name == "retired" {
-                "a retired template is 793"
-            } else {
-                "a revoked template is 793"
-            }
+    // The malformed DTU1 images (wrong magic or version, a wrong stored bump,
+    // reserved bytes, short or long, states 3 and 4, a full counter) are
+    // states only a program bug could write: unit tests of the gate
+    // (config::dtu1_gate_tests; owner decision 2026-10-02). What a caller can
+    // do is below, by real instructions.
+    let init_attempt = |f: &Fix, request: u8| {
+        let binding = Binding2 {
+            request_id: [request; 32],
+            ..f.binding(29, 50)
+        };
+        let descriptor = f.descriptor(&binding, &f.terms_raw, 16);
+        let created = [
+            address::document(&f.program, &descriptor).0,
+            address::positions(&f.program, &descriptor).0,
+            address::family_slots(&f.program, &descriptor).0,
+            address::result(&f.program, &descriptor).0,
+        ];
+        let data = init_data(
+            &f.terms_raw,
+            &binding.encode(),
+            &[[1u8; 32], [2u8; 32], [3u8; 32]],
+            16,
+            &f.family_body,
+            &[],
         );
-    }
-    // The counter at its maximum: the increment is a checked add, 598.
-    expect_init!(
-        f,
-        good(config::DTU1_STATE_LIVE, u32::MAX),
-        598,
-        "documents = u32::MAX is 598 on the increment"
-    );
-    // An account at the wrong address: the PDA is re-derived from the PT2S and
-    // its digest, so a substituted DTU1 is 793 even when it is well formed.
-    let other = Pubkey::new_unique();
-    f.ctx.set_account(
-        &other,
-        &shared(owned(&f.program, good(config::DTU1_STATE_LIVE, 0))),
-    );
-    let metas: Vec<AccountMeta> = {
-        let mut m = f.init_metas(created);
-        let last = m.len() - 1;
-        m[last] = AccountMeta::new(other, false);
-        m
+        (f.init_metas(created), data)
     };
-    let data = init_data(
-        &f.terms_raw,
-        &binding.encode(),
-        &[[1u8; 32], [2u8; 32], [3u8; 32]],
-        16,
-        &f.family_body,
-        &[],
-    );
-    f.ctx
-        .warp_to_slot(
-            f.ctx
-                .banks_client
-                .get_sysvar::<solana_program::clock::Clock>()
-                .await
-                .unwrap()
-                .slot
-                + 1,
-        )
-        .unwrap();
+    // An attacker substitutes an account it controls for DTU1: 793.
+    let (mut metas, data) = init_attempt(&f, 1);
+    let last = metas.len() - 1;
+    metas[last] = AccountMeta::new(Pubkey::new_unique(), false);
     assert_eq!(
-        custom(send(&mut f.ctx, &f.executor, f.program, data.clone(), metas).await),
+        custom(send_fresh_with(&mut f.ctx, &f.executor, f.program, data, metas).await),
         TEMPLATE_SEAL,
-        "a DTU1 at another address is 793"
+        "a substituted DTU1 is 793"
     );
     // A missing meta is the account-count refusal, 580.
-    let metas = f.init_metas(created);
-    f.ctx
-        .warp_to_slot(
-            f.ctx
-                .banks_client
-                .get_sysvar::<solana_program::clock::Clock>()
-                .await
-                .unwrap()
-                .slot
-                + 1,
-        )
-        .unwrap();
+    let (metas, data) = init_attempt(&f, 2);
     assert_eq!(
-        custom(
-            send(
-                &mut f.ctx,
-                &f.executor,
-                f.program,
-                data,
-                metas[..13].to_vec()
-            )
-            .await
-        ),
+        custom(send_fresh_with(&mut f.ctx, &f.executor, f.program, data, metas[..13].to_vec()).await),
         CL_MALFORMED,
         "thirteen metas is 580"
     );
-    assert!(variant >= 8, "every DTU1 variant was refused");
+    // The authority revokes the template (tag 176): no new document, 793.
+    let config_key = address::config(&f.program).0;
+    send_fresh_with(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![TAG_TEMPLATE_SEAL, SEAL_REVOKED],
+        vec![
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new_readonly(config_key, false),
+            AccountMeta::new(f.dta1, false),
+            AccountMeta::new(f.pt2s, false),
+            AccountMeta::new(f.dtu1, false),
+        ],
+    )
+    .await
+    .expect("the configured authority revokes the template");
+    assert_eq!(f.account(f.dtu1).await[6], config::DTU1_STATE_REVOKED);
+    let (metas, data) = init_attempt(&f, 3);
+    assert_eq!(
+        custom(send_fresh_with(&mut f.ctx, &f.executor, f.program, data, metas).await),
+        TEMPLATE_SEAL,
+        "a revoked template admits no new document, 793"
+    );
     let _ = (descriptor, created);
 }
 
@@ -11344,6 +11205,11 @@ async fn rev8_template_retirement_is_irreversible() {
     .await
     .expect("the configured authority retires the template");
     assert_eq!(f.account(f.dtu1).await[6], config::DTU1_STATE_RETIRED);
+    assert_eq!(
+        f.init_refusal(&f.binding(29, 50), 9).await,
+        TEMPLATE_SEAL,
+        "a retired template admits no new document, 793"
+    );
 
     assert_eq!(
         custom(

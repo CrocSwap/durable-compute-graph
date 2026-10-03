@@ -1467,3 +1467,93 @@ fn drain_template_account<'a>(
 ) -> Result<u64, ProgramError> {
     super::result::drain(from, to)
 }
+
+/// DTU1's gate (`template_record` via `template_use`) on constructed
+/// accounts: the malformed images only a program bug could write are reader
+/// unit tests, not bank patches (owner decision 2026-10-02). The honest image
+/// passes, so each refusal is its corruption's.
+#[cfg(all(test, feature = "revision-8"))]
+mod dtu1_gate_tests {
+    use super::*;
+
+    const DIGEST: [u8; 32] = [0x3C; 32];
+
+    fn honest(program: &Pubkey, pt2s: &Pubkey) -> Vec<u8> {
+        let mut raw = vec![0u8; DTU1_BYTES];
+        raw[..4].copy_from_slice(b"DTU1");
+        raw[4..6].copy_from_slice(&DTU1_VERSION.to_le_bytes());
+        raw[6] = DTU1_STATE_LIVE;
+        raw[7] = address::template_use(program, pt2s, &DIGEST).1.value();
+        for (i, limit) in [1u64 << 26, 1 << 23, 1 << 27, 1 << 27, 2_592_000].into_iter().enumerate() {
+            let at = DTU1_MAX_CHALLENGE_AT + 8 * i;
+            raw[at..at + 8].copy_from_slice(&limit.to_le_bytes());
+        }
+        raw
+    }
+
+    fn read(program: &Pubkey, pt2s: &Pubkey, key: Pubkey, mut data: Vec<u8>) -> Result<u32, ProgramError> {
+        let mut lamports = 1u64;
+        let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, program, false, 0);
+        template_use(program, &info, pt2s, &DIGEST).map(|(documents, ..)| documents)
+    }
+
+    #[test]
+    fn the_dtu1_gate_refuses_every_malformed_image_with_793() {
+        let program = Pubkey::new_unique();
+        let pt2s = Pubkey::new_unique();
+        let key = address::template_use(&program, &pt2s, &DIGEST).0;
+        let good = honest(&program, &pt2s);
+        assert_eq!(read(&program, &pt2s, key, good.clone()), Ok(0));
+        let refused = Err(no(TEMPLATE_SEAL));
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut v = good.clone();
+        v[..4].copy_from_slice(b"DTU2");
+        cases.push(("a wrong magic", v));
+        let mut v = good.clone();
+        v[4..6].copy_from_slice(&DTU1_VERSION.wrapping_add(1).to_le_bytes());
+        cases.push(("an unknown version", v));
+        let mut v = good.clone();
+        v[7] ^= 1;
+        cases.push(("a wrong stored use bump", v));
+        let mut v = good.clone();
+        v[15] = 1;
+        cases.push(("reserved 12..16", v));
+        let mut v = good.clone();
+        v[161] = 1;
+        cases.push(("reserved 161", v));
+        let mut v = good.clone();
+        v[165] = 1;
+        cases.push(("reserved 163..168", v));
+        let mut v = good.clone();
+        v.truncate(80);
+        cases.push(("a short record", v));
+        let mut v = good.clone();
+        v.push(0);
+        cases.push(("a long record", v));
+        for state in [3u8, 4] {
+            let mut v = good.clone();
+            v[6] = state;
+            cases.push((if state == 3 { "state 3" } else { "state 4" }, v));
+        }
+        for state in [DTU1_STATE_RETIRED, DTU1_STATE_REVOKED] {
+            let mut v = good.clone();
+            v[6] = state;
+            cases.push((if state == DTU1_STATE_RETIRED { "retired" } else { "revoked" }, v));
+        }
+        for (what, image) in cases {
+            assert_eq!(read(&program, &pt2s, key, image), refused, "{what}");
+        }
+        let elsewhere = Pubkey::new_unique();
+        assert_eq!(read(&program, &pt2s, elsewhere, good), refused, "a well-formed DTU1 at another address");
+    }
+
+    #[test]
+    fn the_documents_counter_is_a_checked_add() {
+        assert_eq!(super::super::document::next_document_count(0), Ok(1));
+        assert_eq!(super::super::document::next_document_count(u32::MAX - 1), Ok(u32::MAX));
+        assert_eq!(
+            super::super::document::next_document_count(u32::MAX),
+            Err(no(super::super::CL_OVERFLOW))
+        );
+    }
+}

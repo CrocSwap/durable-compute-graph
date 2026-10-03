@@ -1049,6 +1049,12 @@ pub fn positions_with_bump(
 }
 
 /// Validate DPR2 using the bump recorded in its already-validated DCM2 parent.
+/// DTU1's `documents + 1` at UnifiedInit: a checked add, 598 at `u32::MAX`
+/// (unit-tested; the counter cannot reach the maximum on chain in practice).
+pub(crate) fn next_document_count(documents: u32) -> Result<u32, ProgramError> {
+    documents.checked_add(1).ok_or(no(CL_OVERFLOW))
+}
+
 pub fn positions_from_document(
     program: &Pubkey,
     positions: &AccountInfo,
@@ -1934,7 +1940,7 @@ pub fn init_v8_with_application(
     // every account this instruction creates exists, so a document can never
     // exist without its template counting it.
     {
-        let count = documents.checked_add(1).ok_or(no(CL_OVERFLOW))?;
+        let count = next_document_count(documents)?;
         dtu1.try_borrow_mut_data()?[8..12].copy_from_slice(&count.to_le_bytes());
     }
     // 10. The INIT event, last: DLE1 v3's 92-byte body.
