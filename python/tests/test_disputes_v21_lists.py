@@ -231,6 +231,73 @@ def test_admission_refuses_malformed_lists():
         b.build()
 
 
+def test_plan_element_budget_covers_the_measured_maximum():
+    assert S.check_list_element_budget([S.MAX_LIST_ELEMENTS] * 8) == 1_024
+    with pytest.raises(S.SpecError, match="total list-element limit"):
+        S.check_list_element_budget([S.MAX_LIST_ELEMENTS] * 8 + [1])
+
+
+def test_element_index_is_refused_before_a_wrong_count_can_rule_for_c():
+    sp, values = mixed_plan()
+    honest, committed = run(sp, values)
+    bad = committed.clone()
+    refs = bad.lists[(6, 0)][:-1]
+    leaf = R.parse_leaf(bad.leaves[6])
+    inputs = list(leaf.inputs)
+    inputs[0] = inputs[0][:23] + R.list_digest(refs)
+    bad.leaves[6] = R.leaf_preimage(leaf.plan_id, leaf.run_id, leaf.region, leaf.segment, leaf.ordinal, leaf.node,
+                                    leaf.kernel_step, inputs, list(leaf.outputs), leaf.prior, leaf.next)
+    bad.lists[(6, 0)] = refs
+    bad.rebuild()
+    record = record_for(sp, values, bad)
+    d = descend_to(record, G.Executor(bad), 6)
+    with pytest.raises(G.Refused, match="no such list element"):
+        d.claim("EDGE", spec_opening=sp.opening(sp.step_leaf_index(6)), index=0,
+                **dict(edge_args(sp, G.Executor(bad), 0), element=len(S.decode_list_spec(sp.list_specs[0])[1])))
+
+
+def test_step_uses_the_spec_producer_kind_for_list_witnesses():
+    sp, values = mixed_plan()
+    honest, committed = run(sp, values)
+    record = record_for(sp, values, committed)
+    executor = G.Executor(committed)
+    d = descend_to(record, executor, 6)
+    witness = [G.honest_value(honest, sp, prod) for _h, prod, _i in S.decode_step_spec(sp.step_spec(6))["inputs"]]
+    # Change the authenticated StepSpec producer to kind 2 while keeping its
+    # input layout and the revealed list refs. The referee must treat this as
+    # one ordinary input based on the spec, regardless of `self.lists`.
+    step_index = sp.step_leaf_index(6)
+    spec = bytearray(sp.step_spec(6))
+    spec[192 + 23:192 + 47] = S.producer(2, 0)
+    sp.block_records[0][6] = bytes(spec)
+    type_code, _ = sp.records[step_index]
+    sp.records[step_index] = (type_code, bytes(spec))
+    sp.tree = __import__("dcg.disputes_v21.trees", fromlist=["build"]).build(
+        "spec", [S.spec_leaf(t, r) for t, r in sp.records])
+    with pytest.raises(G.Refused, match="witness value"):
+        d.claim("STEP", spec_opening=sp.opening(sp.step_leaf_index(6)), witness=witness)
+
+
+@pytest.mark.parametrize("kind", [4, 5, 6, 7])
+def test_list_edge_refuses_element_producer_kinds_four_through_seven(kind):
+    sp, values = mixed_plan()
+    honest, committed = run(sp, values)
+    record = record_for(sp, values, committed)
+    executor = G.Executor(committed)
+    d = descend_to(record, executor, 6)
+    list_id, elements = S.decode_list_spec(sp.list_specs[0])
+    malformed = list(elements)
+    _header, producer = malformed[0]
+    malformed[0] = (_header, S.producer(kind, 0))
+    sp.list_specs[list_id] = S.list_spec(list_id, malformed)
+    sp.records[-1] = (S.TYPE_LIST, sp.list_specs[list_id])
+    sp.tree = __import__("dcg.disputes_v21.trees", fromlist=["build"]).build(
+        "spec", [S.spec_leaf(t, r) for t, r in sp.records])
+    with pytest.raises(G.Refused):
+        d.claim("EDGE", spec_opening=sp.opening(sp.step_leaf_index(6)), index=0,
+                **dict(edge_args(sp, executor, 0)))
+
+
 def test_an_element_ref_with_a_foreign_header_is_convicted():
     """The element's header must be the ListSpec's (node, direction and port
     included), not only its layout fields and digest."""
@@ -316,3 +383,8 @@ def test_list_oracle_scenarios_are_reproducible_and_cover_adversarial_cases():
     setup = stored["setups"]["wide100"]
     list_records = [r for t, r in setup["spec_records"] if t == S.TYPE_LIST]
     assert len(list_records) == 1 and struct.unpack_from("<I", bytes.fromhex(list_records[0]), 8)[0] == 100
+    max_setup = stored["setups"]["max-list8x128"]
+    max_lists = [bytes.fromhex(r) for t, r in max_setup["spec_records"] if t == S.TYPE_LIST]
+    assert len(max_lists) == 8
+    assert sum(struct.unpack_from("<I", record, 8)[0] for record in max_lists) == S.MAX_LIST_ELEMENTS_PER_STEP
+    assert names["max-list8x128-step"]["ruling"] == "E"

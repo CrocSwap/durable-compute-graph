@@ -26,10 +26,19 @@ TYPE_HEADER, TYPE_BLOCK, TYPE_CONST, TYPE_IN, TYPE_OUT, TYPE_OUT_BLOCK, TYPE_REG
 # kind 8 names ListSpec `a`, an ordered list of element producers.
 PRODUCER_LIST = 8
 MAX_LIST_ELEMENTS = 128
+MAX_LIST_ELEMENTS_PER_STEP = 1_024  # 8 list inputs × 128; matches the reviewer's measured 729,674-CU STEP bound.
 
 
 class SpecError(ValueError):
     pass
+
+
+def check_list_element_budget(counts) -> int:
+    """Validate and return a step's summed list-element count."""
+    total = sum(counts)
+    if total > MAX_LIST_ELEMENTS_PER_STEP:
+        raise SpecError("step exceeds the total list-element limit")
+    return total
 
 
 def port_header(node: int, direction: int, port: int, layout_id: int, layout_version: int,

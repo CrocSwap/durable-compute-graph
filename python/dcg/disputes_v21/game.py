@@ -286,12 +286,14 @@ class Dispute:
         if prod[0] == S.PRODUCER_LIST:
             # EDGE(index, element): one element against its one producer.
             elements = self._list(S.decode_producer(prod)[1], list_opening)
+            if not 0 <= element < len(elements):
+                raise Refused("no such list element")
             refs = self.lists.get(index)
             if refs is None or len(refs) != len(elements):
                 return "C"  # E's list has the wrong element count (or no list here)
-            if not 0 <= element < len(elements):
-                raise Refused("no such list element")
             element_header, element_prod = elements[element]
+            if S.decode_producer(element_prod)[0] not in (1, 2, 3):
+                raise Refused("list element producer kind not supported")
             if refs[element][:23] != element_header:
                 return "C"
             return self._edge_value(refs[element], element_header, element_prod, producer_opening, t,
@@ -368,8 +370,12 @@ class Dispute:
     def _step(self, leaf: R.Leaf, d: dict, witness: list | None, state_witness: bytes | None) -> str:
         if witness is None or len(witness) != len(leaf.inputs):
             raise Refused("witness has the wrong input count")
+        step_inputs = d["inputs"]
         for i, (value, ref) in enumerate(zip(witness, leaf.inputs)):
-            if i in self.lists:  # a list input: its element values, against the revealed refs
+            producer_kind = S.decode_producer(step_inputs[i][1])[0]
+            if producer_kind == S.PRODUCER_LIST:
+                if i not in self.lists:
+                    raise Refused("list input has no revealed element refs")
                 refs = self.lists[i]
                 if (not isinstance(value, list) or len(value) != len(refs)
                         or any(R.value_digest(v) != r[23:55] for v, r in zip(value, refs))):

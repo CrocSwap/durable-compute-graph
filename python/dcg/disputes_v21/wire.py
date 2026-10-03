@@ -29,9 +29,8 @@ def template_data(sp: S.Spec, depth: int, plan_id: bytes, *, challenge_window: i
     data += struct.pack("<H", slasher_bps) + plan_id
     if with_blocks:
         data += bytes([len(sp.blocks)]) + b"".join(b.record() for b in sp.blocks)
-    # Preserve the old template bytes and ids exactly for specs without lists.
-    if sp.list_specs:
-        data += struct.pack("<I", sp.first_list_record)
+    # Spec openings identify ListSpecs by their authenticated record type/id;
+    # there is no separate caller-supplied first-list boundary in a template.
     return data
 
 

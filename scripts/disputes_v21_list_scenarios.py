@@ -138,6 +138,17 @@ def wide_plan(n: int):
     return b.build(), {0: struct.pack("<Q", 0x12345678)}
 
 
+def max_width_plan():
+    """Eight 128-element list inputs: the explicit 1,024-element step cap."""
+    b = P.PlanBuilder()
+    external = b.raw_input(0, 8)
+    lists = tuple(b.list_input(i, tuple(P.Input(external, 8) for _ in range(S.MAX_LIST_ELEMENTS)))
+                  for i in range(8))
+    b.enumerated([P.Step(TESTS.SHA, lists, ((0, 32, False),))])
+    b.output(S.producer(1, 0, 0), 32)
+    return b.build(), {0: struct.pack("<Q", 0x12345678)}
+
+
 def wrong_count(commitment):
     bad = commitment.clone()
     refs = bad.lists[(6, 0)][:-1]
@@ -218,6 +229,17 @@ def build():
                                "wide100-step", ordinal=1, claim_name="STEP")
     wide_step["commit"] = "wide100-honest"
     scenarios.extend([wide_edge, wide_step])
+
+    max_width, max_values = max_width_plan()
+    max_setup, max_refs, max_run = setup_for("max-list8x128", max_width, max_values)
+    setups["max-list8x128"] = max_setup
+    max_honest = commit_for(max_width, max_setup, max_run, max_values)
+    commits["max-list8x128-honest"] = {"leaves": [x.hex() if x else None for x in max_honest.leaves],
+                                        "out_entries": [x.hex() if x else None for x in max_honest.out_entries]}
+    max_step = claim_scenario(max_setup, max_refs, max_width, max_run, max_honest, max_honest,
+                              "max-list8x128-step", ordinal=0, claim_name="STEP")
+    max_step["commit"] = "max-list8x128-honest"
+    scenarios.append(max_step)
     return {"setups": setups, "commits": commits, "scenarios": scenarios}
 
 

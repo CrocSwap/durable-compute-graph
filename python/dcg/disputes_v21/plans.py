@@ -254,6 +254,7 @@ class PlanBuilder:
         for k in range(sp.total_steps):
             bi, b, i, _e = sp.locate(k)
             d = S.decode_step_spec(sp.step_spec(k))
+            list_element_counts = []
             for header, prod, _init in d["inputs"]:
                 kind, a, pb, _c, dd = S.decode_producer(prod)
                 if kind == 1 and a >= k:
@@ -274,6 +275,7 @@ class PlanBuilder:
                     elements = self.lists.get(a)
                     if elements is None:
                         raise S.SpecError("unknown list")
+                    list_element_counts.append(len(elements))
                     if struct.unpack_from("<I", header, 19)[0] != sum(e.length for e in elements):
                         raise S.SpecError("a list input reads its elements' total length")
                     for e in elements:
@@ -286,6 +288,7 @@ class PlanBuilder:
                             raise S.SpecError("unknown external input")
                         if ek == 3 and ea not in self.constants:
                             raise S.SpecError("unknown constant")
+            S.check_list_element_budget(list_element_counts)
         if sp.address_height > 40:
             raise S.SpecError("step tree too tall")
         _ = trees  # tree shapes are fixed by place_blocks

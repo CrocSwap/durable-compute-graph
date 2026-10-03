@@ -66,6 +66,10 @@ pub const RUN_ROOT_BYTES: usize = 176;
 pub const VALUE_REF_BYTES: usize = 55;
 pub const PORT_HEADER_BYTES: usize = 23;
 pub const MAX_LIST_ELEMENTS: usize = 128;
+/// Explicit total list-input cap per step: 8 inputs × 128 elements. The
+/// reviewer measured the 8×128 SHA-kernel STEP replay at 729,674 CU, below
+/// the 1.4M transaction budget; keep this bound if either inner limit grows.
+pub const MAX_LIST_ELEMENTS_PER_STEP: usize = 1_024;
 pub const PRODUCER_LIST: u8 = 8;
 pub const LAYOUT_LIST: u32 = 6;
 pub const TYPE_LIST: u8 = 10;

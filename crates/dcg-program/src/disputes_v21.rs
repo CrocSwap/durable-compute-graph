@@ -91,9 +91,11 @@ pub const RECEIPT_BYTES: usize = 136 + D::RUN_ROOT_BYTES;
 pub const SUB_CLOSE_CACHE: u8 = 20;
 /// Close a template with no live runs; its rent returns to its recorded payer.
 pub const SUB_CLOSE_TEMPLATE: u8 = 21;
+/// Retire a tracked template so no new runs can be initialized from it.
+pub const SUB_RETIRE_TEMPLATE: u8 = 22;
 /// Builds the pre-provenance template encoding for backwards-compatibility
 /// tests. This subtype is absent from non-test program builds.
-#[cfg(feature = "test-kernel")]
+#[cfg(feature = "test-legacy-template-create")]
 pub const SUB_TEST_CREATE_LEGACY_TEMPLATE: u8 = 250;
 pub const FROM_STAGING: u8 = 0xFF;
 pub const SUB_CACHE_ANSWER: u8 = 16;
@@ -219,7 +221,8 @@ fn now() -> Result<u64, ProgramError> {
 // Template "D21T": magic(4) depth(1) pad(3) total_steps(8) total_outputs(8)
 // challenge_window(8) phase_window(8) executor_bond(8) challenger_bond(8)
 // out_spec_base(4) step_spec_base(4) spec_root(32) template_id(32)
-// slasher_bps(2) pad(6) plan_id(32) first_list_record:u32 (0: none)
+// slasher_bps(2) pad(6) plan_id(32); byte 134 is the tracked-template
+// retired flag (old templates and newly-created templates start at zero).
 // block_count(1) pad(7)
 // blocks[104 x MAX_BLOCKS] = 1,008 bytes;
 // PDA ["dcg21tmpl", template_id]. The bases are the spec-tree leaf indices of
@@ -240,6 +243,7 @@ const T_TRACKING_MAGIC: &[u8; 4] = b"D21O";
 const T_TRACKING: usize = T_BYTES;
 const T_PAYER: usize = T_TRACKING + 4;
 const T_ACTIVE_RUNS: usize = T_PAYER + 32;
+const T_RETIRED: usize = 134;
 
 struct Template {
     depth: u32,
@@ -254,9 +258,6 @@ struct Template {
     spec_root: [u8; 32],
     slasher_bps: u64,
     plan_id: [u8; 32],
-    /// First DLS1 record. Zero means this template predates list inputs or has
-    /// none; record indices cannot be zero because the spec starts with DCS1.
-    first_list_record: u64,
     /// On the heap: SBF stack frames are 4 KiB.
     blocks: Vec<Block>,
     /// The step tree's height (§6.2).
@@ -311,7 +312,8 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
     }
     if d.len() == T_BYTES_V2
         && (&d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
-            || d[T_PAYER..T_PAYER + 32] == [0; 32])
+            || d[T_PAYER..T_PAYER + 32] == [0; 32]
+            || d[T_RETIRED] > 1)
     {
         return Err(err(4));
     }
@@ -340,10 +342,6 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
         spec_root: key32(&d, 64)?,
         slasher_bps: u16_at(&d, 128)? as u64,
         plan_id: key32(&d, 136)?,
-        first_list_record: match u32_at(&d, 130)? {
-            0 => u64::MAX,
-            n => n as u64,
-        },
     })
 }
 
@@ -361,6 +359,20 @@ fn tracked_template(account: &AccountInfo) -> Result<Option<u32>, ProgramError> 
         return Err(err(4));
     }
     Ok(Some(u32_at(&d, T_ACTIVE_RUNS)?))
+}
+
+fn template_retired(account: &AccountInfo) -> Result<bool, ProgramError> {
+    let d = account.try_borrow_data()?;
+    if d.len() == T_BYTES {
+        return Ok(false);
+    }
+    if d.len() != T_BYTES_V2
+        || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
+        || d[T_RETIRED] > 1
+    {
+        return Err(err(4));
+    }
+    Ok(d[T_RETIRED] == 1)
 }
 
 fn change_template_run_count(template: &AccountInfo, delta: i8) -> ProgramResult {
@@ -453,7 +465,7 @@ pub fn process(
 ) -> ProgramResult {
     match data.get(1).copied().ok_or(ProgramError::InvalidInstructionData)? {
         SUB_CREATE_TEMPLATE => create_template(program_id, accounts, &data[2..]),
-        #[cfg(feature = "test-kernel")]
+        #[cfg(feature = "test-legacy-template-create")]
         SUB_TEST_CREATE_LEGACY_TEMPLATE => create_template_inner(program_id, accounts, &data[2..], false),
         SUB_INIT_RUN => init_run(program_id, accounts, &data[2..]),
         SUB_COMMIT => commit(program_id, accounts, &data[2..]),
@@ -475,6 +487,7 @@ pub fn process(
         SUB_CLOSE_RUN if data.len() == 2 => close_run(program_id, accounts),
         SUB_CLOSE_CACHE if data.len() == 2 => close_cache(program_id, accounts),
         SUB_CLOSE_TEMPLATE if data.len() == 2 => close_template(program_id, accounts),
+        SUB_RETIRE_TEMPLATE if data.len() == 2 => retire_template(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -509,20 +522,19 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     {
         return Err(err(6));
     }
-    // The blocks are optional as before. A new optional final u32 carries the
-    // first ListSpec index; it is omitted when there are no lists, preserving
-    // every existing create instruction and template id.
-    let (block_data_end, first_list_record) = if data.len() == FIXED {
-        (FIXED, 0u32)
-    } else if data.len() == FIXED + 4 {
-        (FIXED, u32_at(data, FIXED)?)
+    // The blocks are optional as before. Old list clients appended a
+    // first-ListSpec index after the template or block records. Keep accepting
+    // that trailing word for wire compatibility, but don't trust or store it:
+    // EDGE authenticates the record type and list id under the spec root.
+    let block_data_end = if data.len() == FIXED || data.len() == FIXED + 4 {
+        FIXED
     } else {
         let count = data[FIXED] as usize;
         let end = FIXED + 1 + Block::BYTES * count;
         if !(1..=MAX_BLOCKS).contains(&count) || (data.len() != end && data.len() != end + 4) {
             return Err(ProgramError::InvalidInstructionData);
         }
-        (end, if data.len() == end + 4 { u32_at(data, end)? } else { 0 })
+        end
     };
     let blocks: Vec<Block> = if block_data_end > FIXED {
         let count = data[FIXED] as usize;
@@ -535,18 +547,8 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     };
     let count = blocks.len();
     check_blocks(&blocks, total_steps)?;
-    if first_list_record != 0
-        && (first_list_record as u64) < blocks.iter().map(|b| b.first_record + b.record_count).max().unwrap_or(0)
-    {
-        return Err(err(6));
-    }
     let template_id = sha256(&[TEMPLATE_DOMAIN, data]);
     let template_bytes = if track_close { T_BYTES_V2 } else { T_BYTES };
-    if track_close && tmpl.lamports() != 0 {
-        // The recorded payer must be the source of the template's rent; a
-        // permissionless pre-fund cannot be attributed to a particular key.
-        return Err(err(31));
-    }
     create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id], template_bytes)?;
     let mut d = tmpl.try_borrow_mut_data()?;
     d[T_FIXED] = count as u8;
@@ -560,13 +562,13 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     d[8..64].copy_from_slice(&data[1..57]);
     d[64..96].copy_from_slice(&data[57..89]);
     d[128..130].copy_from_slice(&data[89..91]);
-    d[130..134].copy_from_slice(&first_list_record.to_le_bytes());
     d[136..168].copy_from_slice(&data[91..123]);
     d[96..128].copy_from_slice(&template_id);
     if track_close {
         d[T_TRACKING..T_TRACKING + 4].copy_from_slice(T_TRACKING_MAGIC);
         d[T_PAYER..T_PAYER + 32].copy_from_slice(admitter.key.as_ref());
         d[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&0u32.to_le_bytes());
+        d[T_RETIRED] = 0;
     }
     Ok(())
 }
@@ -591,6 +593,9 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     }
     let t = template(program_id, tmpl)?;
     let active_runs = tracked_template(tmpl)?;
+    if template_retired(tmpl)? {
+        return Err(err(37));
+    }
     if active_runs.is_some() && !tmpl.is_writable {
         return Err(err(35));
     }
@@ -938,7 +943,8 @@ fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
 fn stage_grow(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [funder, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
-    staging_role(program_id, c.dispute, buffer)?;
+    let role = staging_role(program_id, c.dispute, buffer)?;
+    stage_mutable_for_role(c.dispute, role)?;
     let add = u32_at(data, 0)? as usize;
     let new_len = buffer.data_len().checked_add(add).ok_or(err(8))?;
     if !funder.is_signer || add == 0 || add > 10_240 || new_len > STAGE_HEADER + MAX_STAGE || data.len() != 4 {
@@ -957,6 +963,7 @@ fn stage_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let [writer, run, tmpl, dispute, buffer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     let role = staging_role(program_id, c.dispute, buffer)?;
+    stage_mutable_for_role(c.dispute, role)?;
     if role == ROLE_EXECUTOR {
         executor_signed(c.run, writer)?;
     } else {
@@ -972,6 +979,16 @@ fn stage_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     b[STAGE_HEADER + offset..STAGE_HEADER + end].copy_from_slice(bytes);
     let len = (u32_at(&b, 40)? as usize).max(end);
     b[40..44].copy_from_slice(&(len as u32).to_le_bytes());
+    Ok(())
+}
+
+/// Once E reveals a leaf, its list refs are authenticated by that leaf's list
+/// digests and the staged reveal bytes become immutable for this dispute.
+/// C's buffer remains writable while making its claim.
+fn stage_mutable_for_role(dispute: &AccountInfo, role: u8) -> ProgramResult {
+    if role == ROLE_EXECUTOR && dispute.try_borrow_data()?[D_PHASE] >= PH_CLAIM {
+        return Err(err(37));
+    }
     Ok(())
 }
 
@@ -1042,6 +1059,7 @@ fn validate_leaf_lists(
     };
     let mut lists = lists.into_iter();
     let mut result = Vec::with_capacity(leaf.input_count());
+    let mut total_elements = 0usize;
     for i in 0..leaf.input_count() {
         let r = leaf.input(i);
         let layout = u32::from_le_bytes(r[7..11].try_into().unwrap());
@@ -1054,6 +1072,10 @@ fn validate_leaf_lists(
         }
         let (index, refs) = lists.next().ok_or(err(16))?;
         if index != i || refs.is_empty() || refs.len() > D::MAX_LIST_ELEMENTS {
+            return Err(err(16));
+        }
+        total_elements = total_elements.checked_add(refs.len()).ok_or(err(8))?;
+        if total_elements > D::MAX_LIST_ELEMENTS_PER_STEP {
             return Err(err(16));
         }
         if D::list_digest_elements(&H, &refs).is_none_or(|digest| digest.as_slice() != &r[23..55]) {
@@ -1480,7 +1502,7 @@ impl<'a> Referee<'a> {
         *at += 1;
         let index = u32_at(self.data, *at)? as u64;
         *at += 4;
-        if self.t.first_list_record == u64::MAX || index < self.t.first_list_record || list_id > u32::MAX as u64 {
+        if list_id > u32::MAX as u64 {
             return Err(err(17));
         }
         let (type_code, record) = spec_record(self.t, self.data, at, index)?;
@@ -1541,11 +1563,16 @@ impl<'a> Referee<'a> {
             return Err(err(20));
         }
         let mut ins = Vec::new();
+        let mut total_list_elements = 0usize;
         for i in 0..n {
             let (kind, _, _, _, _) = spec.input_producer(i);
             if kind == D::PRODUCER_LIST {
                 let refs = self.list_refs.get(i).ok_or(err(20))?;
                 if refs.is_empty() || refs.len() > D::MAX_LIST_ELEMENTS {
+                    return Err(err(20));
+                }
+                total_list_elements = total_list_elements.checked_add(refs.len()).ok_or(err(8))?;
+                if total_list_elements > D::MAX_LIST_ELEMENTS_PER_STEP {
                     return Err(err(20));
                 }
                 for r in refs {
@@ -1839,7 +1866,7 @@ fn finalize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 }
 
 // ---------------------------------------------------------------------------
-// Rent reclaim (2026-10-03). Each close moves every lamport of a program
+// Rent reclaim (tag 227 subs 18-22, 2026-10-03). Each close moves every lamport of a program
 // account to the party that paid its rent, empties it and returns it to the
 // system program. Bonds have already moved by then (rule, moot, pay_pot,
 // finalize); a close never decides who is owed a bond.
@@ -1916,7 +1943,8 @@ fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
 // consumers can still read its final status and root at the run's address
 // (consumers identify a run by its address: the run id alone is not unique
 // across payers); anyone may send it. An uncommitted run is cancelled (closed
-// whole) by its payer only. Freed rent goes to the run's payer.
+// whole) by anyone after the commit deadline. Freed rent always goes to the
+// run's payer.
 fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [caller, run, tmpl, payer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     run_checked(program_id, run, tmpl)?;
@@ -1933,10 +1961,12 @@ fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             return Err(err(22));
         }
         if r[R_STATUS] == RUN_OPEN {
-            if !caller.is_signer || caller.key != payer.key {
+            if !caller.is_signer {
                 return Err(ProgramError::MissingRequiredSignature);
             }
-            // Cancel only after the commit deadline (design §9 CANCEL_RUN).
+            // Anyone can release an expired uncommitted run. Rent is still
+            // returned to its payer, so the caller's benefit is only freeing
+            // the template's run slot and allowing template close.
             if now()? <= u64_at(&r, R_DEADLINE)? {
                 return Err(err(37));
             }
@@ -1987,6 +2017,26 @@ fn close_template(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
         return Err(err(37));
     }
     close_into(tmpl, payer)
+}
+
+// 22: [recorded payer(s,w), template(w)]. Stop future runs while existing
+// runs settle or expire. A zero-count template may be retired and then closed
+// immediately by its payer.
+fn retire_template(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [payer, tmpl, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    template(program_id, tmpl)?;
+    if tracked_template(tmpl)?.is_none() || !tmpl.is_writable {
+        return Err(err(37));
+    }
+    let mut d = tmpl.try_borrow_mut_data()?;
+    if d[T_PAYER..T_PAYER + 32] != payer.key.to_bytes() || d[T_RETIRED] != 0 {
+        return Err(err(37));
+    }
+    d[T_RETIRED] = 1;
+    Ok(())
 }
 
 // 20: [anyone, run, cache(w), executor(w)]. A reveal cache closes once its

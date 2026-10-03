@@ -17,6 +17,7 @@ use solana_transaction_error::TransactionError;
 const PROGRAM: Pubkey = Pubkey::new_from_array([0xD7; 32]);
 const SYSTEM: Pubkey = system_program::ID;
 const STAGE_CHUNK: usize = 700;
+const LIST_HEAP_FRAME: u32 = 256 * 1024;
 
 struct Soft;
 impl D::Sha256 for Soft {
@@ -79,12 +80,23 @@ async fn send(
     let blockhash = ctx.get_new_latest_blockhash().await.unwrap();
     let mut all = vec![&ctx.payer];
     all.extend_from_slice(signers);
-    let ixs = vec![
+    let mut ixs = vec![
         solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
             1_400_000,
         ),
-        instruction,
     ];
+    if instruction
+        .data
+        .get(1)
+        .is_some_and(|sub| *sub == V::SUB_REVEAL_LEAF || *sub == V::SUB_CLAIM)
+    {
+        ixs.push(
+            solana_compute_budget_interface::ComputeBudgetInstruction::request_heap_frame(
+                LIST_HEAP_FRAME,
+            ),
+        );
+    }
+    ixs.push(instruction);
     let tx = Transaction::new(
         &all,
         solana_message::Message::new(&ixs, Some(&ctx.payer.pubkey())),
@@ -131,6 +143,47 @@ async fn stage_write(
     }
 }
 
+async fn try_stage_write(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    run: Pubkey,
+    template: Pubkey,
+    dispute: Pubkey,
+    buffer: Pubkey,
+    bytes: &[u8],
+) -> Result<(), TransactionError> {
+    let mut data = 0u32.to_le_bytes().to_vec();
+    data.extend_from_slice(bytes);
+    let accounts = vec![
+        account(signer.pubkey(), false, true),
+        account(run, false, false),
+        account(template, false, false),
+        account(dispute, false, false),
+        account(buffer, true, false),
+    ];
+    send(ctx, ix(V::SUB_STAGE_WRITE, &data, accounts), &[signer]).await
+}
+
+async fn grow_to(ctx: &mut ProgramTestContext, funder: &Keypair, run: Pubkey, template: Pubkey,
+                 dispute: Pubkey, buffer: Pubkey, want: usize) {
+    loop {
+        let have = ctx.banks_client.get_account(buffer).await.unwrap().unwrap().data.len() - V::STAGE_HEADER;
+        if have >= want {
+            return;
+        }
+        let add = (want - have).min(10_240) as u32;
+        let accounts = vec![
+            account(funder.pubkey(), true, true),
+            account(run, false, false),
+            account(template, false, false),
+            account(dispute, false, false),
+            account(buffer, true, false),
+            account(SYSTEM, false, false),
+        ];
+        send(ctx, ix(V::SUB_STAGE_GROW, &add.to_le_bytes(), accounts), &[funder]).await.unwrap();
+    }
+}
+
 async fn new_test() -> ProgramTestContext {
     let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
     let mut test = ProgramTest::default();
@@ -164,6 +217,7 @@ async fn replay(
     commits: &serde_json::Value,
     scenario: &serde_json::Value,
     nonce: u8,
+    corrupt_executor_after_reveal: bool,
 ) -> u8 {
     let mut ctx = new_test().await;
     let (admitter, executor, challenger) = (kp(0xA1), kp(0xE1), kp(0xC1));
@@ -408,6 +462,7 @@ async fn replay(
     .await
     .unwrap();
     let reveal = hex(scenario["staged_leaf_reveal"].as_str().unwrap());
+    grow_to(&mut ctx, &executor, run, template, dispute, executor_buffer, reveal.len()).await;
     stage_write(
         &mut ctx,
         &executor,
@@ -436,6 +491,21 @@ async fn replay(
     .await
     .unwrap();
 
+    if corrupt_executor_after_reveal {
+        assert!(try_stage_write(&mut ctx, &executor, run, template, dispute, executor_buffer, b"X")
+            .await.is_err(), "executor stage_write must be refused after reveal");
+        let grow = ix(V::SUB_STAGE_GROW, &1u32.to_le_bytes(), vec![
+            account(executor.pubkey(), true, true),
+            account(run, false, false),
+            account(template, false, false),
+            account(dispute, false, false),
+            account(executor_buffer, true, false),
+            account(SYSTEM, false, false),
+        ]);
+        assert!(send(&mut ctx, grow, &[&executor]).await.is_err(),
+                "executor stage_grow must be refused after reveal");
+    }
+
     let claim_body = hex(scenario["claim_body"].as_str().unwrap());
     let challenger_buffer = Pubkey::find_program_address(
         &[b"dcg21stg", dispute.as_ref(), &[V::ROLE_CHALLENGER]],
@@ -443,7 +513,7 @@ async fn replay(
     )
     .0;
     let mut create_c = vec![V::ROLE_CHALLENGER];
-    create_c.extend_from_slice(&(claim_body.len() as u32).to_le_bytes());
+    create_c.extend_from_slice(&(claim_body.len().min(V::CREATE_STAGE) as u32).to_le_bytes());
     send(
         &mut ctx,
         ix(
@@ -462,6 +532,7 @@ async fn replay(
     )
     .await
     .unwrap();
+    grow_to(&mut ctx, &challenger, run, template, dispute, challenger_buffer, claim_body.len()).await;
     if let Some(forged) = scenario["forged_claim_body"].as_str() {
         stage_write(
             &mut ctx,
@@ -538,11 +609,11 @@ async fn program_rules_list_input_oracle_scenarios() {
     let data: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let scenarios = data["scenarios"].as_array().unwrap();
-    assert_eq!(scenarios.len(), 11);
+    assert_eq!(scenarios.len(), 12);
     let mut mismatches = Vec::new();
     for (i, scenario) in scenarios.iter().enumerate() {
         let setup = &data["setups"][scenario["setup"].as_str().unwrap()];
-        let got = replay(setup, &data["commits"], scenario, i as u8 + 1).await;
+        let got = replay(setup, &data["commits"], scenario, i as u8 + 1, false).await;
         let want = if scenario["ruling"] == "C" {
             V::RULING_CHALLENGER
         } else {
@@ -556,4 +627,15 @@ async fn program_rules_list_input_oracle_scenarios() {
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn executor_cannot_mutate_revealed_list_refs_and_the_challenger_still_wins() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/dcg/disputes_v21/list_scenarios.json");
+    let data: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let scenario = data["scenarios"].as_array().unwrap().iter()
+        .find(|s| s["name"] == "mixed-lie-kind1").unwrap();
+    let setup = &data["setups"][scenario["setup"].as_str().unwrap()];
+    let got = replay(setup, &data["commits"], scenario, 250, true).await;
+    assert_eq!(got, V::RULING_CHALLENGER);
 }

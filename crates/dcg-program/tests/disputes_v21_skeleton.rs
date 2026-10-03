@@ -3,7 +3,7 @@
 //! (malformed rule), OUT and timeout; an EDGE against an honest leaf loses.
 #![cfg(feature = "graph-v21")]
 
-use dcg_disputes::{self as D, Sha256 as _};
+use dcg_disputes as D;
 use dcg_program::disputes_v21 as V;
 use dcg_program::hash::sha256;
 use solana_account::Account;
@@ -138,7 +138,7 @@ impl Chain {
         Self::new_template_mode(challenge_window, false).await
     }
 
-    #[cfg(feature = "test-kernel")]
+    #[cfg(feature = "test-legacy-template-create")]
     async fn new_legacy_template(challenge_window: u64) -> Self {
         Self::new_template_mode(challenge_window, true).await
     }
@@ -175,12 +175,12 @@ impl Chain {
         let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
         let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
         let admitter = kp(0xA1);
-        #[cfg(feature = "test-kernel")]
+        #[cfg(feature = "test-legacy-template-create")]
         let create_sub = if legacy_template { V::SUB_TEST_CREATE_LEGACY_TEMPLATE } else { V::SUB_CREATE_TEMPLATE };
-        #[cfg(not(feature = "test-kernel"))]
+        #[cfg(not(feature = "test-legacy-template-create"))]
         let create_sub = V::SUB_CREATE_TEMPLATE;
-        #[cfg(not(feature = "test-kernel"))]
-        assert!(!legacy_template, "legacy fixture mode requires the test-kernel feature");
+        #[cfg(not(feature = "test-legacy-template-create"))]
+        assert!(!legacy_template, "legacy fixture mode requires test-legacy-template-create");
         send(&mut ctx, ix(create_sub, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
         // Run.
         let executor = kp(0xE1).pubkey();
@@ -650,7 +650,20 @@ async fn total_lamports(ctx: &mut ProgramTestContext, keys: &[Pubkey]) -> u128 {
     t
 }
 
-// --- rent reclaim (subs 18 to 21) ------------------------------------------------------
+fn template_body(g: &Golden, challenge_window: u64) -> Vec<u8> {
+    let mut data = vec![4u8];
+    for x in [2u64, 1, challenge_window, 750, EXECUTOR_BOND, CHALLENGER_BOND] {
+        data.extend_from_slice(&x.to_le_bytes());
+    }
+    data.extend_from_slice(&OUT_BASE.to_le_bytes());
+    data.extend_from_slice(&STEP_BASE.to_le_bytes());
+    data.extend_from_slice(&g.spec_root);
+    data.extend_from_slice(&SLASHER_BPS.to_le_bytes());
+    data.extend_from_slice(&g.plan_id);
+    data
+}
+
+// --- rent reclaim and template retirement (subs 18 to 22) ------------------------------
 
 impl Chain {
     fn close_dispute_ix(&self, d: Pubkey, buffer_e: Pubkey, buffer_c: Pubkey) -> Instruction {
@@ -682,6 +695,12 @@ impl Chain {
 
     async fn close_template(&mut self) -> Result<(), TransactionError> {
         self.close_template_by(0xA1).await
+    }
+
+    async fn retire_template_by(&mut self, signer: u8) -> Result<(), TransactionError> {
+        let s = kp(signer);
+        let i = ix(V::SUB_RETIRE_TEMPLATE, &[], vec![AccountMeta::new(s.pubkey(), true), AccountMeta::new(self.template, false)]);
+        send(&mut self.ctx, i, &[&s]).await
     }
 
     /// The receipt left at the run's address: magic, status, root.
@@ -865,8 +884,15 @@ async fn an_uncommitted_run_cancels_for_its_payer_after_the_commit_deadline() {
     let e = kp(0xE1);
     let commit = |run: Pubkey, template: Pubkey| ix(V::SUB_COMMIT, &c.root_bytes, vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]);
     assert!(send(&mut ch.ctx, commit(ch.run, ch.template), &[&e]).await.is_err(), "past the commit deadline");
-    assert!(ch.close_run(0xE1).await.is_err(), "only the payer cancels");
-    ch.close_run(0xA1).await.unwrap();
+    let payer = kp(0xA1).pubkey();
+    let payer_before_cancel = ch.ctx.banks_client.get_balance(payer).await.unwrap();
+    let run_rent = ch.ctx.banks_client.get_balance(ch.run).await.unwrap();
+    ch.close_run(0xE1).await.unwrap(); // any signer may cancel after the deadline
+    assert_eq!(
+        ch.ctx.banks_client.get_balance(payer).await.unwrap(),
+        payer_before_cancel + run_rent,
+        "expired-run rent goes to its recorded payer"
+    );
     assert!(ch.gone(ch.run).await, "a cancelled run leaves no receipt");
     // Someone else re-initializing the same run id gets a different address:
     // the payer is part of it, so the executor's commit cannot be redirected.
@@ -891,7 +917,7 @@ async fn an_uncommitted_run_cancels_for_its_payer_after_the_commit_deadline() {
     assert_eq!(total_lamports(&mut ch.ctx, &tracked).await, before, "cancellation and template close conserve lamports");
 }
 
-#[cfg(feature = "test-kernel")]
+#[cfg(feature = "test-legacy-template-create")]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_existing_template_keeps_its_read_only_account_lists_and_cannot_be_closed() {
     let mut ch = Chain::new_legacy_template(30).await;
@@ -1039,4 +1065,124 @@ async fn the_executors_deadlines_grow_with_open_disputes() {
     send(&mut ch.ctx, i, &[&e]).await.unwrap();
     let pick = deadline(&ch.ctx.banks_client.get_account(d0).await.unwrap().unwrap());
     assert!(pick <= slot + 750 + 10, "{pick} vs {slot}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retiring_a_template_blocks_new_runs_and_anyone_can_cancel_an_expired_run() {
+    let mut ch = Chain::new(30).await;
+    let bystander = kp(0xB1);
+    let executor = kp(0xE1);
+    let mut init = vec![7u8; 32];
+    init.extend_from_slice(executor.pubkey().as_ref());
+    init.extend_from_slice(&(ch.g.refs.len() as u32).to_le_bytes());
+    let mut refs = Vec::new();
+    for r in &ch.g.refs {
+        init.extend_from_slice(r);
+        refs.extend_from_slice(r);
+    }
+    let template_id = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap().data[96..128].to_vec();
+    let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &[7u8; 32],
+                          &(ch.g.refs.len() as u32).to_le_bytes(), &refs, executor.pubkey().as_ref()]);
+    let bystander_run = Pubkey::find_program_address(
+        &[b"dcg21run", &run_id, bystander.pubkey().as_ref()], &PROGRAM).0;
+    let bystander_before = ch.ctx.banks_client.get_balance(bystander.pubkey()).await.unwrap();
+    send(&mut ch.ctx, ix(V::SUB_INIT_RUN, &init, vec![
+        AccountMeta::new(bystander.pubkey(), true), AccountMeta::new(bystander_run, false),
+        AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false),
+    ]), &[&bystander]).await.unwrap();
+    assert!(ch.retire_template_by(0xB1).await.is_err(), "only the recorded template payer may retire it");
+    ch.retire_template_by(0xA1).await.unwrap();
+    assert!(ch.retire_template_by(0xA1).await.is_err(), "retirement is one-way");
+
+    let next_payer = kp(0xC1);
+    let next_nonce = [8u8; 32];
+    let next_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &next_nonce,
+                           &(ch.g.refs.len() as u32).to_le_bytes(), &refs, executor.pubkey().as_ref()]);
+    let next_run = Pubkey::find_program_address(
+        &[b"dcg21run", &next_id, next_payer.pubkey().as_ref()], &PROGRAM).0;
+    let mut next_init = next_nonce.to_vec();
+    next_init.extend_from_slice(executor.pubkey().as_ref());
+    next_init.extend_from_slice(&(ch.g.refs.len() as u32).to_le_bytes());
+    for r in &ch.g.refs { next_init.extend_from_slice(r); }
+    assert!(send(&mut ch.ctx, ix(V::SUB_INIT_RUN, &next_init, vec![
+        AccountMeta::new(next_payer.pubkey(), true), AccountMeta::new(next_run, false),
+        AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false),
+    ]), &[&next_payer]).await.is_err(), "a retired template refuses new runs");
+
+    let close_bystander = |caller: &Keypair| ix(V::SUB_CLOSE_RUN, &[], vec![
+        AccountMeta::new(caller.pubkey(), true), AccountMeta::new(bystander_run, false),
+        AccountMeta::new(ch.template, false), AccountMeta::new(bystander.pubkey(), false),
+    ]);
+    let caller = kp(0xC1);
+    assert!(send(&mut ch.ctx, close_bystander(&caller), &[&caller]).await.is_err(),
+            "no one may cancel before the deadline");
+    ch.ctx.warp_to_slot(10_000).unwrap();
+    // A caller that did not fund the run cancels it. The run's rent still
+    // returns to its recorded payer; the caller only unblocks template close.
+    send(&mut ch.ctx, close_bystander(&caller), &[&caller]).await.unwrap();
+    assert_eq!(ch.ctx.banks_client.get_balance(bystander.pubkey()).await.unwrap(), bystander_before,
+               "the run payer receives its rent");
+    assert!(ch.close_run_by(0xC1, 0xA1).await.is_ok(), "any signer may cancel the expired original run");
+    let template_data = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap().data;
+    assert_eq!(u32::from_le_bytes(template_data[template_data.len()-4..].try_into().unwrap()), 0);
+    ch.close_template().await.unwrap();
+    assert!(ch.gone(ch.template).await, "a retired template closes at active_runs == 0");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prefunded_template_is_adopted_and_its_lamports_go_to_the_recorded_payer() {
+    let mut ch = Chain::new(30).await;
+    ch.ctx.warp_to_slot(10_000).unwrap();
+    ch.close_run(0xA1).await.unwrap();
+    ch.close_template().await.unwrap();
+
+    let prefunder = kp(0xB1);
+    let gift = 20_000_000u64;
+    let before_prefunder = ch.ctx.banks_client.get_balance(prefunder.pubkey()).await.unwrap();
+    let before_admitter = ch.ctx.banks_client.get_balance(kp(0xA1).pubkey()).await.unwrap();
+    let transfer = solana_program::system_instruction::transfer(&prefunder.pubkey(), &ch.template, gift);
+    send(&mut ch.ctx, transfer, &[&prefunder]).await.unwrap();
+    let data = template_body(&ch.g, 30);
+    let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
+    assert_eq!(Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0, ch.template);
+    let admitter = kp(0xA1);
+    send(&mut ch.ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![
+        AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(ch.template, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+    ]), &[&admitter]).await.unwrap();
+    ch.close_template().await.unwrap();
+    assert_eq!(ch.ctx.banks_client.get_balance(admitter.pubkey()).await.unwrap(), before_admitter + gift,
+               "pre-funded lamports are a gift to the recorded payer at close");
+    assert_eq!(ch.ctx.banks_client.get_balance(prefunder.pubkey()).await.unwrap(), before_prefunder - gift);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_front_runner_creates_the_same_content_address_and_becomes_its_payer() {
+    let mut ch = Chain::new(30).await;
+    ch.ctx.warp_to_slot(10_000).unwrap();
+    ch.close_run(0xA1).await.unwrap();
+    ch.close_template().await.unwrap();
+    let data = template_body(&ch.g, 30);
+    let front_runner = kp(0xB1);
+    send(&mut ch.ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![
+        AccountMeta::new(front_runner.pubkey(), true), AccountMeta::new(ch.template, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+    ]), &[&front_runner]).await.unwrap();
+    let account = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap();
+    assert_eq!(&account.data[96..128], sha256(&[V::TEMPLATE_DOMAIN, &data]).as_slice());
+    assert!(ch.close_template_by(0xA1).await.is_err());
+    ch.close_template_by(0xB1).await.unwrap();
+    assert!(ch.gone(ch.template).await);
+}
+
+#[cfg(all(feature = "test-kernel", not(feature = "test-legacy-template-create")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shared_test_kernel_image_does_not_dispatch_legacy_create_subtype_250() {
+    let mut ch = Chain::new(30).await;
+    let admitter = kp(0xA1);
+    let i = ix(250, &[], vec![
+        AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(ch.template, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+    ]);
+    assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err());
 }

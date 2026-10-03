@@ -24,12 +24,14 @@ from . import wire as W
 TAG = 227
 SUB = {"create_template": 1, "init_run": 2, "commit": 3, "open": 4, "reveal_nodes": 5, "pick": 6,
        "reveal_leaf": 7, "claim": 8, "finalize": 10, "advance": 11, "pay_pot": 13, "stage_create": 14,
-       "stage_write": 15, "stage_grow": 17, "close_dispute": 18, "close_run": 19, "close_cache": 20}
+       "stage_write": 15, "stage_grow": 17, "close_dispute": 18, "close_run": 19, "close_cache": 20,
+       "close_template": 21, "retire_template": 22}
 RUN_COMMITTED, RUN_FINAL, RUN_REFUTED = 1, 2, 3
 RECEIPT_BYTES = 136 + 176  # a closed run: its first 136 bytes, then its root
 KIND = {"STEP_DESCEND": 1, "OUT_DESCEND": 2}
 ROLE_EXECUTOR, ROLE_CHALLENGER, FROM_STAGING = 1, 2, 0xFF
 DIRECT_LIMIT = 700
+LIST_HEAP_FRAME = 256 * 1024
 # A staged write carries two signatures and five accounts; 600 bytes of
 # body keeps it under the 1,232-byte transaction limit.
 STAGE_PIECE = 600
@@ -38,14 +40,20 @@ SYSTEM = Pubkey.from_string("11111111111111111111111111111111")
 RULINGS = {0: "open", 1: "E", 2: "C", 3: "moot"}
 
 
+def _list_step_heap_frame(leaf: bytes) -> int | None:
+    """Request the expanded SVM heap for a staged list-input leaf."""
+    return LIST_HEAP_FRAME if leaf.startswith(b"LVR1") else None
+
+
 class DisputeClient:
     def __init__(self, gc: GraphClient):
         self.gc = gc
         self.sent = 0
 
-    def _send(self, sub: str, body: bytes, metas: list[AccountMeta], signers: list[Keypair]) -> str:
+    def _send(self, sub: str, body: bytes, metas: list[AccountMeta], signers: list[Keypair],
+              *, heap_frame: int | None = None) -> str:
         self.sent += 1
-        return self.gc.send(bytes([TAG, SUB[sub]]) + body, metas, signers, cu=1_400_000)
+        return self.gc.send(bytes([TAG, SUB[sub]]) + body, metas, signers, cu=1_400_000, heap_frame=heap_frame)
 
     def _send_many(self, items: list[tuple[str, bytes, list[AccountMeta], list[Keypair]]], cap: float = 60.0) -> None:
         """Send order-independent instructions together (staged writes),
@@ -118,7 +126,7 @@ class DisputeClient:
         run = self.pda(b"dcg21run", run_id, bytes(payer.pubkey()))
         body = nonce + bytes(executor) + struct.pack("<I", len(refs)) + flat
         self._send("init_run", body, [AccountMeta(payer.pubkey(), True, True), AccountMeta(run, False, True),
-                                      AccountMeta(template, False, False), AccountMeta(SYSTEM, False, False)], [payer])
+                                      AccountMeta(template, False, True), AccountMeta(SYSTEM, False, False)], [payer])
         return run
 
     def commit(self, run: Pubkey, template: Pubkey, root_bytes: bytes, executor: Keypair) -> None:
@@ -166,11 +174,12 @@ class DisputeClient:
                              for at in range(0, len(body), STAGE_PIECE)])
 
         leaf = bytes.fromhex(transcript["leaf"])
+        heap_frame = _list_step_heap_frame(leaf)
         metas = party(executor)
         if len(leaf) > DIRECT_LIMIT:
             stage(ROLE_EXECUTOR, leaf, executor)
             leaf, metas = bytes([FROM_STAGING]), metas + [AccountMeta(buffer(ROLE_EXECUTOR), False, False)]
-        self._send("reveal_leaf", leaf, metas, [executor])
+        self._send("reveal_leaf", leaf, metas, [executor], heap_frame=heap_frame)
         claim = bytes.fromhex(transcript["claim"])
         metas = [AccountMeta(challenger.pubkey(), True, False), AccountMeta(run, False, True),
                  AccountMeta(template, False, False), AccountMeta(dispute, False, True),
@@ -178,7 +187,7 @@ class DisputeClient:
         if len(claim) > DIRECT_LIMIT:
             stage(ROLE_CHALLENGER, claim, challenger)
             claim, metas = bytes([FROM_STAGING]), metas + [AccountMeta(buffer(ROLE_CHALLENGER), False, False)]
-        self._send("claim", claim, metas, [challenger])
+        self._send("claim", claim, metas, [challenger], heap_frame=heap_frame)
         ruling = RULINGS[self.gc.account(dispute)[6]]
         return {"ruling": ruling, "transactions": self.sent - sent0, "wall_s": round(time.monotonic() - t0, 1),
                 "dispute": str(dispute)}
@@ -220,10 +229,20 @@ class DisputeClient:
     def close_run(self, run: Pubkey, template: Pubkey, payer: Pubkey) -> None:
         """Shrink a settled run whose disputes are all closed to its receipt
         (anyone; the freed rent goes to `payer`, the run's payer). For an
-        uncommitted run this cancels it, and the client's payer must be the
-        run's payer."""
-        self._send("close_run", b"", [self._caller(), AccountMeta(run, False, True), AccountMeta(template, False, False),
+        expired uncommitted run this cancels it, with rent still going to
+        `payer`."""
+        self._send("close_run", b"", [self._caller(), AccountMeta(run, False, True), AccountMeta(template, False, True),
                                       AccountMeta(payer, False, True)], [])
+
+    def retire_template(self, template: Pubkey, payer: Keypair) -> None:
+        """Stop future run creation; only the recorded template payer may retire it."""
+        self._send("retire_template", b"", [AccountMeta(payer.pubkey(), True, True),
+                                               AccountMeta(template, False, True)], [payer])
+
+    def close_template(self, template: Pubkey, payer: Keypair) -> None:
+        """Close a zero-run template and return all its lamports to its recorded payer."""
+        self._send("close_template", b"", [AccountMeta(payer.pubkey(), True, True),
+                                              AccountMeta(template, False, True)], [payer])
 
     def close_cache(self, run: Pubkey, cache: Pubkey, executor: Pubkey) -> None:
         self._send("close_cache", b"", [self._caller(), AccountMeta(run, False, False), AccountMeta(cache, False, True),
