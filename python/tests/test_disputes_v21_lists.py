@@ -251,3 +251,68 @@ def test_an_element_ref_with_a_foreign_header_is_convicted():
     d = descend_to(record, ex, 6)
     assert d.claim("EDGE", spec_opening=sp.opening(sp.step_leaf_index(6)), index=0, **edge_args(sp, ex, 7)) == "C"
     assert G.honest_challenge(record, ex, honest).ruling == "C"
+
+
+def test_list_wire_goldens_and_legacy_template_bytes():
+    import importlib.util
+    from pathlib import Path
+
+    from dcg.disputes_v21 import wire as W
+
+    root = Path(__file__).resolve().parents[2]
+    module = importlib.util.spec_from_file_location("list_goldens", root / "scripts/disputes_v21_list_goldens.py")
+    goldens = importlib.util.module_from_spec(module)
+    module.loader.exec_module(goldens)
+    stored = __import__("json").loads((root / "tests/golden/dcg/disputes_v21/lists.json").read_text())
+    assert goldens.build() == stored
+
+    b = P.PlanBuilder()
+    external = b.raw_input(0, 4)
+    b.enumerated([P.Step(SHA, (P.Input(external, 4),), ((0, 32, False),))])
+    b.output(S.producer(1, 0, 0), 32)
+    plain = b.build()
+    legacy = (bytes([4]) + struct.pack("<6Q", plain.total_steps, plain.total_outputs, 1_000, 750,
+                                       2_000_000, 1_000_000)
+              + struct.pack("<II", plain.first_out_record, plain.first_step_record) + plain.root
+              + struct.pack("<H", 5_000) + PLAN_ID + bytes([len(plain.blocks)])
+              + b"".join(block.record() for block in plain.blocks))
+    assert W.template_data(plain, 4, PLAN_ID) == legacy
+    assert W.stage_create_body(W.ROLE_EXECUTOR) == bytes([1, 0, 0, 0, 0])
+    assert W.stage_create_body(W.ROLE_CHALLENGER, 512) == bytes([2]) + struct.pack("<I", 512)
+    assert W.stage_grow_body(10_240) == struct.pack("<I", 10_240)
+    payload = bytes(range(251)) * 10
+    writes = W.stage_write_bodies(payload, chunk_bytes=700)
+    rebuilt = bytearray(len(payload))
+    for encoded in writes:
+        offset = struct.unpack_from("<I", encoded)[0]
+        rebuilt[offset:offset + len(encoded) - 4] = encoded[4:]
+    assert bytes(rebuilt) == payload
+
+
+def test_list_oracle_scenarios_are_reproducible_and_cover_adversarial_cases():
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    module = importlib.util.spec_from_file_location("list_scenarios", root / "scripts/disputes_v21_list_scenarios.py")
+    scenarios = importlib.util.module_from_spec(module)
+    module.loader.exec_module(scenarios)
+    stored = json.loads((root / "tests/golden/dcg/disputes_v21/list_scenarios.json").read_text())
+    assert scenarios.build() == stored
+    names = {s["name"]: s for s in stored["scenarios"]}
+    wire_goldens = json.loads((root / "tests/golden/dcg/disputes_v21/lists.json").read_text())
+    for name, element in (("mixed-edge-kind1", "0"), ("mixed-edge-kind2", "6"), ("mixed-edge-kind3", "12")):
+        assert names[name]["claim_body"] == wire_goldens["edge_claim_bodies"][element]
+    assert names["mixed-step-honest"]["claim_body"] == wire_goldens["step_claim_body"]
+    assert names["mixed-lie-kind1"]["ruling"] == "C"
+    assert names["mixed-lie-kind2"]["ruling"] == "C"
+    assert names["mixed-lie-kind3"]["ruling"] == "C"
+    assert names["mixed-wrong-count"]["ruling"] == "C"
+    assert names["mixed-foreign-header"]["ruling"] == "C"
+    assert names["mixed-edge-kind1"]["forged_claim_body"]
+    assert names["wide100-edge99"]["ruling"] == "E"
+    assert names["wide100-step"]["ruling"] == "E"
+    setup = stored["setups"]["wide100"]
+    list_records = [r for t, r in setup["spec_records"] if t == S.TYPE_LIST]
+    assert len(list_records) == 1 and struct.unpack_from("<I", bytes.fromhex(list_records[0]), 8)[0] == 100

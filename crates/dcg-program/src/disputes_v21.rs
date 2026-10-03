@@ -213,7 +213,8 @@ fn now() -> Result<u64, ProgramError> {
 // Template "D21T": magic(4) depth(1) pad(3) total_steps(8) total_outputs(8)
 // challenge_window(8) phase_window(8) executor_bond(8) challenger_bond(8)
 // out_spec_base(4) step_spec_base(4) spec_root(32) template_id(32)
-// slasher_bps(2) pad(6) plan_id(32) block_count(1) pad(7)
+// slasher_bps(2) pad(6) plan_id(32) first_list_record:u32 (0: none)
+// block_count(1) pad(7)
 // blocks[104 x MAX_BLOCKS] = 1,008 bytes;
 // PDA ["dcg21tmpl", template_id]. The bases are the spec-tree leaf indices of
 // OutSpec(0) and StepSpec(0) (2 + in_count, and BlockSpec.first_record).
@@ -238,6 +239,9 @@ struct Template {
     spec_root: [u8; 32],
     slasher_bps: u64,
     plan_id: [u8; 32],
+    /// First DLS1 record. Zero means this template predates list inputs or has
+    /// none; record indices cannot be zero because the spec starts with DCS1.
+    first_list_record: u64,
     /// On the heap: SBF stack frames are 4 KiB.
     blocks: Vec<Block>,
     /// The step tree's height (§6.2).
@@ -315,6 +319,10 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
         spec_root: key32(&d, 64)?,
         slasher_bps: u16_at(&d, 128)? as u64,
         plan_id: key32(&d, 136)?,
+        first_list_record: match u32_at(&d, 130)? {
+            0 => u64::MAX,
+            n => n as u64,
+        },
     })
 }
 
@@ -439,12 +447,23 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     {
         return Err(err(6));
     }
-    // The blocks: given after the fixed fields, or the step-1 default.
-    let list: Vec<Block> = if data.len() > FIXED {
+    // The blocks are optional as before. A new optional final u32 carries the
+    // first ListSpec index; it is omitted when there are no lists, preserving
+    // every existing create instruction and template id.
+    let (block_data_end, first_list_record) = if data.len() == FIXED {
+        (FIXED, 0u32)
+    } else if data.len() == FIXED + 4 {
+        (FIXED, u32_at(data, FIXED)?)
+    } else {
         let count = data[FIXED] as usize;
-        if !(1..=MAX_BLOCKS).contains(&count) || data.len() != FIXED + 1 + Block::BYTES * count {
+        let end = FIXED + 1 + Block::BYTES * count;
+        if !(1..=MAX_BLOCKS).contains(&count) || (data.len() != end && data.len() != end + 4) {
             return Err(ProgramError::InvalidInstructionData);
         }
+        (end, if data.len() == end + 4 { u32_at(data, end)? } else { 0 })
+    };
+    let blocks: Vec<Block> = if block_data_end > FIXED {
+        let count = data[FIXED] as usize;
         (0..count)
             .map(|i| Block::parse(&data[FIXED + 1 + Block::BYTES * i..FIXED + 1 + Block::BYTES * (i + 1)]))
             .collect::<Option<Vec<Block>>>()
@@ -452,14 +471,19 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     } else {
         vec![Block::parse(&default_block(total_steps, u32_at(data, 53)? as u64)).ok_or(err(6))?]
     };
-    let count = list.len();
-    check_blocks(&list, total_steps)?;
+    let count = blocks.len();
+    check_blocks(&blocks, total_steps)?;
+    if first_list_record != 0
+        && (first_list_record as u64) < blocks.iter().map(|b| b.first_record + b.record_count).max().unwrap_or(0)
+    {
+        return Err(err(6));
+    }
     let template_id = sha256(&[TEMPLATE_DOMAIN, data]);
     create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id], T_BYTES)?;
     let mut d = tmpl.try_borrow_mut_data()?;
     d[T_FIXED] = count as u8;
-    if data.len() > FIXED {
-        d[T_BLOCKS..T_BLOCKS + Block::BYTES * count].copy_from_slice(&data[FIXED + 1..]);
+    if block_data_end > FIXED {
+        d[T_BLOCKS..T_BLOCKS + Block::BYTES * count].copy_from_slice(&data[FIXED + 1..block_data_end]);
     } else {
         d[T_BLOCKS..T_BLOCKS + Block::BYTES].copy_from_slice(&default_block(total_steps, u32_at(data, 53)? as u64));
     }
@@ -468,6 +492,7 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     d[8..64].copy_from_slice(&data[1..57]);
     d[64..96].copy_from_slice(&data[57..89]);
     d[128..130].copy_from_slice(&data[89..91]);
+    d[130..134].copy_from_slice(&first_list_record.to_le_bytes());
     d[136..168].copy_from_slice(&data[91..123]);
     d[96..128].copy_from_slice(&template_id);
     Ok(())
@@ -877,29 +902,144 @@ fn staging_role(program_id: &Pubkey, dispute: &AccountInfo, buffer: &AccountInfo
     Ok(role)
 }
 
+const LIST_REVEAL_MAGIC: &[u8; 4] = b"LVR1";
+
+/// Staged list reveal: `LVR1 present:u8 leaf_len:u16 leaf list_count:u8`,
+/// then `(input_index:u8 count:u8 refs[55*count])*`. Legacy staged leaf
+/// reveals remain `[present:u8 leaf]` and cannot carry list inputs.
+fn decode_leaf_reveal(data: &[u8]) -> Result<(u8, &[u8], Vec<(usize, Vec<[u8; D::VALUE_REF_BYTES]>)>, bool), ProgramError> {
+    if data.starts_with(LIST_REVEAL_MAGIC) {
+        let present = *data.get(4).ok_or(err(1))?;
+        let len = u16_at(data, 5)? as usize;
+        let leaf_end = 7usize.checked_add(len).ok_or(err(8))?;
+        let body = data.get(7..leaf_end).ok_or(err(1))?;
+        let n = *data.get(leaf_end).ok_or(err(1))? as usize;
+        let mut at = leaf_end + 1;
+        let mut lists = Vec::with_capacity(n);
+        let mut previous = None;
+        for _ in 0..n {
+            let input = *data.get(at).ok_or(err(1))? as usize;
+            let count = *data.get(at + 1).ok_or(err(1))? as usize;
+            at += 2;
+            if count == 0 || count > D::MAX_LIST_ELEMENTS || previous.is_some_and(|p| p >= input) {
+                return Err(err(16));
+            }
+            previous = Some(input);
+            let bytes = count.checked_mul(D::VALUE_REF_BYTES).ok_or(err(8))?;
+            let raw = data.get(at..at + bytes).ok_or(err(1))?;
+            let refs = raw.chunks_exact(D::VALUE_REF_BYTES)
+                .map(|r| <[u8; D::VALUE_REF_BYTES]>::try_from(r).unwrap()).collect();
+            lists.push((input, refs));
+            at += bytes;
+        }
+        if at != data.len() {
+            return Err(err(16));
+        }
+        Ok((present, body, lists, true))
+    } else {
+        let present = *data.first().ok_or(err(1))?;
+        Ok((present, &data[1..], Vec::new(), false))
+    }
+}
+
+/// Validate list refs against the list-layout inputs in a step leaf. This is
+/// called both when E reveals and when C claims, so mutating E's staging
+/// buffer after reveal cannot change the authenticated refs.
+fn validate_leaf_lists(
+    present: u8,
+    body: &[u8],
+    lists: &[(usize, Vec<[u8; D::VALUE_REF_BYTES]>)],
+    framed: bool,
+) -> Result<Vec<Vec<[u8; D::VALUE_REF_BYTES]>>, ProgramError> {
+    let Some(leaf) = (present == 1).then(|| D::parse_leaf(body)).flatten() else {
+        if !lists.is_empty() {
+            return Err(err(16));
+        }
+        return Ok(Vec::new());
+    };
+    let mut result = vec![Vec::new(); leaf.input_count()];
+    let mut next = 0;
+    for i in 0..leaf.input_count() {
+        let r = leaf.input(i);
+        let layout = u32::from_le_bytes(r[7..11].try_into().unwrap());
+        if layout != D::LAYOUT_LIST {
+            continue;
+        }
+        if !framed || lists.get(next).is_none_or(|(j, _)| *j != i) {
+            return Err(err(16));
+        }
+        let refs = &lists[next].1;
+        let mut packed = Vec::with_capacity(refs.len() * D::VALUE_REF_BYTES);
+        for r in refs { packed.extend_from_slice(r); }
+        if D::list_digest(&H, &packed).is_none_or(|digest| digest.as_slice() != &r[23..55]) {
+            return Err(err(16));
+        }
+        result[i] = refs.clone();
+        next += 1;
+    }
+    if next != lists.len() {
+        return Err(err(16));
+    }
+    Ok(result)
+}
+
+fn staged_leaf_lists(
+    program_id: &Pubkey,
+    dispute: &AccountInfo,
+    buffer: &AccountInfo,
+    expected_present: u8,
+    expected_leaf: &[u8],
+) -> Result<Vec<Vec<[u8; D::VALUE_REF_BYTES]>>, ProgramError> {
+    if staging_role(program_id, dispute, buffer)? != ROLE_EXECUTOR {
+        return Err(err(29));
+    }
+    let b = buffer.try_borrow_data()?;
+    let len = u32_at(&b, 40)? as usize;
+    let end = STAGE_HEADER.checked_add(len).ok_or(err(8))?;
+    let raw = b.get(STAGE_HEADER..end).ok_or(err(29))?;
+    let (present, body, lists, framed) = decode_leaf_reveal(raw)?;
+    if !framed || present != expected_present || body != expected_leaf {
+        return Err(err(29));
+    }
+    validate_leaf_lists(present, body, &lists, framed)
+}
+
 // 7: [executor(s), run, template, dispute(w)] present:u8 preimage
 fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     executor_signed(c.run, executor)?;
     let staged;
-    let data: &[u8] = if data == [FROM_STAGING] {
+    let from_staging = data == [FROM_STAGING];
+    let data: &[u8] = if from_staging {
         let buffer = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
         if staging_role(program_id, c.dispute, buffer)? != ROLE_EXECUTOR {
             return Err(err(29));
         }
         staged = buffer.try_borrow_data()?;
         let len = u32_at(&staged, 40)? as usize;
-        &staged[STAGE_HEADER..STAGE_HEADER + len]
+        let end = STAGE_HEADER.checked_add(len).ok_or(err(8))?;
+        staged.get(STAGE_HEADER..end).ok_or(err(29))?
     } else {
         data
     };
     let mut d = c.dispute.try_borrow_mut_data()?;
     expect_phase(&d, PH_LEAF)?;
-    let present = *data.first().ok_or(err(1))?;
-    let body = &data[1..];
+    let (present, body, list_reveals, framed) = decode_leaf_reveal(data)?;
     if present > 1 || (present == 0 && !body.is_empty()) || body.len() > MAX_LEAF {
         return Err(err(16));
+    }
+    if present == 1 {
+        validate_leaf_lists(present, body, &list_reveals, framed)?;
+    } else if !list_reveals.is_empty() {
+        return Err(err(16));
+    }
+    if !from_staging && present == 1 {
+        if let Some(leaf) = D::parse_leaf(body) {
+            if (0..leaf.input_count()).any(|i| u32::from_le_bytes(leaf.input(i)[7..11].try_into().unwrap()) == D::LAYOUT_LIST) {
+                return Err(err(16));
+            }
+        }
     }
     let position = u64_at(&d, D_POSITION)?;
     let h = if d[D_KIND] == KIND_STEP_DESCEND {
@@ -960,10 +1100,13 @@ fn step_opening<'a>(t: &Template, root: &[u8], data: &'a [u8], at: &mut usize, o
 // claim:u8 index:u8 spec_opening, then by claim (design §7.3):
 //   SHAPE  -
 //   EDGE   kind 1: step_opening(producer); kind 2, 7: -; kind 3: const_opening;
+//          kind 8: element:u8 list_spec_index:u32 list_spec_opening, then
+//                  kind 1: step_opening(producer), kind 3: const_opening;
 //          kind 5: [const_opening, from a constant] chunk_opening; kind 6: last_running(t)
 //   GATE   step_opening(gate leaf of iteration i-1) gate_value
 //   STATE  kind 1 predecessor: step_opening
-//   STEP   n:u8 (len:u32 bytes)* [len:u32 prior state, if stateful]
+//   STEP   n:u8; each ordinary input has one (len:u32 bytes), and a list
+//          input has one pair per element; then prior state if stateful.
 //   OUT    kind 1: step_opening(producer); kind 6: last_running(t)
 // step_opening = present:u8 len:u16 preimage path_len:u8 path;
 // chunk_opening = len:u16 chunk path_len:u8 path;
@@ -979,8 +1122,9 @@ fn claim(
 ) -> ProgramResult {
     let [challenger, run, tmpl, dispute, executor_acct, _challenger_acct, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    let claim_from_staging = data == [FROM_STAGING];
     let staged;
-    let data: &[u8] = if data == [FROM_STAGING] {
+    let data: &[u8] = if claim_from_staging {
         let buffer = rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
         if staging_role(program_id, c.dispute, buffer)? != ROLE_CHALLENGER {
             return Err(err(29));
@@ -1000,10 +1144,23 @@ fn claim(
         (d[D_KIND], u64_at(&d, D_POSITION)?, d[D_LEAF_PRESENT] == 1, (buf, len))
     };
     let leaf_bytes = &leaf_buf.0[..];
+    let leaf_list_refs = if let Some(leaf) = D::parse_leaf(leaf_bytes) {
+        let has_lists = (0..leaf.input_count()).any(|i| {
+            u32::from_le_bytes(leaf.input(i)[7..11].try_into().unwrap()) == D::LAYOUT_LIST
+        });
+        if has_lists {
+            let executor_buffer = rest.get(if claim_from_staging { 1 } else { 0 }).ok_or(ProgramError::NotEnoughAccountKeys)?;
+            staged_leaf_lists(program_id, c.dispute, executor_buffer, 1, leaf_bytes)?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     let root: [u8; D::RUN_ROOT_BYTES] = c.run.try_borrow_data()?[R_ROOT..R_REFS].try_into().unwrap();
     let refs_buf = c.run.try_borrow_data()?;
     let refs = &refs_buf[R_REFS..];
-    let k = Referee { t: &c.t, root: &root, refs, data, manifest };
+    let k = Referee { t: &c.t, root: &root, refs, data, list_refs: &leaf_list_refs, manifest };
     let name = *data.first().ok_or(err(1))?;
     let index = *data.get(1).ok_or(err(1))? as usize;
     let mut at = 2;
@@ -1096,6 +1253,7 @@ struct Referee<'a> {
     root: &'a [u8; D::RUN_ROOT_BYTES],
     refs: &'a [u8],
     data: &'a [u8],
+    list_refs: &'a [Vec<[u8; D::VALUE_REF_BYTES]>],
     manifest: &'static crate::kernel::ApplicationManifest,
 }
 
@@ -1191,6 +1349,9 @@ impl<'a> Referee<'a> {
         let got = leaf.input(index);
         let header = spec.input_header(index);
         let (pk, a, b, c, d) = spec.input_producer(index);
+        if pk == D::PRODUCER_LIST {
+            return self.list_edge(at, index, a);
+        }
         Ok(match pk {
             // The spec names an input the run never posted: C wins.
             2 => self.external_ref(a).is_none_or(|r| got[7..55] != r[4..52]),
@@ -1228,6 +1389,48 @@ impl<'a> Referee<'a> {
         })
     }
 
+    /// EDGE(i,j) opens the committed ListSpec and checks one E-revealed ref
+    /// against its element header and one ordinary producer opening.
+    fn list_edge(&self, at: &mut usize, input: usize, list_id: u64) -> Result<bool, ProgramError> {
+        let element = *self.data.get(*at).ok_or(err(1))? as usize;
+        *at += 1;
+        let index = u32_at(self.data, *at)? as u64;
+        *at += 4;
+        if self.t.first_list_record == u64::MAX || index < self.t.first_list_record || list_id > u32::MAX as u64 {
+            return Err(err(17));
+        }
+        let (type_code, record) = spec_record(self.t, self.data, at, index)?;
+        let list = D::ListSpec(record);
+        if type_code != D::TYPE_LIST || !list.valid() || list.id() as u64 != list_id {
+            return Err(err(17));
+        }
+        if element >= list.count() {
+            return Err(err(19));
+        }
+        let Some(input_refs) = self.list_refs.get(input) else { return Ok(true) };
+        if input_refs.len() != list.count() {
+            return Ok(true);
+        }
+        let got = &input_refs[element];
+        let header = list.element_header(element);
+        if got[..D::PORT_HEADER_BYTES] != *header {
+            return Ok(true);
+        }
+        let (pk, a, b, _c, _d) = list.element_producer(element);
+        Ok(match pk {
+            1 => match self.opening(at, a)?.and_then(D::parse_leaf) {
+                None => true,
+                Some(prod) => prod.output_port(b as u16).is_none_or(|o| got[7..55] != o[7..55]),
+            },
+            2 => self.external_ref(a).is_none_or(|r| got[7..55] != r[4..52]),
+            3 => {
+                let c = self.constant(at, a)?;
+                got[7..23] != c[15..31] || got[23..55] != c[40..72]
+            }
+            _ => return Err(err(19)),
+        })
+    }
+
     fn state(&self, at: &mut usize, leaf: &D::Leaf, spec: &D::StepSpec) -> Result<bool, ProgramError> {
         if spec.state_scheme() == 0 {
             return Ok(false);
@@ -1250,18 +1453,37 @@ impl<'a> Referee<'a> {
     fn step(&self, at: &mut usize, leaf: &D::Leaf, spec: &D::StepSpec) -> Result<bool, ProgramError> {
         let n = *self.data.get(*at).ok_or(err(1))? as usize;
         *at += 1;
-        if n != leaf.input_count() || n > 8 {
+        if n != leaf.input_count() || n != spec.input_count() || n > 8 {
             return Err(err(20));
         }
-        let mut ins: [&[u8]; 8] = [&[]; 8];
-        for (i, slot) in ins.iter_mut().enumerate().take(n) {
-            let len = u32_at(self.data, *at)? as usize;
-            let v = self.data.get(*at + 4..*at + 4 + len).ok_or(err(1))?;
-            *at += 4 + len;
-            if D::value_digest(&H, v) != leaf.input(i)[23..55] {
-                return Err(err(20));
+        let mut ins = Vec::new();
+        for i in 0..n {
+            let (kind, _, _, _, _) = spec.input_producer(i);
+            if kind == D::PRODUCER_LIST {
+                let refs = self.list_refs.get(i).ok_or(err(20))?;
+                if refs.is_empty() || refs.len() > D::MAX_LIST_ELEMENTS {
+                    return Err(err(20));
+                }
+                for r in refs {
+                    let len = u32_at(self.data, *at)? as usize;
+                    let end = (*at).checked_add(4).and_then(|x| x.checked_add(len)).ok_or(err(8))?;
+                    let v = self.data.get(*at + 4..end).ok_or(err(1))?;
+                    *at = end;
+                    if D::value_digest(&H, v) != r[23..55] {
+                        return Err(err(20));
+                    }
+                    ins.push(v);
+                }
+            } else {
+                let len = u32_at(self.data, *at)? as usize;
+                let end = (*at).checked_add(4).and_then(|x| x.checked_add(len)).ok_or(err(8))?;
+                let v = self.data.get(*at + 4..end).ok_or(err(1))?;
+                *at = end;
+                if D::value_digest(&H, v) != leaf.input(i)[23..55] {
+                    return Err(err(20));
+                }
+                ins.push(v);
             }
-            *slot = v;
         }
         let prior = if spec.state_scheme() != 0 {
             let len = u32_at(self.data, *at)? as usize;
@@ -1276,7 +1498,7 @@ impl<'a> Referee<'a> {
         };
         if D::reductions::lookup(spec.kernel_id()).is_some() {
             // A refused replay cannot carry committed outputs: C wins.
-            let Some(r) = D::reductions::replay(spec.kernel_id(), &ins[..n], prior) else { return Ok(true) };
+            let Some(r) = D::reductions::replay(spec.kernel_id(), &ins, prior) else { return Ok(true) };
             return Ok(r.output_count != leaf.output_count()
                 || (0..r.output_count).any(|i| D::value_digest(&H, r.output(i)) != leaf.output(i)[23..55])
                 || r.next().is_some_and(|nx| D::value_digest(&H, nx) != *leaf.next));
@@ -1295,7 +1517,7 @@ impl<'a> Referee<'a> {
             .filter(|k| k.manifest().modes.contains(&crate::kernel::MODE_STEP_V21));
         if let Some(kernel) = step_kernel {
             let m = kernel.manifest();
-            let spans: Vec<crate::kernel::AccountSpan> = ins[..n]
+            let spans: Vec<crate::kernel::AccountSpan> = ins
                 .iter()
                 .map(|v| crate::kernel::AccountSpan {
                     key: [0; 32],
@@ -1316,7 +1538,7 @@ impl<'a> Referee<'a> {
         let mut out = [0u8; 4];
         // An unknown kernel cannot replay any output (as in the Python
         // referee): it rules for C.
-        Ok(match kernel_code(spec.kernel_id()).ok_or(0u16).and_then(|code| dcg_kernels::execute(code, &ins[..n], &mut out)) {
+        Ok(match kernel_code(spec.kernel_id()).ok_or(0u16).and_then(|code| dcg_kernels::execute(code, &ins, &mut out)) {
             Err(_) => true,
             Ok(_) => leaf.output_count() != 1 || D::value_digest(&H, &out) != leaf.output(0)[23..55],
         })

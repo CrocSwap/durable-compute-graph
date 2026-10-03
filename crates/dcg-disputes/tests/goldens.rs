@@ -44,7 +44,7 @@ fn root_of(tree: Tree, leaves: &[Hash]) -> Hash {
 fn empty_constants_and_tree_roots() {
     let v = vectors();
     for (name, tree) in [("step", Tree::Step), ("out", Tree::Out), ("chunk", Tree::Chunk), ("log", Tree::Log),
-                         ("spec", Tree::Spec)] {
+                         ("spec", Tree::Spec), ("list", Tree::List)] {
         for (l, want) in v["empty"][name].as_array().unwrap().iter().enumerate() {
             assert_eq!(empty(&Soft, tree, l as u16), h32(want.as_str().unwrap()), "{name} {l}");
         }
