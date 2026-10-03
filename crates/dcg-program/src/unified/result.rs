@@ -1128,9 +1128,7 @@ pub fn resolve_v7(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let descriptor = d32(data, 1, CL_MALFORMED)?;
     document::document(program, dcm2, Some(&descriptor), false, CL_MALFORMED)?;
     let v = view(program, dcr2, &descriptor, true)?;
-    if v.status != STATUS_PENDING || v.closed || dcr2.data_len() != v.full {
-        return Err(no(RESULT_STATE));
-    }
+    resolve_state_gate(&v, dcr2.data_len())?;
     let doc = dcm2.try_borrow_data()?;
     let flags = u16_at(&doc, 6, CL_MALFORMED)?;
     let now = now()?;
@@ -1225,6 +1223,16 @@ fn is_stop_value(cell: &[u8], stop_plus_one: u32) -> bool {
 /// **796 is a refusal, not a verdict.** It means the record is not in a state
 /// where the question has an answer: no `L`, a `L` past `count`, an
 /// incompletely attested output set, or a bitmap that is not exactly `[0, L)`.
+/// The DCR2 state gate the resolve and close-time checks share: only a
+/// PENDING, unclosed, fully grown record has a FINAL condition to answer;
+/// anything else is 796.
+fn resolve_state_gate(v: &View, data_len: usize) -> Result<(), ProgramError> {
+    if v.status != STATUS_PENDING || v.closed || data_len != v.full {
+        return Err(no(RESULT_STATE));
+    }
+    Ok(())
+}
+
 pub fn resolve_check(
     binding: &Binding2,
     n: u32,
@@ -1363,9 +1371,7 @@ pub fn resolve_v8_with_hooks(
     let descriptor = d32(data, 1, CL_MALFORMED)?;
     document::document_v8_stored(program, dcm2, Some(&descriptor), false, CL_MALFORMED)?;
     let v = view_v8_status_with_hooks(program, dcr2, &descriptor, true, STATUS_SETTLED, hooks)?;
-    if v.status != STATUS_PENDING || v.closed || dcr2.data_len() != v.full {
-        return Err(no(RESULT_STATE));
-    }
+    resolve_state_gate(&v, dcr2.data_len())?;
     // The four reads §1.6 names inside the DRB1 v2 block, and DCM2 84.
     let (flags, binding, n, open) = {
         let doc = dcm2.try_borrow_data()?;
@@ -2592,5 +2598,42 @@ mod reader_gate_tests {
                 assert_eq!(data, before, "a refused conviction writes nothing");
             }
         }
+    }
+
+    /// The resolve's state gate on every DCR2 state but PENDING: FINAL,
+    /// REFUTED, SETTLED, closed and half-grown are 796. A closed or SETTLED
+    /// record has no DCM2 left on chain (the close drained it), so these are
+    /// unit tests of the gate rather than bank patches.
+    #[test]
+    fn the_resolve_state_gate_admits_only_a_pending_open_full_record() {
+        let program = Pubkey::new_unique();
+        let key = address::result(&program, &DESCRIPTOR).0;
+        let honest = dcr2(&program, &DESCRIPTOR);
+        let view = |data: Vec<u8>| {
+            with_account(&program, key, data, |a| {
+                view_v8_status_with_hooks(
+                    &program,
+                    a,
+                    &DESCRIPTOR,
+                    false,
+                    STATUS_SETTLED,
+                    &crate::compatibility::REVISION8_COMPATIBILITY,
+                )
+            })
+            .unwrap()
+        };
+        let full = bytes_v8(1, 16).unwrap();
+        let mut grown = honest.clone();
+        grown.resize(full, 0);
+        assert_eq!(resolve_state_gate(&view(grown.clone()), full), Ok(()));
+        for status in [STATUS_FINAL, STATUS_REFUTED, STATUS_SETTLED] {
+            let mut v = grown.clone();
+            v[6] = status;
+            assert_eq!(resolve_state_gate(&view(v), full), Err(no(RESULT_STATE)), "status {status}");
+        }
+        let mut closed = grown.clone();
+        closed[7] = 1;
+        assert_eq!(resolve_state_gate(&view(closed), full), Err(no(RESULT_STATE)), "closed");
+        assert_eq!(resolve_state_gate(&view(honest.clone()), honest.len()), Err(no(RESULT_STATE)), "half-grown");
     }
 }

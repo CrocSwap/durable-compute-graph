@@ -1128,13 +1128,8 @@ impl Fix {
             address::family_slots(&self.program, &descriptor).0,
             address::result(&self.program, &descriptor).0,
         ];
-        for key in created {
-            if self.real_pda_funding {
-                fund_system(&mut self.ctx, &self.executor, key, 50_000_000_000).await;
-            } else {
-                fund(&mut self.ctx, key).await;
-            }
-        }
+        // UnifiedInit funds the four PDAs to rent itself (and the pot into
+        // DCM2), so nothing is pre-funded: the balances are the real ones.
         let metas = self.init_metas(created);
         let data = init_data(
             &self.terms_raw,
@@ -1224,9 +1219,6 @@ impl Fix {
             address::family_slots(&self.program, &descriptor).0,
             address::result(&self.program, &descriptor).0,
         ];
-        for key in created {
-            fund(&mut self.ctx, key).await;
-        }
         let data = init_data(
             &self.terms_raw,
             &b.encode(),
@@ -3602,9 +3594,6 @@ async fn rev8_attest_output_end_to_end() {
         address::family_slots(&f.program, &descriptor).0,
         address::result(&f.program, &descriptor).0,
     ];
-    for key in created {
-        fund(&mut f.ctx, key).await;
-    }
     let metas = f.init_metas(created);
     send(
         &mut f.ctx,
@@ -3921,9 +3910,6 @@ async fn rev8_attest_three_outputs_of_one_run() {
         address::family_slots(&f.program, &descriptor).0,
         address::result(&f.program, &descriptor).0,
     ];
-    for key in created {
-        fund(&mut f.ctx, key).await;
-    }
     let metas = f.init_metas(created);
     send(
         &mut f.ctx,
@@ -7000,9 +6986,6 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
                 address::family_slots(&$f.program, &descriptor).0,
                 address::result(&$f.program, &descriptor).0,
             ];
-            for key in created {
-                fund(&mut $f.ctx, key).await;
-            }
             let metas = $f.init_metas(created);
             let data = init_data(
                 &terms,
@@ -7649,50 +7632,6 @@ async fn send_fresh_with(
     }
 }
 
-/// Install a deliberately malformed account after obtaining the transaction's
-/// blockhash, then send against that same working bank. This avoids a
-/// background PoH tick moving the test to a child bank between `set_account`
-/// and the transaction, which would hide the mutation from the handler.
-async fn send_fresh_with_account_override(
-    ctx: &mut ProgramTestContext,
-    signer: &Keypair,
-    program: Pubkey,
-    data: Vec<u8>,
-    metas: Vec<AccountMeta>,
-    key: Pubkey,
-    account: Account,
-) -> Result<(), TransactionError> {
-    let _ = ctx
-        .get_new_latest_blockhash()
-        .await
-        .expect("a fresh blockhash");
-    ctx.set_account(&key, &shared(account));
-    let blockhash = ctx
-        .banks_client
-        .get_latest_blockhash()
-        .await
-        .expect("the overridden working bank");
-    // A distinct compute-unit limit per call: the same refused bytes under
-    // the same working-bank blockhash would otherwise be AlreadyProcessed.
-    static SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let ixs = vec![
-        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
-            1_400_000 - serial % 100_000,
-        ),
-        Instruction {
-            program_id: program,
-            accounts: metas,
-            data,
-        },
-    ];
-    let tx = Transaction::new_signed_with_payer(&ixs, Some(&signer.pubkey()), &[signer], blockhash);
-    match ctx.banks_client.process_transaction_with_metadata(tx).await {
-        Ok(inner) => inner.result,
-        Err(error) => panic!("the banks client refused the transaction: {error:?}"),
-    }
-}
-
 /// Send a fresh instruction and return its decoded `Program data:` events.
 /// Close-refund regressions must check the DLE1 body as well as balances: C1
 /// corrupted the event field while the actual rent transfer still succeeded.
@@ -7807,6 +7746,36 @@ fn assert_close_event_refund(events: &[Vec<u8>], expected: u64) {
 }
 
 /// The two metas of §1.6's account list, for a named pair of accounts.
+/// A document convicted for real (rule 6): a completion with a stop value at
+/// output 4 of L = 10 (clause 1, "ran long"), every output attested, the
+/// clock past its deadline, and a writable ResolveResultV5 that convicts it
+/// (DCM2 flag 4, challenger_wins + 1, DCR2 REFUTED). Records no winner: the
+/// stop-rule conviction leaves DCR2 352 to the challenge route.
+async fn convicted_by_resolve(f: &mut Fix, request: u8) -> Crafted {
+    let binding = f.binding_stop(29, 50, STOP_PLUS_ONE);
+    let tokens = vec![(4u32, STOP_PLUS_ONE - 1), (9u32, STOP_PLUS_ONE - 1)];
+    let (descriptor, created, _) = attest_all(f, &binding, 40, &tokens, request).await;
+    let c = Crafted {
+        dcm2: created[0],
+        dpr2: created[1],
+        dcr2: created[3],
+        descriptor,
+    };
+    past_deadline(f, c.dcm2).await;
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        vec![AccountMeta::new(c.dcm2, false), AccountMeta::new(c.dcr2, false)],
+    )
+    .await
+    .expect("the stop-rule conviction");
+    assert_eq!(f.account(c.dcr2).await[6], result::STATUS_REFUTED);
+    assert_ne!(u16_at(&f.account(c.dcm2).await, 6) & FLAG_REFUTED, 0);
+    c
+}
+
 fn pair(dcm2: Pubkey, dcr2: Pubkey) -> Vec<AccountMeta> {
     vec![
         AccountMeta::new_readonly(dcm2, false),
@@ -7885,9 +7854,6 @@ async fn attest_all(
         address::family_slots(&f.program, &descriptor).0,
         address::result(&f.program, &descriptor).0,
     ];
-    for key in created {
-        fund(&mut f.ctx, key).await;
-    }
     let (data, metas) = (
         init_data(
             &f.terms_raw,
@@ -8569,67 +8535,21 @@ async fn rev8_resolve_refusals() {
         RESULT_STATE,
         "a record at status FINAL is 796"
     );
-    // PENDING-MIGRATION (T7): closed, REFUTED, SETTLED and half-grown records
-    // are reachable states still made by override here, until real close and
-    // conviction flows produce them.
-    // **796 on DCR2's state**, which is not a malformed record: closed, not
-    // PENDING, and a record the attest has not finished growing — the clause
-    // reads the whole bitmap, so a half-grown record has no answer.
-    let mut closed = good_res.clone();
-    closed[7] = 1;
+    // A really convicted document does not resolve again either: 796 at
+    // REFUTED. Closed, SETTLED and half-grown records are the state gate's
+    // unit test (result::reader_gate_tests): a closed record's DCM2 is gone,
+    // so no real resolve reaches that branch.
+    let convicted = convicted_by_resolve(&mut f, 16).await;
     assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, closed),
-            )
-            .await
-        ),
+        refused_resolve(
+            &mut f,
+            convicted.dcr2,
+            resolve_data(&convicted.descriptor),
+            pair(convicted.dcm2, convicted.dcr2)
+        )
+        .await,
         RESULT_STATE,
-        "a closed record is 796"
-    );
-    for status in [result::STATUS_REFUTED, result::STATUS_SETTLED] {
-        let mut settled = good_res.clone();
-        settled[6] = status;
-        assert_eq!(
-            custom(
-                send_fresh_with_account_override(
-                    &mut f.ctx,
-                    &f.signer,
-                    f.program,
-                    resolve_data(&descriptor),
-                    base.clone(),
-                    dcr2,
-                    owned(&f.program, settled),
-                )
-                .await
-            ),
-            RESULT_STATE,
-            "a record at status {status} is 796"
-        );
-    }
-    let mut partial = good_res.clone();
-    partial.truncate(partial.len() - 1);
-    assert_eq!(
-        custom(
-            send_fresh_with_account_override(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                resolve_data(&descriptor),
-                base.clone(),
-                dcr2,
-                owned(&f.program, partial),
-            )
-            .await
-        ),
-        RESULT_STATE,
-        "a half-grown record is 796"
+        "a record at status REFUTED is 796"
     );
 
 }
@@ -10347,48 +10267,25 @@ async fn rev8_close_refusals() {
 async fn rev8_close_escrows_past_a_prefunded_address() {
     let Some(mut f) = build().await else { return };
     let base = Terms2::decode(&f.terms_raw).unwrap();
-    let pot = 50_000_000;
+    // Larger than the three real accounts' rent (a real document's DPR2 page
+    // is bigger than the old hand-built one).
+    let pot = 500_000_000;
     f.terms_raw = Terms2 {
         executor_bond_lamports: pot,
         ..base
     }
     .encode()
     .to_vec();
-    let roots = f.position_roots[..33].to_vec();
     let payer = f.executor.pubkey();
-    for (i, gift) in [1u64, ESCROW_FLOOR].into_iter().enumerate() {
-        let b = f.binding_stop(29, 50, STOP_PLUS_ONE);
-        let c = closable_hand_built(&mut f, &b, 33, &roots, 95 + i as u8).await;
+    // A 1-lamport deposit cannot be created by a transfer under current rent
+    // rules, so the gift is the rent floor (the smallest real deposit).
+    for (i, gift) in [ESCROW_FLOOR].into_iter().enumerate() {
+        // A really convicted document (stop-rule resolve), no record patch.
+        let c = convicted_by_resolve(&mut f, 95 + i as u8).await;
         let escrow = address::bond_escrow(&f.program, &c.descriptor).0;
         // A plain lamport deposit into a system-owned 0-byte account: what any
         // third party can do with a public address and a transfer.
-        f.ctx.set_account(
-            &escrow,
-            &shared(Account {
-                lamports: gift,
-                data: vec![],
-                owner: SYSTEM,
-                executable: false,
-                rent_epoch: 0,
-            }),
-        );
-        let mut doc = f.account(c.dcm2).await;
-        doc[6..8].copy_from_slice(
-            &(FLAG_ARMED | FLAG_ROOT_ONLY | FLAG_SEALED | FLAG_FINAL | FLAG_REFUTED).to_le_bytes(),
-        );
-        {
-            let lamports = f.lamports(c.dcm2).await;
-            f.ctx.set_account(
-                &c.dcm2,
-                &shared(Account {
-                    lamports,
-                    data: doc,
-                    owner: f.program,
-                    executable: false,
-                    rent_epoch: 0,
-                }),
-            );
-        }
+        fund_system(&mut f.ctx, &f.executor, escrow, gift).await;
         clock_to(&mut f, 6_000_100 + i as u64).await;
         let payer_before = f.lamports(payer).await;
         let in_three = f.lamports(c.dcm2).await
@@ -15751,7 +15648,10 @@ async fn rev8_timeout_refutes_a_challenger_who_stalls_in_descent() {
     let before_executor = f.lamports(f.executor.pubkey()).await;
     let before_challenger = f.lamports(f.signer.pubkey()).await;
     let settler = Keypair::new();
-    fund(&mut f.ctx, settler.pubkey()).await;
+    // Funded by the bank's own payer, a neutral party, so the executor's and
+    // the challenger's balances stay exactly what the settlement leaves.
+    let bank = f.ctx.payer.insecure_clone();
+    fund_system(&mut f.ctx, &bank, settler.pubkey(), 1_000_000_000).await;
     let settle_metas = vec![
         AccountMeta::new(record, false),
         AccountMeta::new(response, false),
