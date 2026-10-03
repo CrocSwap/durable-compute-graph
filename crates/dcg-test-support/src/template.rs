@@ -116,6 +116,24 @@ pub fn locator_for(fixture: &Fixture) -> Locator {
     }
 }
 
+/// The DCF1 account natively installed in place of ConfigInit (the one
+/// environment exception): DCF1, version 1, `authority` in all three roles,
+/// created at slot 1, rent-exempt, owned by the program. `tests/test_support_template.rs`
+/// checks on SBF that the real ConfigInit writes exactly this account.
+pub fn native_config_account(program: Pubkey, authority: Pubkey) -> solana_account::Account {
+    let mut dcf1 = vec![0u8; config::CONFIG_BYTES];
+    dcf1[..4].copy_from_slice(b"DCF1");
+    dcf1[4..6].copy_from_slice(&1u16.to_le_bytes());
+    for role in 0..3 {
+        dcf1[8 + 32 * role..40 + 32 * role].copy_from_slice(authority.as_ref());
+    }
+    // created_slot: real ConfigInit stamps its clock slot, which is 1 for the
+    // first instruction of a fresh bank (the SBF guard pins this).
+    dcf1[104..112].copy_from_slice(&1u64.to_le_bytes());
+    let lamports = solana_program::rent::Rent::default().minimum_balance(dcf1.len());
+    solana_account::Account { lamports, data: dcf1, owner: program, executable: false, rent_epoch: 0 }
+}
+
 /// The typed-decision position (29 by default, as the retained harness;
 /// `BASANOS_PT2P_F47_POSITION` overrides it).
 pub fn f47_position() -> u32 {
@@ -152,17 +170,7 @@ impl Template {
             // ConfigInit (tag 174) cannot run. Install exactly the bytes it
             // would write: DCF1, version 1, the three role keys. On SBF the
             // real instruction runs below.
-            let mut dcf1 = vec![0u8; config::CONFIG_BYTES];
-            dcf1[..4].copy_from_slice(b"DCF1");
-            dcf1[4..6].copy_from_slice(&1u16.to_le_bytes());
-            for role in 0..3 {
-                dcf1[8 + 32 * role..40 + 32 * role].copy_from_slice(roles.executor.pubkey().as_ref());
-            }
-            let lamports = solana_program::rent::Rent::default().minimum_balance(dcf1.len());
-            test.add_account(
-                config,
-                solana_account::Account { lamports, data: dcf1, owner: program, executable: false, rent_epoch: 0 },
-            );
+            test.add_account(config, native_config_account(program, roles.executor.pubkey()));
         }
         let mut chain = Chain::start(test, program, &[roles.executor.pubkey(), roles.signer.pubkey()]).await;
         if options.trace_cu {

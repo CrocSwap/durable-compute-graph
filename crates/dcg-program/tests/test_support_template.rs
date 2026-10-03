@@ -5,6 +5,7 @@ use dcg_program::pt2p_onchain as S;
 use dcg_program::unified::config;
 use dcg_test_support::template::Admission;
 use dcg_test_support::{FixtureKind, Target, Template, TemplateOptions};
+use solana_signer::Signer;
 
 fn target() -> Target {
     dcg_test_support::dcg_program_target!()
@@ -83,4 +84,25 @@ async fn a_restored_template_is_the_real_one() {
         assert_eq!(u32::from_le_bytes(dea2[148..152].try_into().unwrap()), t.class_total);
         assert_eq!(dcg_program::hash::sha256(&[&t.chain.data(t.pt2s).await]), t.pt2s_sha);
     }
+}
+
+/// The guard on the one environment exception (owner decision 2026-10-02):
+/// on SBF the real ConfigInit (tag 174) runs, and the DCF1 it writes must be
+/// byte-identical (data, owner, lamports) to the image native runs install.
+/// Skips natively; run with BASANOS_DCG_V8_SBF=1 and BPF_OUT_DIR.
+#[tokio::test(flavor = "multi_thread")]
+async fn config_init_on_sbf_writes_the_native_dcf1_image() {
+    let target = target();
+    if !target.is_sbf() {
+        eprintln!("SKIP: the DCF1 guard needs the SBF image (BASANOS_DCG_V8_SBF=1, BPF_OUT_DIR)");
+        return;
+    }
+    let mut options = TemplateOptions::new(FixtureKind::K80);
+    options.admission = dcg_test_support::template::Admission::Begun;
+    let Some(mut t) = Template::build(&target, options).await else { return };
+    let real = t.chain.account(t.config).await.expect("ConfigInit created DCF1");
+    let native = dcg_test_support::template::native_config_account(t.program, t.roles.executor.pubkey());
+    assert_eq!(real.data, native.data, "DCF1 bytes");
+    assert_eq!(real.owner, native.owner, "DCF1 owner");
+    assert_eq!(real.lamports, native.lamports, "DCF1 lamports");
 }
