@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -15,6 +16,11 @@ const CALLER_GATED_WRITERS: &[(&str, &str)] = &[
     ("unified/bond.rs", "standard_payout"),
 ];
 
+// This is not a PDA writer. raw_write is a signer-authorized test upload.
+const TEST_ONLY_EXEMPTIONS: &[(&str, &str)] = &[
+    ("graph_v2.rs", "raw_write"),
+];
+
 const GATES: &[&str] = &[
     "expect_derived",
     "expect_derived_with_bump",
@@ -25,6 +31,7 @@ const GATES: &[&str] = &[
     "allocate_derived_account",
     "validate_creation_target",
     "create_pda",
+    "blob_pda", // graph_v2::blob_pda compares kind/ID-derived key before blob writes.
     "checked_session",
     "checked_session_from",
     "checked_resource",
@@ -255,6 +262,12 @@ fn audit_functions(file: &str, source: &str) -> Vec<String> {
         {
             return;
         }
+        if TEST_ONLY_EXEMPTIONS
+            .iter()
+            .any(|(path, name)| *path == file && *name == function_name)
+        {
+            return;
+        }
         failures.push(format!("{file}::{function}"));
     }
 
@@ -336,6 +349,78 @@ fn audit_functions(file: &str, source: &str) -> Vec<String> {
     failures
 }
 
+fn quoted_values(line: &str) -> Vec<String> {
+    line.split('"').skip(1).step_by(2).map(str::to_owned).collect()
+}
+
+fn feature_members(manifest: &str, feature: &str) -> Vec<String> {
+    let section = manifest.split("[features]").nth(1).expect("Cargo features section");
+    for line in section.lines().take_while(|line| !line.starts_with('[')) {
+        if line.trim_start().starts_with(&format!("{feature} =")) {
+            return quoted_values(line);
+        }
+    }
+    panic!("missing feature {feature}");
+}
+
+fn reject_raw_feature(manifest: &str, features: &[String], label: &str) {
+    fn walk(manifest: &str, feature: &str, seen: &mut HashSet<String>) {
+        if !seen.insert(feature.to_owned()) {
+            return;
+        }
+        assert_ne!(feature, "graph-v2-raw-write", "raw-write in production feature set");
+        for member in feature_members(manifest, feature) {
+            if let Some(core) = member.strip_prefix("dcg_core/") {
+                assert_ne!(core, "graph-v2-raw-write", "raw-write in Basanos feature set");
+            } else {
+                walk(manifest, &member, seen);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    for feature in features {
+        walk(manifest, feature, &mut seen);
+    }
+    assert!(!seen.contains("graph-v2-raw-write"), "{label}");
+}
+
+#[test]
+fn production_images_exclude_raw_write_required_for_legacy_forgery() {
+    let dcg_manifest = include_str!("../Cargo.toml");
+    reject_raw_feature(dcg_manifest, &["default".to_owned()], "DCG default");
+
+    // The Basanos assembly is in this worktree when DCG is nested there;
+    // otherwise it is a sibling checkout of the standalone DCG repository.
+    let dcg_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let basanos_manifest = dcg_root.ancestors()
+        .map(|root| root.join("chain/dcg-program/Cargo.toml"))
+        .chain(dcg_root.ancestors().map(|root| root.join("basanos/chain/dcg-program/Cargo.toml")))
+        .find(|path| path.is_file()).expect("Basanos image Cargo manifest");
+    let basanos = fs::read_to_string(basanos_manifest).unwrap();
+    let dependency = basanos.lines().find(|line| line.starts_with("dcg_core ="))
+        .expect("Basanos DCG dependency");
+    assert!(dependency.contains("default-features = false"));
+    let dependency_features = dependency.split("features =").nth(1).expect("DCG core features");
+    let mut core_features = quoted_values(dependency_features);
+    for wrapper in feature_members(&basanos, "default") {
+        for member in feature_members(&basanos, &wrapper) {
+            if let Some(core) = member.strip_prefix("dcg_core/") {
+                core_features.push(core.to_owned());
+            }
+        }
+    }
+    reject_raw_feature(dcg_manifest, &core_features, "Basanos switchover");
+
+    let hello = include_str!("../../../docs/hello-graph.md");
+    let line = hello.lines().find(|line| line.starts_with("The next shared testnet image feature set is "))
+        .expect("declared shared testnet feature set");
+    let selected = line.split("--features \"").nth(1).expect("shared image features");
+    let selected = selected.split('"').next().unwrap();
+    let features: Vec<String> = selected.split_whitespace().map(str::to_owned).collect();
+    assert!(!features.is_empty());
+    reject_raw_feature(dcg_manifest, &features, "next shared testnet image");
+}
+
 #[test]
 fn source_audit_matches_the_reviewed_writer_allowlist() {
     let mut failures = Vec::new();
@@ -380,6 +465,7 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "closure_v2_bootstrap.rs::pub init_v4",
     "closure_v2_bootstrap.rs::pub seal_v2",
     "closure_v2_bootstrap.rs::pub upload_v2",
+    "closure_v2_generic.rs::private rule_legacy", // HIGH, unresolved: Basanos's pinned DCG core routes tag 140/141 to arbitrary signer-owned byte accounts; forged DCR1 v2/v4 needs no raw-write.
     "closure_v2_generic.rs::private rule_v6", // execute authenticates the v5 DCR1 and v6 DCM2 PDAs, size and kind before this helper.
     "desc_upload.rs::private store_dcd1",
     "desc_upload.rs::pub process_alloc",

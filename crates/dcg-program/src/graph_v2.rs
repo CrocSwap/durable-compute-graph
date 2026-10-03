@@ -152,6 +152,10 @@ fn derived(program_id: &Pubkey, account: &AccountInfo, seeds: &[&[u8]]) -> Progr
     Ok(())
 }
 
+fn blob_pda(program_id: &Pubkey, blob: &AccountInfo, kind: u8, id: &[u8; 32]) -> ProgramResult {
+    derived(program_id, blob, &[b"dcg2blob", &[kind], id])
+}
+
 fn owned(program_id: &Pubkey, account: &AccountInfo) -> ProgramResult {
     if account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
@@ -223,13 +227,21 @@ fn blob_write(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     let [writer, blob, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     owned(program_id, blob)?;
     let mut d = blob.try_borrow_mut_data()?;
+    if d.len() < BLOB_HEADER {
+        return Err(err(6));
+    }
     if !writer.is_signer || d[44..76] != writer.key.as_ref()[..] {
         return Err(ProgramError::MissingRequiredSignature);
     }
     if &d[0..4] != b"DCB2" || d[5] != 0 {
         return Err(err(6));
     }
+    let id = key32(&d, 12)?;
+    blob_pda(program_id, blob, d[4], &id)?;
     let len = u32_at(&d, 8)? as usize;
+    if BLOB_HEADER + len != d.len() {
+        return Err(err(7));
+    }
     let offset = u32_at(data, 1)? as usize;
     let bytes = &data[5..];
     if offset + bytes.len() > len {
@@ -244,12 +256,17 @@ fn blob_seal(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [writer, blob, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     owned(program_id, blob)?;
     let mut d = blob.try_borrow_mut_data()?;
+    if d.len() < BLOB_HEADER {
+        return Err(err(6));
+    }
     if !writer.is_signer || d[44..76] != writer.key.as_ref()[..] {
         return Err(ProgramError::MissingRequiredSignature);
     }
     if d.len() < BLOB_HEADER || &d[0..4] != b"DCB2" || d[5] != 0 {
         return Err(err(6));
     }
+    let id = key32(&d, 12)?;
+    blob_pda(program_id, blob, d[4], &id)?;
     let len = u32_at(&d, 8)? as usize;
     if BLOB_HEADER + len != d.len() {
         return Err(err(7));

@@ -119,6 +119,42 @@ recorded payout keys supply authorization.
 No program behavior was changed. The four findings remain absent from the
 reviewed writer snapshot, so the lint is expected to remain red for them.
 
+## L4b follow-up (source reachability)
+
+`graph_v2::blob_write` and `blob_seal` now check the DCB2 header length and
+derive `dcg2blob` from the stored kind and ID before writing. The lint keeps
+`raw_write` in a separate test-only exemption list, never in the PDA writer
+allowlist. `rule_legacy` remains an explicit **high, unresolved** lint finding;
+its ruling code was not changed.
+
+The Basanos switchover assembly pins DCG `9ec8d6a`, which predates the
+`revision-8-lifecycle` tag gate in this review branch. Its dispatcher sends
+tag 140 to DCG core. Exact route to chosen bytes in a non-PDA program-owned
+account, without raw-write:
+
+1. Create and fund a zeroed signer-owned PT1X state account and three nonzero
+   system-owned keypair byte accounts; make one byte account 8,192 bytes.
+2. Call tag 140 (`pt1_onchain::init_fresh`) with all four account signers and
+   the system program. It assigns the three byte accounts to the program and
+   records their keys and lengths in the PT1X state.
+3. Call tag 141 (`pt1_onchain::upload`) in 900-byte chunks, with the recorded
+   authority signer and byte account. It copies the supplied bytes into that
+   program-owned keypair account, with no PDA check on the byte account. Put a
+   chosen DCR1 v2/v4 header and 8,192-byte body there.
+4. `closure_v2_generic::live` accepts a v2/v4 DCR1 by owner, size, magic,
+   version, phase, deadline, and supported form, without deriving its key.
+
+This proves a production-image route to the forged record bytes, not an
+end-to-end false ruling: `execute` separately validates the document and
+response. `desc_upload::process_upload` is another owner-and-bytes writer in
+source, but no production dispatcher calls its handlers. In the later DCG
+review branch, `revision-8-lifecycle` gates tags 115–200; that gate does not
+exist at the pinned switchover commit. The deployed shared testnet image in
+`docs/hello-graph.md` also contains raw-write and cannot establish a raw-free
+production precondition. The no-raw guard covers the DCG review branch's
+default feature set, the Basanos manifest's selected features, and the next
+declared shared testnet feature set; it does not erase the pinned-code route.
+
 ## Native verification
 
 - Measured: `CARGO_BUILD_JOBS=3 cargo test --profile fasttest -p dcg-program
