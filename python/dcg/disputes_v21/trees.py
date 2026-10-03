@@ -25,6 +25,7 @@ NODE_DOMAINS = {
     "log": b"dcg.log.node.v2.1\x00",
     "spec": b"dcg.spec.node.v2.1\x00",
     "lazy": b"dcg.lazy.node.v1\x00",
+    "lxstate": b"dcg.lx.state.node.v1\x00",
 }
 EMPTY_LEAVES = {
     "step": _h(b"dcg.leaf.empty.v2.1\x00"),
@@ -33,6 +34,7 @@ EMPTY_LEAVES = {
     "log": _h(b"dcg.log.empty.v2.1\x00"),
     "spec": _h(b"dcg.spec.empty.v2.1\x00"),
     "lazy": _h(b"dcg.lazy.empty.v1\x00"),
+    "lxstate": _h(b"dcg.lx.slot.empty.v1\x00"),
 }
 EMPTY_LEAF = EMPTY_LEAVES["step"]
 EMPTY_OUT = EMPTY_LEAVES["out"]
