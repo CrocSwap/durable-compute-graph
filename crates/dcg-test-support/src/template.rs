@@ -566,15 +566,16 @@ async fn seal_pt1x(chain: &mut Chain, authority: &Keypair, pt1x: Pubkey, byte_ke
     }
 }
 
-async fn seal_pt2s(
+/// PT2S init (binds PT1X) and hash, stopping before the seal: an
+/// initialized, bound template whose setup can still be abandoned (tag 197).
+async fn init_and_hash_pt2s(
     chain: &mut Chain,
     authority: &Keypair,
     pt2s: &Keypair,
     pt1x: Pubkey,
     byte_keys: [Pubkey; 3],
     pwr1: &[u8],
-    locator: Locator,
-) {
+) -> Vec<AccountMeta> {
     let mut data = vec![S::TAG_INIT];
     data.extend_from_slice(pwr1);
     chain
@@ -603,6 +604,19 @@ async fn seal_pt2s(
             .await
             .expect("PT2S hash chunk");
     }
+    hash_metas
+}
+
+async fn seal_pt2s(
+    chain: &mut Chain,
+    authority: &Keypair,
+    pt2s: &Keypair,
+    pt1x: Pubkey,
+    byte_keys: [Pubkey; 3],
+    pwr1: &[u8],
+    locator: Locator,
+) {
+    let hash_metas = init_and_hash_pt2s(chain, authority, pt2s, pt1x, byte_keys, pwr1).await;
     let mut data = vec![S::TAG_SEAL];
     data.extend_from_slice(&[9u8; 32]);
     data.extend_from_slice(&locator.base_entry.to_le_bytes());
@@ -620,5 +634,47 @@ async fn seal_pt2s(
         let mut data = vec![S::TAG_SEAL_PXR_CHUNK];
         data.extend_from_slice(&S::MAX_PXR_SEAL_ROWS.to_le_bytes());
         chain.send(authority, &[], data, seal_metas.clone()).await.expect("PT2S PXR1 seal chunk");
+    }
+}
+
+/// A second template's resources set up by the real instructions (PT1X
+/// upload and seal, PT2S init binding it and hash) and stopped before the
+/// PT2S seal: the state tag 197 lets the uploader abandon. Fresh keys, so it
+/// lives beside a built template in the same bank.
+pub struct Unsealed {
+    pub pt1x: Keypair,
+    pub routes: Keypair,
+    pub geometry: Keypair,
+    pub payloads: Keypair,
+    pub pt2s: Keypair,
+}
+
+impl Template {
+    pub async fn unsealed_resources(&mut self) -> Unsealed {
+        let u = Unsealed {
+            pt1x: Keypair::new(),
+            routes: Keypair::new(),
+            geometry: Keypair::new(),
+            payloads: Keypair::new(),
+            pt2s: Keypair::new(),
+        };
+        let program = self.program;
+        let ex = self.roles.executor.insecure_clone();
+        let base_entries = self.fixture.view().base_entries;
+        let chain = &mut self.chain;
+        let fixture = &self.fixture;
+        chain
+            .allocate(&ex, &u.pt1x, program, dcg_program::pt1_onchain::OFF_PAYLOAD_INDEX + 4 * (base_entries as usize + 1))
+            .await;
+        chain.allocate(&ex, &u.routes, SYSTEM, fixture.routes.len()).await;
+        chain.allocate(&ex, &u.geometry, SYSTEM, fixture.geometry.len()).await;
+        chain.allocate(&ex, &u.payloads, SYSTEM, fixture.payloads.len()).await;
+        chain.allocate(&ex, &u.pt2s, program, S::OFF_PWR1 + fixture.pwr1.len()).await;
+        let byte_keys = [u.routes.pubkey(), u.geometry.pubkey(), u.payloads.pubkey()];
+        upload_pt1x(chain, &ex, &u.pt1x, [&u.routes, &u.geometry, &u.payloads], [&fixture.routes, &fixture.geometry, &fixture.payloads])
+            .await;
+        seal_pt1x(chain, &ex, u.pt1x.pubkey(), byte_keys, &fixture.routes).await;
+        init_and_hash_pt2s(chain, &ex, &u.pt2s, u.pt1x.pubkey(), byte_keys, &fixture.pwr1).await;
+        u
     }
 }
