@@ -2383,3 +2383,155 @@ pub fn close_result_with_hooks<'a>(
         close_result_v8_with_hooks(program, accounts, data, hooks)
     }
 }
+
+/// The DCM2, DPR2 and DCR2 readers attest (177) uses, on constructed
+/// accounts. A wrong-kind image, the same record at another descriptor's
+/// address and a stale stored bump are states only a program bug could
+/// write, so they are reader unit tests rather than integration tests that
+/// patch a bank (owner decision 2026-10-02). Each starts from a minimal
+/// honest image the reader accepts, so a refusal is the corruption's.
+#[cfg(all(test, feature = "revision-8"))]
+mod reader_gate_tests {
+    use super::super::document::{self as d, FLAG_ROOT_ONLY, FLAG_SEALED};
+    use super::super::terms::BOND_POLICY_CUSTOM;
+    use super::*;
+
+    const DESCRIPTOR: [u8; 32] = [0x5D; 32];
+    const OTHER: [u8; 32] = [0xA7; 32];
+    const P_COUNT: u32 = 80;
+
+    fn dcm2(program: &Pubkey, descriptor: &[u8; 32]) -> Vec<u8> {
+        let mut raw = vec![0u8; d::OPTION_REGION_AT];
+        raw[..4].copy_from_slice(b"DCM2");
+        raw[4..6].copy_from_slice(&7u16.to_le_bytes());
+        raw[6..8].copy_from_slice(&(FLAG_ROOT_ONLY | FLAG_SEALED).to_le_bytes());
+        raw[8..40].copy_from_slice(descriptor);
+        raw[d::DCM2_BUMP_AT] = address::document(program, descriptor).1.value();
+        raw[d::DPR2_BUMP_AT] = address::positions(program, descriptor).1.value();
+        raw
+    }
+
+    fn dpr2(descriptor: &[u8; 32]) -> Vec<u8> {
+        let mut raw = vec![0u8; d::DPR2_HEADER];
+        raw[..4].copy_from_slice(b"DPR2");
+        raw[4..6].copy_from_slice(&1u16.to_le_bytes());
+        raw[8..40].copy_from_slice(descriptor);
+        raw[40..44].copy_from_slice(&P_COUNT.to_le_bytes());
+        raw
+    }
+
+    fn dcr2(program: &Pubkey, descriptor: &[u8; 32]) -> Vec<u8> {
+        let terms = Terms2 {
+            challenge_window_slots: 90_000,
+            response_window_slots: 45_000,
+            challenger_bond_lamports: 1_000_000,
+            executor_bond_lamports: 890_880,
+            executor_reward_bps: 0,
+            bond_policy_kind: BOND_POLICY_CUSTOM,
+            bond_slasher_bps: 0,
+            settlement_program: [7u8; 32],
+            custom_settle_window_slots: 604_800,
+            result_retention_slots: 2_592_000,
+            bond_remainder: [8u8; 32],
+            abandon_after_slots: 5_184_000,
+        };
+        let mut raw = vec![0u8; HEADER_V6];
+        raw[..4].copy_from_slice(b"DCR2");
+        raw[4..6].copy_from_slice(&VERSION_V6.to_le_bytes());
+        raw[8..40].copy_from_slice(descriptor);
+        raw[196..200].copy_from_slice(&1u32.to_le_bytes());
+        raw[208] = 16;
+        raw[RESULT_TERMS_AT_V6..RESULT_TERMS_AT_V6 + TERMS_BYTES_V2].copy_from_slice(&terms.encode());
+        raw[RETENTION_SLOTS_AT_V6..RETENTION_SLOTS_AT_V6 + 8]
+            .copy_from_slice(&terms.result_retention_slots.to_le_bytes());
+        raw[RESULT_PDA_BUMP_AT_V6] = address::result(program, descriptor).1.value();
+        raw
+    }
+
+    /// Run `read` over an account `key` holding `data`, owned by `program`.
+    fn with_account<T>(program: &Pubkey, key: Pubkey, mut data: Vec<u8>, read: impl FnOnce(&AccountInfo) -> T) -> T {
+        let mut lamports = 1u64;
+        let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, program, false, 0);
+        read(&info)
+    }
+
+    fn read_dcm2(program: &Pubkey, key: Pubkey, data: Vec<u8>) -> Result<(), ProgramError> {
+        with_account(program, key, data, |a| {
+            d::document_v8_stored(program, a, Some(&DESCRIPTOR), false, CL_MALFORMED).map(|_| ())
+        })
+    }
+
+    fn read_dpr2(program: &Pubkey, key: Pubkey, data: Vec<u8>, doc: Vec<u8>) -> Result<(), ProgramError> {
+        let doc_key = address::document(program, &DESCRIPTOR).0;
+        let mut doc_data = doc;
+        let mut doc_lamports = 1u64;
+        let doc_info = AccountInfo::new(&doc_key, false, false, &mut doc_lamports, &mut doc_data, program, false, 0);
+        with_account(program, key, data, |a| {
+            d::positions_from_document(program, a, &doc_info, &DESCRIPTOR, P_COUNT, false, CL_MALFORMED)
+        })
+    }
+
+    fn read_dcr2(program: &Pubkey, key: Pubkey, data: Vec<u8>) -> Result<(), ProgramError> {
+        with_account(program, key, data, |a| {
+            view_v8_status_with_hooks(
+                program,
+                a,
+                &DESCRIPTOR,
+                false,
+                STATUS_SETTLED,
+                &crate::compatibility::REVISION8_COMPATIBILITY,
+            )
+            .map(|_| ())
+        })
+    }
+
+    #[test]
+    fn the_dcm2_reader_refuses_wrong_kind_another_instance_and_a_stale_bump() {
+        let program = Pubkey::new_unique();
+        let key = address::document(&program, &DESCRIPTOR).0;
+        let honest = dcm2(&program, &DESCRIPTOR);
+        assert_eq!(read_dcm2(&program, key, honest.clone()), Ok(()));
+        let mut wrong_kind = honest.clone();
+        wrong_kind[..4].copy_from_slice(b"XXXX");
+        assert_eq!(read_dcm2(&program, key, wrong_kind), Err(no(CL_MALFORMED)), "wrong kind");
+        let other = address::document(&program, &OTHER).0;
+        assert_eq!(read_dcm2(&program, other, honest.clone()), Err(no(CL_MALFORMED)), "second instance");
+        let mut stale = honest;
+        stale[d::DCM2_BUMP_AT] = stale[d::DCM2_BUMP_AT].wrapping_add(1);
+        assert_eq!(read_dcm2(&program, key, stale), Err(no(CL_MALFORMED)), "stale bump");
+    }
+
+    #[test]
+    fn the_dpr2_reader_refuses_wrong_kind_another_instance_and_a_stale_bump() {
+        let program = Pubkey::new_unique();
+        let key = address::positions(&program, &DESCRIPTOR).0;
+        let doc = dcm2(&program, &DESCRIPTOR);
+        let honest = dpr2(&DESCRIPTOR);
+        assert_eq!(read_dpr2(&program, key, honest.clone(), doc.clone()), Ok(()));
+        let mut wrong_kind = honest.clone();
+        wrong_kind[..4].copy_from_slice(b"XXXX");
+        assert_eq!(read_dpr2(&program, key, wrong_kind, doc.clone()), Err(no(CL_MALFORMED)), "wrong kind");
+        let other = address::positions(&program, &OTHER).0;
+        assert_eq!(read_dpr2(&program, other, honest.clone(), doc.clone()), Err(no(CL_MALFORMED)), "second instance");
+        // The DPR2 bump is stored in DCM2.
+        let mut stale_doc = doc;
+        stale_doc[d::DPR2_BUMP_AT] = stale_doc[d::DPR2_BUMP_AT].wrapping_add(1);
+        assert_eq!(read_dpr2(&program, key, honest, stale_doc), Err(no(CL_MALFORMED)), "stale bump");
+    }
+
+    #[test]
+    fn the_dcr2_reader_refuses_wrong_kind_another_instance_and_a_stale_bump() {
+        let program = Pubkey::new_unique();
+        let key = address::result(&program, &DESCRIPTOR).0;
+        let honest = dcr2(&program, &DESCRIPTOR);
+        assert_eq!(read_dcr2(&program, key, honest.clone()), Ok(()));
+        let mut wrong_kind = honest.clone();
+        wrong_kind[..4].copy_from_slice(b"XXXX");
+        assert_eq!(read_dcr2(&program, key, wrong_kind), Err(no(CL_MALFORMED)), "wrong kind");
+        let other = address::result(&program, &OTHER).0;
+        assert_eq!(read_dcr2(&program, other, honest.clone()), Err(no(CL_MALFORMED)), "second instance");
+        let mut stale = honest;
+        stale[RESULT_PDA_BUMP_AT_V6] = stale[RESULT_PDA_BUMP_AT_V6].wrapping_add(1);
+        assert_eq!(read_dcr2(&program, key, stale), Err(no(CL_MALFORMED)), "stale bump");
+    }
+}

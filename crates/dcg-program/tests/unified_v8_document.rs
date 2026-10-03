@@ -3764,90 +3764,9 @@ async fn rev8_attest_refuses_a_stale_or_wrong_descriptor() {
     .await
     .expect("the honest attest");
 
-    // Exercise each revision-8 lifecycle record role through the real tag-177
-    // handler. Wrong-kind images keep the expected size, second instances have
-    // the same valid image at a different descriptor PDA, and stale images
-    // retain the address while carrying a non-canonical stored bump.
-    let roles = [
-        (1usize, created[0], document::DCM2_BUMP_AT, "DCM2"),
-        (2usize, created[1], document::DPR2_BUMP_AT, "DPR2"),
-        (3usize, created[3], result::RESULT_PDA_BUMP_AT_V6, "DCR2"),
-    ];
-    for (meta_at, key, bump_at, role) in roles {
-        let original = f.account(key).await;
-        let mut wrong_kind = original.clone();
-        wrong_kind[..4].copy_from_slice(b"XXXX");
-        f.ctx
-            .set_account(&key, &shared(owned(&f.program, wrong_kind)));
-        assert_eq!(
-            custom(
-                send(
-                    &mut f.ctx,
-                    &f.signer,
-                    f.program,
-                    proof.data.clone(),
-                    metas.clone()
-                )
-                .await
-            ),
-            CL_MALFORMED,
-            "tag 177 rejects a same-sized wrong-kind {role}"
-        );
-        f.ctx
-            .set_account(&key, &shared(owned(&f.program, original.clone())));
-
-        let second_descriptor = [0xA7; 32];
-        let second_key = match role {
-            "DCM2" => address::document(&f.program, &second_descriptor).0,
-            "DPR2" => address::positions(&f.program, &second_descriptor).0,
-            _ => address::result(&f.program, &second_descriptor).0,
-        };
-        f.ctx
-            .set_account(&second_key, &shared(owned(&f.program, original.clone())));
-        let mut second_instance = metas.clone();
-        second_instance[meta_at] = AccountMeta::new(second_key, false);
-        assert_eq!(
-            custom(
-                send(
-                    &mut f.ctx,
-                    &f.signer,
-                    f.program,
-                    proof.data.clone(),
-                    second_instance
-                )
-                .await
-            ),
-            CL_MALFORMED,
-            "tag 177 rejects a second {role} instance"
-        );
-
-        let stale_key = if role == "DPR2" { created[0] } else { key };
-        let stale_original = f.account(stale_key).await;
-        let mut stale = stale_original.clone();
-        stale[bump_at] = stale[bump_at].wrapping_add(1);
-        f.ctx
-            .set_account(&stale_key, &shared(owned(&f.program, stale)));
-        assert_eq!(
-            custom(
-                send(
-                    &mut f.ctx,
-                    &f.signer,
-                    f.program,
-                    proof.data.clone(),
-                    metas.clone()
-                )
-                .await
-            ),
-            CL_MALFORMED,
-            "tag 177 rejects a stale/non-canonical-bump {role}"
-        );
-        if stale_key != key {
-            f.ctx
-                .set_account(&stale_key, &shared(owned(&f.program, stale_original)));
-        }
-        f.ctx
-            .set_account(&key, &shared(owned(&f.program, original)));
-    }
+    // The wrong-kind, second-instance and stale-bump images of DCM2, DPR2
+    // and DCR2 are states only a program bug could write: unit tests of the
+    // three readers (result::reader_gate_tests; owner decision 2026-10-02).
 
     // **The retained packet, unmodified.** Its twelve path entries and its
     // SPP1 siblings are the revision-7 document's own digests over the
@@ -3927,9 +3846,13 @@ async fn rev8_attest_refuses_a_stale_or_wrong_descriptor() {
         &descriptor[..],
         "the record's own header names the descriptor"
     );
-    let elsewhere = address::document(&f.program, &[7u8; 32]).0;
-    f.ctx
-        .set_account(&elsewhere, &shared(owned(&f.program, doc)));
+    // The attacker's version: another real document, at its own address.
+    let other = Binding2 {
+        request_id: [0x77; 32],
+        ..binding
+    };
+    let (_, other_created) = f.run_document(&other, n).await;
+    let elsewhere = other_created[0];
     let mut wrong_account =
         attest_metas(f.signer.pubkey(), (f.pt2s, f.routes, f.geometry), created);
     wrong_account[1] = AccountMeta::new_readonly(elsewhere, false);
@@ -3945,7 +3868,7 @@ async fn rev8_attest_refuses_a_stale_or_wrong_descriptor() {
             .await
         ),
         CL_MALFORMED,
-        "the same record at another address is 580: the key is PDA(descriptor)"
+        "another real document is 580: the key is PDA(descriptor)"
     );
     // The refused packets left the proven cell alone, and the honest cell is
     // still the value the re-keyed leaf committed.
