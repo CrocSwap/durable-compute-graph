@@ -8714,10 +8714,10 @@ async fn rev8_resolve_skips_a_record_that_is_already_final() {
         Ok(result::Verdict::Violated),
         "the same bytes, PENDING, are convicted"
     );
-    // And the handler still refuses the already-FINAL record, so nothing here
-    // opens a second status write.
-    f.ctx
-        .set_account(&c.dcr2, &shared(owned(&f.program, broken)));
+    // And the handler refuses a second resolve of the real FINAL record, so
+    // nothing opens a second status write. (The broken bytes above are a state
+    // only a program bug could write, so they stay off the bank: the clause's
+    // own answers on them are the claim.)
     assert_eq!(
         custom(
             send_fresh(
@@ -9545,7 +9545,6 @@ async fn rev8_close_skips_a_record_that_is_already_final() {
         dcr2: created[3],
         descriptor,
     };
-    f.install_dfs2(&c).await;
     // A real resolve first: the challenger's route, and the only thing that
     // writes `status = 1`.
     let slot = past_deadline(&mut f, c.dcm2).await;
@@ -9560,24 +9559,14 @@ async fn rev8_close_skips_a_record_that_is_already_final() {
     .await
     .expect("resolve");
     assert_eq!(f.account(c.dcr2).await[6], result::STATUS_FINAL);
-    // Now forge a violation into an **attested** cell: output 0 becomes the stop
-    // value, which is clause 1 (a stop value in `[0, L-2)` = `[0, 2)`).
+    // The record's bytes with a violation forged into an **attested** cell:
+    // output 0 becomes the stop value, which is clause 1 (a stop value in
+    // `[0, L-2)` = `[0, 2)`). Only a program bug could write these bytes, so
+    // they stay off the bank; the clause's answers on them are the claim, and
+    // the close below runs on the real FINAL record.
     let mut dcr2 = f.account(c.dcr2).await;
     let cell = result::HEADER_V6;
     dcr2[cell + 8..cell + 16].copy_from_slice(&((STOP_PLUS_ONE - 1) as u64).to_le_bytes());
-    {
-        let lamports = f.lamports(c.dcr2).await;
-        f.ctx.set_account(
-            &c.dcr2,
-            &shared(Account {
-                lamports,
-                data: dcr2.clone(),
-                owner: f.program,
-                executable: false,
-                rent_epoch: 0,
-            }),
-        );
-    }
     // Without the skip this record convicts, which is the control: the same
     // clause over the same fields on a PENDING status.
     assert_eq!(
@@ -15526,23 +15515,10 @@ async fn rev8_pt1x_output_pda_provenance_sbf() {
         ]
     };
 
-    let mut wrong_kind_data = f.account(f.dea2).await;
-    wrong_kind_data.resize(512, 0);
-    assert_eq!(&wrong_kind_data[..4], b"DEA2");
-    f.ctx
-        .set_account(&output, &shared(owned(&program, wrong_kind_data)));
-    let wrong_kind = send(&mut f.ctx, &f.executor, program, data(), metas_for(output)).await;
-    assert!(
-        matches!(
-            wrong_kind,
-            Err(TransactionError::InstructionError(
-                _,
-                InstructionError::InvalidAccountData
-            ))
-        ),
-        "tag 146 refuses a same-sized wrong-kind PT1O"
-    );
-
+    // A program-owned wrong-kind image at the PT1O address is a state only a
+    // program bug could write (only the program assigns that PDA): the
+    // account-provenance gate's unit tests refuse it. What a caller can do is
+    // fund addresses, below, by real transfers.
     let other_binding = dcg_program::pt1_onchain::pt1x_output_binding(
         &program,
         &input_refs,
@@ -15553,7 +15529,7 @@ async fn rev8_pt1x_output_pda_provenance_sbf() {
     let (second_output, _) =
         dcg_program::pt1_onchain::pt1x_output_address(&program, &other_binding);
     assert_ne!(output, second_output);
-    f.ctx.set_account(&second_output, &shared(system_funded()));
+    fund_system(&mut f.ctx, &f.executor, second_output, 1_000_000_000_000).await;
     let second_instance = send(
         &mut f.ctx,
         &f.executor,
@@ -15589,8 +15565,7 @@ async fn rev8_pt1x_output_pda_provenance_sbf() {
     )
     .unwrap();
     assert_ne!(output, noncanonical_output);
-    f.ctx
-        .set_account(&noncanonical_output, &shared(system_funded()));
+    fund_system(&mut f.ctx, &f.executor, noncanonical_output, 1_000_000_000_000).await;
     let stale = send(
         &mut f.ctx,
         &f.executor,
@@ -15610,7 +15585,7 @@ async fn rev8_pt1x_output_pda_provenance_sbf() {
         "tag 146 refuses a non-canonical PT1O address planted at another key"
     );
 
-    f.ctx.set_account(&output, &shared(system_funded()));
+    fund_system(&mut f.ctx, &f.executor, output, 1_000_000_000_000).await;
     send(&mut f.ctx, &f.executor, program, data(), metas_for(output))
         .await
         .expect("tag 146 creates the honest PT1O output");
