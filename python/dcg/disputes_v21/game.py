@@ -25,12 +25,10 @@ class ExecutorRefused(Refused):
 
 
 def log_claim_neutral(step: dict, name: str) -> bool:
-    """On-chain LOG gap: only STEP and uncheckable initial STATE are neutral."""
-    if step["state_scheme"] != 2:
+    """On-chain LOG gap: STATE and STEP need admitted predecessor semantics."""
+    if step["state_scheme"] <= 1:
         return False
-    if name == "STEP":
-        return True
-    return name == "STATE" and S.decode_producer(step["state_predecessor"])[0] not in (1, 2)
+    return name in ("STEP", "STATE")
 
 
 @dataclass

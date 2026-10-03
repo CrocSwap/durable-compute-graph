@@ -158,7 +158,7 @@ class DisputeClient:
 
         def stage(role: int, body: bytes, writer: Keypair) -> None:
             created = CREATE_STAGE if role == ROLE_EXECUTOR else min(len(body), CREATE_STAGE)
-            grow_metas = [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, True),
+            grow_metas = [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, False),
                           AccountMeta(template, False, False), AccountMeta(dispute, False, False),
                           AccountMeta(buffer(role), False, True), AccountMeta(SYSTEM, False, False)]
             self._send("stage_create", bytes([role]) + struct.pack("<I", created), grow_metas, [challenger])
@@ -167,7 +167,7 @@ class DisputeClient:
                 add = min(len(body) - size, 10_240)
                 self._send("stage_grow", struct.pack("<I", add), grow_metas, [challenger])
                 size += add
-            write_metas = [AccountMeta(writer.pubkey(), True, False), AccountMeta(run, False, True),
+            write_metas = [AccountMeta(writer.pubkey(), True, False), AccountMeta(run, False, False),
                            AccountMeta(template, False, False), AccountMeta(dispute, False, False),
                            AccountMeta(buffer(role), False, True)]
             self._send_many([("stage_write", struct.pack("<I", at) + body[at:at + STAGE_PIECE], write_metas, [writer])
@@ -248,7 +248,7 @@ class DisputeClient:
                                               AccountMeta(template, False, True)], [payer])
 
     def close_cache(self, run: Pubkey, cache: Pubkey, executor: Pubkey) -> None:
-        self._send("close_cache", b"", [self._caller(), AccountMeta(run, False, True), AccountMeta(cache, False, True),
+        self._send("close_cache", b"", [self._caller(), AccountMeta(run, False, False), AccountMeta(cache, False, True),
                                         AccountMeta(executor, False, True)], [])
 
     def settle_dispute(self, run: Pubkey, template: Pubkey, dispute: Pubkey, challenger: Pubkey,

@@ -1,8 +1,4 @@
-"""Tag-227 skeleton's additive executor-wait clock.
-
-The bounded skeleton fixes c=1 and extend_slots=phase_window. Its run-level
-extension is applied to executor phases only; challenger deadlines stay fixed.
-"""
+"""Tag-227 skeleton's per-phase executor-wait clock."""
 
 from dataclasses import dataclass
 
@@ -11,7 +7,7 @@ from dataclasses import dataclass
 class LoadClock:
     phase_window: int
     waiting_e: int = 0
-    extension_total: int = 0
+    max_window: int = 10_000_000
 
     @staticmethod
     def _u64(value: int) -> int:
@@ -20,11 +16,9 @@ class LoadClock:
         return value
 
     def begin_executor_wait(self, now: int) -> int:
-        total = self._u64(self.extension_total + (self.phase_window if self.waiting_e >= 1 else 0))
         if self.waiting_e == (1 << 32) - 1:
             raise OverflowError("u32 executor wait overflow")
-        deadline = self._u64(now + self.phase_window)
-        self.extension_total = total
+        deadline = self._u64(now + min(self.phase_window * (1 + self.waiting_e), self.max_window))
         self.waiting_e += 1
         return deadline
 
@@ -32,9 +26,6 @@ class LoadClock:
         if self.waiting_e == 0:
             raise ValueError("no executor wait")
         self.waiting_e -= 1
-
-    def deadline(self, base: int, *, executor_wait: bool) -> int:
-        return self._u64(base + (self.extension_total if executor_wait else 0))
 
     @staticmethod
     def timed_out(now: int, deadline: int) -> bool:

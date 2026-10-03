@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""LOG-state claims with the narrowed on-chain neutrality (follow-up A).
+"""LOG-state claims under the safe on-chain neutrality boundary.
 
-The program judges LOG predecessor STATE claims for kinds 1 and 2. STEP and
-initial-state claims stay neutral. Replayed by the chunked oracle
+The template instruction cannot inspect predecessor specs, so STATE and STEP
+claims stay neutral. Replayed by the chunked oracle
 test with CHUNKED_SCENARIOS=tests/golden/dcg/disputes_v21/log_neutral_scenarios.json.
 """
 from __future__ import annotations

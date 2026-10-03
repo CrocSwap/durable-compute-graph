@@ -804,24 +804,20 @@ write_rate) × write_slots`.
 - With collision resistance, a node has one fold-valid child set, so one
   dispute cannot poison another (R2-S7).
 
-**Load extension, uncapped** (R3-B1).
-- The run keeps `extension_total:u64`. E's effective deadline in any dispute
-  is the stored base deadline plus `extension_total`, so an extension writes
-  only the run account, not N dispute accounts.
-- Each time a dispute starts waiting on E while `waiting_E ≥ c`,
-  `extension_total` grows by `extend_slots`. Extensions are counted per
-  *wait*, not per open.
-- Admission requires `extend_slots ≥ answer_slots`, the measured time for
-  E to land its largest answer. A kind 6 opening is the largest: three
-  leaves, three paths and a gate value, about 3.2 KB plus `3 × 32 × h` bytes
-  (R3-S3). Each additional waiting dispute therefore buys E the time to
-  answer it.
-- Every open costs a bond and pre-funds E's buffer, so the delay is paid
-  for.
+**Load extension, capped per phase** (R3-B1, follow-up B).
+- The run keeps `waiting_E:u32`. When a dispute begins waiting on E, its
+  deadline is stored once as `now + min(MAX_WINDOW, phase_window +
+  extend_slots × waiting_E)`. The bounded skeleton uses `extend_slots =
+  phase_window` and `c = 1`. Later opens, picks and answers never change that
+  deadline. Ending a wait only decrements `waiting_E`.
+- Admission requires `extend_slots ≥ answer_slots`, the measured time for E
+  to land its largest answer. A kind 6 opening is the largest: three leaves,
+  three paths and a gate value, about 3.2 KB plus `3 × 32 × h` bytes (R3-S3).
+- Every open costs a bond and pre-funds E's buffer, so the delay is paid for.
 - **Contention** (R3-S5). Picks and answers both write the run account.
   `answer_slots` must be measured with an attacker spamming picks before the
-  constants are fixed. Otherwise `waiting_E` and `extension_total` move to a
-  per-run counter account that only E's answers and the extension write.
+  constants are fixed. Otherwise `waiting_E` moves to a per-run counter
+  account that only phase transitions write.
 
 ## 9. Instructions
 
@@ -966,19 +962,20 @@ of tag 227 at bc4e391:
     dispute to a LOG step and get a free moot (no dispute cost, delayed
     finality), and a lie at a LOG step cannot be convicted. The program
     cannot enforce this, because it trusts the spec root.
-- **Follow-up A (queued):** narrow F3 to keep judging the STATE
-    predecessor check for producer kinds 1 and 2, which does not depend on
-    the scheme.
-  - **Follow-up B (queued):** the load extension counts every open dispute,
-    including the executor's own puppets waiting on their challenger, so an
-    executor can stretch its own deadlines up to `MAX_WINDOW` per phase (a
-    probe: 20 puppets, 15,750-slot deadlines, about 0.36 SOL locked and all
-    returned). Implement §8.3's additive extension, counted only while
-    disputes wait on the executor. There is no false finality: finalize
-    needs zero open disputes.
-  - Upgrading an existing program in place strands runs created before
-    0862470 (the run address changed). Drain them first, or deploy at
-    fresh addresses, as testnet already does.
+  - **Follow-up A (builder done; program admission open):** PlanBuilder
+    refuses LOG kind 1 chains with a different predecessor scheme or capacity.
+    The program template
+    instruction has only a spec root, so it cannot inspect those records;
+    LOG STATE and STEP claims remain neutral in this image. Kind 2 has no
+    reference or goldens yet. Admitters must still refuse LOG templates while
+    LOG STEP claims are moot; partial STATE checks do not establish soundness.
+  - **Follow-up B (done):** each executor wait gets a fixed, capped deadline
+    based on other live executor waits when it starts. Puppets cannot bank
+    time for future phases or revive an expired one.
+  - The shared testnet image needs a drain before an in-place upgrade: no
+    open v2.1 disputes. Old runs with a 12-byte load trailer are explicitly
+    refused by the new handler; the new trailer is 4 bytes. The earlier run
+    address change also strands older runs. Fresh addresses avoid both issues.
   - The commit deadline reuses the challenge window; the design's own
     commit deadline (after the inputs are complete) is not built.
   - Consumers identify a run by its address. The run id is not unique
@@ -986,35 +983,35 @@ of tag 227 at bc4e391:
   - Follow-ups A and B change endings and get their own independent review
     (Basanos project rule 10).
 
-**Follow-ups A and B (implementation candidate, 2026-10-03; independent
-review pending).** For LOG state, a present, well-formed leaf's STATE claim
-judges predecessor kinds 1 and 2 using the authenticated predecessor leaf or
-the run's external ref. An initial/other predecessor STATE claim and every
-LOG STEP claim remain neutral. Empty or malformed executor leaves still lose.
-The bounded skeleton encodes `waiting_E:u32` and `extension_total:u64` after
-the run's external refs. It uses `c=1` and `extend_slots=phase_window` (the
-only timing parameter its current template admits). OPEN and PICK enter an
-executor wait; REVEAL_NODES, CACHE_ANSWER, and REVEAL_LEAF leave it. An entry
-when another executor wait exists adds one phase window to the run total.
-An executor phase times out only after its stored base deadline plus that
-total; a challenger phase times out after its unextended stored deadline.
+**Follow-ups A and B (fix round, 2026-10-03; independent review
+pending).** PlanBuilder refuses LOG kind 1 chains with a different scheme or
+capacity. The program cannot make this check at template admission because
+its instruction receives only the spec root and block metadata. For safety,
+all LOG STATE and STEP claims remain neutral in this image. A program-side
+admission mechanism and kind 2 reference with goldens remain open. Empty or
+malformed executor leaves still lose. The bounded skeleton
+encodes `waiting_E:u32` after the run's external refs. OPEN and PICK enter an
+executor wait; REVEAL_NODES, CACHE_ANSWER and REVEAL_LEAF leave it. The
+entering dispute's deadline is fixed then, capped at `MAX_WINDOW` per phase.
 Ruling or mooting an executor wait decrements `waiting_E`. Arithmetic is
-checked; overflow refuses the instruction. The changed run account size
-requires fresh testnet runs for this skeleton.
+checked; overflow refuses the instruction. The changed run size requires
+fresh testnet runs.
 
 **Who profits by calling first?** OPEN is funded by its challenger; opening
-while another dispute waits on E extends E's deadline, but a puppet already
-waiting on C buys no extension. PICK can buy that extension only by ending
-its challenger's own wait and starting E's next wait. REVEAL_NODES,
-CACHE_ANSWER, and REVEAL_LEAF end an E wait, so a caller cannot bank future
-extension by answering first. CLAIM can now convict a false LOG predecessor
-of kind 1 or 2; the honest challenger receives its bond and, if earliest,
-the slasher share, while the payer receives the remainder. TIMEOUT respects
-the same effective deadline for E and the unchanged deadline for C. MOOT,
-CLOSE_DISPUTE, CLOSE_RUN, and CLOSE_TEMPLATE pay their recorded recipients;
-the permissionless caller, including a bystander, receives no rent or bond
-merely by calling first. For all these calls, the executor's only timing gain
-is the extension earned by genuine outstanding executor waits.
+while another dispute waits on E extends only the new dispute's deadline.
+PICK ends C's wait and fixes the next E deadline from the current live count.
+REVEAL_NODES, CACHE_ANSWER and REVEAL_LEAF end an E wait; a later OPEN sees
+only the remaining waits. CLAIM on LOG STATE or STEP returns the bond
+neutrally. A non-LOG
+proof claim may convict; the honest challenger receives its bond and, if
+earliest, the slasher share, while the payer receives the remainder. TIMEOUT
+reads the stored deadline for
+either role. MOOT, CLOSE_DISPUTE, CLOSE_RUN and CLOSE_TEMPLATE pay their
+recorded recipients; a bystander receives no rent or bond for calling first.
+Post-ruling staging formerly accepted CREATE, WRITE and GROW. It appears to
+profit nobody: the creator still receives buffer rent on CLOSE, and the
+caller pays transaction fees. Those staging calls now refuse after a ruling;
+CLOSE remains allowed.
 - **Not changed:** F6 (buffers an executor created before bc4e391 refund the
   challenger; testnet only), F7 (receipt offsets differ from a live run;
   status stays at byte 4, and the Python client now checks the magic), F8 (a

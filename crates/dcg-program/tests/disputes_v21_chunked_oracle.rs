@@ -117,11 +117,11 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
             .unwrap_or_else(|err| panic!("{name}: reveal {r}: {err:?}"));
         if settle {
             let raw = ctx.banks_client.get_account(run).await.unwrap().unwrap().data;
-            let extension = &raw[raw.len() - 12..];
+            let extension = &raw[raw.len() - 4..];
             let before = extension.to_vec();
             assert!(tx.send(ctx, reveal, &[&e]).await.is_err(), "{name}: E banked time while C owed PICK");
             let raw = ctx.banks_client.get_account(run).await.unwrap().unwrap().data;
-            assert_eq!(&raw[raw.len() - 12..], before, "{name}: E wait extension grew on C's turn");
+            assert_eq!(&raw[raw.len() - 4..], before, "{name}: E wait count changed on C's turn");
         }
         tx.send(ctx, ix(V::SUB_PICK, &[round["pick"].as_u64().unwrap() as u8], party(&c)), &[&c])
             .await
@@ -141,13 +141,13 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
         let created = if *role == V::ROLE_EXECUTOR { V::CREATE_STAGE } else { body.len().min(V::CREATE_STAGE) };
         let mut data = vec![*role];
         data.extend_from_slice(&(created as u32).to_le_bytes());
-        tx.send(ctx, ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(dispute, false), AccountMeta::new(buffer(*role), false), AccountMeta::new_readonly(SYSTEM, false)]), &[&c])
+        tx.send(ctx, ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(dispute, false), AccountMeta::new(buffer(*role), false), AccountMeta::new_readonly(SYSTEM, false)]), &[&c])
             .await
             .unwrap_or_else(|err| panic!("{name}: stage create: {err:?}"));
         let mut size = created;
         while size < body.len() {
             let add = (body.len() - size).min(10_240);
-            tx.send(ctx, ix(V::SUB_STAGE_GROW, &(add as u32).to_le_bytes(), vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(dispute, false), AccountMeta::new(buffer(*role), false), AccountMeta::new_readonly(SYSTEM, false)]), &[&c])
+            tx.send(ctx, ix(V::SUB_STAGE_GROW, &(add as u32).to_le_bytes(), vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(dispute, false), AccountMeta::new(buffer(*role), false), AccountMeta::new_readonly(SYSTEM, false)]), &[&c])
                 .await
                 .unwrap_or_else(|err| panic!("{name}: stage grow: {err:?}"));
             size += add;
@@ -157,7 +157,7 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
         for (i, piece) in body.chunks(600).enumerate() {
             let mut w = ((i * 600) as u32).to_le_bytes().to_vec();
             w.extend_from_slice(piece);
-            tx.send(ctx, ix(V::SUB_STAGE_WRITE, &w, vec![AccountMeta::new_readonly(writer.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(dispute, false), AccountMeta::new(buffer(*role), false)]), &[writer])
+            tx.send(ctx, ix(V::SUB_STAGE_WRITE, &w, vec![AccountMeta::new_readonly(writer.pubkey(), true), AccountMeta::new_readonly(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(dispute, false), AccountMeta::new(buffer(*role), false)]), &[writer])
                 .await
                 .unwrap_or_else(|err| panic!("{name}: stage write: {err:?}"));
         }
