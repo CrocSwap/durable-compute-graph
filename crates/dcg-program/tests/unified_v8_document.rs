@@ -6278,7 +6278,7 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             }
         );
         let (bond_escrow, _) = address::bond_escrow(&f.program, &descriptor);
-        f.ctx.set_account(&bond_escrow, &shared(system_funded()));
+        fund_system(&mut f.ctx, &f.executor, bond_escrow, 1_000_000_000_000).await;
         let executor = f.executor.pubkey();
         let settlement_winner = if expected_winner == 2 {
             challenger
@@ -12462,8 +12462,7 @@ async fn settle_and_close_standard_app_challenge(
     terms: &Terms2,
 ) {
     let third_party = Keypair::new();
-    f.ctx
-        .set_account(&third_party.pubkey(), &shared(system_funded()));
+    fund_system(&mut f.ctx, &f.executor, third_party.pubkey(), 1_000_000_000_000).await;
     let (response, response_bump) = dcg_program::closure_v2_response::address(&f.program, &record);
     let settled_record = f.account(record).await;
     assert_eq!(
@@ -12619,8 +12618,7 @@ async fn settle_and_close_neutral_app_challenge(
     terms: &Terms2,
 ) {
     let third_party = Keypair::new();
-    f.ctx
-        .set_account(&third_party.pubkey(), &shared(system_funded()));
+    fund_system(&mut f.ctx, &f.executor, third_party.pubkey(), 1_000_000_000_000).await;
     let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
     let record_before = f.lamports(record).await;
     let challenger_before = f.lamports(f.signer.pubkey()).await;
@@ -14223,8 +14221,7 @@ async fn rev8_two_challengers_can_contest_the_same_app_leaf_sbf() {
     .await;
 
     let first_challenger = std::mem::replace(&mut f.signer, Keypair::new());
-    f.ctx
-        .set_account(&f.signer.pubkey(), &shared(system_funded()));
+    fund_system(&mut f.ctx, &f.executor, f.signer.pubkey(), 1_000_000_000_000).await;
     let second_record = descend_position_challenge_with_witness(
         &mut f,
         created,
@@ -15311,8 +15308,7 @@ async fn rev8_select_timeout_preserves_response_bump_for_settlement_sbf() {
         expected_response_bump.value()
     );
     let third_party = Keypair::new();
-    f.ctx
-        .set_account(&third_party.pubkey(), &shared(system_funded()));
+    fund_system(&mut f.ctx, &f.executor, third_party.pubkey(), 1_000_000_000_000).await;
     let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
     send_fresh_with(
         &mut f.ctx,
@@ -15384,8 +15380,7 @@ async fn rev8_app_leaf_fast_conviction_settles_from_open_bump_sbf() {
         expected_response_bump.value()
     );
     let third_party = Keypair::new();
-    f.ctx
-        .set_account(&third_party.pubkey(), &shared(system_funded()));
+    fund_system(&mut f.ctx, &f.executor, third_party.pubkey(), 1_000_000_000_000).await;
     let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
     let record_balance = f.lamports(record).await;
     let challenger_before = f.lamports(f.signer.pubkey()).await;
