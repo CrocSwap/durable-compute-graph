@@ -59,10 +59,6 @@ pub const MAX_TRANSACTION_COMPUTE_UNITS: u64 = 1_400_000;
 pub const MAX_DECLARED_KERNEL_COMPUTE_UNITS: u64 =
     MAX_TRANSACTION_COMPUTE_UNITS - APP_REPLAY_MEASURED_OVERHEAD_CU - APP_REPLAY_CU_MARGIN;
 
-/// The mode a kernel advertises to replay a DCG v2.1 STEP claim (tag 227):
-/// `"STEP"`, version 1. A manifest kernel without it is not a STEP kernel.
-pub const MODE_STEP_V21: ModeId = VersionedId { id: 0x5354_4550, version: 1 };
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelManifest {
     pub id: KernelId,
@@ -2326,3 +2322,9 @@ mod tests {
         assert_eq!(registry.resolve(b"child", 8), None);
     }
 }
+
+// Kept at the end of the file: items added for feature-gated code must not
+// shift the line numbers (panic locations) of code in the default image.
+/// The mode a kernel advertises to replay a DCG v2.1 STEP claim (tag 227):
+/// `"STEP"`, version 1. A manifest kernel without it is not a STEP kernel.
+pub const MODE_STEP_V21: ModeId = VersionedId { id: 0x5354_4550, version: 1 };
