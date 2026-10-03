@@ -1,36 +1,55 @@
 # DCG v2 milestone roadmap
 
-**Status: milestones 1–3 reached on Fogo testnet as fast-path mechanics
-demonstrations (2026-10-01/02); none of it is reviewed yet.** The table
-below is the original designed sequence. Its durations are **estimates**
-from the kickoff and must not be summed as elapsed time. The status by
-milestone follows.
+**Status (2026-10-03): milestones 1, 2 and 4 are done for the v2.0 trace
+path. Milestone 3, disputes, moved to v2.1 (optimistic first-divergence
+descent, tag 227), which now runs on testnet with real Basanos kernels but
+is not yet independently reviewed (a review is running).** The table at the
+end is the original designed sequence; its durations are **estimates** from
+the kickoff and must not be summed as elapsed time.
 
-## Status (2026-10-02)
+## Status by milestone (2026-10-03)
 
 | # | Milestone | Status |
 |---|---|---|
-| 1 | Hello Graph locally | **Done.** `dcg.tracing` lowers every expressible traced graph to canonical v2.0 graph and plan bytes. `crates/dcg-wire` decodes them against golden vectors, and admission checks the uploaded bytes against the canonical lowering (errors 29–31). |
-| 2 | Hello Graph on the shared program | **Done on testnet** (*measured* 2026-10-01, `docs/hello-graph.md`). Labeled a mechanics demonstration; its shortcuts against the frozen spec are listed in that note. |
-| 3 | Hello Dispute | **Runs on testnet; not sound yet.** Root-committed descent (tags 220–226) and trace-committed replay ran honest, dishonest, forged-input and silent cases on testnet (*measured*, `docs/hello-graph.md`), and the value digest is final (`dcg.value.v2`). The 2026-10-02 review (Basanos `out/runs/review-dcg-graph-v2-2026-10-02.md`) found eight blockers: forgeable records via raw-write tag 208 (B1); region outputs and leaf positions not bound to steps (B2); replay needing preimages of committed digests (B3); child authentication accepting any child (B4); one dispute slot that can be held past the window (B5); a grindable sampling seed (B6); refutations that exceed one transaction (B7); root commits on unverified templates (B8). Verdict: never default tag 208; the trace-committed path (209–218) after B1, S1, S3, S5 and a program-test suite; sampling and descent need a redesign. Tags 208–226 stay behind the `graph-v2` feature. |
-| 4 | `explain()` with a composed guarantee | **Done for the trace-committed v2.0 profile (offline, 2026-10-02).** `explain(mode, samples, measured, commitment)` names each region's mode, every cross-region import and its relation, the registered kernels, the dispute path, the image's open review status, and designed versus measured ceilings. It refuses (`TraceError`) an unknown mode or commitment, an unregistered kernel version, and, per the review, any root commitment or sampling mode (`UNSOUND`) until those are redesigned. Composition is trivial today because the program admits one mode per template; mixed-mode regions are spec-legal but refused at admission. Tests: `python/tests/test_explain.py`. |
-| 5 | Doom consumer | **Running on stateful v3, below target.** Doom runs on DCG stateful v3 sessions (not the v2 graph lifecycle) at 1.63–1.66 frames/s on testnet (*measured*, Basanos `docs/experiments/fast-path-status-2026-10-01.md`) against the 3.0/s goal. The limit is v3's single cursor, phase lock and write set; `docs/design/stateful-session-lanes-v1.md` is the designed fix (owner decisions recorded, not implemented). |
-| 6–8 | Sampling, Freivalds, ZK | Not started. |
+| 1 | Hello Graph locally | **Done** (2026-10-01). `dcg.tracing` lowers traced graphs to canonical v2.0 graph and plan bytes; `crates/dcg-wire` decodes them against goldens; admission checks uploads against the canonical lowering. |
+| 2 | Hello Graph on the shared program | **Done on testnet** (*measured* 2026-10-01, `docs/hello-graph.md`), a mechanics demonstration. The shared program runs image `7b04f8d5` (2026-10-02). |
+| 3 | Hello Dispute | **v2.0 descent and sampling are retired in favour of v2.1** (`docs/design/optimistic-descent-v2.1.md`), after the 2026-10-02 review's eight v2.0 blockers. v2.1 status is below. |
+| 4 | `explain()` with a composed guarantee | **Done for the trace-committed v2.0 profile** (offline, 2026-10-02); it refuses root commitments and sampling. Not yet extended to v2.1 templates. |
+| 5 | Doom consumer | **Runs on stateful v3, below target:** 1.63–1.67 frames/s on testnet against the 3.0/s goal (*measured* 10-02). Lanes (`docs/design/stateful-session-lanes-v1.md`) have owner decisions; the sequencer's `OrderedLane` exists; the program-side lanes are not implemented. |
+| 6–8 | Sampling, Freivalds, ZK | Not started. Their place in v2.1 is a per-region mode (design §11). |
 
-Trace-path blockers (2026-10-02, offline): `graph-v2` now routes only
-209–218; sampling and descent moved to `graph-v2-experimental`, raw write to
-`graph-v2-raw-write`. B1 (derived addresses for blobs, templates and runs;
-blob seal checks its magic and length), S1 (dust-proof creation), S3
-(window 1–10,000,000 slots, checked deadline) and S5 (payer closes an
-uncommitted run) are fixed, with a native program-test suite
-(`crates/dcg-program/tests/graph_v2_trace.rs`, 10 tests). Not done: an SBF
-build and a redeploy of the shared testnet program, which still runs the
-pre-review image; S2, S4, S6–S11 are open.
+## v2.1 (tag 227) status
 
-Next, in order: a re-review of the trace path for default builds; SBF build
-and testnet redeploy; redesign descent and sampling (B2–B8); lanes
-implementation; a testnet run of the transport v1.1 work (done offline,
-`docs/design/realtime-transport-v1.md`).
+All *measured* items are on Fogo testnet or in ProgramTest as named; none is
+independently reviewed yet.
+
+| Capability | Status |
+|---|---|
+| Descent, claims (SHAPE, EDGE, STATE, STEP, GATE, OUT), repeated blocks, gates, kind 6 | Done: native and SBF oracle suites agree with the Python referee (687+ chunked scenarios). |
+| Chunked kernels, committed constants (plain and chunked) | Done (10-02): oracle-checked natively, on SBF and on testnet (26/26 replay scenarios, forged ConstSpec openings refused). |
+| Staging buffers (128 KiB), reveal cache | Done. |
+| Application kernels from the embedding image's manifest | Done (8680be8, 10-03). Basanos's test image runs form 4 (`basanos-f4-v1`, weight rows as committed constants) and form 22 (`basanos-f22-v1`): 31/31 oracle cases natively and on SBF, and 31 live disputes on testnet rule as the oracle. |
+| Rent reclaim | Done (bc4e391, 10-03): disputes with their staging buffers, runs (shrunk to a receipt that keeps status and root), caches. Live on testnet: a 64 KiB dispute returns about 0.48 FOGO. **Open:** template closes (in progress). |
+| LOG state (KV cache) | Python reference only (d2d9f51). |
+| List inputs (wide steps, more than 8 producers) | Python reference done and owner-approved (10-03); crate, wire and program in progress. |
+| Attested admission | Done for revision 8 (9cad0d3). |
+| Admission cursor | Parked (10-02): templates are trusted subjectively and verified off-chain. |
+
+**What Basanos still needs before migrating documents to v2.1** (design §13):
+1. Attention witness growth at late positions: being measured (10-03).
+2. LOG state in the program.
+3. Typed decisions as a v2.1 template.
+4. Per-form decompositions and CU.
+
+## Next, in order
+
+1. The independent v2.1 review; fix its findings.
+2. List inputs and template closes in the program (in progress).
+3. LOG state in the crate and program.
+4. The attention decomposition, chosen from the 10-03 measurement.
+5. A v2.1 Basanos document template (one repeated block per position), end to end on testnet.
+6. Lanes in the program, for Doom.
+7. Sampling and Freivalds as v2.1 region modes.
 
 ## Original sequence (kickoff estimates)
 
