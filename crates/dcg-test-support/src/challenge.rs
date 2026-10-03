@@ -172,3 +172,110 @@ impl Template {
         self.response_seal(c).await.expect("seal (118)");
     }
 }
+
+/// A position committed around one chosen leaf: what the executor landed and
+/// what a leaf challenge on that leaf carries.
+#[derive(Clone, Debug)]
+pub struct CommittedLeaf {
+    pub position: u32,
+    pub segment: u16,
+    pub local: u32,
+    pub leaf: [u8; 32],
+    pub path: Vec<[u8; 32]>,
+    pub spp1: Vec<u8>,
+    pub position_root: [u8; 32],
+}
+
+/// A Merkle path over `leaves` in the closure-v2 node format (duplicate-last
+/// on odd levels), and the tree root.
+pub fn tree_path(descriptor: &[u8; 32], kind: u8, scope: u32, leaves: &[[u8; 32]], target: usize) -> (Vec<[u8; 32]>, [u8; 32]) {
+    let mut nodes: Vec<([u8; 32], u32, u32)> = leaves.iter().enumerate().map(|(i, l)| (*l, i as u32, i as u32 + 1)).collect();
+    let (mut at, mut height, mut path) = (target, 0u8, Vec::new());
+    while nodes.len() > 1 {
+        path.push(nodes.get(at ^ 1).unwrap_or(&nodes[at]).0);
+        height += 1;
+        nodes = nodes
+            .chunks(2)
+            .map(|pair| {
+                let (l, r) = (pair[0], *pair.get(1).unwrap_or(&pair[0]));
+                let digest = h::hash(
+                    b"node/2",
+                    &[descriptor, &[kind], &scope.to_le_bytes(), &l.1.to_le_bytes(), &r.2.to_le_bytes(), &[height, 1], &l.0, &r.0],
+                );
+                (digest, l.1, r.2)
+            })
+            .collect();
+        at /= 2;
+    }
+    (path, nodes[0].0)
+}
+
+impl Template {
+    /// The position root an executor commits at `position` with `leaf` at
+    /// plan entry `entry`; every other leaf and segment root is the
+    /// executor's own filler (only the challenged leaf's path matters).
+    pub fn commit_leaf(&self, descriptor: &[u8; 32], position: u32, entry: u32, leaf: [u8; 32]) -> CommittedLeaf {
+        let x = self.fixture.view();
+        let c = x.coordinate(position, entry).unwrap();
+        let (ordinal, count) = (0..x.segment_count as usize)
+            .find_map(|o| x.segment_row(position, o).ok().filter(|r| r.0 == c.segment).map(|r| (o, r.1)))
+            .expect("the entry's segment is in the plan");
+        let mut leaves: Vec<[u8; 32]> = (0..count).map(|i| sha256(&[b"executor-filler-leaf", &i.to_le_bytes()])).collect();
+        leaves[c.local as usize] = leaf;
+        let (path, tree) = tree_path(descriptor, 1, position, &leaves, c.local as usize);
+        let segment_root = h::hash(
+            b"segment-root/2",
+            &[descriptor, &position.to_le_bytes(), &c.segment.to_le_bytes(), &count.to_le_bytes(), &tree, &[1]],
+        );
+        let mut segment_roots: Vec<[u8; 32]> =
+            (0..x.segment_count as u32).map(|i| sha256(&[b"executor-filler-segment", &i.to_le_bytes()])).collect();
+        segment_roots[ordinal] = segment_root;
+        let (spp_path, _) = tree_path(descriptor, 2, position, &segment_roots, ordinal);
+        let table_root = x.segment_table_root(position).unwrap();
+        let position_root = challenge::spp1_position_root(
+            descriptor,
+            position,
+            x.segment_count,
+            &segment_root,
+            ordinal as u16,
+            &table_root,
+            &spp_path,
+            &table_root,
+        )
+        .unwrap()
+        .expect("the segment proof folds");
+        let mut spp1 = (ordinal as u16).to_le_bytes().to_vec();
+        spp1.push(spp_path.len() as u8);
+        spp1.push(0);
+        spp1.extend_from_slice(&table_root);
+        for s in &spp_path {
+            spp1.extend_from_slice(s);
+        }
+        CommittedLeaf { position, segment: c.segment, local: c.local, leaf, path, spp1, position_root }
+    }
+
+    /// Tag 166's data opening a committed leaf.
+    pub fn committed_leaf_packet(&self, doc: &Document, c: &CommittedLeaf, nonce: u32) -> Vec<u8> {
+        let mut out = vec![TAG_CHALLENGE_LEAF];
+        out.extend_from_slice(&doc.descriptor);
+        out.extend_from_slice(&c.position.to_le_bytes());
+        out.extend_from_slice(&c.segment.to_le_bytes());
+        out.extend_from_slice(&c.local.to_le_bytes());
+        out.extend_from_slice(&c.leaf);
+        out.push(c.path.len() as u8);
+        for s in &c.path {
+            out.extend_from_slice(s);
+        }
+        out.extend_from_slice(&c.spp1);
+        out.extend_from_slice(&nonce.to_le_bytes());
+        out
+    }
+
+    /// Open a leaf challenge (166) on a committed leaf.
+    pub async fn open_committed_leaf(&mut self, doc: &Document, c: &CommittedLeaf, nonce: u32) -> Result<Challenge, TransactionError> {
+        let data = self.committed_leaf_packet(doc, c, nonce);
+        self.send_challenge_leaf(doc, data).await?;
+        let record = self.challenge_record(doc, nonce);
+        Ok(Challenge { record, response: response::address(&self.program, &record).0, nonce })
+    }
+}

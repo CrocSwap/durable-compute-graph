@@ -514,6 +514,10 @@ impl Binding2 {
         // Refuse an id outside the committed logits row here, before any of
         // the derived gather routes can be instantiated. Keep the hash check
         // first so malformed bytes cannot be reported as a semantic id error.
+        // The test-only legacy mode admits such a table, as a program before
+        // this check did, so the fix-point's conviction can be tested on a
+        // document made by real instructions.
+        #[cfg(not(feature = "test-legacy-unchecked-option-range"))]
         for token in options.chunks_exact(4) {
             let id = u32::from_le_bytes(token.try_into().unwrap());
             if id as usize >= crate::kernels::decision::LOGITS_ROW_LENGTH {

@@ -23,6 +23,7 @@ use dcg_program::unified::{TAG_ATTEST_OUTPUT, TAG_FINALIZE_DOCUMENT, TAG_LAND_PO
 use solana_instruction::account_meta::AccountMeta;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
+use solana_transaction_error::TransactionError;
 
 pub const ESCROW_FLOOR: u64 = 890_880;
 pub const FAMILY_COUNT: u16 = 16;
@@ -175,6 +176,17 @@ impl Template {
     /// UnifiedInit (161). The four created PDAs are funded by real System
     /// Program transfers first, as the permissionless path expects.
     pub async fn init_document(&mut self, binding: &Binding2, terms: &[u8], family_body: &[u8], options: &[u8]) -> Document {
+        self.try_init_document(binding, terms, family_body, options).await.expect("UnifiedInit (161)")
+    }
+
+    /// UnifiedInit (161), returning the program's refusal instead of panicking.
+    pub async fn try_init_document(
+        &mut self,
+        binding: &Binding2,
+        terms: &[u8],
+        family_body: &[u8],
+        options: &[u8],
+    ) -> Result<Document, TransactionError> {
         let descriptor = self.descriptor(binding, terms, family_body);
         let created = [
             address::document(&self.program, &descriptor).0,
@@ -211,8 +223,8 @@ impl Template {
             AccountMeta::new(created[3], false),
             AccountMeta::new(self.dtu1, false),
         ];
-        self.chain.send(&ex, &[], data, metas).await.expect("UnifiedInit (161)");
-        Document {
+        self.chain.send(&ex, &[], data, metas).await?;
+        Ok(Document {
             descriptor,
             dcm2: created[0],
             dpr2: created[1],
@@ -220,7 +232,7 @@ impl Template {
             dcr2: created[3],
             binding: *binding,
             terms: terms.to_vec(),
-        }
+        })
     }
 
     /// Land position roots (162) from `first`, in batches of 20.
