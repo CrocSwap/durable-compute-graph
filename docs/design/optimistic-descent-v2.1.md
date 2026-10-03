@@ -765,8 +765,11 @@ OPEN(kind = STEP_DESCEND | OUT_DESCEND); C posts its bond and pre-funds both sta
   Both rents are refunded to C at close. So griefing locks C's capital, not
   E's. In section 9, `STAGE_CREATE` for E's buffer happens inside
   `OPEN_DISPUTE`.
-- Either party may write to its buffer at any time, in 900-byte writes,
-  growing it 10,240 bytes at a time. Only the submit is timed.
+- Each party may write to its buffer in 900-byte writes and grow it in
+  10,240-byte increments. E's writes and growth stop when the dispute enters
+  `AWAIT_CLAIM`; this freezes any leaf data, including revealed list refs,
+  that a later claim reads. C can continue writing its own claim through
+  submission. Only the submit is timed.
 - Admission sets `max_opening` to the largest of:
   - one leaf (up to 1,040 bytes) plus a path;
   - one spec record (up to 1,024 bytes) plus a path;
@@ -832,11 +835,12 @@ write_rate) × write_slots`.
 | `STAGE_CREATE`, `STAGE_WRITE` | each party, on its own buffer |
 | `REVEAL_NODES`, `PICK`, `REVEAL_LEAF`, `CLAIM`, `SUBMIT_OPENING`, `SUBMIT_WITNESS` | E, C, E, C, E, C |
 | `TIMEOUT`, `ADVANCE_RULED_PREFIX`, `SETTLE`, `FINALIZE_RUN` | anyone |
-| `CANCEL_RUN` | the payer, while `now > commit_deadline` with no commit |
+| `CANCEL_RUN` | anyone, while `now > commit_deadline` with no commit; rent goes to the run payer |
 | `CLOSE_DISPUTE` (only after `ruled_prefix > sequence`, R2-S8), `CLOSE_STAGING`, `CLOSE_RUN` (leaves the receipt), `CLOSE_CACHE` | anyone; rent goes to the recorded payers |
-| `CLOSE_TEMPLATE` | the recorded template payer, after every run has been cancelled or converted to a receipt |
+| `RETIRE_TEMPLATE` | the recorded template payer; blocks future `INIT_RUN` calls |
+| `CLOSE_TEMPLATE` | the recorded template payer, when the active-run count is zero |
 
-**Rent reclaim (tag 227 subs 18–21).** Dispute, run and cache reclaim is
+**Rent reclaim (tag 227 subs 18–22).** Dispute, run and cache reclaim is
 measured by the v2.1 skeleton suite, natively and on SBF; nine planted guard
 bugs are each caught. Template-close coverage and its planted guard bugs are
 recorded below with their implementation results.
@@ -855,18 +859,25 @@ recorded below with their implementation results.
   bytes, then its root) instead of a separate `["dcg2rcpt", run_id]`
   account. Keeping the address occupied keeps the run id single-use, so the
   same run cannot be initialized and committed a second time. The freed
-  rent goes to the run's payer. An uncommitted run is cancelled (closed
-  whole) by its payer only, as `CANCEL_RUN` would be.
+  rent goes to the run's payer. An uncommitted run may be cancelled by anyone
+  after the commit deadline; the full run balance still goes to its payer.
+  **Who profits by calling this first?** The caller receives no rent. It can
+  free one template run slot and unblock the payer's template closure.
 - **`CLOSE_CACHE` (20), anyone.** Allowed once the run is settled with no
   open dispute, or is a receipt or cancelled. New caches record the
   executor that paid their rent (32 bytes after the revealed nodes, 1,112
   bytes in all); `cache_answer` accepts both sizes. A cache from before this
   change closes only while its run or receipt can name the executor.
+- **`RETIRE_TEMPLATE` (22), the recorded template payer.** This one-way
+  transition sets the retired bit in the template's previously reserved pad
+  and makes `INIT_RUN` refuse. The payer can stop new runs while existing
+  runs settle or expire.
 - **`CLOSE_TEMPLATE` (21), the recorded template payer.** New templates
   append a 40-byte extension after the fixed block area: `D21O`, the
   creating admitter's key (the account funding template rent), and
-  `active_runs:u32`. The extension does not enter the template ID or change
-  the instruction's account order. Existing template accounts retain their
+  `active_runs:u32`. The retired flag uses a previously reserved byte; neither
+  field enters the template ID or changes the instruction's account order.
+  Existing template accounts retain their
   original size and remain usable with their original read-only template
   metas; they lack reliable provenance and are therefore not closeable.
   `INIT_RUN` increments the count. `CLOSE_RUN` decrements it only when an
@@ -879,33 +890,38 @@ recorded below with their implementation results.
   `CLOSE_RUN` mark their existing template account slot writable to update
   the count; the account positions are unchanged. Template closure requires
   the recorded payer's signature, a writable template account and a zero
-  count, then drains the account to that payer. New closeable template PDAs
-  reject prior system-account pre-funding, so the recorded admitter actually
-  supplies the creation rent; old template creation keeps its original
-  pre-funding behavior.
+  count, then drains the account to that payer. A zero-count template may be
+  retired and closed immediately. Empty, system-owned, pre-funded template
+  PDAs are adopted, and all lamports held at close go to the recorded payer,
+  including the pre-fund (a pre-funded escrow is a gift, not a lock). A
+  front-run creator can become the recorded payer, but creation is
+  content-addressed, so the template bytes and identity are unchanged.
 
   **Who profits by calling this first?** The executor gets no rent and
   cannot authorize closure; the challenger gets no rent and cannot
   authorize closure; the payer receives the template rent and chooses when
   to give up future reuse; a bystander gets no rent and cannot authorize
   closure. The signature plus zero-count guard prevents another role from
-  racing the payer to remove a reusable template. Concurrent initialization
-  and closure serialize on the writable template account.
+  racing the payer to remove a reusable template. Concurrent initialization,
+  retirement and closure serialize on the writable template account.
 
-  **Template-close validation (measured, 2026-10-03).** The v2.1 skeleton
-  suite passed 18 tests natively and 18 against the v1.51 SBF image. It
-  covers cancellation, final receipts, refuted receipts, claim and timeout
-  rulings, moot disputes, legacy read-only template accounts, and exact
-  lamport conservation. Three native guard mutations were each caught:
+  **Template-close validation (measured, 2026-10-03).** The original close
+  implementation passed 18 tests natively and 18 against the v1.51 SBF image.
+  After the independent-review rework, the 21-test v2.1 skeleton suite passed
+  natively and against the v1.51 SBF image. It covers cancellation, retired
+  templates, final receipts, refuted receipts, claim and timeout rulings,
+  moot disputes, legacy read-only template accounts, pre-funded template
+  adoption, front-run creation, and exact lamport conservation. The earlier
+  native guard-mutation run caught each of these failures:
   removing the active-run check fails
   `an_uncommitted_run_cancels_for_its_payer_after_the_commit_deadline`,
   removing the recorded-payer check fails
   `an_honest_run_closes_every_account_and_returns_all_rent`, and skipping the
   run-close decrement makes that same test fail at template closure. The
-  mutations were restored before the final native and SBF runs. Receipts
-  are under Basanos `out/runs/dcg-v21-lists-2026-10-03/`; the SBF image
-  SHA-256 is
-  `1a3cf788e6e36e01e2c45607a5753160cd38fd8f59e4844d34d6515896b81e9b`.
+  mutations were restored before their final native and SBF runs. Current
+  rework artifacts are under Basanos
+  `out/runs/dcg-v21-lists-r2-2026-10-03/`; the SBF image SHA-256 is
+  `651e937e56abd33467b328d44f7b2a7b5d4986134fabbfd96208c49b9fba9ecd`.
 
 **Independent review fixes (2026-10-03).** From the first independent review
 of tag 227 at bc4e391:
