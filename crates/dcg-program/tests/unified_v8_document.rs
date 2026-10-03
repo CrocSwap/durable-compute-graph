@@ -147,6 +147,7 @@ use solana_signer::Signer;
 use solana_transaction::Transaction;
 use solana_transaction_error::TransactionError;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const SYSTEM: Pubkey = solana_program::system_program::ID;
 const CL_MALFORMED: u32 = 580;
@@ -957,6 +958,8 @@ fn hashing_pt2s(
 /// need, so there is no method-borrow dance to get wrong.
 struct Fix {
     ctx: ProgramTestContext,
+    /// The lifecycle-v2 property path's quiet sender.
+    lifecycle_v2_cache: QuietSendCache,
     program: Pubkey,
     executor: Keypair,
     signer: Keypair,
@@ -1774,6 +1777,7 @@ async fn build_from_template(
     .to_vec();
     let locator = t.locator;
     Some(Fix {
+        lifecycle_v2_cache: QuietSendCache::default(),
         ctx: t.chain.ctx,
         program: t.program,
         executor: t.roles.executor,
@@ -2655,6 +2659,7 @@ async fn build_with_pre_fix_seal_processor(
     .encode()
     .to_vec();
     Some(Fix {
+        lifecycle_v2_cache: QuietSendCache::default(),
         ctx,
         program,
         executor: executor_kp,
@@ -4281,6 +4286,7 @@ async fn rev8_finalize_refuses_a_late_document_with_736() {
         ..Terms2::decode(&f.terms_raw).unwrap()
     };
     let mut f2 = Fix {
+        lifecycle_v2_cache: QuietSendCache::default(),
         terms_raw: big.encode().to_vec(),
         ..f
     };
@@ -4372,6 +4378,7 @@ async fn rev8_land_clamps_the_production_deadline_to_the_lifetime() {
         ..Terms2::decode(&f.terms_raw).unwrap()
     };
     let mut f = Fix {
+        lifecycle_v2_cache: QuietSendCache::default(),
         terms_raw: big.encode().to_vec(),
         ..f
     };
@@ -16540,4 +16547,711 @@ async fn rev8_timeout_refutes_a_challenger_who_stalls_in_descent() {
         "the record rent returns to the challenger who funded it"
     );
     assert_eq!(f.lamports(record).await, 0, "the settled record is drained");
+}
+
+
+// ------------------------------------------------- lifecycle-v2 property path
+// Ported from the Basanos switchover copy (2026-10-02): DCG-core lifecycle
+// behavior lives with DCG (rule 6).
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LifecycleV2AccountImage {
+    lamports: u64,
+    data: Vec<u8>,
+    owner: Pubkey,
+    executable: bool,
+    rent_epoch: u64,
+}
+
+static LIFECYCLE_V2_TX_COUNT: AtomicU64 = AtomicU64::new(0);
+
+static LIFECYCLE_V2_TOTAL_CU: AtomicU64 = AtomicU64::new(0);
+
+static LIFECYCLE_V2_MAX_CU: AtomicU64 = AtomicU64::new(0);
+
+static LIFECYCLE_V2_REFUSAL_PROBES: AtomicU64 = AtomicU64::new(0);
+
+fn lifecycle_v2_record_cu(compute_units: u64) {
+    LIFECYCLE_V2_TX_COUNT.fetch_add(1, Ordering::Relaxed);
+    LIFECYCLE_V2_TOTAL_CU.fetch_add(compute_units, Ordering::Relaxed);
+    let mut prior = LIFECYCLE_V2_MAX_CU.load(Ordering::Relaxed);
+    while compute_units > prior {
+        match LIFECYCLE_V2_MAX_CU.compare_exchange_weak(
+            prior,
+            compute_units,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => prior = actual,
+        }
+    }
+}
+
+fn lifecycle_v2_known_keys(f: &Fix, extra: &[Pubkey]) -> Vec<Pubkey> {
+    let mut keys = vec![
+        f.program,
+        f.executor.pubkey(),
+        f.pt2s,
+        f.pt1s_index,
+        f.routes,
+        f.geometry,
+        f.payloads,
+        f.drp2,
+        f.dea2,
+        f.dta1,
+        f.dtu1,
+    ];
+    keys.extend_from_slice(extra);
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+async fn lifecycle_v2_snapshot(
+    ctx: &mut ProgramTestContext,
+    keys: &[Pubkey],
+    fee_payer: Pubkey,
+) -> Vec<(Pubkey, Option<LifecycleV2AccountImage>)> {
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys.iter().copied().filter(|key| *key != fee_payer) {
+        let image = ctx.banks_client.get_account(key).await.unwrap().map(|account| {
+            LifecycleV2AccountImage {
+                lamports: account.lamports,
+                data: account.data,
+                owner: account.owner,
+                executable: account.executable,
+                rent_epoch: account.rent_epoch,
+            }
+        });
+        out.push((key, image));
+    }
+    out
+}
+
+async fn lifecycle_v2_expect_refusal_unchanged(
+    ctx: &mut ProgramTestContext,
+    cache: &mut QuietSendCache,
+    signer: &Keypair,
+    extra_signers: &[&Keypair],
+    program: Pubkey,
+    data: Vec<u8>,
+    metas: Vec<AccountMeta>,
+    keys: &[Pubkey],
+    dispatcher_refusal: bool,
+    label: &str,
+) {
+    LIFECYCLE_V2_REFUSAL_PROBES.fetch_add(1, Ordering::Relaxed);
+    let before = lifecycle_v2_snapshot(ctx, keys, signer.pubkey()).await;
+    let result = send_quiet_cached(ctx, signer, extra_signers, program, data, metas, cache).await;
+    if dispatcher_refusal {
+        assert!(
+            matches!(result, Err(TransactionError::InstructionError(_, InstructionError::InvalidInstructionData))),
+            "{label}: unsupported tag did not stop at the Rev 8 allowlist: {result:?}",
+        );
+    } else {
+        assert!(result.is_err(), "{label}: closed state unexpectedly accepted reuse");
+    }
+    let after = lifecycle_v2_snapshot(ctx, keys, signer.pubkey()).await;
+    assert_eq!(after, before, "{label}: refusal changed a tracked account");
+}
+
+async fn lifecycle_v2_probe_dispatch_refusal(f: &mut Fix, extra: &[Pubkey], label: &str) {
+    if std::env::var_os("BASANOS_DCG_PREP_V2").is_none() {
+        return;
+    }
+    let keys = lifecycle_v2_known_keys(f, extra);
+    lifecycle_v2_expect_refusal_unchanged(
+        &mut f.ctx,
+        &mut f.lifecycle_v2_cache,
+        &f.signer,
+        &[],
+        f.program,
+        vec![201],
+        vec![],
+        &keys,
+        true,
+        label,
+    )
+    .await;
+}
+
+/// Seeded Rev 8 lifecycle-v2 scenario. The retained 80-position fixture matches
+/// the proof packets already used by the document harness, while staying small
+/// beside the 4B model artifacts. Fixture account images are setup inputs; the
+/// lifecycle transitions below are instruction-produced.
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_property_v2_generated_valid_paths() {
+    if std::env::var_os("BASANOS_DCG_PREP_V2").is_none() {
+        eprintln!("needs_local_artifacts: set BASANOS_DCG_PREP_V2=1 and BASANOS_PT2P_ROOT to run the Rev 8 lifecycle-v2 property path");
+        return;
+    }
+    let started = std::time::Instant::now();
+    let seed = std::env::var("BASANOS_DCG_PREP_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0x8deb_236c_0dc0_0001);
+    LIFECYCLE_V2_TX_COUNT.store(0, Ordering::Relaxed);
+    LIFECYCLE_V2_TOTAL_CU.store(0, Ordering::Relaxed);
+    LIFECYCLE_V2_MAX_CU.store(0, Ordering::Relaxed);
+    LIFECYCLE_V2_REFUSAL_PROBES.store(0, Ordering::Relaxed);
+
+    let Some(mut f) = build().await else {
+        panic!("BASANOS_DCG_PREP_V2 requires the retained 80-position PT2P fixture");
+    };
+    assert_eq!(f.k, 80, "the v2 fixture is the retained 80-position template");
+    let mut completed = vec!["tag176 published retained PT1X/PT2S fixture".to_owned()];
+    let dta1 = f.account(f.dta1).await;
+    assert_eq!((&dta1[..4], dta1[6]), (b"DTA1".as_slice(), config::SEAL_APPROVED));
+    assert_eq!(&f.account(f.dtu1).await[..4], b"DTU1");
+
+    // PT1O path: reserve a bounded batch under tag 199, instantiate it with
+    // tag 146, and close the written output with tag 198. The compact P=0
+    // slice excludes the typed-decision entries, which require a document.
+    let routes = f.account(f.routes).await;
+    let geometry = f.account(f.geometry).await;
+    let payloads = f.account(f.payloads).await;
+    let pt1x_image = f.account(f.pt1s_index).await;
+    let pwr1 = &f.pt2s_image[S::OFF_PWR1..];
+    let view = Pt2p::new(
+        &routes,
+        &geometry,
+        &payloads,
+        Some(&pt1x_image[dcg_program::pt1_onchain::OFF_PAYLOAD_INDEX..]),
+        pt2p::Program::decode(pwr1).unwrap(),
+    )
+    .unwrap();
+    let (output_position, output_count) = (0..f.k)
+        .find_map(|position| {
+            // Keep one measured-local SBF request comfortably below the
+            // 1.4M-CU transaction limit while still crossing the 10 KiB
+            // reservation boundary.
+            let count = view.entry_count(position).ok()?.min(S::MAX_INSTANTIATE).min(36);
+            if count == 0 {
+                return None;
+            }
+            let safe = (0..count).all(|offset| {
+                view.entry(position, offset)
+                    .is_ok_and(|entry| !matches!(entry.kernel_index, 47 | 48))
+            });
+            safe.then_some((position, count))
+        })
+        .expect("the small fixture has a non-decision output slice");
+    let mut stream_bytes = 44usize;
+    for offset in 0..output_count {
+        let entry = view.entry(output_position, offset).unwrap();
+        stream_bytes = stream_bytes
+            .checked_add(14 + view.payload_len(&entry).unwrap() + 40 * entry.route_count() as usize)
+            .expect("PT1O stream size is bounded");
+    }
+    let output_required = dcg_program::pt1_onchain::PT1X_OUTPUT_HEADER_BYTES
+        + stream_bytes
+        + dcg_program::pt1_onchain::PT1X_OUTPUT_TRAILER_FIXED_BYTES
+        + 5 * 32;
+    assert!(
+        output_required > dcg_program::pt1_onchain::PT1X_OUTPUT_MAX_GROW_BYTES,
+        "the generated PT1O stream crosses the bounded tag-199 growth step",
+    );
+    let output_keys = [f.pt2s, f.pt1s_index, f.routes, f.geometry, f.payloads];
+    let output_key_refs: [&Pubkey; 5] = [
+        &output_keys[0],
+        &output_keys[1],
+        &output_keys[2],
+        &output_keys[3],
+        &output_keys[4],
+    ];
+    let output_binding = dcg_program::pt1_onchain::pt1x_output_binding(
+        &f.program,
+        &output_key_refs,
+        output_position,
+        0,
+        output_count,
+    );
+    let (output, _) = dcg_program::pt1_onchain::pt1x_output_address(&f.program, &output_binding);
+    let (pt2s_key, pt1x_key, routes_key, geometry_key, payloads_key, authority_key) =
+        (f.pt2s, f.pt1s_index, f.routes, f.geometry, f.payloads, f.executor.pubkey());
+    let pt1o_data = |tag: u8, position: u32, first: u32, count: u32| {
+        let mut data = vec![tag];
+        data.extend_from_slice(&position.to_le_bytes());
+        data.extend_from_slice(&first.to_le_bytes());
+        data.extend_from_slice(&(count as u16).to_le_bytes());
+        data
+    };
+    let pt1o_metas = |output_key| vec![
+        AccountMeta::new(pt2s_key, false),
+        AccountMeta::new_readonly(pt1x_key, false),
+        AccountMeta::new_readonly(routes_key, false),
+        AccountMeta::new_readonly(geometry_key, false),
+        AccountMeta::new_readonly(payloads_key, false),
+        AccountMeta::new(output_key, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+        AccountMeta::new(authority_key, true),
+    ];
+    let mut cache = QuietSendCache::default();
+    let mut reserve_steps = 0usize;
+    let mut reserved_bytes = 0usize;
+    while reserved_bytes < output_required {
+        let old = reserved_bytes;
+        let result = send_quiet_cached(
+            &mut f.ctx,
+            &f.signer,
+            &[&f.executor],
+            f.program,
+            pt1o_data(199, output_position, 0, output_count),
+            pt1o_metas(output),
+            &mut cache,
+        )
+        .await;
+        result.unwrap_or_else(|error| panic!("seed={seed:#x} PT1O reserve(199): {error:?}"));
+        reserved_bytes = f
+            .ctx
+            .banks_client
+            .get_account(output)
+            .await
+            .unwrap()
+            .expect("tag 199 creates its output PDA")
+            .data
+            .len();
+        let expected = if old == 0 {
+            output_required.min(dcg_program::pt1_onchain::PT1X_OUTPUT_MAX_GROW_BYTES)
+        } else {
+            output_required.min(old + dcg_program::pt1_onchain::PT1X_OUTPUT_MAX_GROW_BYTES)
+        };
+        assert_eq!(reserved_bytes, expected, "tag 199 grows by one bounded reservation step");
+        reserve_steps += 1;
+        assert!(reserve_steps <= 32, "the test slice stays within bounded PT1O growth");
+        lifecycle_v2_probe_dispatch_refusal(&mut f, &[output], "after tag 199 reserve step").await;
+    }
+    assert_eq!(reserve_steps, 2, "the PT1O stream needs two bounded tag-199 steps");
+    assert_eq!(f.account(output).await[..4], *b"PT1R");
+    completed.push(format!("tag199 reserve PT1O {reserve_steps} steps {reserved_bytes} bytes"));
+
+    send_with_signers_mode(
+        &mut f.ctx,
+        &f.signer,
+        &[&f.executor],
+        f.program,
+        pt1o_data(146, output_position, 0, output_count),
+        pt1o_metas(output),
+        true,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("seed={seed:#x} PT1O write(146): {error:?}"));
+    let written = f.account(output).await;
+    assert_eq!(&written[..4], b"PT1O");
+    assert_eq!(written.len(), output_required);
+    completed.push(format!("tag146 instantiate PT1O {} entries", output_count));
+    lifecycle_v2_probe_dispatch_refusal(&mut f, &[output], "after tag 146 write").await;
+    let output_rent = f.lamports(output).await;
+    let executor_before_output_close = f.lamports(f.executor.pubkey()).await;
+    send_with_signers_mode(
+        &mut f.ctx,
+        &f.signer,
+        &[&f.executor],
+        f.program,
+        vec![dcg_program::pt1_onchain::TAG_CLOSE_PT1O],
+        vec![AccountMeta::new(output, false), AccountMeta::new(f.executor.pubkey(), true)],
+        true,
+    )
+    .await
+    .expect("tag 198 closes the written PT1O to its recorded authority");
+    assert_eq!(f.lamports(output).await, 0);
+    assert_eq!(f.lamports(f.executor.pubkey()).await, executor_before_output_close + output_rent);
+    completed.push("tag198 close written PT1O to recorded authority".to_owned());
+    lifecycle_v2_probe_dispatch_refusal(&mut f, &[output], "after tag 198 close").await;
+
+    // An unwritten PT1R follows its own close path and returns its exact rent.
+    let reservation_position = (output_position + 1) % f.k;
+    let reservation_binding = dcg_program::pt1_onchain::pt1x_output_binding(
+        &f.program,
+        &output_key_refs,
+        reservation_position,
+        0,
+        1,
+    );
+    let (reservation, _) = dcg_program::pt1_onchain::pt1x_output_address(
+        &f.program,
+        &reservation_binding,
+    );
+    let reservation_metas = pt1o_metas(reservation);
+    send_with_signers_mode(
+        &mut f.ctx,
+        &f.signer,
+        &[&f.executor],
+        f.program,
+        pt1o_data(199, reservation_position, 0, 1),
+        reservation_metas.clone(),
+        true,
+    )
+    .await
+    .expect("tag 199 reserves an unwritten PT1R");
+    assert_eq!(&f.account(reservation).await[..4], b"PT1R");
+    lifecycle_v2_probe_dispatch_refusal(&mut f, &[reservation], "after unwritten tag 199 reserve").await;
+    let reservation_rent = f.lamports(reservation).await;
+    let executor_before_reservation_close = f.lamports(f.executor.pubkey()).await;
+    send_with_signers_mode(
+        &mut f.ctx,
+        &f.signer,
+        &[&f.executor],
+        f.program,
+        pt1o_data(200, reservation_position, 0, 1),
+        reservation_metas,
+        true,
+    )
+    .await
+    .expect("tag 200 closes only the unwritten reservation");
+    assert_eq!(f.lamports(reservation).await, 0);
+    assert_eq!(
+        f.lamports(f.executor.pubkey()).await,
+        executor_before_reservation_close + reservation_rent,
+        "tag 200 refunds the recorded authority, not the fee payer",
+    );
+    completed.push("tag200 close unwritten reservation to recorded authority".to_owned());
+    lifecycle_v2_probe_dispatch_refusal(&mut f, &[reservation], "after tag 200 close").await;
+
+    // Document: actual UnifiedInit -> root landing -> finalize -> attest ->
+    // resolve -> close -> retention cleanup. The one output is a re-keyed
+    // compiler-v1 proof and the cell is mechanics data, not a model result.
+    let output_first = 29;
+    let output_count = 50;
+    let document_n = output_first + 2;
+    let binding = f.binding(output_first, output_count);
+    let variant = ((seed % 250) + 1) as u8;
+    let (descriptor, created, proofs) = attest_all(&mut f, &binding, document_n, &[], variant).await;
+    assert_eq!(proofs.len(), 1);
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_PENDING);
+    assert_eq!(u32_at(&f.account(created[3]).await, 204), 1);
+    completed.push("tag161 init -> tag162 roots -> tag165 finalize -> tag177 attest".to_owned());
+    past_deadline(&mut f, created[0]).await;
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&descriptor),
+        pair(created[0], created[3]),
+    )
+    .await
+    .expect("tag 178 resolves the fully attested completion");
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_FINAL);
+    completed.push("tag178 resolve final".to_owned());
+    lifecycle_v2_probe_dispatch_refusal(&mut f, &created, "after final tag 178 resolve").await;
+
+    let crafted = Crafted { dcm2: created[0], dpr2: created[1], dcr2: created[3], descriptor };
+    let payer = f.executor.pubkey();
+    let rent_refund = f.lamports(created[0]).await
+        + f.lamports(created[1]).await
+        + f.lamports(address::family_slots(&f.program, &descriptor).0).await;
+    let payer_before_close = f.lamports(payer).await;
+    let close_metas = f.close_metas(&crafted, f.signer.pubkey());
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&descriptor),
+        close_metas,
+    )
+    .await
+    .expect("tag 172 closes the final document");
+    assert_eq!(f.account(created[3]).await[6], result::STATUS_SETTLED);
+    assert_eq!(f.lamports(payer).await, payer_before_close + rent_refund);
+    completed.push("tag172 close final document; rent returned to payer".to_owned());
+    lifecycle_v2_probe_dispatch_refusal(&mut f, &created, "after final tag 172 close").await;
+
+    let closed_binding = Binding2 { request_id: [variant.max(1); 32], ..binding };
+    let closed_init = init_data(
+        &f.terms_raw,
+        &closed_binding.encode(),
+        &[[1u8; 32], [2u8; 32], [3u8; 32]],
+        16,
+        &f.family_body,
+        &[],
+    );
+    let closed_keys = lifecycle_v2_known_keys(&f, &created);
+    let closed_metas = f.init_metas(created);
+    lifecycle_v2_expect_refusal_unchanged(
+        &mut f.ctx,
+        &mut f.lifecycle_v2_cache,
+        &f.executor,
+        &[],
+        f.program,
+        closed_init.clone(),
+        closed_metas.clone(),
+        &closed_keys,
+        false,
+        "tag 161 cannot reuse a closed document",
+    )
+    .await;
+    completed.push("closed document re-init refused without changing state".to_owned());
+    let retention_deadline = u64_at(
+        &f.account(created[3]).await,
+        result::RETENTION_DEADLINE_AT_V6,
+    );
+    clock_to(&mut f, retention_deadline).await;
+    let payer_before_cleanup = f.lamports(payer).await;
+    let result_rent = f.lamports(created[3]).await
+        - solana_program::rent::Rent::default().minimum_balance(result::TOMBSTONE_BYTES);
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        {
+            let mut data = vec![dcg_program::unified::TAG_CLOSE_RESULT];
+            data.extend_from_slice(&descriptor);
+            data
+        },
+        vec![
+            AccountMeta::new(f.signer.pubkey(), true),
+            AccountMeta::new(created[3], false),
+            AccountMeta::new(payer, false),
+        ],
+    )
+    .await
+    .expect("tag 185 writes the retained result tombstone");
+    assert_eq!(f.lamports(payer).await, payer_before_cleanup + result_rent);
+    assert_eq!(&f.account(created[3]).await[..4], b"DCRZ");
+    completed.push("tag185 retention cleanup to recorded executor".to_owned());
+    lifecycle_v2_probe_dispatch_refusal(&mut f, &created, "after tag 185 retention cleanup").await;
+    let closed_keys = lifecycle_v2_known_keys(&f, &created);
+    lifecycle_v2_expect_refusal_unchanged(
+        &mut f.ctx,
+        &mut f.lifecycle_v2_cache,
+        &f.executor,
+        &[],
+        f.program,
+        closed_init,
+        closed_metas,
+        &closed_keys,
+        false,
+        "tag 161 cannot reuse a retained DCRZ tombstone",
+    )
+    .await;
+
+    // Challenge: open a position dispute, reveal roots, select a segment,
+    // bisect to a fix-point, answer the family-table round, time out the
+    // unanswered response, settle it, close the refuted document, and clean up
+    // the retained DCR2. Timeout is an honest protocol outcome for a stalled
+    // executor response; it is not a fabricated successful inference.
+    let mut terms = Terms2::decode(&f.terms_raw).unwrap();
+    terms.executor_bond_lamports = 500_000;
+    terms.bond_policy_kind = BOND_POLICY_STANDARD;
+    terms.bond_slasher_bps = 0;
+    terms.settlement_program = [0; 32];
+    terms.custom_settle_window_slots = 0;
+    f.terms_raw = terms.encode().to_vec();
+    let challenge_binding = Binding2 {
+        request_id: [variant.wrapping_add(1).max(1); 32],
+        ..f.binding(output_first, output_count)
+    };
+    let challenge_position = output_first;
+    let (challenge_descriptor, challenge_created, roots, segment, target, levels) =
+        commit_challenge_tree(&mut f, &challenge_binding, challenge_position, 0).await;
+    let nonce = seed as u32;
+    let record = descend_position_challenge(
+        &mut f,
+        challenge_created,
+        &challenge_descriptor,
+        &roots,
+        challenge_position,
+        0,
+        segment,
+        target,
+        &levels,
+        nonce,
+        false,
+    )
+    .await;
+    assert_eq!(f.account(record).await[4], challenge::PHASE_RESPOND);
+    completed.push("tag167 open -> tag163/164/168/169 position and tree response".to_owned());
+    let mut family_reveal = vec![TAG_REVEAL_FAMILY_TABLE, 0, f.family_roots.len() as u8];
+    for root in &f.family_roots {
+        family_reveal.extend_from_slice(root);
+    }
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        family_reveal,
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new_readonly(challenge_created[0], false),
+        ],
+    )
+    .await
+    .expect("tag 173 responds with the committed family roots");
+    assert_eq!(f.account(record).await[challenge::FTR_AT], 1);
+    completed.push("tag173 family-table response".to_owned());
+    lifecycle_v2_probe_dispatch_refusal(
+        &mut f,
+        &[record, challenge_created[0], challenge_created[1], challenge_created[2], challenge_created[3]],
+        "after tag 173 family response",
+    )
+    .await;
+    let response_deadline = u64_at(&f.account(record).await, 148);
+    clock_to(&mut f, response_deadline + 1).await;
+    send(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_TIMEOUT],
+        vec![AccountMeta::new(record, false), AccountMeta::new(challenge_created[0], false)],
+    )
+    .await
+    .expect("tag 132 rules for the challenger after the missing proof response");
+    assert_eq!(f.account(record).await[4], challenge::PHASE_RULED);
+    assert_eq!(f.account(record).await[5], 2);
+    assert_ne!(u16_at(&f.account(challenge_created[0]).await, 6) & FLAG_REFUTED, 0);
+    assert_eq!(u32_at(&f.account(challenge_created[0]).await, 132), 1);
+    lifecycle_v2_probe_dispatch_refusal(
+        &mut f,
+        &[record, challenge_created[0], challenge_created[1], challenge_created[2], challenge_created[3]],
+        "after tag 132 timeout",
+    )
+    .await;
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let remainder = Pubkey::new_from_array(terms.bond_remainder);
+    send(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![dcg_program::root_only_challenge::TAG_SETTLE],
+        vec![
+            AccountMeta::new(record, false),
+            AccountMeta::new(response, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(f.executor.pubkey(), false),
+            AccountMeta::new(challenge_created[0], false),
+            AccountMeta::new(incinerator::ID, false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(f.signer.pubkey(), false),
+            AccountMeta::new(remainder, false),
+        ],
+    )
+    .await
+    .expect("tag 131 settles the challenged bond under the standard policy");
+    assert!(f.ctx.banks_client.get_account(record).await.unwrap().is_none(),
+        "tag 131 drains the settled challenge record");
+    assert_eq!(u32_at(&f.account(challenge_created[0]).await, 128), 0,
+        "tag 131 decrements the document's open-challenge count");
+    completed.push("tag132 timeout rule -> tag131 settle".to_owned());
+    lifecycle_v2_probe_dispatch_refusal(
+        &mut f,
+        &[record, response, challenge_created[0], challenge_created[1], challenge_created[2], challenge_created[3]],
+        "after tag 131 settle",
+    )
+    .await;
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        resolve_data(&challenge_descriptor),
+        pair(challenge_created[0], challenge_created[3]),
+    )
+    .await
+    .expect("tag 178 resolves the ruled challenge as refuted");
+    assert_eq!(f.account(challenge_created[3]).await[6], result::STATUS_REFUTED);
+    completed.push("tag178 resolves the settled challenge as refuted".to_owned());
+    lifecycle_v2_probe_dispatch_refusal(
+        &mut f,
+        &[challenge_created[0], challenge_created[1], challenge_created[2], challenge_created[3]],
+        "after challenge tag 178 resolve",
+    )
+    .await;
+
+    let challenge_crafted = Crafted {
+        dcm2: challenge_created[0],
+        dpr2: challenge_created[1],
+        dcr2: challenge_created[3],
+        descriptor: challenge_descriptor,
+    };
+    let close_slot = u64_at(&f.account(challenge_created[0]).await, 144)
+        .max(u64_at(&f.account(challenge_created[0]).await, document::ABANDON_DEADLINE_AT))
+        + 1;
+    clock_to(&mut f, close_slot).await;
+    let challenge_rent = f.lamports(challenge_created[0]).await
+        + f.lamports(challenge_created[1]).await
+        + f.lamports(address::family_slots(&f.program, &challenge_descriptor).0).await;
+    let payer_before_challenge_close = f.lamports(payer).await;
+    let challenge_close_metas = f.close_metas_slots(
+        &challenge_crafted,
+        f.signer.pubkey(),
+        AccountMeta::new(f.signer.pubkey(), false),
+        AccountMeta::new(remainder, false),
+    );
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        close_data(&challenge_descriptor),
+        challenge_close_metas,
+    )
+    .await
+    .expect("tag 172 closes after the challenge settled and its deadline passed");
+    assert_eq!(f.account(challenge_created[3]).await[6], result::STATUS_REFUTED);
+    assert_eq!(f.lamports(payer).await, payer_before_challenge_close + challenge_rent);
+    let challenge_retention = u64_at(
+        &f.account(challenge_created[3]).await,
+        result::RETENTION_DEADLINE_AT_V6,
+    );
+    lifecycle_v2_probe_dispatch_refusal(
+        &mut f,
+        &challenge_created,
+        "after challenge tag 172 close",
+    )
+    .await;
+    clock_to(&mut f, challenge_retention).await;
+    let challenge_result_rent = f.lamports(challenge_created[3]).await
+        - solana_program::rent::Rent::default().minimum_balance(result::TOMBSTONE_BYTES);
+    let payer_before_challenge_cleanup = f.lamports(payer).await;
+    let mut cleanup = vec![dcg_program::unified::TAG_CLOSE_RESULT];
+    cleanup.extend_from_slice(&challenge_descriptor);
+    send_fresh(
+        &mut f.ctx,
+        &f.signer,
+        f.program,
+        cleanup,
+        vec![
+            AccountMeta::new(f.signer.pubkey(), true),
+            AccountMeta::new(challenge_created[3], false),
+            AccountMeta::new(payer, false),
+        ],
+    )
+    .await
+    .expect("tag 185 cleans up the settled challenge result");
+    assert_eq!(f.lamports(payer).await, payer_before_challenge_cleanup + challenge_result_rent);
+    assert_eq!(&f.account(challenge_created[3]).await[..4], b"DCRZ");
+    completed.push("tag185 challenge result cleanup".to_owned());
+    lifecycle_v2_probe_dispatch_refusal(
+        &mut f,
+        &challenge_created,
+        "after challenge tag 185 cleanup",
+    )
+    .await;
+
+    let elapsed_ms = started.elapsed().as_millis();
+    if std::env::var_os("BASANOS_DCG_PREP_LONG").is_none() {
+        assert!(elapsed_ms < 120_000, "default lifecycle-v2 path exceeded two minutes: {elapsed_ms}ms");
+    }
+    let mode = if std::env::var_os("BASANOS_DCG_V8_SBF").is_some() { "sbf" } else { "native" };
+    let summary = format!(
+        "lifecycle_property_v2 seed={seed:#x} mode={mode} fixture=retained-k80-v3 steps={} interleaved_refusal_probes={} program_transactions={} programtest_cu_total={} programtest_cu_max={} elapsed_ms={elapsed_ms} reserve_steps={reserve_steps} reserved_bytes={reserved_bytes} output_required={output_required}",
+        completed.len(),
+        LIFECYCLE_V2_REFUSAL_PROBES.load(Ordering::Relaxed),
+        LIFECYCLE_V2_TX_COUNT.load(Ordering::Relaxed),
+        LIFECYCLE_V2_TOTAL_CU.load(Ordering::Relaxed),
+        LIFECYCLE_V2_MAX_CU.load(Ordering::Relaxed),
+    );
+    eprintln!("{summary}");
+    for step in &completed {
+        eprintln!("lifecycle_property_v2_step {step}");
+    }
+    if let Some(receipt) = std::env::var_os("BASANOS_DCG_PREP_RECEIPT") {
+        let path = PathBuf::from(receipt);
+        std::fs::create_dir_all(path.parent().expect("receipt file has a parent")).unwrap();
+        let mut text = format!("{summary}\n");
+        for step in completed {
+            text.push_str(&format!("step={step}\n"));
+        }
+        std::fs::write(path, text).unwrap();
+    }
 }
