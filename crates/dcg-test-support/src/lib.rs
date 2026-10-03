@@ -16,6 +16,7 @@
 //! - [`snapshot`]: saved real-flow states for expensive stages.
 
 pub mod chain;
+pub mod challenge;
 pub mod document;
 pub mod fixtures;
 pub mod snapshot;
@@ -23,6 +24,7 @@ pub mod target;
 pub mod template;
 
 pub use chain::{custom, Chain};
+pub use challenge::Challenge;
 pub use document::{Document, Rekeyed, RungD};
 pub use fixtures::{Fixture, FixtureKind};
 pub use target::Target;
