@@ -21,6 +21,7 @@ const MALFORMED: u32 = 730;
 const AUTH: u32 = 731;
 const STATE: u32 = 733;
 const PROOF: u32 = 734;
+const LEGACY_DCR1_DISABLED: u32 = 742;
 const DEADLINE: u32 = 736;
 const ROUTE: u32 = 738;
 const ROW_BYTES: usize = 120;
@@ -128,8 +129,11 @@ fn live(
     {
         return Err(no(STATE));
     }
-    if version != challenge::VERSION && record.owner != program {
-        return Err(no(AUTH));
+    if version != challenge::VERSION {
+        // Legacy DCR1 v2/v4 records were never created at a derivable address,
+        // and no DCG image can create them, so they are refused outright
+        // (provenance audit 2026-10-03; review Low 2).
+        return Err(no(LEGACY_DCR1_DISABLED));
     }
     if !manifest
         .dispute_hooks()
@@ -2089,21 +2093,10 @@ fn execute(
             return Err(no(PROOF));
         }
     } else {
-        rule_legacy(&mut state, &accounts[2], honest)?;
+        // Unreachable: `live` refuses every legacy version.
+        let _ = (honest, &mut *state);
+        return Err(no(LEGACY_DCR1_DISABLED));
     }
-    Ok(())
-}
-
-fn rule_legacy(state: &mut [u8], document: &AccountInfo, honest: bool) -> ProgramResult {
-    if !honest {
-        let mut doc = document.try_borrow_mut_data()?;
-        let wins = u32_at(&doc, 132)?.checked_add(1).ok_or(no(STATE))?;
-        doc[132..136].copy_from_slice(&wins.to_le_bytes());
-        let flags = u16_at(&doc, 6)? | 4;
-        doc[6..8].copy_from_slice(&flags.to_le_bytes());
-    }
-    state[4] = 3;
-    state[5] = if honest { 1 } else { 2 };
     Ok(())
 }
 

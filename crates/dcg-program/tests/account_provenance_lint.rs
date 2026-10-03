@@ -465,7 +465,6 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "closure_v2_bootstrap.rs::pub init_v4",
     "closure_v2_bootstrap.rs::pub seal_v2",
     "closure_v2_bootstrap.rs::pub upload_v2",
-    "closure_v2_generic.rs::private rule_legacy", // HIGH, unresolved: Basanos's pinned DCG core routes tag 140/141 to arbitrary signer-owned byte accounts; forged DCR1 v2/v4 needs no raw-write.
     "closure_v2_generic.rs::private rule_v6", // execute authenticates the v5 DCR1 and v6 DCM2 PDAs, size and kind before this helper.
     "desc_upload.rs::private store_dcd1",
     "desc_upload.rs::pub process_alloc",

@@ -81,7 +81,7 @@ recorded payout keys supply authorization.
 | `graph_v2.rs:1121 choose` | Checked run/dispute at 1123-1125; recorded challenger signer, phase and selected child at 1126-1149. | Confirmed |
 | `graph_v2.rs:1155 reveal_leaf` | Checked run/dispute at 1157-1159; executor signer, phase and step-root path at 1161-1173. | Confirmed |
 | `graph_v2.rs:1334 settle_descent` | Checked run/dispute at 1338-1341; phase/deadline and recorded payee keys at 1343-1359. Permissionless timeout. | Confirmed |
-| `closure_v2_generic.rs:2097 rule_legacy` | `execute` checks DCM2 owner, derived address, DCM2 kind and minimum size at 1985 and 267-283, but `live` accepts a legacy DCR1 by owner/bytes alone at 120-145. | Finding |
+| `closure_v2_generic.rs` legacy ruling | `live` refuses every v2/v4 record (742), with or without `legacy-hclosure-handlers`. The legacy ruling branch in `execute` is unreachable and also refuses; no legacy write remains. | Resolved: removed |
 | `closure_v2_generic.rs:2110 rule_v6` | `execute` checks v5 DCR1 exact size, kind, owner, seeds and stored bump at 1964 and 120-174; v6 DCM2 exact size, kind, owner and descriptor-derived PDA at 1985 and 234-260. | Confirmed |
 
 ## Findings and concrete substitution
@@ -124,8 +124,7 @@ reviewed writer snapshot, so the lint is expected to remain red for them.
 `graph_v2::blob_write` and `blob_seal` now check the DCB2 header length and
 derive `dcg2blob` from the stored kind and ID before writing. The lint keeps
 `raw_write` in a separate test-only exemption list, never in the PDA writer
-allowlist. `rule_legacy` remains an explicit **high, unresolved** lint finding;
-its ruling code was not changed.
+allowlist. The legacy ruling was then removed: `live` refuses every v2/v4 record, so no legacy writer remains for the lint to list.
 
 The Basanos switchover assembly pins DCG `9ec8d6a`, which predates the
 `revision-8-lifecycle` tag gate in this review branch. Its dispatcher sends
@@ -166,3 +165,24 @@ declared shared testnet feature set; it does not erase the pinned-code route.
 - Measured: `CARGO_BUILD_JOBS=3 cargo test --profile fasttest -p dcg-program
   --features graph-v21 --test disputes_v21_skeleton --quiet` passed 21/21.
   This is a native ProgramTest check, not SBF or live-validator verification.
+
+## Legacy DCR1 closure (2026-10-03)
+
+The Basanos switchover revision-8 image now refuses DCR1 v2/v4 at `live` with
+error 742, and so does DCG core, unconditionally. A review found that honest v2/v4
+records were never created at a derivable address, so a feature-gated derivation
+could never accept one. Both implementations check the v5 challenge PDA from its
+stored bump (`create_program_address` on the seeds plus byte 146, with byte 147
+equal to 1), which costs the same whatever bump a challenger grinds. The uploaded
+keypair PoC is retained as a tag-124 regression for v2, v4 and v5. This closes the
+forged-record entry point; the older document check had already prevented a
+false ruling in the investigated revision-8 image.
+
+Permissionless call ordering: an executor who calls `execute` first can obtain
+the honest ruling only after all committed proofs are complete. A challenger who
+calls first with a forged record now receives a refusal and cannot set a winner.
+The payer gains no refund or priority from a refused call. A bystander can call
+first only on an authenticated live challenge with complete proofs; the recorded
+winner and payout addresses control the result, so the bystander gains no bond.
+Timeout, moot and close handlers do not call this legacy `execute` ruling helper;
+they keep their existing authenticated record checks.
