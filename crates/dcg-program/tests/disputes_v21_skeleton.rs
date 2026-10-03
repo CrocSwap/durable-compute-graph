@@ -173,7 +173,11 @@ impl Chain {
         data.extend_from_slice(&SLASHER_BPS.to_le_bytes());
         data.extend_from_slice(&g.plan_id);
         let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
-        let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
+        let template = if legacy_template {
+            Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0
+        } else {
+            Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, kp(0xA1).pubkey().as_ref()], &PROGRAM).0
+        };
         let admitter = kp(0xA1);
         #[cfg(feature = "test-legacy-template-create")]
         let create_sub = if legacy_template { V::SUB_TEST_CREATE_LEGACY_TEMPLATE } else { V::SUB_CREATE_TEMPLATE };
@@ -613,7 +617,7 @@ async fn admission_refuses_bad_templates_and_runs() {
         data.extend_from_slice(&SLASHER_BPS.to_le_bytes());
         data.extend_from_slice(&ch.g.plan_id);
         let id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
-        let t = Pubkey::find_program_address(&[b"dcg21tmpl", &id], &PROGRAM).0;
+        let t = Pubkey::find_program_address(&[b"dcg21tmpl", &id, admitter.pubkey().as_ref()], &PROGRAM).0;
         let i = ix(V::SUB_CREATE_TEMPLATE, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(t, false), AccountMeta::new_readonly(SYSTEM, false)]);
         assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err(), "depth {depth} phase {phase} bonds {eb} {cb}");
     }
@@ -1144,7 +1148,7 @@ async fn a_prefunded_template_is_adopted_and_its_lamports_go_to_the_recorded_pay
     send(&mut ch.ctx, transfer, &[&prefunder]).await.unwrap();
     let data = template_body(&ch.g, 30);
     let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
-    assert_eq!(Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0, ch.template);
+    assert_eq!(Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, kp(0xA1).pubkey().as_ref()], &PROGRAM).0, ch.template);
     let admitter = kp(0xA1);
     send(&mut ch.ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![
         AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(ch.template, false),
@@ -1157,22 +1161,32 @@ async fn a_prefunded_template_is_adopted_and_its_lamports_go_to_the_recorded_pay
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_front_runner_creates_the_same_content_address_and_becomes_its_payer() {
+async fn a_front_runner_cannot_squat_on_another_payers_template() {
     let mut ch = Chain::new(30).await;
     ch.ctx.warp_to_slot(10_000).unwrap();
     ch.close_run(0xA1).await.unwrap();
     ch.close_template().await.unwrap();
     let data = template_body(&ch.g, 30);
     let front_runner = kp(0xB1);
+    let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
+    let squat = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, front_runner.pubkey().as_ref()], &PROGRAM).0;
+    assert_ne!(squat, ch.template);
     send(&mut ch.ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![
-        AccountMeta::new(front_runner.pubkey(), true), AccountMeta::new(ch.template, false),
+        AccountMeta::new(front_runner.pubkey(), true), AccountMeta::new(squat, false),
         AccountMeta::new_readonly(SYSTEM, false),
     ]), &[&front_runner]).await.unwrap();
-    let account = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap();
-    assert_eq!(&account.data[96..128], sha256(&[V::TEMPLATE_DOMAIN, &data]).as_slice());
-    assert!(ch.close_template_by(0xA1).await.is_err());
-    ch.close_template_by(0xB1).await.unwrap();
+    assert!(ch.ctx.banks_client.get_account(ch.template).await.unwrap().is_none());
+    let admitter = kp(0xA1);
+    send(&mut ch.ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![
+        AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(ch.template, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+    ]), &[&admitter]).await.unwrap();
+    assert!(ch.ctx.banks_client.get_account(ch.template).await.unwrap().is_some());
+    assert!(ch.ctx.banks_client.get_account(squat).await.unwrap().is_some());
+    assert!(ch.close_template_by(0xB1).await.is_err());
+    ch.close_template().await.unwrap();
     assert!(ch.gone(ch.template).await);
+    assert!(ch.ctx.banks_client.get_account(squat).await.unwrap().is_some());
 }
 
 #[cfg(all(feature = "test-kernel", not(feature = "test-legacy-template-create")))]

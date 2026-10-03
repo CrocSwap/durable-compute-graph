@@ -292,10 +292,10 @@ class Dispute:
             if refs is None or len(refs) != len(elements):
                 return "C"  # E's list has the wrong element count (or no list here)
             element_header, element_prod = elements[element]
-            if S.decode_producer(element_prod)[0] not in (1, 2, 3):
-                raise Refused("list element producer kind not supported")
             if refs[element][:23] != element_header:
                 return "C"
+            if S.decode_producer(element_prod)[0] not in (1, 2, 3):
+                raise Refused("list element producer kind not supported")
             return self._edge_value(refs[element], element_header, element_prod, producer_opening, t,
                                     gate_opening, gate_value, chunk_opening, const_opening)
         return self._edge_value(got, header, prod, producer_opening, t, gate_opening, gate_value, chunk_opening,

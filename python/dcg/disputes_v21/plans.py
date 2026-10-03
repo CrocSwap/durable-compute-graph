@@ -289,6 +289,19 @@ class PlanBuilder:
                         if ek == 3 and ea not in self.constants:
                             raise S.SpecError("unknown constant")
             S.check_list_element_budget(list_element_counts)
+            # Each STEP value is length-prefixed. Include the claim's spec
+            # opening so the whole instruction fits C's 128 KiB buffer.
+            witness_size = 1 + sum(4 + (sum(e.length for e in self.lists[S.decode_producer(prod)[1]])
+                                          + 4 * len(self.lists[S.decode_producer(prod)[1]])
+                                          if S.decode_producer(prod)[0] == S.PRODUCER_LIST
+                                          else struct.unpack_from("<I", header, 19)[0])
+                                   for header, prod, _ in d["inputs"])
+            if d["state_scheme"]:
+                witness_size += 4 + d["state_size"]
+            _, opening_record, opening_path = sp.opening(sp.step_leaf_index(k))
+            opening_size = 1 + 2 + len(opening_record) + 1 + 32 * len(opening_path)
+            if 2 + opening_size + witness_size > 128 * 1024:
+                raise S.SpecError("STEP claim exceeds the 128 KiB challenger staging buffer")
         if sp.address_height > 40:
             raise S.SpecError("step tree too tall")
         _ = trees  # tree shapes are fixed by place_blocks

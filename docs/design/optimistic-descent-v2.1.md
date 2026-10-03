@@ -875,8 +875,11 @@ recorded below with their implementation results.
 - **`CLOSE_TEMPLATE` (21), the recorded template payer.** New templates
   append a 40-byte extension after the fixed block area: `D21O`, the
   creating admitter's key (the account funding template rent), and
-  `active_runs:u32`. The retired flag uses a previously reserved byte; neither
-  field enters the template ID or changes the instruction's account order.
+  `active_runs:u32`. The retired flag uses a previously reserved byte. The
+  template ID remains the hash of the exact template wire bytes, while new
+  template addresses derive from `["dcg21tmpl", template_id, payer]`.
+  The instruction's account order is unchanged. New creates refuse the old
+  ignored trailing four-byte word; previously created accounts remain readable.
   Existing template accounts retain their
   original size and remain usable with their original read-only template
   metas; they lack reliable provenance and are therefore not closeable.
@@ -894,16 +897,19 @@ recorded below with their implementation results.
   retired and closed immediately. Empty, system-owned, pre-funded template
   PDAs are adopted, and all lamports held at close go to the recorded payer,
   including the pre-fund (a pre-funded escrow is a gift, not a lock). A
-  front-run creator can become the recorded payer, but creation is
-  content-addressed, so the template bytes and identity are unchanged.
+  front-run creator becomes the recorded payer only on its own template
+  address, because creation is keyed by payer as well as content.
 
-  **Who profits by calling this first?** The executor gets no rent and
-  cannot authorize closure; the challenger gets no rent and cannot
-  authorize closure; the payer receives the template rent and chooses when
-  to give up future reuse; a bystander gets no rent and cannot authorize
-  closure. The signature plus zero-count guard prevents another role from
-  racing the payer to remove a reusable template. Concurrent initialization,
-  retirement and closure serialize on the writable template account.
+  **Who profits by calling this first?** For CREATE, a caller can create and
+  fund only the PDA derived from its own key. It becomes that account's payer
+  and may later recover its rent, but gains no control of another payer's
+  template. The intended admitter can create the same content at its own
+  address and initialize runs there. For RETIRE, only the recorded payer can
+  stop future runs from its template; a squatter can retire its own separate
+  template only. The executor, challenger, and bystanders gain no rent or
+  retirement authority on the admitter's account. Concurrent initialization,
+  retirement, and closure on one template serialize through its writable
+  account. Legacy templates retain their old address derivation and read path.
 
   **Template-close validation (measured, 2026-10-03).** The original close
   implementation passed 18 tests natively and 18 against the v1.51 SBF image.

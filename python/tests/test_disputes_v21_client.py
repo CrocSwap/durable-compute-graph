@@ -64,3 +64,111 @@ def test_close_run_marks_the_tracked_template_writable():
     assert metas[1].pubkey == run
     assert metas[2].pubkey == template and metas[2].is_writable
     assert metas[3].pubkey == payer and metas[3].is_writable
+
+
+def test_client_plays_a_recorded_list_dispute_through_staging():
+    import importlib.util
+    from pathlib import Path
+    from dcg.disputes_v21 import game as G, transcript as T
+
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location("list_scenarios", root / "scripts/disputes_v21_list_scenarios.py")
+    scenarios = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scenarios)
+    sp, values = scenarios.TESTS.mixed_plan()
+    setup, refs, run_id = scenarios.setup_for("mixed", sp, values)
+    honest = scenarios.commit_for(sp, setup, run_id, values)
+    committed = scenarios.commit_for(sp, setup, run_id, values,
+        list_fault=lambda o, i, e, value: bytes([value[0] ^ 1]) + value[1:]
+        if (o, i, e) == (6, 0, 0) else value)
+    record = G.RunRecord(scenarios.PLAN_ID, run_id, sp, committed.root_bytes, refs)
+    transcript = T.record(record, committed, honest, 4)
+    assert transcript["ruling"] == "C"
+    assert bytes.fromhex(transcript["leaf"]).startswith(b"LVR1")
+
+    class RecordingClient:
+        program_id = Pubkey.new_unique()
+        payer = Keypair()
+
+        def __init__(self):
+            self.calls = []
+
+        def pda(self, *seeds):
+            return Pubkey.find_program_address(list(seeds), self.program_id)[0]
+
+        def send(self, data, metas, signers, cu, heap_frame=None):
+            self.calls.append((data[1], data[2:], metas, heap_frame))
+            return "sig"
+
+        def account(self, _key):
+            return bytes(6) + bytes([2])
+
+    gc = RecordingClient()
+    client = DisputeClient(gc)
+    client._send_many = lambda items: gc.calls.extend((15, body, metas, None) for _, body, metas, _ in items)
+    executor, challenger = Keypair(), Keypair()
+    run, template = Pubkey.new_unique(), Pubkey.new_unique()
+    result = client.play(run, template, transcript, executor, challenger)
+    assert result["ruling"] == "C"
+    dispute = client.pda(b"dcg21dsp", bytes(run), bytes(challenger.pubkey()), bytes([1]) * 32)
+    executor_buffer = client.pda(b"dcg21stg", bytes(dispute), bytes([1]))
+    reveal = next(call for call in gc.calls if call[0] == 7)
+    claim = next(call for call in gc.calls if call[0] == 8)
+    assert reveal[1] == b"\xff" and reveal[3] == LIST_HEAP_FRAME
+    assert executor_buffer in [meta.pubkey for meta in reveal[2]]
+    assert executor_buffer == claim[2][-1].pubkey and claim[3] == LIST_HEAP_FRAME
+    assert any(call[0] == 14 for call in gc.calls)
+    assert any(call[0] == 15 for call in gc.calls)
+
+
+def test_template_address_is_scoped_to_its_payer():
+    class RecordingClient:
+        program_id = Pubkey.new_unique()
+
+        def pda(self, *seeds):
+            return Pubkey.find_program_address(list(seeds), self.program_id)[0]
+
+        def account(self, _key):
+            return None
+
+        def send(self, data, metas, signers, cu, heap_frame=None):
+            return "sig"
+
+    client = DisputeClient(RecordingClient())
+    data = bytes(range(123))
+    assert client.create_template(data, Keypair()) != client.create_template(data, Keypair())
+
+
+def test_short_list_reveal_is_staged_and_claim_reads_executor_buffer():
+    class RecordingClient:
+        program_id = Pubkey.new_unique()
+        payer = Keypair()
+
+        def __init__(self):
+            self.calls = []
+
+        def pda(self, *seeds):
+            return Pubkey.find_program_address(list(seeds), self.program_id)[0]
+
+        def send(self, data, metas, signers, cu, heap_frame=None):
+            self.calls.append((data[1], data[2:], metas))
+            return "sig"
+
+        def account(self, _key):
+            return bytes(6) + bytes([2])
+
+    gc = RecordingClient()
+    client = DisputeClient(gc)
+    client._send_many = lambda items: gc.calls.extend((15, body, metas) for _, body, metas, _ in items)
+    run, template = Pubkey.new_unique(), Pubkey.new_unique()
+    executor, challenger = Keypair(), Keypair()
+    transcript = {"kind": "STEP_DESCEND", "rounds": [], "leaf": (b"LVR1" + bytes(96)).hex(),
+                  "claim": bytes(50).hex()}
+    client.play(run, template, transcript, executor, challenger)
+    dispute = client.pda(b"dcg21dsp", bytes(run), bytes(challenger.pubkey()), bytes([1]) * 32)
+    executor_buffer = client.pda(b"dcg21stg", bytes(dispute), bytes([1]))
+    reveal = next(call for call in gc.calls if call[0] == 7)
+    claim = next(call for call in gc.calls if call[0] == 8)
+    assert reveal[1] == b"\xff"
+    assert executor_buffer in [meta.pubkey for meta in reveal[2]]
+    assert executor_buffer == claim[2][-1].pubkey

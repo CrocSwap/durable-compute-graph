@@ -227,7 +227,7 @@ async fn replay(
         template_id.as_slice(),
         hex(setup["template_id"].as_str().unwrap())
     );
-    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
+    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, admitter.pubkey().as_ref()], &PROGRAM).0;
     send(
         &mut ctx,
         ix(

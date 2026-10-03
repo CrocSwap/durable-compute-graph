@@ -225,7 +225,7 @@ fn now() -> Result<u64, ProgramError> {
 // retired flag (old templates and newly-created templates start at zero).
 // block_count(1) pad(7)
 // blocks[104 x MAX_BLOCKS] = 1,008 bytes;
-// PDA ["dcg21tmpl", template_id]. The bases are the spec-tree leaf indices of
+// New PDA ["dcg21tmpl", template_id, payer]; old templates retain their original PDA. The bases are the spec-tree leaf indices of
 // OutSpec(0) and StepSpec(0) (2 + in_count, and BlockSpec.first_record).
 // Create data without blocks (the step-1 form) means one enumerated block of
 // `total_steps` at address 0; with blocks, it is followed by
@@ -317,7 +317,11 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
     {
         return Err(err(4));
     }
-    derived(program_id, account, &[b"dcg21tmpl", &d[96..128]])?;
+    if d.len() == T_BYTES_V2 {
+        derived(program_id, account, &[b"dcg21tmpl", &d[96..128], &d[T_PAYER..T_PAYER + 32]])?;
+    } else {
+        derived(program_id, account, &[b"dcg21tmpl", &d[96..128]])?;
+    }
     let block_count = d[T_FIXED] as usize;
     if !(1..=MAX_BLOCKS).contains(&block_count) {
         return Err(err(4));
@@ -522,16 +526,13 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     {
         return Err(err(6));
     }
-    // The blocks are optional as before. Old list clients appended a
-    // first-ListSpec index after the template or block records. Keep accepting
-    // that trailing word for wire compatibility, but don't trust or store it:
-    // EDGE authenticates the record type and list id under the spec root.
-    let block_data_end = if data.len() == FIXED || data.len() == FIXED + 4 {
+    // The blocks are optional. An ignored trailing word is not a distinct template.
+    let block_data_end = if data.len() == FIXED {
         FIXED
     } else {
         let count = data[FIXED] as usize;
         let end = FIXED + 1 + Block::BYTES * count;
-        if !(1..=MAX_BLOCKS).contains(&count) || (data.len() != end && data.len() != end + 4) {
+        if !(1..=MAX_BLOCKS).contains(&count) || data.len() != end {
             return Err(ProgramError::InvalidInstructionData);
         }
         end
@@ -549,7 +550,11 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     check_blocks(&blocks, total_steps)?;
     let template_id = sha256(&[TEMPLATE_DOMAIN, data]);
     let template_bytes = if track_close { T_BYTES_V2 } else { T_BYTES };
-    create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id], template_bytes)?;
+    if track_close {
+        create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id, admitter.key.as_ref()], template_bytes)?;
+    } else {
+        create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id], template_bytes)?;
+    }
     let mut d = tmpl.try_borrow_mut_data()?;
     d[T_FIXED] = count as u8;
     if block_data_end > FIXED {
@@ -1237,7 +1242,7 @@ fn claim(
         }
         staged = buffer.try_borrow_data()?;
         let len = u32_at(&staged, 40)? as usize;
-        &staged[STAGE_HEADER..STAGE_HEADER + len]
+        staged.get(STAGE_HEADER..STAGE_HEADER.checked_add(len).ok_or(err(8))?).ok_or(err(1))?
     } else {
         data
     };
@@ -1562,7 +1567,8 @@ impl<'a> Referee<'a> {
         if n != leaf.input_count() || n != spec.input_count() || n > 8 {
             return Err(err(20));
         }
-        let mut ins = Vec::new();
+        let list_capacity: usize = self.list_refs.iter().map(Vec::len).sum();
+        let mut ins = Vec::with_capacity(n + list_capacity.min(D::MAX_LIST_ELEMENTS_PER_STEP));
         let mut total_list_elements = 0usize;
         for i in 0..n {
             let (kind, _, _, _, _) = spec.input_producer(i);

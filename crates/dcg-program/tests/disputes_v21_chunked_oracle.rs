@@ -72,7 +72,7 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
     let name = s["name"].as_str().unwrap();
     let tdata = hex(s["template_data"].as_str().unwrap());
     let template_id = sha256(&[V::TEMPLATE_DOMAIN, &tdata]);
-    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
+    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, admitter.pubkey().as_ref()], &PROGRAM).0;
     if ctx.banks_client.get_account(template).await.unwrap().is_none() {
         tx.send(ctx, ix(V::SUB_CREATE_TEMPLATE, &tdata, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter])
             .await

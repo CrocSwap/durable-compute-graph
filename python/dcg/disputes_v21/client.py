@@ -110,7 +110,7 @@ class DisputeClient:
     # --- setup ----------------------------------------------------------------------
     def create_template(self, tdata: bytes, admitter: Keypair) -> Pubkey:
         template_id = hashlib.sha256(W.TEMPLATE_DOMAIN + tdata).digest()
-        template = self.pda(b"dcg21tmpl", template_id)
+        template = self.pda(b"dcg21tmpl", template_id, bytes(admitter.pubkey()))
         if self.gc.account(template) is None:
             self._send("create_template", tdata, [AccountMeta(admitter.pubkey(), True, True),
                                                   AccountMeta(template, False, True),
@@ -176,7 +176,8 @@ class DisputeClient:
         leaf = bytes.fromhex(transcript["leaf"])
         heap_frame = _list_step_heap_frame(leaf)
         metas = party(executor)
-        if len(leaf) > DIRECT_LIMIT:
+        list_leaf = leaf.startswith(b"LVR1")
+        if list_leaf or len(leaf) > DIRECT_LIMIT:
             stage(ROLE_EXECUTOR, leaf, executor)
             leaf, metas = bytes([FROM_STAGING]), metas + [AccountMeta(buffer(ROLE_EXECUTOR), False, False)]
         self._send("reveal_leaf", leaf, metas, [executor], heap_frame=heap_frame)
@@ -187,6 +188,8 @@ class DisputeClient:
         if len(claim) > DIRECT_LIMIT:
             stage(ROLE_CHALLENGER, claim, challenger)
             claim, metas = bytes([FROM_STAGING]), metas + [AccountMeta(buffer(ROLE_CHALLENGER), False, False)]
+        if list_leaf:
+            metas.append(AccountMeta(buffer(ROLE_EXECUTOR), False, False))
         self._send("claim", claim, metas, [challenger], heap_frame=heap_frame)
         ruling = RULINGS[self.gc.account(dispute)[6]]
         return {"ruling": ruling, "transactions": self.sent - sent0, "wall_s": round(time.monotonic() - t0, 1),

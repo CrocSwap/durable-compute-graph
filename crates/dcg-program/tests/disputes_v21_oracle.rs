@@ -84,7 +84,7 @@ async fn replay(s: &serde_json::Value) -> u8 {
     let (admitter, e, c) = (kp(0xA1), kp(0xE1), kp(0xC1));
     let tdata = hex(s["template_data"].as_str().unwrap());
     let template_id = sha256(&[V::TEMPLATE_DOMAIN, &tdata]);
-    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
+    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, admitter.pubkey().as_ref()], &PROGRAM).0;
     send(&mut ctx, ix(V::SUB_CREATE_TEMPLATE, &tdata, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
 
     let refs: Vec<Vec<u8>> = s["refs"].as_array().unwrap().iter().map(|r| hex(r.as_str().unwrap())).collect();

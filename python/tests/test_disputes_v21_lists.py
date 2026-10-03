@@ -320,6 +320,37 @@ def test_an_element_ref_with_a_foreign_header_is_convicted():
     assert G.honest_challenge(record, ex, honest).ruling == "C"
 
 
+def test_edge_checks_list_header_before_unsupported_element_kind():
+    sp, values = mixed_plan()
+    honest, _ = run(sp, values)
+    bad = honest.clone()
+    refs = list(bad.lists[(6, 0)])
+    refs[0] = struct.pack("<I", 99) + refs[0][4:]
+    leaf = R.parse_leaf(bad.leaves[6])
+    inputs = list(leaf.inputs)
+    inputs[0] = inputs[0][:23] + R.list_digest(refs)
+    bad.leaves[6] = R.leaf_preimage(leaf.plan_id, leaf.run_id, leaf.region, leaf.segment, leaf.ordinal,
+                                    leaf.node, leaf.kernel_step, inputs, list(leaf.outputs), leaf.prior, leaf.next)
+    bad.lists[(6, 0)] = refs
+    bad.rebuild()
+    d = descend_to(record_for(sp, values, bad), G.Executor(bad), 6)
+    original = d._list
+    d._list = lambda list_id, opening: [(header, S.producer(4, 0)) if i == 0 else (header, producer)
+                                        for i, (header, producer) in enumerate(original(list_id, opening))]
+    assert d.claim("EDGE", spec_opening=sp.opening(sp.step_leaf_index(6)), index=0,
+                   **edge_args(sp, G.Executor(bad), 0)) == "C"
+
+
+def test_plan_rejects_step_witness_larger_than_challenger_stage():
+    b = P.PlanBuilder()
+    external = b.raw_input(0, 1024)
+    wide = b.list_input(0, tuple(P.Input(external, 1024) for _ in range(128)))
+    b.enumerated([P.Step(SHA, (wide,), ((0, 32, False),))])
+    b.output(S.producer(1, 0, 0), 32)
+    with pytest.raises(S.SpecError, match="128 KiB"):
+        b.build()
+
+
 def test_list_wire_goldens_and_legacy_template_bytes():
     import importlib.util
     from pathlib import Path
