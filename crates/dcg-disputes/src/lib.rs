@@ -194,6 +194,23 @@ pub fn list_digest<H: Sha256>(h: &H, refs: &[u8]) -> Option<Hash> {
         return None;
     }
     let count = refs.len() / VALUE_REF_BYTES;
+    list_digest_iter(h, count, refs.chunks_exact(VALUE_REF_BYTES))
+}
+
+/// Digest an already parsed list of fixed-width refs without packing them into
+/// a second buffer. This keeps wide STEP claims inside the SVM heap limit.
+pub fn list_digest_elements<H: Sha256>(h: &H, refs: &[[u8; VALUE_REF_BYTES]]) -> Option<Hash> {
+    list_digest_iter(h, refs.len(), refs.iter().map(|r| r.as_slice()))
+}
+
+fn list_digest_iter<'a, H: Sha256>(
+    h: &H,
+    count: usize,
+    mut refs: impl Iterator<Item = &'a [u8]>,
+) -> Option<Hash> {
+    if count == 0 {
+        return None;
+    }
     if count > MAX_LIST_ELEMENTS {
         return None;
     }
@@ -205,7 +222,7 @@ pub fn list_digest<H: Sha256>(h: &H, refs: &[u8]) -> Option<Hash> {
     let empty_leaf = empty(h, Tree::List, 0);
     for position in 0..capacity {
         let mut current = if position < count {
-            list_leaf(h, position as u32, &refs[position * VALUE_REF_BYTES..(position + 1) * VALUE_REF_BYTES])?
+            list_leaf(h, position as u32, refs.next()?)?
         } else {
             empty_leaf
         };

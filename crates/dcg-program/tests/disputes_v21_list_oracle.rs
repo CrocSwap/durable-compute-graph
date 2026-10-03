@@ -215,7 +215,11 @@ async fn replay(
         executor.pubkey().as_ref(),
     ]);
     assert_eq!(run_id.as_slice(), hex(setup["run_id"].as_str().unwrap()));
-    let run = Pubkey::find_program_address(&[b"dcg21run", &run_id], &PROGRAM).0;
+    let run = Pubkey::find_program_address(
+        &[b"dcg21run", &run_id, admitter.pubkey().as_ref()],
+        &PROGRAM,
+    )
+    .0;
     send(
         &mut ctx,
         ix(
@@ -516,7 +520,7 @@ async fn replay(
         &[&challenger],
     )
     .await
-    .expect("claim accepted");
+    .unwrap_or_else(|err| panic!("{}: claim accepted: {err:?}", scenario["name"].as_str().unwrap()));
     ctx.banks_client
         .get_account(dispute)
         .await

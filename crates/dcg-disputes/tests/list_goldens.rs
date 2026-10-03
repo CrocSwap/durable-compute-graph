@@ -86,6 +86,14 @@ fn dls1_and_list_digest_match_python_vectors() {
         D::list_digest(&Soft, &packed).unwrap().as_slice(),
         hex(v["list_digest"].as_str().unwrap())
     );
+    let refs: Vec<[u8; D::VALUE_REF_BYTES]> = packed
+        .chunks_exact(D::VALUE_REF_BYTES)
+        .map(|r| r.try_into().unwrap())
+        .collect();
+    assert_eq!(
+        D::list_digest_elements(&Soft, &refs).unwrap().as_slice(),
+        hex(v["list_digest"].as_str().unwrap())
+    );
 
     let leaf = hex(v["step_leaf"].as_str().unwrap());
     let parsed = D::parse_leaf(&leaf).unwrap();

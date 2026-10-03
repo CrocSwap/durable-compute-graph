@@ -948,7 +948,7 @@ fn decode_leaf_reveal(data: &[u8]) -> Result<(u8, &[u8], Vec<(usize, Vec<[u8; D:
 fn validate_leaf_lists(
     present: u8,
     body: &[u8],
-    lists: &[(usize, Vec<[u8; D::VALUE_REF_BYTES]>)],
+    lists: Vec<(usize, Vec<[u8; D::VALUE_REF_BYTES]>)>,
     framed: bool,
 ) -> Result<Vec<Vec<[u8; D::VALUE_REF_BYTES]>>, ProgramError> {
     let Some(leaf) = (present == 1).then(|| D::parse_leaf(body)).flatten() else {
@@ -957,27 +957,28 @@ fn validate_leaf_lists(
         }
         return Ok(Vec::new());
     };
-    let mut result = vec![Vec::new(); leaf.input_count()];
-    let mut next = 0;
+    let mut lists = lists.into_iter();
+    let mut result = Vec::with_capacity(leaf.input_count());
     for i in 0..leaf.input_count() {
         let r = leaf.input(i);
         let layout = u32::from_le_bytes(r[7..11].try_into().unwrap());
         if layout != D::LAYOUT_LIST {
+            result.push(Vec::new());
             continue;
         }
-        if !framed || lists.get(next).is_none_or(|(j, _)| *j != i) {
+        if !framed {
             return Err(err(16));
         }
-        let refs = &lists[next].1;
-        let mut packed = Vec::with_capacity(refs.len() * D::VALUE_REF_BYTES);
-        for r in refs { packed.extend_from_slice(r); }
-        if D::list_digest(&H, &packed).is_none_or(|digest| digest.as_slice() != &r[23..55]) {
+        let (index, refs) = lists.next().ok_or(err(16))?;
+        if index != i || refs.is_empty() || refs.len() > D::MAX_LIST_ELEMENTS {
             return Err(err(16));
         }
-        result[i] = refs.clone();
-        next += 1;
+        if D::list_digest_elements(&H, &refs).is_none_or(|digest| digest.as_slice() != &r[23..55]) {
+            return Err(err(16));
+        }
+        result.push(refs);
     }
-    if next != lists.len() {
+    if lists.next().is_some() {
         return Err(err(16));
     }
     Ok(result)
@@ -1001,7 +1002,7 @@ fn staged_leaf_lists(
     if !framed || present != expected_present || body != expected_leaf {
         return Err(err(29));
     }
-    validate_leaf_lists(present, body, &lists, framed)
+    validate_leaf_lists(present, body, lists, framed)
 }
 
 // 7: [executor(s), run, template, dispute(w)] present:u8 preimage
@@ -1030,7 +1031,7 @@ fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         return Err(err(16));
     }
     if present == 1 {
-        validate_leaf_lists(present, body, &list_reveals, framed)?;
+        validate_leaf_lists(present, body, list_reveals, framed)?;
     } else if !list_reveals.is_empty() {
         return Err(err(16));
     }
