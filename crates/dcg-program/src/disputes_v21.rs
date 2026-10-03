@@ -362,7 +362,14 @@ const PH_LEAF: u8 = 3; // E reveals the leaf
 const PH_CLAIM: u8 = 4; // C claims
 const PH_RULED: u8 = 5;
 
-pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+/// Tag 227. STEP claims resolve application kernels from `manifest`, the
+/// static manifest of the image that embeds this program.
+pub fn process(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &'static crate::kernel::ApplicationManifest,
+) -> ProgramResult {
     match data.get(1).copied().ok_or(ProgramError::InvalidInstructionData)? {
         SUB_CREATE_TEMPLATE => create_template(program_id, accounts, &data[2..]),
         SUB_INIT_RUN => init_run(program_id, accounts, &data[2..]),
@@ -371,7 +378,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         SUB_REVEAL_NODES => reveal_nodes(program_id, accounts, &data[2..]),
         SUB_PICK => pick(program_id, accounts, &data[2..]),
         SUB_REVEAL_LEAF => reveal_leaf(program_id, accounts, &data[2..]),
-        SUB_CLAIM => claim(program_id, accounts, &data[2..]),
+        SUB_CLAIM => claim(program_id, accounts, &data[2..], manifest),
         SUB_TIMEOUT => timeout(program_id, accounts),
         SUB_FINALIZE => finalize(program_id, accounts),
         SUB_ADVANCE => advance(program_id, accounts),
@@ -921,7 +928,12 @@ fn step_opening<'a>(t: &Template, root: &[u8], data: &'a [u8], at: &mut usize, o
 // const_opening = leaf_index:u32 spec_opening (of the constant's ConstSpec);
 // last_running(t) = t:u32 step_opening(leaf (B, t, e')) and, unless
 // t = K - 1, step_opening(gate leaf (B, t, g)) gate_value.
-fn claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn claim(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &'static crate::kernel::ApplicationManifest,
+) -> ProgramResult {
     let [challenger, run, tmpl, dispute, executor_acct, _challenger_acct, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     let staged;
@@ -948,7 +960,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
     let root: [u8; D::RUN_ROOT_BYTES] = c.run.try_borrow_data()?[R_ROOT..R_REFS].try_into().unwrap();
     let refs_buf = c.run.try_borrow_data()?;
     let refs = &refs_buf[R_REFS..];
-    let k = Referee { t: &c.t, root: &root, refs, data };
+    let k = Referee { t: &c.t, root: &root, refs, data, manifest };
     let name = *data.first().ok_or(err(1))?;
     let index = *data.get(1).ok_or(err(1))? as usize;
     let mut at = 2;
@@ -1032,6 +1044,7 @@ struct Referee<'a> {
     root: &'a [u8; D::RUN_ROOT_BYTES],
     refs: &'a [u8],
     data: &'a [u8],
+    manifest: &'static crate::kernel::ApplicationManifest,
 }
 
 impl<'a> Referee<'a> {
@@ -1220,9 +1233,9 @@ impl<'a> Referee<'a> {
             return Ok(true); // no stateful kernel by that id
         }
         // An application kernel, resolved by id and versions from the
-        // image's manifest: one output, stateless (this slice).
+        // embedding image's manifest: one output, stateless (this slice).
         let id = crate::kernel::KernelId(spec.kernel_id().try_into().unwrap());
-        if let Some(kernel) = crate::application_manifest().resolve(id, spec.semantic_version(), spec.abi_version()) {
+        if let Some(kernel) = self.manifest.resolve(id, spec.semantic_version(), spec.abi_version()) {
             let m = kernel.manifest();
             let spans: Vec<crate::kernel::AccountSpan> = ins[..n]
                 .iter()

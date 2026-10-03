@@ -152,7 +152,7 @@ pub fn process_instruction_with_manifest(
         #[cfg(feature = "graph-v2")]
         208..=226 => graph_v2::process(program_id, accounts, data),
         #[cfg(feature = "graph-v21")]
-        227 => disputes_v21::process(program_id, accounts, data),
+        227 => disputes_v21::process(program_id, accounts, data, manifest),
         140 => pt1_onchain::init_fresh(program_id, accounts, data),
         141 => pt1_onchain::upload(program_id, accounts, data),
         142 => pt1_onchain::seal(program_id, accounts, data),
