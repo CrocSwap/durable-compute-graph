@@ -1,0 +1,513 @@
+{
+ "cases": [
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "1ac69a273de7a308e6f6a32e43ded69781bcd84dd9bc36ec4f828865c97757da"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "652612ede9d2dee5eaf5f298cac958b53fdb265863320402851da6ff8eabf492"
+   ],
+   "slots": [
+    0
+   ],
+   "values": [
+    "0700000000000000"
+   ]
+  },
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "1ac69a273de7a308e6f6a32e43ded69781bcd84dd9bc36ec4f828865c97757da",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "652612ede9d2dee5eaf5f298cac958b53fdb265863320402851da6ff8eabf492"
+   ],
+   "slots": [
+    0,
+    1,
+    2
+   ],
+   "values": [
+    "0700000000000000",
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "5ca1b798f82cfa3ed9feb853af2750e798e8318ea53243810e3c867ba1c1cf95"
+   ],
+   "slots": [
+    10,
+    11,
+    12
+   ],
+   "values": [
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "1ac69a273de7a308e6f6a32e43ded69781bcd84dd9bc36ec4f828865c97757da",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ],
+   "slots": [
+    0,
+    3,
+    6,
+    9,
+    12
+   ],
+   "values": [
+    "0700000000000000",
+    null,
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "5ca1b798f82cfa3ed9feb853af2750e798e8318ea53243810e3c867ba1c1cf95"
+   ],
+   "slots": [
+    12
+   ],
+   "values": [
+    null
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "dfb505cf80be806f8e239dcdade8a4b8e43f100ed4fe2f833118f16d2ae148b3"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "78679bebfed2ddd6cfd38aafda8129d13a412cf2bb15cff918e64980804cba0c",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "d46fd5859b61afe2588ba1125fdfcb0e4e04768027bf2935297d5787fd6a05aa"
+   ],
+   "slots": [
+    0
+   ],
+   "values": [
+    "2e00000000000000"
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "dfb505cf80be806f8e239dcdade8a4b8e43f100ed4fe2f833118f16d2ae148b3",
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "d46fd5859b61afe2588ba1125fdfcb0e4e04768027bf2935297d5787fd6a05aa"
+   ],
+   "slots": [
+    0,
+    1,
+    2
+   ],
+   "values": [
+    "2e00000000000000",
+    "1600000000000000",
+    "2e00000000000000"
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "a2a3d401862194566d2f0691abaf1f722e817779208df181c42d7d9630d19a03",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "3cbc0bf59095ecdc81aaa0bd6575aed96a8b5d819f1dd9e9f901a66cf639f46a"
+   ],
+   "slots": [
+    10,
+    11,
+    12
+   ],
+   "values": [
+    "8d00000000000000",
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "dfb505cf80be806f8e239dcdade8a4b8e43f100ed4fe2f833118f16d2ae148b3",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "d8cadcede1a7f0a306a5bb9b9410ebdff168dda87f83f49eca4935c6196f40d7",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ],
+   "slots": [
+    0,
+    3,
+    6,
+    9,
+    12
+   ],
+   "values": [
+    "2e00000000000000",
+    null,
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "a31574d92191595638efe19eeee866e81fb7b1a519792cb68fbffecf56505817",
+    "3cbc0bf59095ecdc81aaa0bd6575aed96a8b5d819f1dd9e9f901a66cf639f46a"
+   ],
+   "slots": [
+    12
+   ],
+   "values": [
+    null
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "bfb192f901141de8bf03fb070eea6ac9d1f4b4a370409a576293a2b8a79bc1f6"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "a3d6a552163d8b39d119df10b43af92066d094bf0baa8cb663aeda8030c811f1",
+    "592062f01f3ffb783f37fcb391528385f811b77bd8b9406df6487078761ec46b"
+   ],
+   "slots": [
+    0
+   ],
+   "values": [
+    "5607000000000000"
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "bfb192f901141de8bf03fb070eea6ac9d1f4b4a370409a576293a2b8a79bc1f6",
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "669de90834b5d5d7140ceb306dc63bd6e53c232c6c2583fec9d0e1127f125f36",
+    "a3d6a552163d8b39d119df10b43af92066d094bf0baa8cb663aeda8030c811f1",
+    "592062f01f3ffb783f37fcb391528385f811b77bd8b9406df6487078761ec46b"
+   ],
+   "slots": [
+    0,
+    1,
+    2
+   ],
+   "values": [
+    "5607000000000000",
+    "1600000000000000",
+    "2e00000000000000"
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "96300f1d7ee37ad4ed5dd75505381e3ffeecc1c7b8dc4254ca45c6a32a26c370",
+    "db1c95f44ec1c9be9446c0ad1f833524f88e52d5e7276b8006a3586511c43d7b",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "5180294c8574868653e3a2b1f44bd4264ec221817a180c2f780ff56d053f5eae"
+   ],
+   "slots": [
+    10,
+    11,
+    12
+   ],
+   "values": [
+    "0816000000000000",
+    "5607000000000000",
+    null
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "bfb192f901141de8bf03fb070eea6ac9d1f4b4a370409a576293a2b8a79bc1f6",
+    "669de90834b5d5d7140ceb306dc63bd6e53c232c6c2583fec9d0e1127f125f36",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+    "9d67305552893bb099e3fd55bea020f9a54fe63ada9a61253b46e3156246e021",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ],
+   "slots": [
+    0,
+    3,
+    6,
+    9,
+    12
+   ],
+   "values": [
+    "5607000000000000",
+    "7700000000000000",
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e4e3cf57b7e0504ba3dd5f2a4874e2d80572e83109196c6f5cca0b461709388b",
+    "5180294c8574868653e3a2b1f44bd4264ec221817a180c2f780ff56d053f5eae"
+   ],
+   "slots": [
+    12
+   ],
+   "values": [
+    null
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "1ced19aa3b0362b8c44dd247ae01c89f4b2b73b9021f8bfde733c9f26c65f7a2"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6",
+    "e96c79ddce845f9a977709667be47e27294bee188e5ff7606973732078015160"
+   ],
+   "slots": [
+    0
+   ],
+   "values": [
+    "0a464c0000000000"
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "1ced19aa3b0362b8c44dd247ae01c89f4b2b73b9021f8bfde733c9f26c65f7a2",
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "669de90834b5d5d7140ceb306dc63bd6e53c232c6c2583fec9d0e1127f125f36",
+    "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6",
+    "e96c79ddce845f9a977709667be47e27294bee188e5ff7606973732078015160"
+   ],
+   "slots": [
+    0,
+    1,
+    2
+   ],
+   "values": [
+    "0a464c0000000000",
+    "1600000000000000",
+    "2e00000000000000"
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "6080fef5a902201423cdfcc93ac22e4d8f4d1cf12fb82f37e908d6fdef0ec890",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "66ccf4eff7d77e3ded743c2e091cac95a90ab587097e06b2c7bfe0e404d61388"
+   ],
+   "slots": [
+    10,
+    11,
+    12
+   ],
+   "values": [
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "1ced19aa3b0362b8c44dd247ae01c89f4b2b73b9021f8bfde733c9f26c65f7a2",
+    "669de90834b5d5d7140ceb306dc63bd6e53c232c6c2583fec9d0e1127f125f36",
+    "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+    "a3a6e7d151b2103e530fcd370cb7ba80d1dcbebdc01d1579c67b4ef3857bdd6d",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7",
+    "c39841986cb2f5e759bca0553a79119e41ebd088d6a0216487e0022eb2af1968",
+    "8cd3158000508db6c8c6f49383675fb825286430f6d10156eede973852a33563",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ],
+   "slots": [
+    0,
+    3,
+    6,
+    9,
+    12
+   ],
+   "values": [
+    "0a464c0000000000",
+    "7700000000000000",
+    "b329000000000000",
+    "0a464c0000000000",
+    null
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "5262fe0fda889912279ff44e7d82a747f666baeee2e1e201bedab0ee7588dac5",
+    "66ccf4eff7d77e3ded743c2e091cac95a90ab587097e06b2c7bfe0e404d61388"
+   ],
+   "slots": [
+    12
+   ],
+   "values": [
+    null
+   ]
+  }
+ ],
+ "slot_leaf_domain": "6463672e6c782e736c6f742e6c6561662e763100"
+}

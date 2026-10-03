@@ -13,6 +13,7 @@
 #![no_std]
 
 pub mod blocks;
+pub mod lx;
 pub mod reductions;
 
 pub type Hash = [u8; 32];
@@ -29,6 +30,8 @@ pub enum Tree {
     Chunk,
     Log,
     Spec,
+    /// LX1 state slots (design `v2.1-lazy-expansion.md`).
+    LxState,
 }
 
 impl Tree {
@@ -39,6 +42,7 @@ impl Tree {
             Tree::Chunk => b"dcg.chunk.node.v2.1\x00",
             Tree::Log => b"dcg.log.node.v2.1\x00",
             Tree::Spec => b"dcg.spec.node.v2.1\x00",
+            Tree::LxState => b"dcg.lx.state.node.v1\x00",
         }
     }
     pub fn empty_label(self) -> &'static [u8] {
@@ -48,6 +52,7 @@ impl Tree {
             Tree::Chunk => b"dcg.chunk.empty.v2.1\x00",
             Tree::Log => b"dcg.log.empty.v2.1\x00",
             Tree::Spec => b"dcg.spec.empty.v2.1\x00",
+            Tree::LxState => b"dcg.lx.slot.empty.v1\x00",
         }
     }
 }
