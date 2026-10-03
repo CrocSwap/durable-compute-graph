@@ -100,6 +100,14 @@ async fn forge_and_execute(version: u16) {
     forged[176] = 1;                                 // "target posted" marker
     // descriptor / seal bytes arbitrary (attacker-chosen)
     for (i, b) in forged[72..104].iter_mut().enumerate() { *b = (i as u8).wrapping_add(1); }
+    if version == 5 {
+        forged[8..40].copy_from_slice(author.pubkey().as_ref());
+        let (_, bump) = Pubkey::find_program_address(&[
+            b"dcg-unified-challenge", &forged[72..104], author.pubkey().as_ref(), &[0; 4],
+        ], &PROGRAM);
+        forged[146] = bump;
+        forged[147] = 1; // Valid bump metadata, but the keypair is still not the PDA.
+    }
 
     // Step 3: tag 141 (upload) copies the chosen bytes into the program-owned,
     // NON-PDA keypair account, in 900-byte chunks, no PDA check on the target.
