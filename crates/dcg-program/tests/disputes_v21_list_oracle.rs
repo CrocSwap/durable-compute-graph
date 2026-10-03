@@ -228,7 +228,7 @@ async fn replay(
             vec![
                 account(admitter.pubkey(), true, true),
                 account(run, true, false),
-                account(template, false, false),
+                account(template, true, false),
                 account(SYSTEM, false, false),
             ],
         ),

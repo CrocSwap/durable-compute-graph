@@ -124,6 +124,7 @@ struct Chain {
     run_id: [u8; 32],
     g: Golden,
     spec_levels: Vec<Vec<D::Hash>>,
+    legacy_template: bool,
 }
 
 fn ix(sub: u8, data: &[u8], accounts: Vec<AccountMeta>) -> Instruction {
@@ -134,6 +135,15 @@ fn ix(sub: u8, data: &[u8], accounts: Vec<AccountMeta>) -> Instruction {
 
 impl Chain {
     async fn new(challenge_window: u64) -> Self {
+        Self::new_template_mode(challenge_window, false).await
+    }
+
+    #[cfg(feature = "test-kernel")]
+    async fn new_legacy_template(challenge_window: u64) -> Self {
+        Self::new_template_mode(challenge_window, true).await
+    }
+
+    async fn new_template_mode(challenge_window: u64, legacy_template: bool) -> Self {
         // V21_SBF=1 (with BPF_OUT_DIR naming a graph-v21 image) runs the SBF
         // program; otherwise native.
         let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
@@ -144,7 +154,7 @@ impl Chain {
         } else {
             test.add_program("dcg_program", PROGRAM, processor!(dcg_program::process_instruction));
         }
-        for b in [0xA1u8, 0xE1, 0xC1] {
+        for b in [0xA1u8, 0xE1, 0xC1, 0xB1] {
             test.add_account(kp(b).pubkey(), Account { lamports: 10_000_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 });
         }
         let mut ctx = test.start_with_context().await;
@@ -165,7 +175,13 @@ impl Chain {
         let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
         let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
         let admitter = kp(0xA1);
-        send(&mut ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
+        #[cfg(feature = "test-kernel")]
+        let create_sub = if legacy_template { V::SUB_TEST_CREATE_LEGACY_TEMPLATE } else { V::SUB_CREATE_TEMPLATE };
+        #[cfg(not(feature = "test-kernel"))]
+        let create_sub = V::SUB_CREATE_TEMPLATE;
+        #[cfg(not(feature = "test-kernel"))]
+        assert!(!legacy_template, "legacy fixture mode requires the test-kernel feature");
+        send(&mut ctx, ix(create_sub, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
         // Run.
         let executor = kp(0xE1).pubkey();
         let mut init = vec![0u8; 32];
@@ -180,8 +196,13 @@ impl Chain {
         }
         let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &[0u8; 32], &2u32.to_le_bytes(), &refs, executor.as_ref()]);
         let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
-        send(&mut ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
-        Chain { ctx, template, run, run_id, g, spec_levels }
+        if !legacy_template {
+            let readonly = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+            assert!(send(&mut ctx, readonly, &[&admitter]).await.is_err(), "new templates must be writable while incrementing their run count");
+        }
+        let template_meta = if legacy_template { AccountMeta::new_readonly(template, false) } else { AccountMeta::new(template, false) };
+        send(&mut ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), template_meta, AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
+        Chain { ctx, template, run, run_id, g, spec_levels, legacy_template }
     }
 
     fn honest(&self) -> Commit {
@@ -610,7 +631,7 @@ async fn admission_refuses_bad_templates_and_runs() {
     let selfpaid = init(&admitter.pubkey(), &[&ch.g.refs[0], &ch.g.refs[1]]);
     for data in [unsorted, selfpaid] {
         let run = Pubkey::new_unique();
-        let i = ix(V::SUB_INIT_RUN, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+        let i = ix(V::SUB_INIT_RUN, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
         assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err());
     }
     // A commit under another plan id is refused.
@@ -629,7 +650,7 @@ async fn total_lamports(ctx: &mut ProgramTestContext, keys: &[Pubkey]) -> u128 {
     t
 }
 
-// --- rent reclaim (subs 18 to 20) ------------------------------------------------------
+// --- rent reclaim (subs 18 to 21) ------------------------------------------------------
 
 impl Chain {
     fn close_dispute_ix(&self, d: Pubkey, buffer_e: Pubkey, buffer_c: Pubkey) -> Instruction {
@@ -644,12 +665,23 @@ impl Chain {
     /// Sub 19 sent by `signer`, naming `payer` as the run's payer.
     async fn close_run_by(&mut self, signer: u8, payer: u8) -> Result<(), TransactionError> {
         let s = kp(signer);
-        let i = ix(V::SUB_CLOSE_RUN, &[], vec![AccountMeta::new(s.pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new(kp(payer).pubkey(), false)]);
+        let template_meta = if self.legacy_template { AccountMeta::new_readonly(self.template, false) } else { AccountMeta::new(self.template, false) };
+        let i = ix(V::SUB_CLOSE_RUN, &[], vec![AccountMeta::new(s.pubkey(), true), AccountMeta::new(self.run, false), template_meta, AccountMeta::new(kp(payer).pubkey(), false)]);
         send(&mut self.ctx, i, &[&s]).await
     }
 
     async fn close_run(&mut self, signer: u8) -> Result<(), TransactionError> {
         self.close_run_by(signer, 0xA1).await
+    }
+
+    async fn close_template_by(&mut self, signer: u8) -> Result<(), TransactionError> {
+        let s = kp(signer);
+        let i = ix(V::SUB_CLOSE_TEMPLATE, &[], vec![AccountMeta::new(s.pubkey(), true), AccountMeta::new(self.template, false)]);
+        send(&mut self.ctx, i, &[&s]).await
+    }
+
+    async fn close_template(&mut self) -> Result<(), TransactionError> {
+        self.close_template_by(0xA1).await
     }
 
     /// The receipt left at the run's address: magic, status, root.
@@ -684,11 +716,12 @@ async fn an_honest_run_closes_every_account_and_returns_all_rent() {
     let cache = Pubkey::find_program_address(&[b"dcg21rc", ch.run.as_ref(), &[V::KIND_STEP_DESCEND], &1u32.to_le_bytes(), &0u64.to_le_bytes()], &PROGRAM).0;
     let (buf_e, buf_c) = (ch.buffer(d, V::ROLE_EXECUTOR), ch.buffer(d, V::ROLE_CHALLENGER));
     // Fees come from the test payer, so these balances must sum exactly.
-    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), ch.run, ch.template, d, cache, buf_e, buf_c];
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), kp(0xB1).pubkey(), ch.run, ch.template, d, cache, buf_e, buf_c];
     let before = total_lamports(&mut ch.ctx, &tracked).await;
     let template_before = ch.ctx.banks_client.get_balance(ch.template).await.unwrap();
     let payer_before = ch.ctx.banks_client.get_balance(kp(0xA1).pubkey()).await.unwrap();
     let run_rent = ch.ctx.banks_client.get_balance(ch.run).await.unwrap(); // paid by A1 at init
+    assert!(ch.close_template().await.is_err(), "an initialized run needs its template");
     ch.commit(&c).await;
     ch.open(50, V::KIND_STEP_DESCEND).await;
     // E reveals the root's children and records them in a reveal cache.
@@ -734,6 +767,7 @@ async fn an_honest_run_closes_every_account_and_returns_all_rent() {
     ch.ctx.warp_to_slot(100).unwrap();
     let caller = kp(0xA1);
     send(&mut ch.ctx, ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(e.pubkey(), false)]), &[&caller]).await.unwrap();
+    assert!(ch.close_template().await.is_err(), "a finalized run still needs its template until it becomes a receipt");
     assert!(ch.close_cache(cache, kp(0xC1).pubkey()).await.is_err(), "rent goes to the recorded executor only");
     assert!(ch.close_run_by(0xC1, 0xC1).await.is_err(), "the freed rent goes to the run's payer only");
     let receipt_rent = ch.ctx.banks_client.get_rent().await.unwrap().minimum_balance(V::RECEIPT_BYTES);
@@ -749,8 +783,13 @@ async fn an_honest_run_closes_every_account_and_returns_all_rent() {
     for r in &ch.g.refs {
         init.extend_from_slice(r);
     }
-    let i = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    let i = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
     assert!(send(&mut ch.ctx, i, &[&caller]).await.is_err(), "run id reused");
+    assert!(ch.close_template_by(0xE1).await.is_err(), "the executor did not pay for the template");
+    assert!(ch.close_template_by(0xC1).await.is_err(), "the challenger did not pay for the template");
+    assert!(ch.close_template_by(0xB1).await.is_err(), "a bystander cannot close it");
+    ch.close_template().await.unwrap();
+    assert!(ch.gone(ch.template).await);
     // The cache records its executor, so it still closes after the run.
     let e_before = ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap();
     let rent_k = ch.ctx.banks_client.get_balance(cache).await.unwrap();
@@ -758,9 +797,8 @@ async fn an_honest_run_closes_every_account_and_returns_all_rent() {
     assert!(ch.gone(cache).await);
     assert_eq!(ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap(), e_before + rent_k);
     assert_eq!(total_lamports(&mut ch.ctx, &tracked).await, before, "lamports are conserved");
-    // The payer has its run rent back less the receipt; the template keeps its rent (templates do not close yet).
-    assert_eq!(ch.ctx.banks_client.get_balance(ch.template).await.unwrap(), template_before);
-    assert_eq!(ch.ctx.banks_client.get_balance(kp(0xA1).pubkey()).await.unwrap(), payer_before + run_rent - receipt_rent);
+    // The payer receives both the run's excess and the template's rent.
+    assert_eq!(ch.ctx.banks_client.get_balance(kp(0xA1).pubkey()).await.unwrap(), payer_before + run_rent - receipt_rent + template_before);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -772,7 +810,7 @@ async fn a_refuted_run_closes_after_the_pot_and_buffers_refund_their_creator() {
     l[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
     let c = commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(l)], h.outs.clone());
     let (d0, d1) = (ch.dispute(60), ch.dispute(61));
-    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), ch.run, d0, d1, ch.buffer(d1, V::ROLE_EXECUTOR)];
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), ch.run, ch.template, d0, d1, ch.buffer(d1, V::ROLE_EXECUTOR)];
     let before = total_lamports(&mut ch.ctx, &tracked).await;
     ch.commit(&c).await;
     ch.open(60, V::KIND_STEP_DESCEND).await; // sequence 0
@@ -800,8 +838,11 @@ async fn a_refuted_run_closes_after_the_pot_and_buffers_refund_their_creator() {
     send(&mut ch.ctx, i, &[&caller]).await.unwrap();
     assert!(ch.close_run(0xA1).await.is_err(), "d0 is not closed");
     ch.close_dispute(d0).await.unwrap();
+    assert!(ch.close_template().await.is_err(), "a refuted run still needs the template until it becomes a receipt");
     ch.close_run(0xE1).await.unwrap();
     assert_eq!(ch.receipt().await.1, V::RUN_REFUTED, "the receipt keeps the refutation");
+    ch.close_template().await.unwrap();
+    assert!(ch.gone(ch.template).await);
     for k in [d0, d1, buf] {
         assert!(ch.gone(k).await);
     }
@@ -812,6 +853,11 @@ async fn a_refuted_run_closes_after_the_pot_and_buffers_refund_their_creator() {
 async fn an_uncommitted_run_cancels_for_its_payer_after_the_commit_deadline() {
     // The commit deadline is the init slot plus the challenge window (30).
     let mut ch = Chain::new(30).await;
+    let other = kp(0xC1);
+    let theirs = Pubkey::find_program_address(&[b"dcg21run", &ch.run_id, other.pubkey().as_ref()], &PROGRAM).0;
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), other.pubkey(), ch.template, ch.run, theirs];
+    let before = total_lamports(&mut ch.ctx, &tracked).await;
+    assert!(ch.close_template().await.is_err(), "a live uncommitted run needs its template");
     assert!(ch.close_run(0xA1).await.is_err(), "not before the commit deadline");
     ch.ctx.warp_to_slot(100).unwrap();
     // A late commit is refused (review 10-03, F5).
@@ -824,33 +870,117 @@ async fn an_uncommitted_run_cancels_for_its_payer_after_the_commit_deadline() {
     assert!(ch.gone(ch.run).await, "a cancelled run leaves no receipt");
     // Someone else re-initializing the same run id gets a different address:
     // the payer is part of it, so the executor's commit cannot be redirected.
-    let other = kp(0xC1);
     let mut init = vec![0u8; 32];
     init.extend_from_slice(e.pubkey().as_ref());
     init.extend_from_slice(&2u32.to_le_bytes());
     for r in &ch.g.refs {
         init.extend_from_slice(r);
     }
-    let theirs = Pubkey::find_program_address(&[b"dcg21run", &ch.run_id, other.pubkey().as_ref()], &PROGRAM).0;
     assert_ne!(theirs, ch.run);
-    let i = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(other.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    let i = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(other.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
     assert!(send(&mut ch.ctx, i, &[&other]).await.is_err(), "the payer's address is not theirs");
-    let i = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(other.pubkey(), true), AccountMeta::new(theirs, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    let i = ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(other.pubkey(), true), AccountMeta::new(theirs, false), AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
     send(&mut ch.ctx, i, &[&other]).await.unwrap();
     assert!(send(&mut ch.ctx, commit(ch.run, ch.template), &[&e]).await.is_err(), "the cancelled address is gone");
+    assert!(ch.close_template().await.is_err(), "the other live run still needs the template");
+    ch.ctx.warp_to_slot(200).unwrap();
+    let close_theirs = ix(V::SUB_CLOSE_RUN, &[], vec![AccountMeta::new(other.pubkey(), true), AccountMeta::new(theirs, false), AccountMeta::new(ch.template, false), AccountMeta::new(other.pubkey(), false)]);
+    send(&mut ch.ctx, close_theirs, &[&other]).await.unwrap();
+    ch.close_template().await.unwrap();
+    assert!(ch.gone(ch.template).await);
+    assert_eq!(total_lamports(&mut ch.ctx, &tracked).await, before, "cancellation and template close conserve lamports");
+}
+
+#[cfg(feature = "test-kernel")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_existing_template_keeps_its_read_only_account_lists_and_cannot_be_closed() {
+    let mut ch = Chain::new_legacy_template(30).await;
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), ch.template, ch.run];
+    let before = total_lamports(&mut ch.ctx, &tracked).await;
+    assert!(ch.close_template().await.is_err(), "legacy templates have no recorded payer or active-run count");
+    let committed = ch.honest();
+    ch.commit(&committed).await; // commit still reads the old template as readonly
+    ch.ctx.warp_to_slot(100).unwrap();
+    let caller = kp(0xC1);
+    let finalize = ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(kp(0xE1).pubkey(), false)]);
+    send(&mut ch.ctx, finalize, &[&caller]).await.unwrap();
+    ch.close_run(0xC1).await.unwrap(); // legacy CLOSE_RUN keeps a readonly template
+    assert_eq!(ch.receipt().await.1, V::RUN_FINAL);
+    assert!(ch.close_template().await.is_err(), "legacy templates remain usable but not closeable");
+    assert_eq!(total_lamports(&mut ch.ctx, &tracked).await, before, "legacy run closure conserves lamports");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn both_timeout_winners_can_close_their_run_and_template() {
+    // C misses PICK, so E wins the dispute and the run can finalize.
+    let mut executor_win = Chain::new(30).await;
+    let committed = executor_win.honest();
+    let d = executor_win.dispute(90);
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), executor_win.run, executor_win.template, d];
+    let before = total_lamports(&mut executor_win.ctx, &tracked).await;
+    executor_win.commit(&committed).await;
+    executor_win.open(90, V::KIND_STEP_DESCEND).await;
+    let mut nodes = Vec::new();
+    nodes.extend_from_slice(&committed.step[0][0]);
+    nodes.extend_from_slice(&committed.step[0][1]);
+    let e = kp(0xE1);
+    let reveal_accounts = executor_win.party(0xE1, d);
+    send(&mut executor_win.ctx, ix(V::SUB_REVEAL_NODES, &nodes, reveal_accounts), &[&e]).await.unwrap();
+    executor_win.ctx.warp_to_slot(5_000).unwrap();
+    let caller = kp(0xA1);
+    let timeout = ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(executor_win.run, false), AccountMeta::new_readonly(executor_win.template, false), AccountMeta::new(d, false), AccountMeta::new(e.pubkey(), false), AccountMeta::new(kp(0xC1).pubkey(), false)]);
+    send(&mut executor_win.ctx, timeout, &[&caller]).await.unwrap();
+    assert_eq!(executor_win.ruling(d).await, V::RULING_EXECUTOR);
+    executor_win.advance(d).await.unwrap();
+    let close_d = executor_win.close_dispute_ix(d, executor_win.buffer(d, V::ROLE_EXECUTOR), executor_win.buffer(d, V::ROLE_CHALLENGER));
+    send(&mut executor_win.ctx, close_d, &[&caller]).await.unwrap();
+    let finalize = ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(executor_win.run, false), AccountMeta::new_readonly(executor_win.template, false), AccountMeta::new(e.pubkey(), false)]);
+    send(&mut executor_win.ctx, finalize, &[&caller]).await.unwrap();
+    executor_win.close_run(0xC1).await.unwrap();
+    executor_win.close_template().await.unwrap();
+    assert_eq!(total_lamports(&mut executor_win.ctx, &tracked).await, before, "executor timeout win conserves lamports");
+
+    // E misses NODES, so C wins; after the ruled prefix passes, the pot and
+    // the refuted receipt can close, followed by the now-unused template.
+    let mut challenger_win = Chain::new(30).await;
+    let committed = challenger_win.honest();
+    let d = challenger_win.dispute(91);
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), challenger_win.run, challenger_win.template, d];
+    let before = total_lamports(&mut challenger_win.ctx, &tracked).await;
+    challenger_win.commit(&committed).await;
+    challenger_win.open(91, V::KIND_STEP_DESCEND).await;
+    challenger_win.ctx.warp_to_slot(5_000).unwrap();
+    let c = kp(0xC1);
+    let timeout = ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(challenger_win.run, false), AccountMeta::new_readonly(challenger_win.template, false), AccountMeta::new(d, false), AccountMeta::new(kp(0xE1).pubkey(), false), AccountMeta::new(c.pubkey(), false)]);
+    send(&mut challenger_win.ctx, timeout, &[&caller]).await.unwrap();
+    assert_eq!(challenger_win.ruling(d).await, V::RULING_CHALLENGER);
+    challenger_win.advance(d).await.unwrap();
+    let pay = ix(V::SUB_PAY_POT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(challenger_win.run, false), AccountMeta::new_readonly(challenger_win.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(c.pubkey(), false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+    send(&mut challenger_win.ctx, pay, &[&caller]).await.unwrap();
+    challenger_win.close_dispute(d).await.unwrap();
+    assert!(challenger_win.close_template().await.is_err(), "the refuted run still needs the template until receipt conversion");
+    challenger_win.close_run(0xE1).await.unwrap();
+    assert_eq!(challenger_win.receipt().await.1, V::RUN_REFUTED);
+    challenger_win.close_template().await.unwrap();
+    assert_eq!(total_lamports(&mut challenger_win.ctx, &tracked).await, before, "challenger timeout win conserves lamports");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_timeout_after_the_best_win_is_moot_and_keeps_the_challengers_bond() {
     let mut ch = Chain::new(1_000).await;
+    let d0 = ch.dispute(70);
+    let d1 = ch.dispute(71);
+    let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), ch.run, ch.template, d0, d1];
+    let before = total_lamports(&mut ch.ctx, &tracked).await;
     let h = ch.honest();
     let mut l = h.leaves[1].clone().unwrap();
     let n = l.len();
     l[n - 96..n - 64].copy_from_slice(&D::value_digest(&Soft, &43i32.to_le_bytes()));
     let c = commitment(&ch.g, &ch.run_id, vec![h.leaves[0].clone(), Some(l)], h.outs.clone());
+    assert!(ch.close_template().await.is_err(), "a committed run needs its template");
     ch.commit(&c).await;
-    let d0 = ch.open(70, V::KIND_STEP_DESCEND).await; // sequence 0
-    let d1 = ch.open(71, V::KIND_STEP_DESCEND).await; // sequence 1
+    assert_eq!(ch.open(70, V::KIND_STEP_DESCEND).await, d0); // sequence 0
+    assert_eq!(ch.open(71, V::KIND_STEP_DESCEND).await, d1); // sequence 1
     // E answers d1's first reveal, so d1 waits on its challenger's pick.
     let e = kp(0xE1);
     let mut nodes = Vec::new();
@@ -870,6 +1000,18 @@ async fn a_timeout_after_the_best_win_is_moot_and_keeps_the_challengers_bond() {
     assert_eq!(ch.ruling(d1).await, V::RULING_MOOT);
     assert_eq!(ch.ctx.banks_client.get_balance(e.pubkey()).await.unwrap(), e_before, "E gains nothing");
     assert_eq!(ch.ctx.banks_client.get_balance(kp(0xC1).pubkey()).await.unwrap(), c_before + CHALLENGER_BOND, "C's bond returns");
+    ch.advance(d0).await.unwrap();
+    ch.advance(d1).await.unwrap();
+    ch.close_dispute(d1).await.unwrap(); // the moot dispute does not wait for the pot
+    assert!(ch.close_template().await.is_err(), "ruled disputes do not release the template before run closure");
+    let pay = ix(V::SUB_PAY_POT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d0, false), AccountMeta::new(kp(0xC1).pubkey(), false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+    send(&mut ch.ctx, pay, &[&caller]).await.unwrap();
+    ch.close_dispute(d0).await.unwrap();
+    ch.close_run(0xC1).await.unwrap();
+    ch.close_template().await.unwrap();
+    assert_eq!(ch.receipt().await.1, V::RUN_REFUTED);
+    assert!(ch.gone(ch.template).await);
+    assert_eq!(total_lamports(&mut ch.ctx, &tracked).await, before, "timeout, moot, pot, and closes conserve lamports");
 }
 
 #[tokio::test(flavor = "multi_thread")]

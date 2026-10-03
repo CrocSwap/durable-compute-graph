@@ -89,6 +89,12 @@ pub const SUB_CLOSE_RUN: u8 = 19;
 pub const RECEIPT_BYTES: usize = 136 + D::RUN_ROOT_BYTES;
 /// Close a reveal cache once its run is settled with no open dispute, or gone.
 pub const SUB_CLOSE_CACHE: u8 = 20;
+/// Close a template with no live runs; its rent returns to its recorded payer.
+pub const SUB_CLOSE_TEMPLATE: u8 = 21;
+/// Builds the pre-provenance template encoding for backwards-compatibility
+/// tests. This subtype is absent from non-test program builds.
+#[cfg(feature = "test-kernel")]
+pub const SUB_TEST_CREATE_LEGACY_TEMPLATE: u8 = 250;
 pub const FROM_STAGING: u8 = 0xFF;
 pub const SUB_CACHE_ANSWER: u8 = 16;
 
@@ -225,6 +231,15 @@ fn now() -> Result<u64, ProgramError> {
 const T_FIXED: usize = 168;
 const T_BLOCKS: usize = T_FIXED + 8;
 const T_BYTES: usize = T_BLOCKS + Block::BYTES * MAX_BLOCKS;
+// New templates append provenance and a live-run count. Existing T_BYTES
+// templates remain readable and usable, but cannot be closed because their
+// payer and live-run count were never recorded.
+const T_TRACKING_BYTES: usize = 40;
+const T_BYTES_V2: usize = T_BYTES + T_TRACKING_BYTES;
+const T_TRACKING_MAGIC: &[u8; 4] = b"D21O";
+const T_TRACKING: usize = T_BYTES;
+const T_PAYER: usize = T_TRACKING + 4;
+const T_ACTIVE_RUNS: usize = T_PAYER + 32;
 
 struct Template {
     depth: u32,
@@ -291,7 +306,13 @@ fn check_blocks(blocks: &[Block], total_steps: u64) -> Result<u32, ProgramError>
 
 fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, ProgramError> {
     let d = account.try_borrow_data()?;
-    if d.len() != T_BYTES || &d[0..4] != b"D21T" {
+    if (d.len() != T_BYTES && d.len() != T_BYTES_V2) || &d[0..4] != b"D21T" {
+        return Err(err(4));
+    }
+    if d.len() == T_BYTES_V2
+        && (&d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
+            || d[T_PAYER..T_PAYER + 32] == [0; 32])
+    {
         return Err(err(4));
     }
     derived(program_id, account, &[b"dcg21tmpl", &d[96..128]])?;
@@ -324,6 +345,40 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
             n => n as u64,
         },
     })
+}
+
+/// Whether a template has the close-tracking extension. Old templates have
+/// no reliable payer or live-run count, so they are deliberately uncloseable.
+fn tracked_template(account: &AccountInfo) -> Result<Option<u32>, ProgramError> {
+    let d = account.try_borrow_data()?;
+    if d.len() == T_BYTES {
+        return Ok(None);
+    }
+    if d.len() != T_BYTES_V2
+        || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
+        || d[T_PAYER..T_PAYER + 32] == [0; 32]
+    {
+        return Err(err(4));
+    }
+    Ok(Some(u32_at(&d, T_ACTIVE_RUNS)?))
+}
+
+fn change_template_run_count(template: &AccountInfo, delta: i8) -> ProgramResult {
+    if !template.is_writable {
+        return Err(err(35));
+    }
+    let mut d = template.try_borrow_mut_data()?;
+    if d.len() != T_BYTES_V2 || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC {
+        return Err(err(4));
+    }
+    let count = u32_at(&d, T_ACTIVE_RUNS)?;
+    let next = match delta {
+        1 => count.checked_add(1).ok_or(err(8))?,
+        -1 => count.checked_sub(1).ok_or(err(37))?,
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+    d[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&next.to_le_bytes());
+    Ok(())
 }
 
 // Run "D21R": magic(4) status(1) pad(3) template(32) payer(32) executor(32)
@@ -398,6 +453,8 @@ pub fn process(
 ) -> ProgramResult {
     match data.get(1).copied().ok_or(ProgramError::InvalidInstructionData)? {
         SUB_CREATE_TEMPLATE => create_template(program_id, accounts, &data[2..]),
+        #[cfg(feature = "test-kernel")]
+        SUB_TEST_CREATE_LEGACY_TEMPLATE => create_template_inner(program_id, accounts, &data[2..], false),
         SUB_INIT_RUN => init_run(program_id, accounts, &data[2..]),
         SUB_COMMIT => commit(program_id, accounts, &data[2..]),
         SUB_OPEN => open(program_id, accounts, &data[2..]),
@@ -417,6 +474,7 @@ pub fn process(
         SUB_CLOSE_DISPUTE if data.len() == 2 => close_dispute(program_id, accounts),
         SUB_CLOSE_RUN if data.len() == 2 => close_run(program_id, accounts),
         SUB_CLOSE_CACHE if data.len() == 2 => close_cache(program_id, accounts),
+        SUB_CLOSE_TEMPLATE if data.len() == 2 => close_template(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -426,6 +484,10 @@ pub fn process(
 // challenger_bond:u64 out_spec_base:u32 step_spec_base:u32 spec_root[32]
 // slasher_bps:u16 (< 10,000: the remainder deterrent, design §10.3) plan_id[32]
 fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    create_template_inner(program_id, accounts, data, true)
+}
+
+fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], track_close: bool) -> ProgramResult {
     let [admitter, tmpl, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     const FIXED: usize = 1 + 6 * 8 + 8 + 32 + 2 + 32;
     if !admitter.is_signer || data.len() < FIXED {
@@ -479,7 +541,13 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         return Err(err(6));
     }
     let template_id = sha256(&[TEMPLATE_DOMAIN, data]);
-    create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id], T_BYTES)?;
+    let template_bytes = if track_close { T_BYTES_V2 } else { T_BYTES };
+    if track_close && tmpl.lamports() != 0 {
+        // The recorded payer must be the source of the template's rent; a
+        // permissionless pre-fund cannot be attributed to a particular key.
+        return Err(err(31));
+    }
+    create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id], template_bytes)?;
     let mut d = tmpl.try_borrow_mut_data()?;
     d[T_FIXED] = count as u8;
     if block_data_end > FIXED {
@@ -495,6 +563,11 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     d[130..134].copy_from_slice(&first_list_record.to_le_bytes());
     d[136..168].copy_from_slice(&data[91..123]);
     d[96..128].copy_from_slice(&template_id);
+    if track_close {
+        d[T_TRACKING..T_TRACKING + 4].copy_from_slice(T_TRACKING_MAGIC);
+        d[T_PAYER..T_PAYER + 32].copy_from_slice(admitter.key.as_ref());
+        d[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&0u32.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -517,6 +590,11 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         return Err(ProgramError::MissingRequiredSignature);
     }
     let t = template(program_id, tmpl)?;
+    let active_runs = tracked_template(tmpl)?;
+    if active_runs.is_some() && !tmpl.is_writable {
+        return Err(err(35));
+    }
+    let next_active_runs = active_runs.map(|n| n.checked_add(1).ok_or(err(8))).transpose()?;
     let n = u32_at(data, 64)? as usize;
     let refs = data.get(68..68 + n * 52).ok_or(err(1))?;
     if data.len() != 68 + n * 52 {
@@ -552,6 +630,11 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     let commit_deadline = now()?.checked_add(t.challenge_window).ok_or(err(8))?;
     d[R_DEADLINE..R_DEADLINE + 8].copy_from_slice(&commit_deadline.to_le_bytes());
     d[R_REFS..].copy_from_slice(refs);
+    drop(d);
+    if let Some(next) = next_active_runs {
+        let mut t = tmpl.try_borrow_mut_data()?;
+        t[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&next.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -1828,7 +1911,7 @@ fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     close_into(c.dispute, challenger)
 }
 
-// 19: [caller(s), run(w), template, payer(w)]. A settled run whose disputes
+// 19: [caller(s), run(w), template(w for tracked templates), payer(w)]. A settled run whose disputes
 // are all closed shrinks to its receipt (design §6.4) at the same address, so
 // consumers can still read its final status and root at the run's address
 // (consumers identify a run by its address: the run id alone is not unique
@@ -1837,6 +1920,13 @@ fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
 fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [caller, run, tmpl, payer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     run_checked(program_id, run, tmpl)?;
+    template(program_id, tmpl)?;
+    let active_runs = tracked_template(tmpl)?;
+    if let Some(count) = active_runs {
+        if count == 0 || !tmpl.is_writable {
+            return Err(err(37));
+        }
+    }
     let status = {
         let r = run.try_borrow_data()?;
         if payer.key.to_bytes() != r[R_PAYER..R_PAYER + 32] {
@@ -1855,6 +1945,11 @@ fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         }
         r[R_STATUS]
     };
+    if active_runs.is_some() {
+        // This instruction is atomic: a later close/refund failure rolls the
+        // count change back with the run mutation.
+        change_template_run_count(tmpl, -1)?;
+    }
     if status == RUN_OPEN {
         return close_into(run, payer);
     }
@@ -1870,6 +1965,28 @@ fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(err(35));
     }
     move_lamports(run, payer, extra)
+}
+
+// 21: [recorded payer(s,w), template(w)]. Closing is payer-authorized to
+// avoid griefing a reusable template by an executor, challenger or bystander.
+// A zero active-run count means no run or dispute still needs the template.
+fn close_template(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let [payer, tmpl, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    template(program_id, tmpl)?;
+    let Some(active_runs) = tracked_template(tmpl)? else {
+        return Err(err(37));
+    };
+    let recorded_payer = {
+        let d = tmpl.try_borrow_data()?;
+        Pubkey::new_from_array(d[T_PAYER..T_PAYER + 32].try_into().unwrap())
+    };
+    if payer.key != &recorded_payer || active_runs != 0 {
+        return Err(err(37));
+    }
+    close_into(tmpl, payer)
 }
 
 // 20: [anyone, run, cache(w), executor(w)]. A reveal cache closes once its

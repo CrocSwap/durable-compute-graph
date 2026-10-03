@@ -835,10 +835,12 @@ write_rate) × write_slots`.
 | `TIMEOUT`, `ADVANCE_RULED_PREFIX`, `SETTLE`, `FINALIZE_RUN` | anyone |
 | `CANCEL_RUN` | the payer, while `now > commit_deadline` with no commit |
 | `CLOSE_DISPUTE` (only after `ruled_prefix > sequence`, R2-S8), `CLOSE_STAGING`, `CLOSE_RUN` (leaves the receipt), `CLOSE_CACHE` | anyone; rent goes to the recorded payers |
+| `CLOSE_TEMPLATE` | the recorded template payer, after every run has been cancelled or converted to a receipt |
 
-**Rent reclaim as implemented (2026-10-03, tag 227 subs 18–20).** Measured
-by the v2.1 skeleton suite, natively and on SBF; nine planted guard bugs are
-each caught.
+**Rent reclaim (tag 227 subs 18–21).** Dispute, run and cache reclaim is
+measured by the v2.1 skeleton suite, natively and on SBF; nine planted guard
+bugs are each caught. Template-close coverage and its planted guard bugs are
+recorded below with their implementation results.
 - **`CLOSE_DISPUTE` (18), anyone.** Allowed for a ruled or moot dispute once
   the ruled prefix has passed it; the run's lowest challenger win must also
   wait until the pot is paid. It closes the dispute's two staging buffers in
@@ -861,8 +863,35 @@ each caught.
   executor that paid their rent (32 bytes after the revealed nodes, 1,112
   bytes in all); `cache_answer` accepts both sizes. A cache from before this
   change closes only while its run or receipt can name the executor.
-- **Not yet:** template closes (a template records no payer, and runs still
-  read it).
+- **`CLOSE_TEMPLATE` (21), the recorded template payer.** New templates
+  append a 40-byte extension after the fixed block area: `D21O`, the
+  creating admitter's key (the account funding template rent), and
+  `active_runs:u32`. The extension does not enter the template ID or change
+  the instruction's account order. Existing template accounts retain their
+  original size and remain usable with their original read-only template
+  metas; they lack reliable provenance and are therefore not closeable.
+  `INIT_RUN` increments the count. `CLOSE_RUN` decrements it only when an
+  uncommitted run is cancelled or a settled run becomes a receipt. Thus the
+  count remains nonzero for every live run, including a run whose disputes
+  have ended but whose run account has not yet been closed. Receipts and
+  caches do not read the template. No separate dispute count is needed:
+  `CLOSE_RUN` already requires every dispute to be terminal, past the ruled
+  prefix and closed (and any winning pot paid). New-template `INIT_RUN` and
+  `CLOSE_RUN` mark their existing template account slot writable to update
+  the count; the account positions are unchanged. Template closure requires
+  the recorded payer's signature, a writable template account and a zero
+  count, then drains the account to that payer. New closeable template PDAs
+  reject prior system-account pre-funding, so the recorded admitter actually
+  supplies the creation rent; old template creation keeps its original
+  pre-funding behavior.
+
+  **Who profits by calling this first?** The executor gets no rent and
+  cannot authorize closure; the challenger gets no rent and cannot
+  authorize closure; the payer receives the template rent and chooses when
+  to give up future reuse; a bystander gets no rent and cannot authorize
+  closure. The signature plus zero-count guard prevents another role from
+  racing the payer to remove a reusable template. Concurrent initialization
+  and closure serialize on the writable template account.
 
 **Independent review fixes (2026-10-03).** From the first independent review
 of tag 227 at bc4e391:

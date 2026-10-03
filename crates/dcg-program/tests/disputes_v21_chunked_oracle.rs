@@ -87,7 +87,7 @@ async fn replay(ctx: &mut ProgramTestContext, tx: &mut Sender, s: &serde_json::V
     init.extend_from_slice(&flat);
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &nonce, &(refs.len() as u32).to_le_bytes(), &flat, e.pubkey().as_ref()]);
     let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
-    tx.send(ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter])
+    tx.send(ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter])
         .await
         .unwrap_or_else(|err| panic!("{name}: init: {err:?}"));
     let root = hex(s["root_bytes"].as_str().unwrap());
