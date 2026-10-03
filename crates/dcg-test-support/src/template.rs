@@ -61,11 +61,13 @@ pub struct TemplateOptions {
     pub admission: Admission,
     /// Print compute units for the setup tags.
     pub trace_cu: bool,
+    /// The five limits the template seal (176) approves.
+    pub limits: TemplateLimits,
 }
 
 impl TemplateOptions {
     pub fn new(kind: FixtureKind) -> TemplateOptions {
-        TemplateOptions { kind, swap_roles: false, admission: Admission::Complete, trace_cu: false }
+        TemplateOptions { kind, swap_roles: false, admission: Admission::Complete, trace_cu: false, limits: EXAMPLE_LIMITS }
     }
 }
 
@@ -255,11 +257,11 @@ impl Template {
         let dtu1 = address::template_use(&program, &pt2s, &pt2s_sha).0;
         let mut data = vec![TAG_TEMPLATE_SEAL, config::SEAL_APPROVED];
         for limit in [
-            EXAMPLE_LIMITS.max_challenge_window_slots,
-            EXAMPLE_LIMITS.max_response_window_slots,
-            EXAMPLE_LIMITS.max_document_lifetime_slots,
-            EXAMPLE_LIMITS.max_abandon_after_slots,
-            EXAMPLE_LIMITS.min_abandon_after_slots,
+            options.limits.max_challenge_window_slots,
+            options.limits.max_response_window_slots,
+            options.limits.max_document_lifetime_slots,
+            options.limits.max_abandon_after_slots,
+            options.limits.min_abandon_after_slots,
         ] {
             data.extend_from_slice(&limit.to_le_bytes());
         }
@@ -371,7 +373,17 @@ impl Template {
             Admission::Form48Only => 1,
             Admission::Begun => 2,
         };
-        let opts = [options.kind as u8, options.swap_roles as u8, admission, target.is_sbf() as u8];
+        let mut opts = vec![options.kind as u8, options.swap_roles as u8, admission, target.is_sbf() as u8];
+        let l = &options.limits;
+        for v in [
+            l.max_challenge_window_slots,
+            l.max_response_window_slots,
+            l.max_document_lifetime_slots,
+            l.max_abandon_after_slots,
+            l.min_abandon_after_slots,
+        ] {
+            opts.extend_from_slice(&v.to_le_bytes());
+        }
         crate::snapshot::key("template", &opts, &fixture.digest(), &target.identity)
     }
 

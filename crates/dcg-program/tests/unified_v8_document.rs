@@ -1704,6 +1704,10 @@ async fn seal_pt2s(
 async fn build() -> Option<Fix> {
     build_with_pre_fix_seal_processor(false, false, false, false, false, false).await
 }
+/// The K=80 template sealed (tag 176) with `limits` instead of the example's.
+async fn build_with_limits(limits: TemplateLimits) -> Option<Fix> {
+    build_from_template(false, false, false, false, limits).await
+}
 async fn build_f47() -> Option<Fix> {
     build_with_pre_fix_seal_processor(false, false, false, true, false, false).await
 }
@@ -1738,6 +1742,7 @@ async fn build_from_template(
     f47_fixture: bool,
     k10240_fixture: bool,
     admit_form48_only: bool,
+    limits: TemplateLimits,
 ) -> Option<Fix> {
     use dcg_test_support::template::Admission;
     let kind = if k10240_fixture {
@@ -1752,6 +1757,7 @@ async fn build_from_template(
     if admit_form48_only {
         options.admission = Admission::Form48Only;
     }
+    options.limits = limits;
     let target = dcg_test_support::dcg_program_target!();
     let t = dcg_test_support::Template::build_cached(&target, options).await?;
     let total = total_entries(&t.fixture.view()).unwrap();
@@ -1824,7 +1830,14 @@ async fn build_with_pre_fix_seal_processor(
     // comes from the real-flow template stage.
     if !use_old_seal {
         let _ = full_honest_setup;
-        return build_from_template(swap_executor_and_challenger, f47_fixture, k10240_fixture, admit_form48_only).await;
+        return build_from_template(
+            swap_executor_and_challenger,
+            f47_fixture,
+            k10240_fixture,
+            admit_form48_only,
+            EXAMPLE_LIMITS,
+        )
+        .await;
     }
     assert!(!admit_form48_only || (full_honest_setup && f47_fixture));
     let fixture = if k10240_fixture {
@@ -4634,8 +4647,8 @@ async fn f47_compiler_v1_unified_init_accepts_option_counts_1_47_48_80() {
             );
             let (decision_output, _) =
                 dcg_program::pt1_onchain::pt1x_output_address(&f.program, &decision_binding);
-            f.ctx
-                .set_account(&decision_output, &shared(system_funded()));
+            // A real System Program transfer funds the output PDA.
+            fund_system(&mut f.ctx, &f.executor, decision_output, 1_000_000_000_000).await;
             let mut decision_data = vec![S::TAG_INSTANTIATE];
             decision_data.extend_from_slice(&29u32.to_le_bytes());
             decision_data.extend_from_slice(&decision_entry.to_le_bytes());
@@ -4688,7 +4701,7 @@ async fn f47_compiler_v1_unified_init_accepts_option_counts_1_47_48_80() {
             );
             let (output, _) =
                 dcg_program::pt1_onchain::pt1x_output_address(&f.program, &output_binding);
-            f.ctx.set_account(&output, &shared(system_funded()));
+            fund_system(&mut f.ctx, &f.executor, output, 1_000_000_000_000).await;
             let mut data = vec![S::TAG_INSTANTIATE];
             data.extend_from_slice(&29u32.to_le_bytes());
             data.extend_from_slice(&entry.to_le_bytes());
@@ -6961,35 +6974,19 @@ async fn rev8_dtu1_malformed_inputs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ() {
     let Some(mut f) = build().await else { return };
+    let Some(mut fs) = build_with_limits(SHORT_LIMITS).await else { return };
     let n = 2u32;
     let roots = f.position_roots[..n as usize].to_vec();
-    let authority = f.executor.pubkey();
-    let registry = f.drp2;
-    let fixture_dtu1 = f.account(f.dtu1).await;
-    let with_limits = |limits: &TemplateLimits| {
-        let mut out = fixture_dtu1.clone();
-        out[16..48].copy_from_slice(authority.as_ref());
-        out[48..80].copy_from_slice(registry.as_ref());
-        for (i, limit) in [
-            limits.max_challenge_window_slots,
-            limits.max_response_window_slots,
-            limits.max_document_lifetime_slots,
-            limits.max_abandon_after_slots,
-            limits.min_abandon_after_slots,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let at = config::DTU1_MAX_CHALLENGE_AT + 8 * i;
-            out[at..at + 8].copy_from_slice(&limit.to_le_bytes());
-        }
-        out
-    };
+    // Two real templates: their DTU1s carry exactly the limits each seal
+    // approved.
+    assert_eq!(TemplateLimits::from_dtu1(&f.account(f.dtu1).await), Ok(EXAMPLE_LIMITS));
+    assert_eq!(TemplateLimits::from_dtu1(&fs.account(fs.dtu1).await), Ok(SHORT_LIMITS));
     let mut variant = 0u8;
-    // A real init with the fixture's DTU1 replaced by `image`, and the code.
+    // A real init on template `$f`, and the code. Each template is sealed for
+    // real with its own limits (rule 6): `f` with the example's, `fs` with
+    // SHORT_LIMITS.
     macro_rules! init_with {
-        ($f:ident, $image:expr, $terms:expr) => {{
-            let image = $image;
+        ($f:ident, $terms:expr) => {{
             let terms = $terms;
             variant += 1;
             let binding = Binding2 {
@@ -7006,8 +7003,6 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
             for key in created {
                 fund(&mut $f.ctx, key).await;
             }
-            $f.ctx
-                .set_account(&$f.dtu1, &shared(owned(&$f.program, image)));
             let metas = $f.init_metas(created);
             let data = init_data(
                 &terms,
@@ -7048,7 +7043,7 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
         abandon_after_slots: EXAMPLE_LIMITS.max_abandon_after_slots,
         ..base
     };
-    let (_, _, _, code) = init_with!(f, with_limits(&EXAMPLE_LIMITS), at_max.encode().to_vec());
+    let (_, _, _, code) = init_with!(f, at_max.encode().to_vec());
     assert_eq!(
         code, None,
         "a document AT its template's grace maximum is admitted"
@@ -7057,7 +7052,7 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
         abandon_after_slots: EXAMPLE_LIMITS.max_abandon_after_slots + 1,
         ..base
     };
-    let (_, _, _, code) = init_with!(f, with_limits(&EXAMPLE_LIMITS), over.encode().to_vec());
+    let (_, _, _, code) = init_with!(f, over.encode().to_vec());
     assert_eq!(code, Some(DISPUTE_TERMS), "one slot OVER it is 791");
     // One slot under the template's **floor**, the same code: the grace is the
     // owner's in both directions, which is the whole of check 17.
@@ -7065,7 +7060,7 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
         abandon_after_slots: EXAMPLE_LIMITS.min_abandon_after_slots - 1,
         ..base
     };
-    let (_, _, _, code) = init_with!(f, with_limits(&EXAMPLE_LIMITS), under.encode().to_vec());
+    let (_, _, _, code) = init_with!(f, under.encode().to_vec());
     assert_eq!(code, Some(DISPUTE_TERMS), "one under the floor is 791 too");
     // (2) Two templates, the same terms. The golden's grace is inside the wide
     // one and over the short one's ceiling.
@@ -7073,7 +7068,7 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
         abandon_after_slots: SHORT_LIMITS.max_abandon_after_slots + 1,
         ..base
     };
-    let (_, _, _, code) = init_with!(f, with_limits(&SHORT_LIMITS), short_grace.encode().to_vec());
+    let (_, _, _, code) = init_with!(fs, short_grace.encode().to_vec());
     assert_eq!(
         code,
         Some(DISPUTE_TERMS),
@@ -7090,15 +7085,15 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
     };
     let small_raw = small.encode().to_vec();
     let (binding, descriptor, _, code) =
-        init_with!(f, with_limits(&SHORT_LIMITS), small_raw.clone());
+        init_with!(fs, small_raw.clone());
     assert_eq!(
         code, None,
         "a document at the short template's grace maximum is admitted"
     );
     // `craft` builds the record from the fixture's own terms, so they are set to
     // the document's: the record under test must be the one init admitted.
-    f.terms_raw = small_raw.clone();
-    let c = f.craft(&binding, n, &roots, 0, descriptor).await;
+    fs.terms_raw = small_raw.clone();
+    let c = fs.craft(&binding, n, &roots, 0, descriptor).await;
     let slot = f
         .ctx
         .banks_client
@@ -7111,20 +7106,20 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
         "the document is created at slot 0, so this landing is past its init"
     );
     let (metas, data) = (
-        f.land_metas(&c),
+        fs.land_metas(&c),
         land_data(
             &c.descriptor,
             n,
-            &f.position_roots[n as usize..n as usize + 1],
+            &fs.position_roots[n as usize..n as usize + 1],
         ),
     );
-    send(&mut f.ctx, &f.executor, f.program, data, metas)
+    send(&mut fs.ctx, &fs.executor, fs.program, data, metas)
         .await
         .expect("a landing under the short template");
-    let doc = f.account(c.dcm2).await;
+    let doc = fs.account(c.dcm2).await;
     assert_eq!(
         u64_at(&doc, document::ABANDON_DEADLINE_AT),
-        f.init_slot(&c).await + SHORT_LIMITS.max_document_lifetime_slots,
+        fs.init_slot(&c).await + SHORT_LIMITS.max_document_lifetime_slots,
         "THE CLAMP READS THE TEMPLATE: the ceiling is init_slot + 4,096,000"
     );
     assert!(
@@ -7135,7 +7130,8 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
     // The same document, the same slot, under the **wide** template: the same
     // program writes the plain forward value, because that template's ceiling is
     // 134,217,728 away. This is the user's decision in two assertions.
-    let (binding, descriptor2, _, code) = init_with!(f, with_limits(&EXAMPLE_LIMITS), small_raw);
+    f.terms_raw = small_raw.clone();
+    let (binding, descriptor2, _, code) = init_with!(f, small_raw);
     assert_eq!(code, None, "and the same document under the wide template");
     let c2 = f.craft(&binding, n, &roots, 0, descriptor2).await;
     let (metas, data) = (
@@ -7166,10 +7162,22 @@ async fn rev8_the_per_template_limits_bound_a_document_and_two_templates_differ(
     );
     // (4) A **retired** template: `state` is not read by the two deadline
     // writers, or a retirement would strand the rent it was meant to protect.
-    let mut retired = with_limits(&EXAMPLE_LIMITS);
-    retired[6] = config::DTU1_STATE_RETIRED;
-    f.ctx
-        .set_account(&f.dtu1, &shared(owned(&f.program, retired)));
+    let config_key = address::config(&f.program).0;
+    send_fresh(
+        &mut f.ctx,
+        &f.executor,
+        f.program,
+        vec![TAG_TEMPLATE_SEAL, SEAL_RETIRED],
+        vec![
+            AccountMeta::new(f.executor.pubkey(), true),
+            AccountMeta::new_readonly(config_key, false),
+            AccountMeta::new(f.dta1, false),
+            AccountMeta::new(f.pt2s, false),
+            AccountMeta::new(f.dtu1, false),
+        ],
+    )
+    .await
+    .expect("the authority retires the wide template (176)");
     let (metas, data) = (
         f.land_metas(&c2),
         land_data(
@@ -10761,9 +10769,10 @@ async fn rev8_tag197_zero_length_form_pins_refund_and_refuses_bound_payload() {
     assert_eq!(f.account(f.payloads).await, payload_before);
     assert_eq!(f.lamports(f.payloads).await, payload_lamports);
 
-    let four_zero = Pubkey::new_unique();
-    f.ctx
-        .set_account(&four_zero, &shared(owned(&f.program, vec![0; 4])));
+    // Program-owned accounts anyone can create through the System Program.
+    let four_zero_kp = Keypair::new();
+    let four_zero = four_zero_kp.pubkey();
+    allocate_program_account(&mut f.ctx, &f.executor, &four_zero_kp, f.program, 4).await;
     let four_zero_before = f.account(four_zero).await;
     assert_eq!(
         custom(
@@ -10787,8 +10796,7 @@ async fn rev8_tag197_zero_length_form_pins_refund_and_refuses_bound_payload() {
 
     let wrong_refund = Pubkey::new_unique();
     let empty = Keypair::new();
-    f.ctx
-        .set_account(&empty.pubkey(), &shared(owned(&f.program, vec![])));
+    allocate_program_account(&mut f.ctx, &f.executor, &empty, f.program, 0).await;
     let empty_before = f.lamports(empty.pubkey()).await;
     assert_eq!(
         custom(
@@ -10812,8 +10820,7 @@ async fn rev8_tag197_zero_length_form_pins_refund_and_refuses_bound_payload() {
     assert_eq!(f.lamports(empty.pubkey()).await, empty_before);
 
     let good_empty = Keypair::new();
-    f.ctx
-        .set_account(&good_empty.pubkey(), &shared(owned(&f.program, vec![])));
+    allocate_program_account(&mut f.ctx, &f.executor, &good_empty, f.program, 0).await;
     let good_rent = f.lamports(good_empty.pubkey()).await;
     let good_owner_before = f.account(good_empty.pubkey()).await;
     send_with_signers(
@@ -11459,18 +11466,10 @@ async fn rev8_init_refuses_an_over_cap_decision_before_plan_binding() {
     wrong.output_count = 82;
     wrong.option_table_offset = OPTION_REGION_AT as u16;
     wrong.option_table_sha256 = [1; 32];
-    // A malformed template would be a plan-binding refusal if init reached it.
-    // The 80-option cap is enforced by the binding's 794 before plan binding.
-    f.ctx.set_account(
-        &f.routes,
-        &shared(Account {
-            lamports: 1_000_000_000,
-            data: vec![],
-            owner: SYSTEM,
-            executable: false,
-            rent_epoch: 0,
-        }),
-    );
+    // A caller-substituted routes account would be a plan-binding refusal if
+    // init reached it. The 80-option cap is enforced by the binding's 794
+    // before plan binding.
+    f.routes = Pubkey::new_unique();
     assert_eq!(f.init_refusal(&wrong, 73).await, document::RUN_BINDING);
 }
 
@@ -13033,35 +13032,11 @@ async fn rev8_challenge_open_refuses_malformed_and_revision7_documents() {
         .unwrap()
         .is_none());
 
-    f.ctx
-        .set_account(&created[0], &shared(owned(&f.program, v8_doc.clone())));
-    let mut malformed = v8_doc;
-    malformed.truncate(31);
-    f.ctx
-        .set_account(&created[0], &shared(owned(&f.program, malformed)));
-    let bad_record = address::challenge(&f.program, &descriptor, &f.signer.pubkey(), 32).0;
-    let bad_metas = challenge_position_metas(&f, created, bad_record);
-    assert_eq!(
-        custom(
-            send_fresh(
-                &mut f.ctx,
-                &f.signer,
-                f.program,
-                challenge_position_data(&descriptor, 79, 32),
-                bad_metas,
-            )
-            .await
-        ),
-        731,
-        "a short DCM2 is refused by the same v8 reader"
-    );
-    assert!(f
-        .ctx
-        .banks_client
-        .get_account(bad_record)
-        .await
-        .unwrap()
-        .is_none());
+    // A truncated DCM2 is a state only a program bug could write: the same
+    // reader's unit test refuses it (result::reader_gate_tests). The v6 record
+    // above is different: genuine revision-7 state from the retained golden,
+    // kept until a named legacy mode can produce it.
+    let _ = v8_doc;
 }
 
 /// Tag 167's coordinate is a landed position, bounded by this finalized
