@@ -27,6 +27,9 @@ pub struct Fixture {
     pub payloads: Vec<u8>,
     pub pwr1: Vec<u8>,
     pub clause12: Vec<u8>,
+    /// The payload-row offsets (one per row, then the end), as tag 142
+    /// writes them into PT1X; host-side class shapes need it.
+    pub payload_index: Vec<u8>,
 }
 
 const DEFAULT_K80: &str =
@@ -57,7 +60,8 @@ impl Fixture {
             let view = Pt2p::new(&routes, &geometry, &payloads, None, g.clone()).expect("PT2P view decodes");
             pt2p::encode_clause12_v4(view.position_count, view.segment_count, &g.digest()).to_vec()
         });
-        let fixture = Fixture { kind, root, routes, geometry, payloads, pwr1, clause12 };
+        let payload_index = payload_index(&payloads);
+        let fixture = Fixture { kind, root, routes, geometry, payloads, pwr1, clause12, payload_index };
         if kind == FixtureKind::F47 {
             assert!(fixture.has_pxr1(), "the F47 fixture must carry a PXR1 decision tail");
         }
@@ -74,6 +78,11 @@ impl Fixture {
 
     pub fn view(&self) -> Pt2p<'_> {
         Pt2p::new(&self.routes, &self.geometry, &self.payloads, None, self.program()).unwrap()
+    }
+
+    /// A view with the payload index (class shapes read payload rows).
+    pub fn view_indexed(&self) -> Pt2p<'_> {
+        Pt2p::new(&self.routes, &self.geometry, &self.payloads, Some(&self.payload_index), self.program()).unwrap()
     }
 
     /// The SHA-256 over the emission's files: part of every snapshot key.
@@ -163,4 +172,19 @@ pub fn decision_registry_rows() -> (Vec<u8>, [u8; 32]) {
     let gather = registry::find_row(&rows, decision::GATHER_FORM_ID).unwrap().expect("Form-48 row");
     assert_eq!((gather.respond_path, gather.witness_kind), (1, 0));
     (rows, census)
+}
+
+/// The offset of each payload row (rows are `id:u32 | len:u16 | len bytes`,
+/// in id order), then the end offset.
+fn payload_index(payloads: &[u8]) -> Vec<u8> {
+    let (mut out, mut at, mut expected) = (Vec::new(), 0usize, 0u32);
+    while at < payloads.len() {
+        assert_eq!(u32::from_le_bytes(payloads[at..at + 4].try_into().unwrap()), expected, "payload row order");
+        out.extend_from_slice(&(at as u32).to_le_bytes());
+        at += 6 + u16::from_le_bytes([payloads[at + 4], payloads[at + 5]]) as usize;
+        assert!(at <= payloads.len(), "payload row in bounds");
+        expected += 1;
+    }
+    out.extend_from_slice(&(at as u32).to_le_bytes());
+    out
 }

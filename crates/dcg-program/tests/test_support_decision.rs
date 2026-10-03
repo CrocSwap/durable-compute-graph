@@ -5,19 +5,9 @@ use dcg_program::hash::sha256;
 use dcg_program::kernels::decision::{ERR_OPTION_RANGE, LOGITS_ROW_LENGTH};
 use dcg_program::unified::challenge;
 use dcg_test_support::{custom, FixtureKind, RungD, Target, Template, TemplateOptions};
-use solana_program_test::{processor, ProgramTest};
-use solana_pubkey::Pubkey;
-use std::path::PathBuf;
 
 fn target() -> Target {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    Target::from_env(
-        "BASANOS_DCG_V8_SBF",
-        Pubkey::new_from_array([0x80; 32]),
-        |id| ProgramTest::new("dcg_program", id, processor!(dcg_program::process_instruction)),
-        &[src],
-        "dcg_program",
-    )
+    dcg_test_support::dcg_program_target!()
 }
 
 fn u32_at(b: &[u8], at: usize) -> u32 {

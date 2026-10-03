@@ -346,7 +346,10 @@ fn dcm2_option_binding(
         || u16_at(doc, 4)? != 7
         || count == 0
         || count > crate::kernels::decision::MAX_OPTIONS_SINGLE
-        || doc.len() != end
+        // The table ends the document, or an app-bound template's document
+        // carries its ARI1 identity after it (the stored-DCM2 reader's rule).
+        || doc.len() < end
+        || d::application_identity_v8(doc).is_err()
     {
         return Err(no(PROOF));
     }
@@ -2598,6 +2601,35 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_option_binding_accepts_an_app_bound_decision_document() {
+        use crate::unified::document as d;
+        let table: Vec<u8> = [5u32, 3].iter().flat_map(|t| t.to_le_bytes()).collect();
+        let mut doc = vec![0u8; d::OPTION_REGION_AT];
+        doc[..4].copy_from_slice(b"DCM2");
+        doc[4..6].copy_from_slice(&7u16.to_le_bytes());
+        doc[d::BINDING_AT_V8 + 151] = 2;
+        doc[d::BINDING_AT_V8 + 164..d::BINDING_AT_V8 + 196].copy_from_slice(&crate::hash::sha256(&[&table]));
+        doc.extend_from_slice(&table);
+        let plain = super::dcm2_option_binding(&doc).expect("the table ends the document");
+        assert_eq!(plain.0, 2);
+        let mut identity = vec![0u8; d::APP_IDENTITY_BYTES];
+        identity[..4].copy_from_slice(b"ARI1");
+        identity[4..36].copy_from_slice(&[9; 32]);
+        let mut bound = doc.clone();
+        bound.extend_from_slice(&identity);
+        assert_eq!(super::dcm2_option_binding(&bound).expect("a table then ARI1"), plain);
+        let mut junk = doc.clone();
+        junk.extend_from_slice(&[1u8; 64]);
+        assert!(super::dcm2_option_binding(&junk).is_err(), "64 bytes that are not ARI1");
+        let mut dirty = bound.clone();
+        dirty[d::OPTION_REGION_AT + 8 + 40] = 1;
+        assert!(super::dcm2_option_binding(&dirty).is_err(), "ARI1 with a nonzero reserved tail");
+        let mut long = doc.clone();
+        long.push(0);
+        assert!(super::dcm2_option_binding(&long).is_err(), "one stray byte");
+    }
+
     use super::*;
 
     fn empty_body(version: u16) -> Vec<u8> {

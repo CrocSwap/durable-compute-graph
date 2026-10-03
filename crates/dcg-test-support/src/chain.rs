@@ -12,10 +12,11 @@ use solana_transaction_error::TransactionError;
 
 pub const SYSTEM: Pubkey = solana_program::system_program::ID;
 
-/// A system-owned, empty, funded account: a signer's starting balance. This is
+/// A system-owned, empty, funded account (1,000,000 SOL, enough for every
+/// real PDA funding a suite makes): a signer's starting balance. This is
 /// environment, not protocol state.
 pub fn system_funded() -> Account {
-    Account { lamports: 1_000_000_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 }
+    Account { lamports: 1_000_000_000_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 }
 }
 
 /// The custom code of a refused instruction (0 when it did not refuse with one).

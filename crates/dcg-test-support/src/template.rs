@@ -294,7 +294,7 @@ impl Template {
             Admission::Complete => (0, class_total),
             Admission::Begun => (0, 0),
             Admission::Form48Only => {
-                let view = fixture.view();
+                let view = fixture.view_indexed();
                 let c = (0..class_total)
                     .find(|i| {
                         let key = dcg_program::unified::classes::key_of(&view, *i).unwrap();

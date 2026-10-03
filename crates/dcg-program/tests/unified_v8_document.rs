@@ -1727,6 +1727,87 @@ async fn build_before_payer_alias_fix() -> Option<Fix> {
     build_with_pre_fix_seal_processor(true, false, false, false, false, false).await
 }
 
+/// The fixture from the shared real-flow template stage (rule 6): config,
+/// PT1X, PT2S seal, registry, template seal and admission all ran as real
+/// instructions, restored from a byte-checked snapshot when one exists.
+async fn build_from_template(
+    swap_executor_and_challenger: bool,
+    f47_fixture: bool,
+    k10240_fixture: bool,
+    admit_form48_only: bool,
+) -> Option<Fix> {
+    use dcg_test_support::template::Admission;
+    let kind = if k10240_fixture {
+        dcg_test_support::FixtureKind::K10240
+    } else if f47_fixture {
+        dcg_test_support::FixtureKind::F47
+    } else {
+        dcg_test_support::FixtureKind::K80
+    };
+    let mut options = dcg_test_support::TemplateOptions::new(kind);
+    options.swap_roles = swap_executor_and_challenger;
+    if admit_form48_only {
+        options.admission = Admission::Form48Only;
+    }
+    let target = dcg_test_support::dcg_program_target!();
+    let t = dcg_test_support::Template::build_cached(&target, options).await?;
+    let total = total_entries(&t.fixture.view()).unwrap();
+    let g = v7_golden();
+    let e = executor();
+    let dfs2 = unhex(g["dfs2"]["hex"].as_str().unwrap());
+    let rung = dcg_test_support::RungD::load();
+    let terms_raw = Terms2 {
+        challenge_window_slots: 90_000,
+        response_window_slots: 45_000,
+        challenger_bond_lamports: 1_000_000,
+        executor_bond_lamports: ESCROW_FLOOR,
+        executor_reward_bps: 0,
+        bond_policy_kind: BOND_POLICY_CUSTOM,
+        bond_slasher_bps: 0,
+        settlement_program: [7u8; 32],
+        custom_settle_window_slots: 604_800,
+        result_retention_slots: 2_592_000,
+        bond_remainder: [8u8; 32],
+        abandon_after_slots: 2 * EXAMPLE_LIMITS.min_abandon_after_slots,
+    }
+    .encode()
+    .to_vec();
+    let locator = t.locator;
+    Some(Fix {
+        ctx: t.chain.ctx,
+        program: t.program,
+        executor: t.roles.executor,
+        signer: t.roles.signer,
+        pt2s: t.pt2s,
+        routes: t.routes,
+        geometry: t.geometry,
+        payloads: t.payloads,
+        drp2: t.drp2,
+        dea2: t.dea2,
+        dta1: t.dta1,
+        dtu1: t.dtu1,
+        pt1s_index: t.pt1x,
+        pt2s_image: t.pt2s_image,
+        pt2s_sha: t.pt2s_sha,
+        descriptor_v7: d32(&unhex(e["descriptor"].as_str().unwrap()), 0),
+        position_roots: rung.position_roots,
+        attestations: rung.attestations,
+        family_body: dfs2[document::DFS2_HEADER..].to_vec(),
+        family_roots: rung.family_roots,
+        k: t.k,
+        segments: t.segments,
+        reg_root: t.reg_root,
+        total_entries: total,
+        locator,
+        terms_raw,
+        base_entry: locator.base_entry,
+        output_write: locator.write,
+        output_width: locator.width,
+        real_pda_funding: true,
+        payload_key: Keypair::new_from_array([0x87; 32]),
+    })
+}
+
 async fn build_with_pre_fix_seal_processor(
     use_old_seal: bool,
     full_honest_setup: bool,
@@ -1735,6 +1816,12 @@ async fn build_with_pre_fix_seal_processor(
     k10240_fixture: bool,
     admit_form48_only: bool,
 ) -> Option<Fix> {
+    // Every fixture but the old-seal regression's named legacy processor
+    // comes from the real-flow template stage.
+    if !use_old_seal {
+        let _ = full_honest_setup;
+        return build_from_template(swap_executor_and_challenger, f47_fixture, k10240_fixture, admit_form48_only).await;
+    }
     assert!(!admit_form48_only || (full_honest_setup && f47_fixture));
     let fixture = if k10240_fixture {
         k10240_artifacts()
@@ -2626,7 +2713,9 @@ async fn rev8_init_land_and_finalize_at_three_lengths() {
         let dcr2 = f.account(created[3]).await;
         let terms = Terms2::decode(&doc[TERMS_AT_V8..TERMS_AT_V8 + TERMS_BYTES_V2]).unwrap();
         // The record init wrote, field for field, at the frozen offsets.
-        assert_eq!(doc.len(), OPTION_REGION_AT, "a completion is 2,182 bytes");
+        // A completion has no option table: 2,182 bytes, plus ARI1 on an
+        // app-bound template.
+        assert_option_tail(&mut f, &doc, &[]).await;
         assert_eq!(&doc[..4], b"DCM2");
         assert_eq!(u32_at(&doc, 4) as u16, 7, "version 7");
         assert_eq!(
@@ -4458,16 +4547,8 @@ async fn f47_compiler_v1_unified_init_accepts_option_counts_1_47_48_80() {
         let (descriptor, created) = f.run_document_with_options(&binding, n, &options).await;
         let doc = f.account(created[0]).await;
         assert_eq!(&doc[8..40], &descriptor);
-        assert_eq!(
-            &doc[OPTION_REGION_AT..],
-            options.as_slice(),
-            "option table at K = {k}"
-        );
-        assert_eq!(
-            doc.len(),
-            OPTION_REGION_AT + options.len(),
-            "DCM2 length at K = {k}"
-        );
+        // The option table at K, then ARI1 exactly on an app-bound template.
+        assert_option_tail(&mut f, &doc, &options).await;
         let finalized = f.finalize(&descriptor, created, n).await;
         assert_eq!(
             u16_at(&finalized, 6),
@@ -4922,6 +5003,14 @@ fn fixture_decision_record(logits: &[i64]) -> Vec<u8> {
 /// its producer write, with a finalized path through the real PT2P segment
 /// table. The proof is synthetic data; the compiler routes and PXR1 directory
 /// are the captured compiler-v1 fixture.
+/// What a real tag-166 open on the Form-47 target leaf carries.
+struct F47TargetOpen {
+    segment: u16,
+    local: u32,
+    path: Vec<[u8; 32]>,
+    spp1: Vec<u8>,
+}
+
 fn f47_honest_body(
     x: &Pt2p<'_>,
     descriptor: &[u8; 32],
@@ -4933,7 +5022,7 @@ fn f47_honest_body(
     wrong_duplicate_probability: bool,
     test_kernel_output: bool,
     position_root_at: &mut [u8; 32],
-) -> (Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>) {
+) -> (Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>, F47TargetOpen) {
     let gather_index = f47_gather_before(x, position, decision_entry);
     let gather_entry = x.entry(position, gather_index).unwrap();
     let target_entry = x.entry(position, decision_entry).unwrap();
@@ -4975,35 +5064,6 @@ fn f47_honest_body(
         &[gather_write],
     );
     let gather_leaf = sha256(&[&gather_preimage]);
-
-    let (gather_segment_ordinal, gather_segment_count) = (0..x.segment_count as usize)
-        .find_map(|ordinal| {
-            let row = x.segment_row(position, ordinal).ok()?;
-            (row.0 == gather_at.segment).then_some((ordinal, row.1))
-        })
-        .expect("gather segment exists");
-    let mut segment_leaves = (0..gather_segment_count as usize)
-        .map(|i| sha256(&[b"f47-producer-sibling", &i.to_le_bytes()]))
-        .collect::<Vec<_>>();
-    segment_leaves[gather_at.local as usize] = gather_leaf;
-    let (producer_path, producer_segment_tree_root) = f47_tree_path(
-        descriptor,
-        1,
-        position,
-        &segment_leaves,
-        gather_at.local as usize,
-    );
-    let producer_segment_root = h::hash(
-        b"segment-root/2",
-        &[
-            descriptor,
-            &position.to_le_bytes(),
-            &gather_at.segment.to_le_bytes(),
-            &(gather_segment_count as u32).to_le_bytes(),
-            &producer_segment_tree_root,
-            &[1],
-        ],
-    );
 
     let table_hash = sha256(&[table]);
     let target_coordinate = h::Coordinate {
@@ -5118,10 +5178,72 @@ fn f47_honest_body(
     );
     let target_leaf = sha256(&[&target_preimage]);
 
+    let (gather_segment_ordinal, gather_segment_count) = (0..x.segment_count as usize)
+        .find_map(|ordinal| {
+            let row = x.segment_row(position, ordinal).ok()?;
+            (row.0 == gather_at.segment).then_some((ordinal, row.1))
+        })
+        .expect("gather segment exists");
+    let mut segment_leaves = (0..gather_segment_count as usize)
+        .map(|i| sha256(&[b"f47-producer-sibling", &i.to_le_bytes()]))
+        .collect::<Vec<_>>();
+    segment_leaves[gather_at.local as usize] = gather_leaf;
+    // The executor commits both the producer (Form-48) leaf and the target
+    // (Form-47) leaf, so a real tag-166 open can name the target.
+    let same_segment = target_at.segment == gather_at.segment;
+    if same_segment {
+        segment_leaves[target_at.local as usize] = target_leaf;
+    }
+    let (producer_path, producer_segment_tree_root) = f47_tree_path(
+        descriptor,
+        1,
+        position,
+        &segment_leaves,
+        gather_at.local as usize,
+    );
+    let producer_segment_root = h::hash(
+        b"segment-root/2",
+        &[
+            descriptor,
+            &position.to_le_bytes(),
+            &gather_at.segment.to_le_bytes(),
+            &(gather_segment_count as u32).to_le_bytes(),
+            &producer_segment_tree_root,
+            &[1],
+        ],
+    );
+
     let mut segment_roots = (0..x.segment_count as usize)
         .map(|i| sha256(&[b"f47-segment-sibling", &i.to_le_bytes()]))
         .collect::<Vec<_>>();
     segment_roots[gather_segment_ordinal] = producer_segment_root;
+    let (target_segment_ordinal, target_segment_count) = (0..x.segment_count as usize)
+        .find_map(|ordinal| {
+            let row = x.segment_row(position, ordinal).ok()?;
+            (row.0 == target_at.segment).then_some((ordinal, row.1))
+        })
+        .expect("target segment exists");
+    let target_path = if same_segment {
+        f47_tree_path(descriptor, 1, position, &segment_leaves, target_at.local as usize).0
+    } else {
+        let mut leaves = (0..target_segment_count as usize)
+            .map(|i| sha256(&[b"f47-target-sibling", &i.to_le_bytes()]))
+            .collect::<Vec<_>>();
+        leaves[target_at.local as usize] = target_leaf;
+        let (path, tree) = f47_tree_path(descriptor, 1, position, &leaves, target_at.local as usize);
+        segment_roots[target_segment_ordinal] = h::hash(
+            b"segment-root/2",
+            &[
+                descriptor,
+                &position.to_le_bytes(),
+                &target_at.segment.to_le_bytes(),
+                &(target_segment_count as u32).to_le_bytes(),
+                &tree,
+                &[1],
+            ],
+        );
+        path
+    };
     let (spp_path, _) = f47_tree_path(
         descriptor,
         2,
@@ -5151,6 +5273,28 @@ fn f47_honest_body(
     for sibling in &spp_path {
         spp1.extend_from_slice(sibling);
     }
+
+    let (target_spp_path, _) = f47_tree_path(
+        descriptor,
+        2,
+        position,
+        &segment_roots,
+        target_segment_ordinal,
+    );
+    let mut target_spp1 = Vec::with_capacity(36 + 32 * target_spp_path.len());
+    target_spp1.extend_from_slice(&(target_segment_ordinal as u16).to_le_bytes());
+    target_spp1.push(target_spp_path.len() as u8);
+    target_spp1.push(0);
+    target_spp1.extend_from_slice(&table_root);
+    for sibling in &target_spp_path {
+        target_spp1.extend_from_slice(sibling);
+    }
+    let target_open = F47TargetOpen {
+        segment: target_at.segment,
+        local: target_at.local,
+        path: target_path,
+        spp1: target_spp1,
+    };
 
     let mut producer_proof = Vec::new();
     producer_proof.extend_from_slice(&(gather_preimage.len() as u16).to_le_bytes());
@@ -5200,7 +5344,7 @@ fn f47_honest_body(
     for (offset, section) in section_offsets.iter().zip(&read_sections) {
         body[*offset..*offset + section.len()].copy_from_slice(section);
     }
-    (body, gather_preimage, target_leaf, root, claimed)
+    (body, gather_preimage, target_leaf, root, claimed, target_open)
 }
 
 /// Give the retained Form-47 fixture a tiny app-owned descriptor and row
@@ -5742,6 +5886,73 @@ async fn f47_measured_custom_refusal(
 
 /// Full compiler-v1 form-47 dispute response, including the producer write
 /// preimage, DGR1 sections, and finalized segment/position proof paths.
+/// A real tag-166 open by the challenger on the committed Form-47 target
+/// leaf, then the executor's real response upload (115-118) of `body`.
+/// Returns the DCR1 record and its DRU1 response.
+async fn f47_open_and_respond(
+    f: &mut Fix,
+    created: [Pubkey; 4],
+    descriptor: &[u8; 32],
+    position: u32,
+    target_leaf: [u8; 32],
+    open: &F47TargetOpen,
+    nonce: u32,
+    body: &[u8],
+) -> (Pubkey, Pubkey) {
+    let mut packet = vec![TAG_CHALLENGE_LEAF];
+    packet.extend_from_slice(descriptor);
+    packet.extend_from_slice(&position.to_le_bytes());
+    packet.extend_from_slice(&open.segment.to_le_bytes());
+    packet.extend_from_slice(&open.local.to_le_bytes());
+    packet.extend_from_slice(&target_leaf);
+    packet.push(open.path.len() as u8);
+    for sibling in &open.path {
+        packet.extend_from_slice(sibling);
+    }
+    packet.extend_from_slice(&open.spp1);
+    packet.extend_from_slice(&nonce.to_le_bytes());
+    let record = address::challenge(&f.program, descriptor, &f.signer.pubkey(), nonce).0;
+    let metas = challenge_leaf_metas(f, created, record);
+    send_fresh_with(&mut f.ctx, &f.signer, f.program, packet, metas)
+        .await
+        .expect("the challenger opens the Form-47 leaf (166)");
+    let opened = f.account(record).await;
+    assert_eq!(opened[4], challenge::PHASE_RESPOND, "the honest option table is admitted at fix-point");
+
+    let response = dcg_program::closure_v2_response::address(&f.program, &record).0;
+    let executor = f.executor.insecure_clone();
+    let begin_metas = vec![
+        AccountMeta::new(response, false),
+        AccountMeta::new(executor.pubkey(), true),
+        AccountMeta::new_readonly(record, false),
+        AccountMeta::new_readonly(SYSTEM, false),
+    ];
+    let metas = vec![
+        AccountMeta::new(response, false),
+        AccountMeta::new(executor.pubkey(), true),
+        AccountMeta::new_readonly(record, false),
+    ];
+    let mut begin = vec![dcg_program::closure_v2_response::TAG_BEGIN];
+    begin.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    begin.extend_from_slice(&sha256(&[body]));
+    send_fresh_with(&mut f.ctx, &executor, f.program, begin, begin_metas).await.expect("response begin (115)");
+    while f.account(response).await.len() < dcg_program::closure_v2_response::HEADER + body.len() {
+        send_fresh_with(&mut f.ctx, &executor, f.program, vec![dcg_program::closure_v2_response::TAG_GROW], metas.clone())
+            .await
+            .expect("response grow (116)");
+    }
+    for (i, chunk) in body.chunks(900).enumerate() {
+        let mut write = vec![dcg_program::closure_v2_response::TAG_WRITE];
+        write.extend_from_slice(&((i * 900) as u32).to_le_bytes());
+        write.extend_from_slice(chunk);
+        send_fresh_with(&mut f.ctx, &executor, f.program, write, metas.clone()).await.expect("response write (117)");
+    }
+    send_fresh_with(&mut f.ctx, &executor, f.program, vec![dcg_program::closure_v2_response::TAG_SEAL], metas)
+        .await
+        .expect("response seal (118)");
+    (record, response)
+}
+
 async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
     let maybe = if role_swapped {
         build_f47_with_swapped_roles().await
@@ -5815,7 +6026,7 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
                 .collect::<Vec<_>>()
         };
         let mut position_root = [0u8; 32];
-        let (legacy_body, producer_preimage, target_leaf, root, _claimed) = f47_honest_body(
+        let (legacy_body, producer_preimage, target_leaf, root, _claimed, target_open) = f47_honest_body(
             &x,
             &descriptor,
             position,
@@ -5838,24 +6049,11 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
         let finalized_doc = f.account(created[0]).await;
         assert_eq!(&finalized_doc[200..232], f.pt2s.as_ref());
         assert_eq!(&finalized_doc[232..264], &f.pt2s_sha);
-        assert_eq!(&finalized_doc[OPTION_REGION_AT..], table.as_slice());
+        assert_option_tail(&mut f, &finalized_doc, &table).await;
         assert_eq!(
             &finalized_doc[BINDING_AT_V8 + 164..BINDING_AT_V8 + 196],
             &sha256(&[&table])
         );
-        // This harness installs the DCR1 challenge account directly rather
-        // than calling the normal opener, which increments DCM2's open count.
-        // Model that opener side effect so tag 131 can settle the challenge.
-        let mut document_account = f
-            .ctx
-            .banks_client
-            .get_account(created[0])
-            .await
-            .unwrap()
-            .unwrap();
-        document_account.data[128..132].copy_from_slice(&1u32.to_le_bytes());
-        f.ctx.set_account(&created[0], &shared(document_account));
-
         let pt1s_data = f.account(f.pt1s_index).await;
         assert!(dcg_program::pt1_onchain::is_sealed_template(&pt1s_data));
         let bound_view = dcg_program::unified::plan::view(
@@ -5874,87 +6072,27 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             2
         );
 
+        // Real instructions only: the challenger opens the target leaf
+        // (166) twice, and the executor answers one with the honest body and
+        // the other with a body whose target leaf has one flipped byte.
         let challenger = f.signer.pubkey();
         let nonce = 0x4700_0000 + variant as u32;
-        let (challenge_key, challenge_bump) =
-            address::challenge(&f.program, &descriptor, &challenger, nonce);
-        let (response_key, response_bump) =
-            dcg_program::closure_v2_response::address(&f.program, &challenge_key);
-        let mut state = vec![0u8; 8192];
-        state[..4].copy_from_slice(b"DCR1");
-        state[4] = 1;
-        f47_put_u16(&mut state, 6, 5);
-        state[8..40].copy_from_slice(challenger.as_ref());
-        state[40..72].copy_from_slice(f.executor.pubkey().as_ref());
-        state[72..104].copy_from_slice(&descriptor);
-        state[104..136].copy_from_slice(&target_leaf);
-        state[184..216].copy_from_slice(response_key.as_ref());
-        f47_put_u32(
-            &mut state,
-            136,
-            x.coordinate(position, decision_entry).unwrap().local,
-        );
-        f47_put_u32(&mut state, 140, nonce);
-        state[144] = 1;
-        state[145] = registry::MACHINE_SELECTOR_A16;
-        state[146] = challenge_bump.value();
-        state[147] = 1;
-        state[181] = response_bump.value();
-        state[219] = response_bump.value();
-        f47_put_u64(&mut state, 148, u64::MAX);
-        f47_put_u32(&mut state, 156, position);
-        f47_put_u16(
-            &mut state,
-            160,
-            x.coordinate(position, decision_entry).unwrap().segment,
-        );
-        f47_put_u32(&mut state, 170, decision_entry);
-        f47_put_u16(&mut state, 174, decision::FORM_ID);
-        f.ctx
-            .set_account(&challenge_key, &shared(owned(&f.program, state.clone())));
-        let mut dru1 = vec![0u8; 128];
-        dru1[..4].copy_from_slice(b"DRU1");
-        f47_put_u16(&mut dru1, 4, 1);
-        f47_put_u16(&mut dru1, 6, 2);
-        dru1[8..40].copy_from_slice(challenge_key.as_ref());
-        dru1[40..72].copy_from_slice(f.executor.pubkey().as_ref());
-        f47_put_u32(&mut dru1, 72, body.len() as u32);
-        f47_put_u32(&mut dru1, 76, body.len() as u32);
-        dru1[80..112].copy_from_slice(&sha256(&[&body]));
-        f47_put_u64(&mut dru1, 112, u64::MAX);
-        dru1.extend_from_slice(&body);
-        f.ctx
-            .set_account(&response_key, &shared(owned(&f.program, dru1.clone())));
-
+        let (challenge_key, response_key) = f47_open_and_respond(
+            &mut f, created, &descriptor, position, target_leaf, &target_open, nonce, &body,
+        )
+        .await;
         let (pt2s, pt1s_index, routes, geometry, payloads) =
             (f.pt2s, f.pt1s_index, f.routes, f.geometry, f.payloads);
         let cheat_nonce = nonce.wrapping_add(0x0100_0000);
-        let (cheat_challenge, cheat_challenge_bump) =
-            address::challenge(&f.program, &descriptor, &challenger, cheat_nonce);
-        let (cheat_response, cheat_response_bump) =
-            dcg_program::closure_v2_response::address(&f.program, &cheat_challenge);
-        let mut cheat_state = state.clone();
-        cheat_state[140..144].copy_from_slice(&cheat_nonce.to_le_bytes());
-        cheat_state[146] = cheat_challenge_bump.value();
-        cheat_state[181] = cheat_response_bump.value();
-        cheat_state[219] = cheat_response_bump.value();
-        cheat_state[184..216].copy_from_slice(cheat_response.as_ref());
-        f.ctx
-            .set_account(&cheat_challenge, &shared(owned(&f.program, cheat_state)));
         let mut cheated_body = body.clone();
         let read_count = u16::from_le_bytes(cheated_body[6..8].try_into().unwrap()) as usize;
         let target_at = 36 + 4 * read_count;
         assert!(target_at + LEAF_DOMAIN.len() < cheated_body.len());
         cheated_body[target_at + LEAF_DOMAIN.len()] ^= 1;
-        let mut cheat_dru1 = dru1.clone();
-        cheat_dru1[8..40].copy_from_slice(cheat_challenge.as_ref());
-        cheat_dru1[72..76].copy_from_slice(&(cheated_body.len() as u32).to_le_bytes());
-        cheat_dru1[76..80].copy_from_slice(&(cheated_body.len() as u32).to_le_bytes());
-        cheat_dru1[80..112].copy_from_slice(&sha256(&[&cheated_body]));
-        cheat_dru1.truncate(128);
-        cheat_dru1.extend_from_slice(&cheated_body);
-        f.ctx
-            .set_account(&cheat_response, &shared(owned(&f.program, cheat_dru1)));
+        let (cheat_challenge, cheat_response) = f47_open_and_respond(
+            &mut f, created, &descriptor, position, target_leaf, &target_open, cheat_nonce, &cheated_body,
+        )
+        .await;
         let tag120_cheat_cu = f47_measured_custom_refusal(
             &mut f,
             vec![120],
@@ -6106,7 +6244,11 @@ async fn run_f47_dispute_at_owner_boundaries(role_swapped: bool) {
             "tag 131 drains the settled DCR1 account"
         );
         let settled_doc = f.account(created[0]).await;
-        assert_eq!(u32_at(&settled_doc, 128), 0, "tag 131 clears open count");
+        // Tag 131 drops the settled challenge from DCM2's open count; the
+        // forged-target challenge, whose response tag 120 refused, is still
+        // open at RESPOND.
+        assert_eq!(u32_at(&settled_doc, 128), 1, "tag 131 drops the settled challenge from the open count");
+        assert_eq!(f.account(cheat_challenge).await[4], challenge::PHASE_RESPOND);
         eprintln!("DCG_GENERIC_SBF_CU|122|f47-test-hook|{verify_anchor}");
         eprintln!("DCG_GENERIC_SBF_CU|123|f47-test-hook|{verify_rows}");
         eprintln!(
@@ -7743,9 +7885,13 @@ async fn send_fresh_with_account_override(
         .get_latest_blockhash()
         .await
         .expect("the overridden working bank");
+    // A distinct compute-unit limit per call: the same refused bytes under
+    // the same working-bank blockhash would otherwise be AlreadyProcessed.
+    static SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let ixs = vec![
         solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
-            1_400_000,
+            1_400_000 - serial % 100_000,
         ),
         Instruction {
             program_id: program,
@@ -11804,6 +11950,16 @@ async fn rev8_pt1x_full_honest_path_reaches_challenge_ruling() {
         challenge::PHASE_RULED,
         "the PT1X-backed leaf challenge reaches a ruling"
     );
+}
+
+/// A DCM2's tail after the binding: the option table exactly, then the
+/// 64-byte ARI1 application identity if and only if the template's real
+/// admission marked it app-bound (DEA2 flag bit 2).
+async fn assert_option_tail(f: &mut Fix, doc: &[u8], options: &[u8]) {
+    assert_eq!(&doc[OPTION_REGION_AT..OPTION_REGION_AT + options.len()], options, "the option table");
+    let app_bound = u16_at(&f.account(f.dea2).await, 6) & 2 != 0;
+    let identity = document::application_identity_v8(doc).expect("a well-formed DCM2 tail");
+    assert_eq!(identity.is_some(), app_bound, "ARI1 is present exactly on an app-bound template's document");
 }
 
 fn retained_payload_index(payloads: &[u8]) -> Vec<u8> {

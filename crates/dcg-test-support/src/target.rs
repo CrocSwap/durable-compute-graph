@@ -54,6 +54,15 @@ impl Target {
         }
     }
 
+    /// Mix the enabled feature set into a native identity (an SBF image's
+    /// hash already covers its features).
+    pub fn with_features(mut self, features: &str) -> Target {
+        if !self.is_sbf() {
+            self.identity = dcg_program::hash::sha256(&[&self.identity, b"features\0", features.as_bytes()]);
+        }
+        self
+    }
+
     pub fn is_sbf(&self) -> bool {
         matches!(self.image, Image::Sbf { .. })
     }
@@ -119,4 +128,92 @@ fn collect(path: &std::path::Path, out: &mut Vec<PathBuf>) {
     } else if path.is_file() {
         out.push(path.to_path_buf());
     }
+}
+
+/// Every `dcg-program` feature, in Cargo.toml order (`default` excluded).
+/// `program_features!` must name each; `tests/feature_list.rs` checks this.
+pub const PROGRAM_FEATURES: &[&str] = &[
+    "revision-7",
+    "revision-8",
+    "graph-v2",
+    "graph-v2-experimental",
+    "graph-v2-raw-write",
+    "graph-v21",
+    "test-rev8-before-payer-alias-fix",
+    "no-entrypoint",
+    "custom-heap",
+    "heap-census",
+    "weight-witness-probe",
+    "test-weakened-class-rule",
+    "test-legacy-unchecked-option-range",
+    "v7-cu-probe",
+    "a16-kernel-probe",
+    "decision-kernel-probe",
+    "legacy-basanos-fixtures",
+    "legacy-hclosure-handlers",
+    "pt2p-seal-profile",
+    "test-kernel",
+    "sbf-lifecycle-test",
+    "sbf-real-lifecycle-test",
+    "sbf-unbound-form-test",
+    "sbf-attested-admission-test",
+];
+
+/// The `dcg-program` features enabled where this expands (a `dcg-program`
+/// test), joined by commas. Native snapshot identities include it, since a
+/// feature can change program behavior without changing its source.
+#[macro_export]
+macro_rules! program_features {
+    () => {{
+        let enabled: &[(&str, bool)] = &[
+            ("revision-7", cfg!(feature = "revision-7")),
+            ("revision-8", cfg!(feature = "revision-8")),
+            ("graph-v2", cfg!(feature = "graph-v2")),
+            ("graph-v2-experimental", cfg!(feature = "graph-v2-experimental")),
+            ("graph-v2-raw-write", cfg!(feature = "graph-v2-raw-write")),
+            ("graph-v21", cfg!(feature = "graph-v21")),
+            ("test-rev8-before-payer-alias-fix", cfg!(feature = "test-rev8-before-payer-alias-fix")),
+            ("no-entrypoint", cfg!(feature = "no-entrypoint")),
+            ("custom-heap", cfg!(feature = "custom-heap")),
+            ("heap-census", cfg!(feature = "heap-census")),
+            ("weight-witness-probe", cfg!(feature = "weight-witness-probe")),
+            ("test-weakened-class-rule", cfg!(feature = "test-weakened-class-rule")),
+            ("test-legacy-unchecked-option-range", cfg!(feature = "test-legacy-unchecked-option-range")),
+            ("v7-cu-probe", cfg!(feature = "v7-cu-probe")),
+            ("a16-kernel-probe", cfg!(feature = "a16-kernel-probe")),
+            ("decision-kernel-probe", cfg!(feature = "decision-kernel-probe")),
+            ("legacy-basanos-fixtures", cfg!(feature = "legacy-basanos-fixtures")),
+            ("legacy-hclosure-handlers", cfg!(feature = "legacy-hclosure-handlers")),
+            ("pt2p-seal-profile", cfg!(feature = "pt2p-seal-profile")),
+            ("test-kernel", cfg!(feature = "test-kernel")),
+            ("sbf-lifecycle-test", cfg!(feature = "sbf-lifecycle-test")),
+            ("sbf-real-lifecycle-test", cfg!(feature = "sbf-real-lifecycle-test")),
+            ("sbf-unbound-form-test", cfg!(feature = "sbf-unbound-form-test")),
+            ("sbf-attested-admission-test", cfg!(feature = "sbf-attested-admission-test")),
+        ];
+        enabled.iter().filter(|(_, on)| *on).map(|(n, _)| *n).collect::<Vec<_>>().join(",")
+    }};
+}
+
+/// The program under test in a `dcg-program` integration test: native, or
+/// the SBF image when `BASANOS_DCG_V8_SBF` is set (with `BPF_OUT_DIR`), with
+/// the enabled features in its identity.
+#[macro_export]
+macro_rules! dcg_program_target {
+    () => {
+        $crate::Target::from_env(
+            "BASANOS_DCG_V8_SBF",
+            ::solana_pubkey::Pubkey::new_from_array([0x80; 32]),
+            |id| {
+                ::solana_program_test::ProgramTest::new(
+                    "dcg_program",
+                    id,
+                    ::solana_program_test::processor!(dcg_program::process_instruction),
+                )
+            },
+            &[::std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")],
+            "dcg_program",
+        )
+        .with_features(&$crate::program_features!())
+    };
 }
