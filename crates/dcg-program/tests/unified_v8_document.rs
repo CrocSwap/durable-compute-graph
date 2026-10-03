@@ -11809,10 +11809,12 @@ async fn commit_route_free_app_tree_with_manifest(
     u32,
     Vec<Vec<ChallengeNode>>,
 ) {
-    let mut adm = f.account(f.dea2).await;
-    let flags = u16_at(&adm, 6) | 2;
-    adm[6..8].copy_from_slice(&flags.to_le_bytes());
-    f.ctx.set_account(&f.dea2, &shared(owned(&f.program, adm)));
+    // The template's real (attested) admission marked it app-bound.
+    assert_ne!(
+        u16_at(&f.account(f.dea2).await, 6) & 2,
+        0,
+        "real admission sets the DEA2 app-bound flag"
+    );
 
     let descriptor = f.descriptor(binding, &f.terms_raw, 16);
     let (routes, geometry, payloads, pwr1, _) = artifacts().expect("the retained emission");
@@ -11956,13 +11958,12 @@ async fn commit_challenge_tree_with_route_witness_from_artifacts(
     Vec<Vec<ChallengeNode>>,
     Vec<u8>,
 ) {
-    // This offline challenge fixture installs a complete DEA2 image directly
-    // rather than running tag 160. Mark the two app-bound rows exactly as the
-    // real app image's manifest-aware admission step would.
-    let mut adm = f.account(f.dea2).await;
-    let flags = u16_at(&adm, 6) | 2;
-    adm[6..8].copy_from_slice(&flags.to_le_bytes());
-    f.ctx.set_account(&f.dea2, &shared(owned(&f.program, adm)));
+    // The template's real (attested) admission marked it app-bound.
+    assert_ne!(
+        u16_at(&f.account(f.dea2).await, 6) & 2,
+        0,
+        "real admission sets the DEA2 app-bound flag"
+    );
     let descriptor = f.descriptor(binding, &f.terms_raw, 16);
     let (routes, geometry, payloads, pwr1, _) = fixture;
     let x = Pt2p::new(
@@ -12423,35 +12424,8 @@ async fn executor_opens_app_witness(f: &mut Fix, record: Pubkey, document: Pubke
         AccountMeta::new_readonly(f.drp2, false),
         AccountMeta::new_readonly(f.pt1s_index, false),
     ];
-    if std::env::var_os("BASANOS_EXPECT_STORED_CHALLENGE_BUMP").is_some() {
-        let original = f
-            .ctx
-            .banks_client
-            .get_account(document)
-            .await
-            .unwrap()
-            .expect("the DCM2 account remains open");
-        let mut corrupt = original.clone();
-        corrupt.data[document::DCM2_BUMP_AT] = corrupt.data[document::DCM2_BUMP_AT].wrapping_add(1);
-        f.ctx
-            .set_account(&document, &AccountSharedData::from(corrupt));
-        assert_eq!(
-            custom(
-                send(
-                    &mut f.ctx,
-                    &f.executor,
-                    f.program,
-                    vec![dcg_program::unified::TAG_RESPOND_APP_WITNESS],
-                    response_metas.clone(),
-                )
-                .await,
-            ),
-            DCR1_AUTH_REFUSAL,
-            "tag 184 must refuse a corrupted DCM2 stored bump"
-        );
-        f.ctx
-            .set_account(&document, &AccountSharedData::from(original));
-    }
+    // A corrupted DCM2 stored bump is a state only a program bug could write:
+    // the DCM2 reader's unit test refuses it (result::reader_gate_tests).
     label("challenge-app-witness-respond-184");
     let compute_units = send_cu(
         &mut f.ctx,
