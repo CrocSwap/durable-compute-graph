@@ -1002,8 +1002,9 @@ async fn a_skipped_share_is_redirected_and_uncreditable_residual_is_burned_at_se
     // else to, and that is the one this test empties.
     let mut f = build().await;
     let t = standard(f.ids.remainder, 1);
-    let empty = f.ids.convict;
-    f.install_at(empty, system_funded(0));
+    // A destination holding nothing: a fresh key no one funded (a wallet its
+    // owner emptied is the same account state).
+    let empty = Pubkey::new_unique();
     stage(&mut f, &t, BOND_HELD, Some(empty), None, true).await;
     let rem_before = f.lamports(f.ids.remainder).await;
     let metas = f.settle_metas(empty, f.ids.remainder);
@@ -1028,23 +1029,23 @@ async fn a_skipped_share_is_redirected_and_uncreditable_residual_is_burned_at_se
     // A sub-floor remainder credit is burned, not retained in DCM2 where a
     // later close would send it to the convicted executor.
     let mut g = build().await;
+    // An empty winner and an empty remainder: fresh keys no one funded.
+    let remainder = Pubkey::new_unique();
     let t2 = policy(
         BOND_POLICY_STANDARD,
         1,
         500_000,
-        g.ids.remainder,
+        remainder,
         Pubkey::default(),
     );
-    let empty = g.ids.convict;
-    g.install_at(empty, system_funded(0));
-    g.install_at(g.ids.remainder, system_funded(0));
+    let empty = Pubkey::new_unique();
     stage(&mut g, &t2, BOND_HELD, Some(empty), None, true).await;
     let executor_before = g.lamports(g.ids.executor).await;
     let incinerator_before = g.lamports(INCINERATOR).await;
-    let metas = g.settle_metas(empty, g.ids.remainder);
+    let metas = g.settle_metas(empty, remainder);
     settle_ok(&mut g, metas).await;
     assert_eq!(
-        g.lamports(g.ids.remainder).await,
+        g.lamports(remainder).await,
         0,
         "the redirect is itself subject to the rule"
     );
