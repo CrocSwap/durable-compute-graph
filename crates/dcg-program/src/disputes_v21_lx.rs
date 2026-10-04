@@ -641,13 +641,18 @@ pub mod toy {
         fn apply(&self, p: u64, i: u64, r: &[Option<&[u8]>], c: &[&[u8]], out: &mut X::Outputs) -> Result<(), X::KernelFailure> {
             let nw = self.windows(p);
             let f = X::KernelFailure;
+            // Exact (i128) arithmetic, as the Python toy's unbounded integers;
+            // a value that does not fit i64 fails like Python's struct pack
+            // (fuzz seed 901, play 116).
+            let wide = |v: Option<&[u8]>| dec(v).map(i128::from);
+            let narrow = |v: i128| i64::try_from(v).map_err(|_| f);
             if i == 0 {
                 let w = match c {
-                    [a, b] => dec(a.get(..8)).ok_or(f)?.checked_sub(dec(b.get(..8)).ok_or(f)?).ok_or(f)?,
+                    [a, b] => wide(a.get(..8)).ok_or(f)? - wide(b.get(..8)).ok_or(f)?,
                     _ => 0,
                 };
-                let v = (3 * dec(r[0]).ok_or(f)? + p as i64 + 1).checked_add(w).ok_or(f)?.rem_euclid(MOD);
-                return out.set(0, &v.to_le_bytes());
+                let v = (3 * wide(r[0]).ok_or(f)? + p as i128 + 1 + w).rem_euclid(MOD as i128);
+                return out.set(0, &narrow(v)?.to_le_bytes());
             }
             if i <= nw {
                 let mut m = dec(r[0]);
@@ -658,16 +663,16 @@ pub mod toy {
                 return out.set(0, &m.ok_or(f)?.to_le_bytes());
             }
             if i <= 2 * nw {
-                let m = dec(r[0]).ok_or(f)?;
-                let mut acc = dec(r[1]).unwrap_or(0);
+                let m = wide(r[0]).ok_or(f)?;
+                let mut acc = wide(r[1]).unwrap_or(0);
                 for v in &r[2..] {
-                    acc = acc.checked_add(m.checked_sub(dec(*v).ok_or(f)?).ok_or(f)?).ok_or(f)?;
+                    acc += m - wide(*v).ok_or(f)?;
                 }
-                return out.set(0, &acc.to_le_bytes());
+                return out.set(0, &narrow(acc)?.to_le_bytes());
             }
-            let a = dec(r[1]).ok_or(f)?;
-            let (m, s) = (dec(r[2]).unwrap_or(0), dec(r[3]).unwrap_or(0));
-            let h = a.checked_add(s).and_then(|x| x.checked_sub(m)).ok_or(f)?.rem_euclid(MOD).to_le_bytes();
+            let a = wide(r[1]).ok_or(f)?;
+            let (m, s) = (wide(r[2]).unwrap_or(0), wide(r[3]).unwrap_or(0));
+            let h = narrow((a + s - m).rem_euclid(MOD as i128))?.to_le_bytes();
             out.set(0, &h)?;
             out.set(1, &h)?;
             out.clear(2)?;
