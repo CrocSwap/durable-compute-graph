@@ -424,8 +424,11 @@ laws above apply unchanged. LX1 adds these:
   slots and verify against the agreed lower root (canonical multi-proof). A
   kernel failure on a verified opening rules `CHALLENGER`, because a
   committed state that cannot step cannot lead to the committed upper root.
-- **Constants.** The constant chunks a transition reads are fixed by the
-  machine, not chosen by the opening. Each must verify against the
+- **Constants.** The constant chunks a transition reads are a function of
+  the transition and its read values, which are verified against the agreed
+  lower root first; they are never chosen by the opening. A read function
+  that cannot name its reads for a verified state rules `CHALLENGER`, as a
+  kernel failure does. Each must verify against the
   template's `constants_root` (design §13). A wrong, missing, extra or
   reordered constant is a refusal, so a run computed with other constants
   loses at the first transition that reads a changed chunk.

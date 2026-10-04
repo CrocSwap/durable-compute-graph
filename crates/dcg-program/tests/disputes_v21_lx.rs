@@ -528,6 +528,46 @@ async fn wrong_missing_or_reordered_constants_are_refused_and_the_executor_may_r
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn data_dependent_constant_reads_rule_like_python_in_both_role_orders() {
+    let g = golden();
+    let b = &g["by_value"];
+    let root = h32(&b["constants_root"]);
+    let params = hex(b["params"].as_str().unwrap());
+    for p in b["plays"].as_array().unwrap() {
+        let mut ch = Chain::new_full(p["arity"].as_u64().unwrap() as u8, 100_000, None, params.clone(), root, GOLDEN_BOUNDS, 9).await;
+        check_play(&mut ch, p).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_dependent_read_of_the_wrong_chunk_is_refused() {
+    // Review M2: the chunk the position would select, with a valid path, is
+    // not the one the verified h selects.
+    let g = golden();
+    let b = &g["by_value"];
+    let root = h32(&b["constants_root"]);
+    let params = hex(b["params"].as_str().unwrap());
+    let p = b["plays"].as_array().unwrap().iter().find(|p| p["ruling"] == "E" && p.get("by_position").is_some()).unwrap();
+    let mut ch = Chain::new_full(p["arity"].as_u64().unwrap() as u8, 100_000, None, params, root, GOLDEN_BOUNDS, 9).await;
+    ch.commit(&p["commitment"]).await.unwrap();
+    let body = ch.state_body(&p["commitment"], p["pair"].as_u64().unwrap() as usize);
+    let d = ch.open_raw(1, &body).await.unwrap();
+    for r in p["rounds"].as_array().unwrap() {
+        let mids: Vec<u8> = r["midpoints"].as_array().unwrap().iter().flat_map(h32).collect();
+        ch.midpoints(d, &mids).await.unwrap();
+        ch.pick(d, r["pick"].as_u64().unwrap() as u8).await.unwrap();
+    }
+    let mut wrong = p["opening"].clone();
+    wrong["constants"][0]["chunk"] = p["by_position"]["chunk"].clone();
+    wrong["constants"][0]["chunk_path"] = p["by_position"]["chunk_path"].clone();
+    ch.stage(d, V::ROLE_EXECUTOR, &encode_replay(&wrong)).await;
+    assert_eq!(ch.opening(d).await, Err(custom(50)));
+    ch.write(d, V::ROLE_EXECUTOR, 0, &encode_replay(&p["opening"])).await.unwrap();
+    ch.opening(d).await.unwrap();
+    assert_eq!(ch.account(d).await.data[6], V::RULING_EXECUTOR);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn constants_must_be_under_the_template_constants_root() {
     // The same weighted run on a template that commits other constants (here
     // none): no opening can verify, so the executor cannot answer and loses

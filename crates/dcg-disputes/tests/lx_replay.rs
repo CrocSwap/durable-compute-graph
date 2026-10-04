@@ -100,7 +100,7 @@ impl LxMachine for Toy {
             return None;
         })
     }
-    fn constants(&self, p: u64, i: u64, out: &mut [(u32, u64)]) -> Option<usize> {
+    fn constants(&self, p: u64, i: u64, _reads: &[Option<&[u8]>], out: &mut [(u32, u64)]) -> Option<usize> {
         if !self.weights || i != 0 {
             return Some(0);
         }
@@ -420,7 +420,7 @@ fn weighted_replays_rule_like_python() {
     for w in &cases {
         let (p, i) = locate(&m, w.case.coordinate).unwrap();
         let mut reads = [(0u32, 0u64); 4];
-        let n = m.constants(p, i, &mut reads).unwrap();
+        let n = m.constants(p, i, &[], &mut reads).unwrap();
         assert_eq!(&reads[..n], &w.reads[..], "declared reads match Python");
         for (k, (cid, _)) in w.reads.iter().enumerate() {
             let digest = g["weighted"]["digests"][cid.to_string()].as_str().unwrap();
@@ -485,4 +485,57 @@ fn unweighted_transitions_refuse_constant_entries() {
     for c in cases(&g) {
         assert_eq!(run_c(&m, &c, &c.opened, &c.siblings, &e[..1], &root), Err(LxRefusal::Constant));
     }
+}
+
+
+/// A one-slot machine whose constant read function fails on the verified
+/// value 0xFF (review M3): the replay rules for the challenger.
+struct PickyReads;
+impl LxMachine for PickyReads {
+    fn positions(&self) -> u64 { 1 }
+    fn height(&self) -> u16 { 1 }
+    fn transitions_in(&self, _p: u64) -> u64 { 1 }
+    fn position_start(&self, p: u64) -> u64 { p }
+    fn slots(&self, _p: u64, _i: u64, r: &mut [u32], w: &mut [u32]) -> Option<(usize, usize)> {
+        r[0] = 0;
+        w[0] = 0;
+        Some((1, 1))
+    }
+    fn constants(&self, _p: u64, _i: u64, reads: &[Option<&[u8]>], _out: &mut [(u32, u64)]) -> Option<usize> {
+        (reads[0]? != [0xFF]).then_some(0)
+    }
+    fn apply(&self, _p: u64, _i: u64, _r: &[Option<&[u8]>], _c: &[&[u8]], o: &mut Outputs) -> Result<(), KernelFailure> {
+        o.set(0, &[1])
+    }
+}
+
+#[test]
+fn a_machine_that_cannot_name_its_reads_rules_for_the_challenger() {
+    let (mut reads, mut writes) = ([0u32; 2], [0u32; 2]);
+    let mut nodes = [(0u64, [0u8; 32]); 2];
+    let mut rv: [Option<&[u8]>; 2] = [None; 2];
+    let mut fx = [Write::Keep; 2];
+    let mut out = [0u8; 8];
+    let (mut cr, mut cv) = ([(0u32, 0u64); 1], [&[][..]; 1]);
+    let mut s = Scratch {
+        reads: &mut reads,
+        writes: &mut writes,
+        nodes: &mut nodes,
+        read_values: &mut rv,
+        write_effects: &mut fx,
+        out: &mut out,
+        const_reads: &mut cr,
+        const_values: &mut cv,
+    };
+    let sib = dcg_disputes::empty(&Soft, dcg_disputes::Tree::LxState, 0);
+    let root_of = |v: &[u8]| {
+        let mut n = [(0u64, dcg_disputes::lx::slot_leaf(&Soft, 0, Some(v)))];
+        dcg_disputes::lx::fold(&Soft, 1, &mut n, &[sib]).unwrap()
+    };
+    let (bad, good) = ([0xFFu8], [0x02u8]);
+    let lo = root_of(&bad);
+    let hi = root_of(&[1]);
+    assert_eq!(replay(&Soft, &PickyReads, 0, &[(0, Some(&bad[..]))], &[sib], &[], &[0; 32], &lo, &hi, &mut s), Ok(LxRuling::Challenger));
+    let lo = root_of(&good);
+    assert_eq!(replay(&Soft, &PickyReads, 0, &[(0, Some(&good[..]))], &[sib], &[], &[0; 32], &lo, &hi, &mut s), Ok(LxRuling::Executor));
 }

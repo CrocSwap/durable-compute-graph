@@ -42,6 +42,7 @@ class ToyMachine:
     window: int = 3
     h0: int = 7
     weights: bool = False
+    by_value: bool = False  # the start's constant-0 chunk is chosen by h (data-dependent read)
 
     WEIGHTS0 = (5, -3, 11, 2, 7, 0, -9, 4)
     WEIGHTS2 = (13, 1, 6)
@@ -100,6 +101,10 @@ class ToyMachine:
                 def start_w(r, chunks, p=p):
                     w = dec(chunks[0][:8]) - dec(chunks[1][:8])
                     return {self.A: enc((3 * dec(r[self.H]) + p + 1 + w) % MOD)}
+                if self.by_value:
+                    def reads(r, p=p):
+                        return ((0, dec(r[self.H]) % 4), (2, p % 3))
+                    return Transition(c, f"p{p}.start", (self.H,), (self.A,), start_w, reads)
                 return Transition(c, f"p{p}.start", (self.H,), (self.A,), start_w,
                                   ((0, p % 4), (2, p % 3)))
 

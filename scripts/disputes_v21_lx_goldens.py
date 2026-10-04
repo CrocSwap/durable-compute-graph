@@ -171,7 +171,7 @@ def build_weighted() -> dict:
                 "coordinate": d.lo,
                 "opened": [[s, None if proof.values[s] is None else proof.values[s].hex()] for s in sorted(proof.values)],
                 "siblings": [proof.siblings[k].hex() for k in sorted(proof.siblings)],
-                "const_reads": [list(r) for r in sch.transition(d.lo).constants],
+                "const_reads": [list(r) for r in L.constant_reads(sch.transition(d.lo), executor.states[d.lo])],
                 "constants": [{"chunk": e.chunk.hex(), "chunk_path": [x.hex() for x in e.chunk_path],
                                "digest": e.digest.hex(), "const_path": [x.hex() for x in e.const_path]}
                               for e in proof.constants],

@@ -547,7 +547,8 @@ pub(crate) fn output(
 
 /// The Python toy machine (`python/dcg/disputes_v21/lx_toy.py`) as a
 /// registered LX1 machine, for tests and the DCG example. Parameters:
-/// `positions:u64 window:u64 h0:i64 [weights:u8]`; with `weights = 1` each
+/// `positions:u64 window:u64 h0:i64 [weights:u8]`; with `weights = 1` (or 2,
+/// the start's first chunk chosen by h, as the Python toy's `by_value`) each
 /// start reads two template constant chunks (design §13), as the Python toy's
 /// `weights=True`.
 #[cfg(feature = "test-kernel")]
@@ -562,6 +563,8 @@ pub mod toy {
         w: u64,
         h0: i64,
         weights: bool,
+        /// The start's constant-0 chunk is chosen by h (a data-dependent read).
+        by_value: bool,
         outputs: [u32; 1],
     }
 
@@ -631,11 +634,12 @@ pub mod toy {
                 return None;
             })
         }
-        fn constants(&self, p: u64, i: u64, out: &mut [(u32, u64)]) -> Option<usize> {
+        fn constants(&self, p: u64, i: u64, reads: &[Option<&[u8]>], out: &mut [(u32, u64)]) -> Option<usize> {
             if !self.weights || i != 0 {
                 return Some(0);
             }
-            out.get_mut(..2)?.copy_from_slice(&[(0, p % 4), (2, p % 3)]);
+            let first = if self.by_value { dec(*reads.first()?)?.rem_euclid(4) as u64 } else { p % 4 };
+            out.get_mut(..2)?.copy_from_slice(&[(0, first), (2, p % 3)]);
             Some(2)
         }
         fn apply(&self, p: u64, i: u64, r: &[Option<&[u8]>], c: &[&[u8]], out: &mut X::Outputs) -> Result<(), X::KernelFailure> {
@@ -701,9 +705,10 @@ pub mod toy {
 
     impl LxFactory for ToyFactory {
         fn bind(&self, params: &[u8]) -> Option<Box<dyn LxBound>> {
-            let weights = match params.len() {
-                24 => false,
-                25 if params[24] == 1 => true,
+            let (weights, by_value) = match params.len() {
+                24 => (false, false),
+                25 if params[24] == 1 => (true, false),
+                25 if params[24] == 2 => (true, true),
                 _ => return None,
             };
             let p = u64::from_le_bytes(params[0..8].try_into().ok()?);
@@ -713,7 +718,7 @@ pub mod toy {
             if !(1..=1 << 16).contains(&p) || !(1..=64).contains(&w) {
                 return None;
             }
-            Some(Box::new(Toy { p, w, h0, weights, outputs: [0] }))
+            Some(Box::new(Toy { p, w, h0, weights, by_value, outputs: [0] }))
         }
     }
 

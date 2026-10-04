@@ -153,3 +153,94 @@ def test_a_planted_referee_that_skips_the_constant_path_check_is_caught(monkeypa
     forged = tuple(dataclasses.replace(e, const_path=(bytes(32),) * 2) for e in forged)
     assert d.submit_opening(L.MultiProof(lie.values, lie.siblings, forged)) == "E"  # the mutant is fooled
     del truth
+
+
+# --- data-dependent constant reads (the start's chunk is chosen by h) -------------------
+
+MV = ToyMachine(positions_count=9, window=3, weights=True, by_value=True)
+
+
+class WrongChunk(ToyMachine):
+    """An executor that reads the chunk after the one h selects."""
+
+    def transition(self, p, i):
+        t = super().transition(p, i)
+        if i == 0:
+            return dataclasses.replace(t, constants=lambda r: ((0, (dec(r[self.H]) + 1) % 4), (2, p % 3)))
+        return t
+
+
+def test_by_value_reads_follow_the_verified_state_in_both_role_orders():
+    truth = L.execute(MV)
+    liar = L.execute(WrongChunk(positions_count=9, window=3, weights=True, by_value=True))
+    liar.machine = MV
+    d = L.play(MV, liar, truth, 1, 16)
+    assert d.ruling == "C" and L.Schedule(MV).transition(d.lo).label.endswith(".start")
+    d = L.play(MV, truth, liar, 1, 16, pair=L.first_disputed_pair(L.commit(liar, 1), truth))
+    assert d.ruling == "E"
+
+
+def test_by_value_opening_of_another_chunk_is_refused():
+    run = L.execute(MV)
+    s = L.Schedule(MV)
+    target = next(c for c in range(s.total) if s.transition(c).label == "p5.start")
+    d = L.Dispute(MV, L.commit(run, 1), 16)
+    d.open(5)
+    while d.phase == L.PH_MIDPOINTS:
+        d.commit_midpoints(L.executor_midpoints(run, d))
+        uppers = [x for x, _ in d.midpoints] + [d.hi]
+        d.pick(next(i for i, x in enumerate(uppers) if x > target))
+    good = L.executor_opening(run, d)
+    h = dec(run.states[d.lo][MV.H])
+    table = MV.constant_table()
+    other = (h + 1) % 4
+    wrong = dataclasses.replace(good.constants[0], chunk=table.chunk(0, other),
+                                chunk_path=tuple(table.chunk_tree(0).path(other)))
+    refused(d, L.MultiProof(good.values, good.siblings, (wrong, good.constants[1])))
+    assert d.submit_opening(good) == "E"
+
+
+def test_by_value_reads_are_the_chunk_h_selects_not_the_position():
+    """Review M2: pin the value dependence at a start where h % 4 != p % 4."""
+    run = L.execute(MV)
+    s = L.Schedule(MV)
+    for p in range(MV.positions()):
+        c = s.position_start(p)
+        h = dec(run.states[c][MV.H])
+        if h % 4 != p % 4:
+            break
+    else:
+        raise AssertionError("no start where h % 4 differs from p % 4")
+    t = s.transition(c)
+    assert L.constant_reads(t, run.states[c]) == ((0, h % 4), (2, p % 3))
+    d = L.Dispute(MV, L.commit(run, 1), 16)
+    d.open(p)
+    while d.phase == L.PH_MIDPOINTS:
+        d.commit_midpoints(L.executor_midpoints(run, d))
+        uppers = [x for x, _ in d.midpoints] + [d.hi]
+        d.pick(next(i for i, x in enumerate(uppers) if x > c))
+    good = L.executor_opening(run, d)
+    table = MV.constant_table()
+    by_position = dataclasses.replace(good.constants[0], chunk=table.chunk(0, p % 4),
+                                      chunk_path=tuple(table.chunk_tree(0).path(p % 4)))
+    refused(d, L.MultiProof(good.values, good.siblings, (by_position, good.constants[1])))
+    assert d.submit_opening(good) == "E"
+
+
+def test_a_machine_that_cannot_name_its_reads_rules_for_the_challenger():
+    """Review M3: a committed checkpoint whose h the read function cannot handle
+    (9 bytes) rules like a kernel failure, not a crash or a refusal."""
+    run = L.execute(MV)
+    s = L.Schedule(MV)
+    c1 = s.position_start(1)
+    state1 = {**run.states[c1], MV.H: b"\x01" * 9}
+    honest = L.commit(run, 1)
+    roots = list(honest.roots)
+    roots[1] = L.state_root(MV, state1)
+    d = L.Dispute(MV, L.Commitment(1, tuple(roots), honest.outputs), 16)
+    d.open(1)
+    while d.phase == L.PH_MIDPOINTS:
+        d.commit_midpoints([bytes(32)] * len(d.midpoint_coordinates()))
+        d.pick(0)
+    assert s.transition(d.lo).label == "p1.start"
+    assert d.submit_opening(L.prove(MV, state1, [MV.H, MV.A])) == "C"

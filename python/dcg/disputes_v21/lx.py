@@ -49,19 +49,31 @@ class Transition:
 
     `constants` are the template constant chunks it reads (design §13), as
     `(constant_id, chunk_index)` in order; a transition that reads any is
-    applied as `apply(values, chunks)` with the chunk bytes in that order."""
+    applied as `apply(values, chunks)` with the chunk bytes in that order.
+    `constants` may instead be a function of the read slots' values (an
+    embedding row chosen by a token): the program evaluates it only after the
+    opening verifies against the agreed root, so the executor still cannot
+    choose (§13, data-dependent reads)."""
 
     coordinate: int
     label: str
     reads: tuple[int, ...]
     writes: tuple[int, ...]
     apply: Callable[..., Mapping[int, bytes | None]]
-    constants: tuple[tuple[int, int], ...] = ()
+    constants: tuple[tuple[int, int], ...] | Callable[[Mapping[int, bytes | None]],
+                                                       tuple[tuple[int, int], ...]] = ()
+
+
+def constant_reads(t: Transition, values: Mapping[int, bytes | None]) -> tuple[tuple[int, int], ...]:
+    """The transition's constant reads given its read slots' values."""
+    return tuple(t.constants({s: values.get(s) for s in t.reads})) if callable(t.constants) else t.constants
 
 
 def apply_transition(t: Transition, values: Mapping[int, bytes | None],
                      chunks: Sequence[bytes]) -> Mapping[int, bytes | None]:
-    return t.apply(values, list(chunks)) if t.constants else t.apply(values)
+    # A transition with constant reads, or whose reads depend on values,
+    # takes the chunks (review L1: decided by the declaration, not the count).
+    return t.apply(values, list(chunks)) if (callable(t.constants) or t.constants) else t.apply(values)
 
 
 # --- template constants (design §13) ----------------------------------------------------
@@ -127,29 +139,34 @@ class ConstOpening:
     const_path: tuple[bytes, ...]
 
 
-def open_constants(machine: "Machine", t: Transition) -> tuple[ConstOpening, ...]:
+def open_constants(machine: "Machine", t: Transition,
+                   state: Mapping[int, bytes | None]) -> tuple[ConstOpening, ...]:
     table = constant_table(machine)
-    if not t.constants:
+    reads = constant_reads(t, state)
+    if not reads:
         return ()
     ctree = table.tree()
     return tuple(ConstOpening(table.chunk(cid, j), tuple(table.chunk_tree(cid).path(j)),
                               table.digest(cid), tuple(ctree.path(cid)))
-                 for cid, j in t.constants)
+                 for cid, j in reads)
 
 
 MAX_CHUNK_PATH = 48
 MAX_CONST_PATH = 32
 
 
-def check_constants(t: Transition, opened: Sequence[ConstOpening], root: bytes) -> list[bytes]:
+def check_constants(t: Transition, opened: Sequence[ConstOpening], root: bytes,
+                    values: Mapping[int, bytes | None],
+                    reads: tuple[tuple[int, int], ...] | None = None) -> list[bytes]:
     """What the replay checks before applying (design §13): one entry per
     declared read, in order, each chunk verifying against its constant's
     digest and that digest against the template's `constants_root`. The ids
     and indices come from the machine, never from the opening."""
-    if len(opened) != len(t.constants):
+    reads = constant_reads(t, values) if reads is None else reads
+    if len(opened) != len(reads):
         raise LxRefused("the opening does not cover the transition's constant reads")
     chunks = []
-    for (cid, index), e in zip(t.constants, opened):
+    for (cid, index), e in zip(reads, opened):
         if (len(e.chunk_path) > MAX_CHUNK_PATH or len(e.const_path) > MAX_CONST_PATH
                 or index >> len(e.chunk_path) or cid >> len(e.const_path)):
             raise LxRefused("a constant path is too short or too long")
@@ -237,7 +254,7 @@ def step(machine: Machine, state: dict[int, bytes], t: Transition) -> dict[int, 
     """Apply one transition to a full state (an executor's or challenger's)."""
     out = dict(state)
     table = constant_table(machine)
-    chunks = [table.chunk(cid, j) for cid, j in t.constants]
+    chunks = [table.chunk(cid, j) for cid, j in constant_reads(t, state)]
     for slot, value in apply_transition(t, {s: state.get(s) for s in t.reads}, chunks).items():
         if slot not in t.writes:
             raise ValueError(f"{t.label} wrote undeclared slot {slot}")
@@ -485,17 +502,29 @@ class Dispute:
             raise LxRefused("not awaiting an opening")
         t = self.schedule.transition(self.lo)
         slots = set(t.reads) | set(t.writes)
-        chunks = check_constants(t, proof.constants, constants_root(self.machine))
         if not slots:
             # A transition that touches no slot is the identity (LX1 program
             # review M1): the roots must already agree.
             if proof.values or proof.siblings:
                 raise LxRefused("an identity transition takes an empty opening")
+            try:
+                reads = constant_reads(t, {})
+            except Exception:
+                return self._rule("C")  # the machine cannot name its reads (review M3)
+            check_constants(t, proof.constants, constants_root(self.machine), {}, reads)
             return self._rule("E" if self.root_lo == self.root_hi else "C")
         if set(proof.values) != slots:
             raise LxRefused("the opening does not cover the transition's slots")
         if root_over(self.machine, proof, proof.values) != self.root_lo:
             raise LxRefused("the opening does not verify against the lower root")
+        # Constant reads may depend on the (now verified) read values.
+        try:
+            reads = constant_reads(t, proof.values)
+        except Exception:
+            # The machine cannot name its reads for the verified state: like a
+            # kernel failure, this rules for the challenger (review M3).
+            return self._rule("C")
+        chunks = check_constants(t, proof.constants, constants_root(self.machine), proof.values, reads)
         written = dict(proof.values)
         try:
             updates = apply_transition(t, {s: proof.values[s] for s in t.reads}, chunks)
@@ -556,7 +585,7 @@ def challenger_pick(mine: Execution, dispute: Dispute) -> int:
 def executor_opening(run: Execution, dispute: Dispute) -> MultiProof:
     t = dispute.schedule.transition(dispute.lo)
     proof = prove(run.machine, run.states[dispute.lo], sorted(set(t.reads) | set(t.writes)))
-    return MultiProof(proof.values, proof.siblings, open_constants(run.machine, t))
+    return MultiProof(proof.values, proof.siblings, open_constants(run.machine, t, run.states[dispute.lo]))
 
 
 def play(machine: Machine, executor: Execution, challenger: Execution, k: int,
