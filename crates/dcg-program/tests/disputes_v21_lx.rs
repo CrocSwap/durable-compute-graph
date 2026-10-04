@@ -128,6 +128,11 @@ struct Chain {
 impl Chain {
     /// An LX1 template for the toy machine at `arity`, and a run.
     async fn new(arity: u8, challenge_window: u64) -> Self {
+        Self::new_with_input(arity, challenge_window, None).await
+    }
+
+    /// `input`: the run's input id; by default the digest of the golden params.
+    async fn new_with_input(arity: u8, challenge_window: u64, input: Option<[u8; 32]>) -> Self {
         let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
         let mut test = ProgramTest::default();
         test.prefer_bpf(sbf);
@@ -162,13 +167,16 @@ impl Chain {
         let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, admitter.pubkey().as_ref()], &PROGRAM).0;
         send(&mut ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
         let executor = kp(0xE1).pubkey();
-        let mut init = vec![0u8; 32];
+        let params = hex(golden()["params"].as_str().unwrap());
+        // The payer admits the machine parameters: an LX1 run's input id is
+        // their digest (LX1 program review H1).
+        let input = input.unwrap_or_else(|| sha256(&[LX::PARAMS_DOMAIN, &params]));
+        let mut init = input.to_vec();
         init.extend_from_slice(executor.as_ref());
         init.extend_from_slice(&0u32.to_le_bytes());
-        let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &[0u8; 32], &0u32.to_le_bytes(), &[], executor.as_ref()]);
+        let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &input, &0u32.to_le_bytes(), &[], executor.as_ref()]);
         let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
         send(&mut ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
-        let params = hex(golden()["params"].as_str().unwrap());
         Chain { ctx, template, run, run_id, params, levels: vec![], count: 0 }
     }
 
@@ -461,22 +469,10 @@ async fn output_claims_rule_like_python() {
         let mut ch = Chain::new(16, 100_000).await;
         ch.commit(&o["commitment"]).await.unwrap();
         let d = ch.open_raw(3, &[LX::KIND_LX_OUTPUT]).await.unwrap();
-        // The claimed outputs, the final root with its path, the opening.
-        let outs = o["commitment"]["outputs"].as_array().unwrap();
-        let mut staged = (outs.len() as u32).to_le_bytes().to_vec();
-        for v in outs {
-            match v.as_str() {
-                None => staged.push(0),
-                Some(x) => {
-                    let b = hex(x);
-                    staged.push(1);
-                    staged.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                    staged.extend_from_slice(&b);
-                }
-            }
-        }
+        // The final root with its path, then the opening of the output slots.
+        // The executor's claimed values are never needed: only their digest.
         let roots = o["commitment"]["roots"].as_array().unwrap();
-        staged.extend_from_slice(&h32(roots.last().unwrap()));
+        let mut staged = h32(roots.last().unwrap()).to_vec();
         staged.extend(path(&ch.levels, ch.count - 1));
         staged.extend(encode_opening(&o["opening"]));
         ch.stage(d, V::ROLE_CHALLENGER, &staged).await;
@@ -634,4 +630,35 @@ async fn an_honest_executor_beats_a_false_challenge_finalizes_and_closes() {
     assert_eq!(after[1], before[1] + EXECUTOR_BOND + CHALLENGER_BOND, "the honest executor gets its bond back and the challenger's");
     assert_eq!(before[2] - after[2], CHALLENGER_BOND, "the false challenger loses exactly its bond; all rent back");
     assert_eq!(after[3], before[3], "the bystander gains nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_executor_cannot_commit_inputs_the_payer_did_not_admit() {
+    // Review H1 (probe RV-P1 reversed): the payer initialized the run with a
+    // different input id, so a commit binding these parameters is refused.
+    let g = golden();
+    let p = &g["plays"][0];
+    let mut ch = Chain::new_with_input(p["arity"].as_u64().unwrap() as u8, 100_000, Some([7u8; 32])).await;
+    assert_eq!(ch.commit(&p["commitment"]).await, Err(custom(7)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn withheld_false_outputs_are_convicted_from_the_opening_alone() {
+    // Review H2 (probe RV-P2 reversed): the executor commits the digest of
+    // false outputs and never publishes them; the challenger opens the true
+    // output slots against R_T and wins.
+    let g = golden();
+    let lie = g["outputs"].as_array().unwrap().iter().find(|o| o["ruling"] == "C").unwrap();
+    let mut ch = Chain::new(16, 100_000).await;
+    ch.commit(&lie["commitment"]).await.unwrap();
+    let d = ch.open_raw(3, &[LX::KIND_LX_OUTPUT]).await.unwrap();
+    let roots = lie["commitment"]["roots"].as_array().unwrap();
+    let mut staged = h32(roots.last().unwrap()).to_vec();
+    staged.extend(path(&ch.levels, ch.count - 1));
+    staged.extend(encode_opening(&lie["opening"]));
+    ch.stage(d, V::ROLE_CHALLENGER, &staged).await;
+    let c0 = ch.lamports(kp(0xC1).pubkey()).await;
+    ch.output(d).await.unwrap();
+    assert_eq!(ch.account(d).await.data[6], V::RULING_CHALLENGER);
+    assert_eq!(ch.lamports(kp(0xC1).pubkey()).await - c0, CHALLENGER_BOND);
 }

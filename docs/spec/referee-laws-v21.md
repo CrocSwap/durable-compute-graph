@@ -398,32 +398,48 @@ trusts through the spec root:*
 There is no `extend_slots` parameter. The executor's extension is one phase
 window per other live executor wait (§5).
 
+*The admitter, for LX1 templates:* `phase_window` covers the worst
+first-round recompute plus the answer (the executor recomputes up to
+`(a-1)/a` of a checkpoint interval from its nearest snapshot), and the
+challenger's pick window covers its own recompute; the challenge window covers
+one full re-execution of the run. The program does not scale windows by `k`
+or by the interval (LX1 program review M2).
+
 **Status.** Measured for the program refusals in the skeleton suite, and for
 the planner refusals in the Python suite. A template admitted without the
 planner is trusted subjectively, as the admission-cursor decision allows.
 
-## 10. LX1 additions (designed)
+## 10. LX1 additions
 
 LX1 (`docs/design/v2.1-lazy-expansion.md`) adds checkpointed state chains. The
 laws above apply unchanged. LX1 adds these:
 - **Commit binding.** The checkpoint coordinates are derived from `k` and the
-  schedule; the executor supplies only roots. `R_0` must equal the admitted
-  initial state's root.
+  schedule; the executor supplies only roots. The machine parameters
+  (inputs, length) are admitted by the payer: their digest is the run's
+  input id. `R_0` must equal the root of the initial state those parameters
+  define.
 - **Fixed midpoints.** Midpoint coordinates are fixed by the interval and the
   arity. E supplies only their roots.
 - **Opening.** The opening must cover exactly the transition's read and write
   slots and verify against the agreed lower root (canonical multi-proof). A
   kernel failure on a verified opening rules `CHALLENGER`, because a
   committed state that cannot step cannot lead to the committed upper root.
-- **Outputs.** An OUTPUT claim opens the output slots against `R_T`. C wins
-  exactly when an opened value differs from the claimed output.
+- **Outputs.** The run commits a digest of its claimed outputs. An OUTPUT
+  claim opens the true output slots against `R_T`; C wins exactly when their
+  digest differs from the committed one. No preimage of the claim is needed,
+  so withholding the claimed values does not protect a lie.
+- **Machine contract.** Every position has at least one transition, so every
+  checkpoint pair can be disputed; a transition that touches no slot is the
+  identity. Admitters check the contract; the program cannot.
 - **Accepted property, not a violation.** A wrong intermediate state that
   heals before the next checkpoint cannot be disputed. Only checkpoint states
   and outputs are claims.
 
-Status: the Python reference and the pure Rust functions (slot leaves, the
-proof fold, coordinates, `pick_interval`) are measured against golden vectors.
-The program handlers are not built yet.
+Status: implemented (tag 227 subs 23 to 26). Native and SBF ProgramTests with
+the registered toy machine replay 16 played Python disputes in both role
+orders, the OUTPUT claim, refusals, timeouts and every ending through the
+shared settlement; the independent program review's findings are fixed
+(design §12). Not yet measured: an application machine's compute and heap.
 
 ## 11. The bendSVM settlement subset
 

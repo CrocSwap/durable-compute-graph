@@ -153,6 +153,12 @@ impl Outputs<'_> {
 /// An application's LX1 machine, registered through its manifest. It is
 /// consensus code: the template commits to its id and version. Mirrors the
 /// Python `Machine` protocol.
+///
+/// Contract (LX1 program review M1): every position has at least one
+/// transition (`transitions_in(p) >= 1`), so no checkpoint interval is empty
+/// and every checkpoint pair can be disputed; `slots` returns distinct slots;
+/// `apply` writes only declared slots. A machine that breaks the first rule
+/// lets a lie at an empty interval go undisputed, so admitters must check it.
 pub trait LxMachine {
     /// Positions in the run.
     fn positions(&self) -> u64;
@@ -261,6 +267,14 @@ pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
         + (0..nw).filter(|&k| distinct(writes, k) && !reads.contains(&writes[k])).count();
     if covered != union || s.nodes.len() < covered {
         return Err(LxRefusal::Coverage);
+    }
+    if union == 0 {
+        // A transition that touches no slot is the identity (LX1 program
+        // review M1): nothing can be opened, so the roots must already agree.
+        if !siblings.is_empty() {
+            return Err(LxRefusal::Proof);
+        }
+        return Ok(if root_lo == root_hi { LxRuling::Executor } else { LxRuling::Challenger });
     }
     let value = |slot: u32| opened.binary_search_by_key(&slot, |e| e.0).ok().map(|k| opened[k].1);
     // The opening rebuilds the agreed lower root.

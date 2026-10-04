@@ -282,3 +282,28 @@ fn output_claims_rule_like_python() {
         assert_eq!(output_claim(&Soft, m.height(), &slots, &view, &sib, &wrong_root, &claimed, &mut nodes), Err(LxRefusal::Proof));
     }
 }
+
+/// A machine whose only transition touches no slot (LX1 program review M1).
+struct Empty;
+impl LxMachine for Empty {
+    fn positions(&self) -> u64 { 1 }
+    fn height(&self) -> u16 { 2 }
+    fn transitions_in(&self, _p: u64) -> u64 { 1 }
+    fn position_start(&self, p: u64) -> u64 { p }
+    fn slots(&self, _p: u64, _i: u64, _r: &mut [u32], _w: &mut [u32]) -> Option<(usize, usize)> { Some((0, 0)) }
+    fn apply(&self, _p: u64, _i: u64, _r: &[Option<&[u8]>], _o: &mut Outputs) -> Result<(), KernelFailure> { Ok(()) }
+}
+
+#[test]
+fn a_transition_that_touches_no_slot_is_the_identity() {
+    let (mut reads, mut writes) = ([0u32; 4], [0u32; 4]);
+    let mut nodes = [(0u64, [0u8; 32]); 4];
+    let mut rv: [Option<&[u8]>; 4] = [None; 4];
+    let mut fx = [Write::Keep; 4];
+    let mut out = [0u8; 8];
+    let mut s = Scratch { reads: &mut reads, writes: &mut writes, nodes: &mut nodes, read_values: &mut rv, write_effects: &mut fx, out: &mut out };
+    let (a, b) = ([1u8; 32], [2u8; 32]);
+    assert_eq!(replay(&Soft, &Empty, 0, &[], &[], &a, &a, &mut s), Ok(LxRuling::Executor));
+    assert_eq!(replay(&Soft, &Empty, 0, &[], &[], &a, &b, &mut s), Ok(LxRuling::Challenger));
+    assert_eq!(replay(&Soft, &Empty, 0, &[], &[[0; 32]], &a, &a, &mut s), Err(LxRefusal::Proof));
+}

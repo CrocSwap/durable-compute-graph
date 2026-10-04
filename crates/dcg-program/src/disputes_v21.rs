@@ -712,7 +712,7 @@ fn commit(
     }
     let lx_root;
     let root: &[u8; D::RUN_ROOT_BYTES] = if let Some(binding) = &t.lx {
-        lx_root = lx::check_commit(&t, binding, manifest, run, data)?;
+        lx_root = lx::check_commit(&t, binding, manifest, run, tmpl, data)?;
         &lx_root
     } else {
         let root: &[u8; D::RUN_ROOT_BYTES] = data.try_into().map_err(|_| err(1))?;

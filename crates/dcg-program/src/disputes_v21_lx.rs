@@ -157,16 +157,35 @@ fn read_hashes(data: &[u8], at: usize, n: usize) -> Result<Vec<D::Hash>, Program
 /// COMMIT for an LX1 template: `run_root[176] r0_path[h*32] params`. Checks
 /// the run id, binds the machine, and verifies that checkpoint 0 is the
 /// admitted initial state's root (review H1).
-pub fn check_commit(
+pub(crate) fn check_commit(
     t: &Template,
     lx: &LxBinding,
     manifest: &'static crate::kernel::ApplicationManifest,
     run: &AccountInfo,
+    tmpl: &AccountInfo,
     data: &[u8],
 ) -> Result<[u8; D::RUN_ROOT_BYTES], ProgramError> {
     let root: [u8; D::RUN_ROOT_BYTES] = data.get(..D::RUN_ROOT_BYTES).ok_or(err(1))?.try_into().unwrap();
-    if root[0..32] != run.try_borrow_data()?[R_RUN_ID..R_RUN_ID + 32] {
-        return Err(err(7));
+    {
+        // The payer admitted the machine parameters at INIT_RUN: an LX1 run's
+        // 32-byte input id is their digest, and it is part of the run id. The
+        // executor cannot substitute other inputs or another length (review
+        // H1 of the LX1 program).
+        let r = run.try_borrow_data()?;
+        let n = u32_at(&r, R_NEXT)? as usize;
+        let refs = r.get(R_REFS..R_REFS + 52 * n).ok_or(err(8))?;
+        let template_id = key32(&tmpl.try_borrow_data()?, 96)?;
+        let expected = sha256(&[
+            b"dcg.run.id.v2.1\x00",
+            &template_id,
+            &root[RR_PARAMS..RR_PARAMS + 32],
+            &(n as u32).to_le_bytes(),
+            refs,
+            &r[R_EXECUTOR..R_EXECUTOR + 32],
+        ]);
+        if root[0..32] != r[R_RUN_ID..R_RUN_ID + 32] || expected[..] != r[R_RUN_ID..R_RUN_ID + 32] {
+            return Err(err(7));
+        }
     }
     let positions = u64_at(&root, RR_POSITIONS)?;
     let k = u32_at(&root, RR_K)? as u64;
@@ -188,7 +207,7 @@ pub fn check_commit(
 /// path_lo[h*32] path_hi[h*32] params`, the checkpoint pair the challenger
 /// disputes, opened against the committed checkpoint root. `KIND_LX_OUTPUT`:
 /// no body; the challenger then owes its output claim.
-pub fn open(
+pub(crate) fn open(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
@@ -285,7 +304,7 @@ fn lx_ctx<'a, 'b>(
 
 /// 23: [executor(s), run(w), template, dispute(w)] roots[m*32], the roots at
 /// the interval's fixed midpoint coordinates.
-pub fn midpoints(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+pub(crate) fn midpoints(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let (c, lx) = lx_ctx(program_id, run, tmpl, dispute, KIND_LX_STATE)?;
     executor_signed(c.run, executor)?;
@@ -305,7 +324,7 @@ pub fn midpoints(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
 
 /// 24: [challenger(s), run(w), template, dispute(w)] index:u8, the
 /// sub-interval whose upper root the challenger disputes.
-pub fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+pub(crate) fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [challenger, run, tmpl, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let (c, lx) = lx_ctx(program_id, run, tmpl, dispute, KIND_LX_STATE)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
@@ -382,7 +401,7 @@ fn refusal(r: X::LxRefusal) -> ProgramError {
 /// one remaining transition, staged in its buffer, is replayed and ruled in
 /// this instruction (review M5). A malformed opening is refused; the
 /// executor may retry until its deadline.
-pub fn opening(
+pub(crate) fn opening(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
@@ -424,12 +443,13 @@ pub fn opening(
 }
 
 /// 26: [challenger(s), run(w), template, dispute(w), executor(w), C's staging
-/// buffer] params. The challenger's OUTPUT claim (review H3), staged as: the
-/// claimed outputs `n:u32 (present:u8 [len:u32 bytes])*` (hashing to the
-/// committed digest), the final root and its checkpoint path, then the
-/// opening of the output slots against it. The challenger wins if any opened
-/// value differs from the claimed output.
-pub fn output(
+/// buffer] params. The challenger's OUTPUT claim (review H3), staged as the
+/// final root and its checkpoint path, then the opening of the output slots
+/// against it. The executor committed only a digest of its claimed outputs,
+/// so the program hashes the opened (true) values and rules for the
+/// challenger exactly when they do not match the committed digest. No
+/// preimage of the claim is needed (LX1 program review H2).
+pub(crate) fn output(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
@@ -450,31 +470,6 @@ pub fn output(
     let slots = b.machine.output_slots();
     let staged = buffer.try_borrow_data()?;
     let mut at = STAGE_HEADER;
-    // The claimed outputs, which must be the committed ones.
-    let n = u32_at(&staged, at)? as usize;
-    at += 4;
-    if n != slots.len() {
-        return Err(err(48));
-    }
-    let mut claimed: Vec<Option<&[u8]>> = Vec::with_capacity(n);
-    for _ in 0..n {
-        match *staged.get(at).ok_or(err(46))? {
-            0 => {
-                claimed.push(None);
-                at += 1;
-            }
-            1 => {
-                let len = u32_at(&staged, at + 1)? as usize;
-                let start = at + 5;
-                claimed.push(Some(staged.get(start..start.checked_add(len).ok_or(err(46))?).ok_or(err(46))?));
-                at = start + len;
-            }
-            _ => return Err(err(46)),
-        }
-    }
-    if X::outputs_digest(&H, &claimed) != key32(&root, RR_OUTPUTS)? {
-        return Err(err(49));
-    }
     // The final root, opened from the committed checkpoint tree.
     let count = X::checkpoint_count(b.positions, b.k).ok_or(err(42))?;
     let h = checkpoint_height(count) as usize;
@@ -485,11 +480,17 @@ pub fn output(
         return Err(err(49));
     }
     let (opened, siblings) = decode_opening(&staged, &mut at)?;
+    // The opening covers exactly the output slots and verifies against R_T.
     let mut nodes = vec![(0u64, [0u8; 32]); opened.len()];
-    let ruling = X::output_claim(&H, b.machine.height(), slots, &opened, &siblings, &root_t, &claimed, &mut nodes)
-        .map_err(refusal)?;
+    let values: Vec<Option<&[u8]>> = opened.iter().map(|(_, v)| *v).collect();
+    if X::output_claim(&H, b.machine.height(), slots, &opened, &siblings, &root_t, &values, &mut nodes).map_err(refusal)?
+        != X::LxRuling::Executor
+    {
+        return Err(err(48)); // unreachable: the values compared are the opened ones
+    }
+    let lie = X::outputs_digest(&H, &values) != key32(&root, RR_OUTPUTS)?;
     drop(staged);
-    rule(&c, executor, challenger, ruling == X::LxRuling::Challenger)
+    rule(&c, executor, challenger, lie)
 }
 
 /// The Python toy machine (`python/dcg/disputes_v21/lx_toy.py`) as a

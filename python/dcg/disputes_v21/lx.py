@@ -371,6 +371,12 @@ class Dispute:
             raise LxRefused("not awaiting an opening")
         t = self.schedule.transition(self.lo)
         slots = set(t.reads) | set(t.writes)
+        if not slots:
+            # A transition that touches no slot is the identity (LX1 program
+            # review M1): the roots must already agree.
+            if proof.values or proof.siblings:
+                raise LxRefused("an identity transition takes an empty opening")
+            return self._rule("E" if self.root_lo == self.root_hi else "C")
         if set(proof.values) != slots:
             raise LxRefused("the opening does not cover the transition's slots")
         if root_over(self.machine, proof, proof.values) != self.root_lo:
