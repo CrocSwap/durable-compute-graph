@@ -24,6 +24,8 @@ NODE_DOMAINS = {
     "chunk": b"dcg.chunk.node.v2.1\x00",
     "log": b"dcg.log.node.v2.1\x00",
     "spec": b"dcg.spec.node.v2.1\x00",
+    "lxstate": b"dcg.lx.state.node.v1\x00",
+    "lxcheckpoint": b"dcg.lx.checkpoint.node.v1\x00",
     "list": b"dcg.list.node.v2.1\x00",
 }
 EMPTY_LEAVES = {
@@ -32,6 +34,8 @@ EMPTY_LEAVES = {
     "chunk": _h(b"dcg.chunk.empty.v2.1\x00"),
     "log": _h(b"dcg.log.empty.v2.1\x00"),
     "spec": _h(b"dcg.spec.empty.v2.1\x00"),
+    "lxstate": _h(b"dcg.lx.slot.empty.v1\x00"),
+    "lxcheckpoint": _h(b"dcg.lx.checkpoint.empty.v1\x00"),
     "list": _h(b"dcg.list.empty.v2.1\x00"),
 }
 EMPTY_LEAF = EMPTY_LEAVES["step"]

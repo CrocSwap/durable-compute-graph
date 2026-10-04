@@ -7,6 +7,7 @@ design change, and say so in the commit.
 from __future__ import annotations
 
 import json
+import hashlib
 import struct
 import sys
 from pathlib import Path

@@ -1,0 +1,1443 @@
+{
+ "cases": [
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "1ac69a273de7a308e6f6a32e43ded69781bcd84dd9bc36ec4f828865c97757da"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "652612ede9d2dee5eaf5f298cac958b53fdb265863320402851da6ff8eabf492"
+   ],
+   "slots": [
+    0
+   ],
+   "values": [
+    "0700000000000000"
+   ]
+  },
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "1ac69a273de7a308e6f6a32e43ded69781bcd84dd9bc36ec4f828865c97757da",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "652612ede9d2dee5eaf5f298cac958b53fdb265863320402851da6ff8eabf492"
+   ],
+   "slots": [
+    0,
+    1,
+    2
+   ],
+   "values": [
+    "0700000000000000",
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "5ca1b798f82cfa3ed9feb853af2750e798e8318ea53243810e3c867ba1c1cf95"
+   ],
+   "slots": [
+    10,
+    11,
+    12
+   ],
+   "values": [
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "1ac69a273de7a308e6f6a32e43ded69781bcd84dd9bc36ec4f828865c97757da",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ],
+   "slots": [
+    0,
+    3,
+    6,
+    9,
+    12
+   ],
+   "values": [
+    "0700000000000000",
+    null,
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 0,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "5ca1b798f82cfa3ed9feb853af2750e798e8318ea53243810e3c867ba1c1cf95"
+   ],
+   "slots": [
+    12
+   ],
+   "values": [
+    null
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "dfb505cf80be806f8e239dcdade8a4b8e43f100ed4fe2f833118f16d2ae148b3"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "78679bebfed2ddd6cfd38aafda8129d13a412cf2bb15cff918e64980804cba0c",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "d46fd5859b61afe2588ba1125fdfcb0e4e04768027bf2935297d5787fd6a05aa"
+   ],
+   "slots": [
+    0
+   ],
+   "values": [
+    "2e00000000000000"
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "dfb505cf80be806f8e239dcdade8a4b8e43f100ed4fe2f833118f16d2ae148b3",
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de",
+    "d46fd5859b61afe2588ba1125fdfcb0e4e04768027bf2935297d5787fd6a05aa"
+   ],
+   "slots": [
+    0,
+    1,
+    2
+   ],
+   "values": [
+    "2e00000000000000",
+    "1600000000000000",
+    "2e00000000000000"
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "a2a3d401862194566d2f0691abaf1f722e817779208df181c42d7d9630d19a03",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "3cbc0bf59095ecdc81aaa0bd6575aed96a8b5d819f1dd9e9f901a66cf639f46a"
+   ],
+   "slots": [
+    10,
+    11,
+    12
+   ],
+   "values": [
+    "8d00000000000000",
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "dfb505cf80be806f8e239dcdade8a4b8e43f100ed4fe2f833118f16d2ae148b3",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "d8cadcede1a7f0a306a5bb9b9410ebdff168dda87f83f49eca4935c6196f40d7",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ],
+   "slots": [
+    0,
+    3,
+    6,
+    9,
+    12
+   ],
+   "values": [
+    "2e00000000000000",
+    null,
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 7,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "cba1f1925a7a00b6d000db8f3d4044d0c50ed210aa13e34d456e8d7c73e6d4f4",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "a31574d92191595638efe19eeee866e81fb7b1a519792cb68fbffecf56505817",
+    "3cbc0bf59095ecdc81aaa0bd6575aed96a8b5d819f1dd9e9f901a66cf639f46a"
+   ],
+   "slots": [
+    12
+   ],
+   "values": [
+    null
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "bfb192f901141de8bf03fb070eea6ac9d1f4b4a370409a576293a2b8a79bc1f6"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "a3d6a552163d8b39d119df10b43af92066d094bf0baa8cb663aeda8030c811f1",
+    "592062f01f3ffb783f37fcb391528385f811b77bd8b9406df6487078761ec46b"
+   ],
+   "slots": [
+    0
+   ],
+   "values": [
+    "5607000000000000"
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "bfb192f901141de8bf03fb070eea6ac9d1f4b4a370409a576293a2b8a79bc1f6",
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "669de90834b5d5d7140ceb306dc63bd6e53c232c6c2583fec9d0e1127f125f36",
+    "a3d6a552163d8b39d119df10b43af92066d094bf0baa8cb663aeda8030c811f1",
+    "592062f01f3ffb783f37fcb391528385f811b77bd8b9406df6487078761ec46b"
+   ],
+   "slots": [
+    0,
+    1,
+    2
+   ],
+   "values": [
+    "5607000000000000",
+    "1600000000000000",
+    "2e00000000000000"
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "96300f1d7ee37ad4ed5dd75505381e3ffeecc1c7b8dc4254ca45c6a32a26c370",
+    "db1c95f44ec1c9be9446c0ad1f833524f88e52d5e7276b8006a3586511c43d7b",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "5180294c8574868653e3a2b1f44bd4264ec221817a180c2f780ff56d053f5eae"
+   ],
+   "slots": [
+    10,
+    11,
+    12
+   ],
+   "values": [
+    "0816000000000000",
+    "5607000000000000",
+    null
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "bfb192f901141de8bf03fb070eea6ac9d1f4b4a370409a576293a2b8a79bc1f6",
+    "669de90834b5d5d7140ceb306dc63bd6e53c232c6c2583fec9d0e1127f125f36",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+    "9d67305552893bb099e3fd55bea020f9a54fe63ada9a61253b46e3156246e021",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ],
+   "slots": [
+    0,
+    3,
+    6,
+    9,
+    12
+   ],
+   "values": [
+    "5607000000000000",
+    "7700000000000000",
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 23,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "89ec1a8e437883116522bee2f1c09f004c6a92a81481db912100cc88b8072e6a",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e4e3cf57b7e0504ba3dd5f2a4874e2d80572e83109196c6f5cca0b461709388b",
+    "5180294c8574868653e3a2b1f44bd4264ec221817a180c2f780ff56d053f5eae"
+   ],
+   "slots": [
+    12
+   ],
+   "values": [
+    null
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "1ced19aa3b0362b8c44dd247ae01c89f4b2b73b9021f8bfde733c9f26c65f7a2"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6",
+    "e96c79ddce845f9a977709667be47e27294bee188e5ff7606973732078015160"
+   ],
+   "slots": [
+    0
+   ],
+   "values": [
+    "0a464c0000000000"
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "1ced19aa3b0362b8c44dd247ae01c89f4b2b73b9021f8bfde733c9f26c65f7a2",
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "669de90834b5d5d7140ceb306dc63bd6e53c232c6c2583fec9d0e1127f125f36",
+    "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6",
+    "e96c79ddce845f9a977709667be47e27294bee188e5ff7606973732078015160"
+   ],
+   "slots": [
+    0,
+    1,
+    2
+   ],
+   "values": [
+    "0a464c0000000000",
+    "1600000000000000",
+    "2e00000000000000"
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "6080fef5a902201423cdfcc93ac22e4d8f4d1cf12fb82f37e908d6fdef0ec890",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "66ccf4eff7d77e3ded743c2e091cac95a90ab587097e06b2c7bfe0e404d61388"
+   ],
+   "slots": [
+    10,
+    11,
+    12
+   ],
+   "values": [
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "1ced19aa3b0362b8c44dd247ae01c89f4b2b73b9021f8bfde733c9f26c65f7a2",
+    "669de90834b5d5d7140ceb306dc63bd6e53c232c6c2583fec9d0e1127f125f36",
+    "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+    "a3a6e7d151b2103e530fcd370cb7ba80d1dcbebdc01d1579c67b4ef3857bdd6d",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7",
+    "c39841986cb2f5e759bca0553a79119e41ebd088d6a0216487e0022eb2af1968",
+    "8cd3158000508db6c8c6f49383675fb825286430f6d10156eede973852a33563",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ],
+   "slots": [
+    0,
+    3,
+    6,
+    9,
+    12
+   ],
+   "values": [
+    "0a464c0000000000",
+    "7700000000000000",
+    "b329000000000000",
+    "0a464c0000000000",
+    null
+   ]
+  },
+  {
+   "coordinate": 48,
+   "height": 4,
+   "leaves": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538"
+   ],
+   "root": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "siblings": [
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "5262fe0fda889912279ff44e7d82a747f666baeee2e1e201bedab0ee7588dac5",
+    "66ccf4eff7d77e3ded743c2e091cac95a90ab587097e06b2c7bfe0e404d61388"
+   ],
+   "slots": [
+    12
+   ],
+   "values": [
+    null
+   ]
+  }
+ ],
+ "midpoints": [
+  {
+   "arity": 16,
+   "coordinates": [],
+   "hi": 1,
+   "lo": 0
+  },
+  {
+   "arity": 16,
+   "coordinates": [
+    1
+   ],
+   "hi": 2,
+   "lo": 0
+  },
+  {
+   "arity": 16,
+   "coordinates": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18
+   ],
+   "hi": 20,
+   "lo": 3
+  },
+  {
+   "arity": 16,
+   "coordinates": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+   ],
+   "hi": 16,
+   "lo": 0
+  },
+  {
+   "arity": 16,
+   "coordinates": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+   ],
+   "hi": 17,
+   "lo": 0
+  },
+  {
+   "arity": 16,
+   "coordinates": [
+    67,
+    129,
+    191,
+    253,
+    315,
+    378,
+    440,
+    502,
+    564,
+    626,
+    689,
+    751,
+    813,
+    875,
+    937
+   ],
+   "hi": 1000,
+   "lo": 5
+  },
+  {
+   "arity": 2,
+   "coordinates": [
+    3
+   ],
+   "hi": 7,
+   "lo": 0
+  },
+  {
+   "arity": 16,
+   "coordinates": [
+    771614,
+    1543218,
+    2314822,
+    3086427,
+    3858031,
+    4629635,
+    5401239,
+    6172844,
+    6944448,
+    7716052,
+    8487656,
+    9259261,
+    10030865,
+    10802469,
+    11574073
+   ],
+   "hi": 12345678,
+   "lo": 10
+  },
+  {
+   "arity": 16,
+   "coordinates": [
+    68719476736,
+    137438953472,
+    206158430208,
+    274877906944,
+    343597383680,
+    412316860417,
+    481036337153,
+    549755813889,
+    618475290625,
+    687194767361,
+    755914244098,
+    824633720834,
+    893353197570,
+    962072674306,
+    1030792151042
+   ],
+   "hi": 1099511627779,
+   "lo": 0
+  },
+  {
+   "arity": 3,
+   "coordinates": [
+    4,
+    6
+   ],
+   "hi": 9,
+   "lo": 2
+  }
+ ],
+ "outputs": [
+  {
+   "claimed": [
+    "0a464c0000000000"
+   ],
+   "opened": [
+    [
+     0,
+     "0a464c0000000000"
+    ]
+   ],
+   "output_slots": [
+    0
+   ],
+   "root_t": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "ruling": "E",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6",
+    "e96c79ddce845f9a977709667be47e27294bee188e5ff7606973732078015160"
+   ]
+  },
+  {
+   "claimed": [
+    "3930000000000000"
+   ],
+   "opened": [
+    [
+     0,
+     "0a464c0000000000"
+    ]
+   ],
+   "output_slots": [
+    0
+   ],
+   "root_t": "3deda92eca8686fbf61b7c57cade6f2f62d0b4b16c35432ca3610183ff18c42f",
+   "ruling": "C",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6",
+    "e96c79ddce845f9a977709667be47e27294bee188e5ff7606973732078015160"
+   ]
+  }
+ ],
+ "plays": [
+  {
+   "arity": 16,
+   "fault": 5,
+   "final": [
+    5,
+    6
+   ],
+   "k": 4,
+   "rounds": [
+    {
+     "hi": 14,
+     "lo": 0,
+     "pick": 5
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 2,
+   "fault": 9,
+   "final": [
+    9,
+    10
+   ],
+   "k": 1,
+   "rounds": [
+    {
+     "hi": 10,
+     "lo": 6,
+     "pick": 1
+    },
+    {
+     "hi": 10,
+     "lo": 8,
+     "pick": 1
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 3,
+   "fault": 13,
+   "final": [
+    13,
+    14
+   ],
+   "k": 4,
+   "rounds": [
+    {
+     "hi": 14,
+     "lo": 0,
+     "pick": 2
+    },
+    {
+     "hi": 14,
+     "lo": 9,
+     "pick": 2
+    },
+    {
+     "hi": 14,
+     "lo": 12,
+     "pick": 1
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 16,
+   "fault": 25,
+   "final": [
+    25,
+    26
+   ],
+   "k": 16,
+   "rounds": [
+    {
+     "hi": 48,
+     "lo": 0,
+     "pick": 8
+    },
+    {
+     "hi": 27,
+     "lo": 24,
+     "pick": 1
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 4,
+   "fault": 31,
+   "final": [
+    31,
+    32
+   ],
+   "k": 2,
+   "rounds": [
+    {
+     "hi": 40,
+     "lo": 26,
+     "pick": 1
+    },
+    {
+     "hi": 33,
+     "lo": 29,
+     "pick": 2
+    }
+   ],
+   "ruling": "C"
+  },
+  {
+   "arity": 5,
+   "fault": 39,
+   "final": [
+    39,
+    40
+   ],
+   "k": 3,
+   "rounds": [
+    {
+     "hi": 48,
+     "lo": 26,
+     "pick": 3
+    },
+    {
+     "hi": 43,
+     "lo": 39,
+     "pick": 0
+    }
+   ],
+   "ruling": "C"
+  }
+ ],
+ "replays": [
+  {
+   "coordinate": 5,
+   "opened": [
+    [
+     0,
+     "1600000000000000"
+    ],
+    [
+     2,
+     null
+    ],
+    [
+     10,
+     "4400000000000000"
+    ],
+    [
+     11,
+     "1600000000000000"
+    ],
+    [
+     12,
+     "0000000000000000"
+    ]
+   ],
+   "root_hi": "6ca2bf2591c276a09ab08f225cbd084292d5a5b9e0926fd9c505723aa81c73fa",
+   "root_lo": "210e9c200c4ff5a8c714eab14303e76fe215409df4ff2904daf12eb380c2ce1b",
+   "ruling": "C",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de"
+   ]
+  },
+  {
+   "coordinate": 5,
+   "opened": [
+    [
+     0,
+     "1600000000000000"
+    ],
+    [
+     2,
+     null
+    ],
+    [
+     10,
+     "4400000000000000"
+    ],
+    [
+     11,
+     "1600000000000000"
+    ],
+    [
+     12,
+     "0000000000000000"
+    ]
+   ],
+   "root_hi": "aca23e47f6a271a035618f4910c0172a5ac58bed051fc1dc2e41096955ea70cc",
+   "root_lo": "210e9c200c4ff5a8c714eab14303e76fe215409df4ff2904daf12eb380c2ce1b",
+   "ruling": "E",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de"
+   ]
+  },
+  {
+   "coordinate": 9,
+   "opened": [
+    [
+     0,
+     "2e00000000000000"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     10,
+     "8d00000000000000"
+    ],
+    [
+     11,
+     "2e00000000000000"
+    ],
+    [
+     12,
+     "1800000000000000"
+    ]
+   ],
+   "root_hi": "6ee7c0e1ebc6a9a0d5819ea5f66d76dabfb5431d541ed31538c27e8c539454d5",
+   "root_lo": "17cdffedbcb0322705541233dda732e38f437f9ac3760ad030dd3e8a2956a579",
+   "ruling": "C",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de"
+   ]
+  },
+  {
+   "coordinate": 9,
+   "opened": [
+    [
+     0,
+     "2e00000000000000"
+    ],
+    [
+     3,
+     null
+    ],
+    [
+     10,
+     "8d00000000000000"
+    ],
+    [
+     11,
+     "2e00000000000000"
+    ],
+    [
+     12,
+     "1800000000000000"
+    ]
+   ],
+   "root_hi": "b83f6b1ec34a48db648181591d5be83ce78e2502145eb2020d9ff4136554fac6",
+   "root_lo": "17cdffedbcb0322705541233dda732e38f437f9ac3760ad030dd3e8a2956a579",
+   "ruling": "E",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "785fb8f6f71980efb6bc7b02c15e800d4943d41b09fef45d5903b69990cbd7a7",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "e8746a098ce973eab14a8e0fa3457efb09f8e7e8768f5c7758dc0f9284af81de"
+   ]
+  },
+  {
+   "coordinate": 13,
+   "opened": [
+    [
+     0,
+     "7700000000000000"
+    ],
+    [
+     4,
+     null
+    ],
+    [
+     10,
+     "6901000000000000"
+    ],
+    [
+     11,
+     "7700000000000000"
+    ],
+    [
+     12,
+     "aa00000000000000"
+    ]
+   ],
+   "root_hi": "cade84a87ddf121c65a45d1a5c4bf412172e29e66e91956d20d406a9fabed57a",
+   "root_lo": "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469",
+   "ruling": "C",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ]
+  },
+  {
+   "coordinate": 13,
+   "opened": [
+    [
+     0,
+     "7700000000000000"
+    ],
+    [
+     4,
+     null
+    ],
+    [
+     10,
+     "6901000000000000"
+    ],
+    [
+     11,
+     "7700000000000000"
+    ],
+    [
+     12,
+     "aa00000000000000"
+    ]
+   ],
+   "root_hi": "312e2638665b7882ab42761596590c871e33a792e180e8f47bb52295f21602f1",
+   "root_lo": "ba5d6b149d01d1cac05397478c78c123543cb68c98d368faa9d300bc140b7469",
+   "ruling": "E",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ]
+  },
+  {
+   "coordinate": 25,
+   "opened": [
+    [
+     0,
+     "5607000000000000"
+    ],
+    [
+     6,
+     null
+    ],
+    [
+     10,
+     "0816000000000000"
+    ],
+    [
+     11,
+     "5607000000000000"
+    ],
+    [
+     12,
+     "011b000000000000"
+    ]
+   ],
+   "root_hi": "e05a38cdb3702b790a7aebbacd0d20ec7d89075814883dd39d6c15ce862d9916",
+   "root_lo": "2e75682b4f0b10c9f735dcf3ea90c324258a8dadbeac25f3ce138cb634e26cfd",
+   "ruling": "C",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ]
+  },
+  {
+   "coordinate": 25,
+   "opened": [
+    [
+     0,
+     "5607000000000000"
+    ],
+    [
+     6,
+     null
+    ],
+    [
+     10,
+     "0816000000000000"
+    ],
+    [
+     11,
+     "5607000000000000"
+    ],
+    [
+     12,
+     "011b000000000000"
+    ]
+   ],
+   "root_hi": "570499802f0981978a50ee2190c7a6477d41f32cd9adb7dc5a3d09f5e221479a",
+   "root_lo": "2e75682b4f0b10c9f735dcf3ea90c324258a8dadbeac25f3ce138cb634e26cfd",
+   "ruling": "E",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ]
+  },
+  {
+   "coordinate": 31,
+   "opened": [
+    [
+     0,
+     "b329000000000000"
+    ],
+    [
+     7,
+     null
+    ],
+    [
+     10,
+     "207d000000000000"
+    ],
+    [
+     11,
+     "b329000000000000"
+    ],
+    [
+     12,
+     "d2c6000000000000"
+    ]
+   ],
+   "root_hi": "c86a52ec3c477a5c09cf424c9e758ae0ad720e9779192023b2759f5a8be1c03d",
+   "root_lo": "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701",
+   "ruling": "C",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ]
+  },
+  {
+   "coordinate": 31,
+   "opened": [
+    [
+     0,
+     "b329000000000000"
+    ],
+    [
+     7,
+     null
+    ],
+    [
+     10,
+     "207d000000000000"
+    ],
+    [
+     11,
+     "b329000000000000"
+    ],
+    [
+     12,
+     "d2c6000000000000"
+    ]
+   ],
+   "root_hi": "4d2ceab98f972492c43b20e26ebd0d97fc556fd4d6c1b81b8587b80657cf1e3c",
+   "root_lo": "87c5985f04b99abd0ad5d7b4282cf2c23bbe1306567c3a07a6c2dc5284f48701",
+   "ruling": "E",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "f529e9f41128eb9079db6616ccaf8a40c1fa124667209c0d6692f1ae5c279473",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "24491f310ad61c32471f161843d05cdb5579ed5a9489a341ce9031cc0444b157",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+   ]
+  },
+  {
+   "coordinate": 39,
+   "opened": [
+    [
+     0,
+     "3f1a010000000000"
+    ],
+    [
+     8,
+     null
+    ],
+    [
+     10,
+     "c54e030000000000"
+    ],
+    [
+     11,
+     "3f1a010000000000"
+    ],
+    [
+     12,
+     "1a6a060000000000"
+    ]
+   ],
+   "root_hi": "ec197750e51fd704af3097c6c3c8039100fea26f49f52cca30f5fd8ff9e1312e",
+   "root_lo": "0bfd046e66433b1ce68ec6f4a1a33894c75c89c398b5320cc37208e778cefccf",
+   "ruling": "C",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6"
+   ]
+  },
+  {
+   "coordinate": 39,
+   "opened": [
+    [
+     0,
+     "3f1a010000000000"
+    ],
+    [
+     8,
+     null
+    ],
+    [
+     10,
+     "c54e030000000000"
+    ],
+    [
+     11,
+     "3f1a010000000000"
+    ],
+    [
+     12,
+     "1a6a060000000000"
+    ]
+   ],
+   "root_hi": "0bd7e4202c29f6714b96ad054bd0c0b10f702f237128503e61e19d90d3808aa2",
+   "root_lo": "0bfd046e66433b1ce68ec6f4a1a33894c75c89c398b5320cc37208e778cefccf",
+   "ruling": "E",
+   "siblings": [
+    "670fd66a9fcbb6e9e0c04b3439672986d5d77dd2a0244dfd5b84efb1bcb03b45",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+    "59fa019a98870094d832a69256c560c6dbfa338bbc35edf58fdaa2c3c5f46679",
+    "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+    "6dacafa1b513eb06d0c3990025b6003c3bd5a10b82cfb0c978f08c4cc5d1bdc6"
+   ]
+  }
+ ],
+ "schedules": [
+  {
+   "checkpoints": {
+    "1": [
+     0,
+     2,
+     6,
+     10,
+     14,
+     20,
+     26,
+     32,
+     40,
+     48
+    ],
+    "16": [
+     0,
+     48
+    ],
+    "2": [
+     0,
+     6,
+     14,
+     26,
+     40,
+     48
+    ],
+    "3": [
+     0,
+     10,
+     26,
+     48
+    ],
+    "4": [
+     0,
+     14,
+     40,
+     48
+    ],
+    "7": [
+     0,
+     32,
+     48
+    ]
+   },
+   "positions": 9,
+   "starts": [
+    0,
+    2,
+    6,
+    10,
+    14,
+    20,
+    26,
+    32,
+    40,
+    48
+   ]
+  },
+  {
+   "checkpoints": {
+    "1": [
+     0,
+     2,
+     6,
+     10,
+     16,
+     22
+    ],
+    "16": [
+     0,
+     22
+    ],
+    "2": [
+     0,
+     6,
+     16,
+     22
+    ],
+    "3": [
+     0,
+     10,
+     22
+    ],
+    "4": [
+     0,
+     16,
+     22
+    ],
+    "7": [
+     0,
+     22
+    ]
+   },
+   "positions": 5,
+   "starts": [
+    0,
+    2,
+    6,
+    10,
+    16,
+    22
+   ]
+  },
+  {
+   "checkpoints": {
+    "1": [
+     0,
+     2
+    ],
+    "16": [
+     0,
+     2
+    ],
+    "2": [
+     0,
+     2
+    ],
+    "3": [
+     0,
+     2
+    ],
+    "4": [
+     0,
+     2
+    ],
+    "7": [
+     0,
+     2
+    ]
+   },
+   "positions": 1,
+   "starts": [
+    0,
+    2
+   ]
+  }
+ ],
+ "slot_leaf_domain": "6463672e6c782e736c6f742e6c6561662e763100",
+ "toy": {
+  "h0": 7,
+  "height": 4,
+  "positions": 9,
+  "total": 48,
+  "window": 3
+ }
+}

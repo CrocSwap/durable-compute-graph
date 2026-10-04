@@ -48,6 +48,9 @@ use solana_program::{
 
 use crate::hash::sha256;
 
+#[path = "disputes_v21_lx.rs"]
+pub mod lx;
+
 pub const TAG: u8 = 227;
 pub const SUB_CREATE_TEMPLATE: u8 = 1;
 pub const SUB_INIT_RUN: u8 = 2;
@@ -262,6 +265,8 @@ struct Template {
     blocks: Vec<Block>,
     /// The step tree's height (§6.2).
     height: u32,
+    /// LX1 templates (byte 5 = 1) carry their machine binding.
+    lx: Option<lx::LxBinding>,
 }
 
 impl Template {
@@ -333,9 +338,15 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
         .collect::<Option<Vec<Block>>>()
         .ok_or(err(4))?;
     let height = check_blocks(&list, u64_at(&d, 8)?)?;
+    let lx = match d[lx::T_KIND] {
+        0 => None,
+        lx::TEMPLATE_KIND_LX => Some(lx::parse_tail(&d[lx::T_LX..lx::T_LX + lx::LX_TAIL_BYTES]).ok_or(err(4))?),
+        _ => return Err(err(4)),
+    };
     Ok(Template {
         blocks: list,
         height,
+        lx,
         depth: d[4] as u32,
         total_steps: u64_at(&d, 8)?,
         total_outputs: u64_at(&d, 16)?,
@@ -486,8 +497,12 @@ pub fn process(
         #[cfg(feature = "test-legacy-template-create")]
         SUB_TEST_CREATE_LEGACY_TEMPLATE => create_template_inner(program_id, accounts, &data[2..], false),
         SUB_INIT_RUN => init_run(program_id, accounts, &data[2..]),
-        SUB_COMMIT => commit(program_id, accounts, &data[2..]),
-        SUB_OPEN => open(program_id, accounts, &data[2..]),
+        SUB_COMMIT => commit(program_id, accounts, &data[2..], manifest),
+        SUB_OPEN => open(program_id, accounts, &data[2..], manifest),
+        lx::SUB_LX_MIDPOINTS => lx::midpoints(program_id, accounts, &data[2..]),
+        lx::SUB_LX_PICK => lx::pick(program_id, accounts, &data[2..]),
+        lx::SUB_LX_OPENING => lx::opening(program_id, accounts, &data[2..], manifest),
+        lx::SUB_LX_OUTPUT => lx::output(program_id, accounts, &data[2..], manifest),
         SUB_REVEAL_NODES => reveal_nodes(program_id, accounts, &data[2..]),
         SUB_PICK => pick(program_id, accounts, &data[2..]),
         SUB_REVEAL_LEAF => reveal_leaf(program_id, accounts, &data[2..]),
@@ -540,8 +555,18 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     {
         return Err(err(6));
     }
+    // LX1 templates (design v2.1-lazy-expansion §8) append a "DLX1" tail
+    // instead of blocks: one default block of one step, no spec root and no
+    // descent outputs.
+    let lx_tail = (data.len() == FIXED + lx::LX_TAIL_BYTES && data[FIXED..].starts_with(lx::LX_TAIL_MAGIC))
+        .then(|| &data[FIXED..]);
+    if let Some(tail) = lx_tail {
+        if lx::parse_tail(tail).is_none() || total_steps != 1 || u64_at(data, 9)? != 0 || data[57..89] != [0; 32] {
+            return Err(err(6));
+        }
+    }
     // The blocks are optional. An ignored trailing word is not a distinct template.
-    let block_data_end = if data.len() == FIXED {
+    let block_data_end = if data.len() == FIXED || lx_tail.is_some() {
         FIXED
     } else {
         let count = data[FIXED] as usize;
@@ -583,6 +608,10 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     d[128..130].copy_from_slice(&data[89..91]);
     d[136..168].copy_from_slice(&data[91..123]);
     d[96..128].copy_from_slice(&template_id);
+    if let Some(tail) = lx_tail {
+        d[lx::T_KIND] = lx::TEMPLATE_KIND_LX;
+        d[lx::T_LX..lx::T_LX + lx::LX_TAIL_BYTES].copy_from_slice(tail);
+    }
     if track_close {
         d[T_TRACKING..T_TRACKING + 4].copy_from_slice(T_TRACKING_MAGIC);
         d[T_PAYER..T_PAYER + 32].copy_from_slice(admitter.key.as_ref());
@@ -663,20 +692,33 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
 }
 
 // 3: [executor(s,w), run(w), template, system] run_root_bytes[176]
-fn commit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn commit(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &'static crate::kernel::ApplicationManifest,
+) -> ProgramResult {
     let [executor, run, tmpl, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let t = template(program_id, tmpl)?;
     run_checked(program_id, run, tmpl)?;
-    let root: &[u8; D::RUN_ROOT_BYTES] = data.try_into().map_err(|_| err(1))?;
-    let rr = D::RunRoot(root);
     {
         let d = run.try_borrow_data()?;
         if !executor.is_signer || d[R_EXECUTOR..R_EXECUTOR + 32] != executor.key.to_bytes() {
             return Err(ProgramError::MissingRequiredSignature);
         }
-        if d[R_STATUS] != RUN_OPEN
-            || now()? > u64_at(&d, R_DEADLINE)?
-            || rr.run_id() != &d[R_RUN_ID..R_RUN_ID + 32]
+        if d[R_STATUS] != RUN_OPEN || now()? > u64_at(&d, R_DEADLINE)? {
+            return Err(err(7));
+        }
+    }
+    let lx_root;
+    let root: &[u8; D::RUN_ROOT_BYTES] = if let Some(binding) = &t.lx {
+        lx_root = lx::check_commit(&t, binding, manifest, run, tmpl, data)?;
+        &lx_root
+    } else {
+        let root: &[u8; D::RUN_ROOT_BYTES] = data.try_into().map_err(|_| err(1))?;
+        let rr = D::RunRoot(root);
+        let d = run.try_borrow_data()?;
+        if rr.run_id() != &d[R_RUN_ID..R_RUN_ID + 32]
             || rr.plan_id() != t.plan_id
             || rr.spec_root() != t.spec_root
             || rr.total_steps() != t.total_steps
@@ -684,7 +726,8 @@ fn commit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
         {
             return Err(err(7));
         }
-    }
+        root
+    };
     if t.executor_bond > 0 {
         invoke(&system_instruction::transfer(executor.key, run.key, t.executor_bond), &[executor.clone(), run.clone(), system.clone()])?;
     }
@@ -703,13 +746,21 @@ fn tree_height(n: u64) -> u32 {
 }
 
 // 4: [challenger(s,w), run(w), template, dispute(w), system] nonce[32] kind:u8
-fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn open(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+    manifest: &'static crate::kernel::ApplicationManifest,
+) -> ProgramResult {
     let [challenger, run, tmpl, dispute, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    let t = template(program_id, tmpl)?;
+    run_checked(program_id, run, tmpl)?;
+    if let Some(binding) = t.lx {
+        return lx::open(program_id, accounts, data, &t, &binding, manifest);
+    }
     if !challenger.is_signer || data.len() != 33 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let t = template(program_id, tmpl)?;
-    run_checked(program_id, run, tmpl)?;
     let kind = data[32];
     let (status, deadline, root) = {
         let d = run.try_borrow_data()?;
@@ -725,19 +776,7 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
         _ => return Err(err(10)),
     };
     let _ = rr;
-    create_pda(program_id, challenger, dispute, system, &[b"dcg21dsp", run.key.as_ref(), challenger.key.as_ref(), &data[..32]], D_BYTES)?;
-    if t.challenger_bond > 0 {
-        invoke(&system_instruction::transfer(challenger.key, dispute.key, t.challenger_bond), &[challenger.clone(), dispute.clone(), system.clone()])?;
-    }
-    let (sequence, deadline) = {
-        let mut r = run.try_borrow_mut_data()?;
-        let open = u32_at(&r, R_OPEN)?.checked_add(1).ok_or(err(8))?;
-        r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
-        let deadline = begin_executor_wait(&mut r, &t)?;
-        let seq = u64_at(&r, R_SEQ)?;
-        r[R_SEQ..R_SEQ + 8].copy_from_slice(&seq.checked_add(1).ok_or(err(8))?.to_le_bytes());
-        (seq, deadline)
-    };
+    let (sequence, deadline) = open_record(program_id, challenger, run, dispute, system, &t, &data[..32], true)?;
     let mut d = dispute.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"D21D");
     d[D_PHASE] = if level == 0 { PH_LEAF } else { PH_NODES };
@@ -750,6 +789,44 @@ fn open(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     d[D_CURRENT..D_CURRENT + 32].copy_from_slice(&current);
     d[D_SEQ..D_SEQ + 8].copy_from_slice(&sequence.to_le_bytes());
     d[D_NONCE..D_NONCE + 32].copy_from_slice(&data[..32]);
+    Ok(())
+}
+
+/// Create a dispute record, take the challenger's bond, and take its place in
+/// the run's sequence. A dispute that starts by waiting on the executor
+/// enters an executor wait, whose deadline is returned (zero otherwise).
+fn open_record<'a>(
+    program_id: &Pubkey,
+    challenger: &AccountInfo<'a>,
+    run: &AccountInfo<'a>,
+    dispute: &AccountInfo<'a>,
+    system: &AccountInfo<'a>,
+    t: &Template,
+    nonce: &[u8],
+    waits_on_executor: bool,
+) -> Result<(u64, u64), ProgramError> {
+    create_pda(program_id, challenger, dispute, system, &[b"dcg21dsp", run.key.as_ref(), challenger.key.as_ref(), nonce], D_BYTES)?;
+    if t.challenger_bond > 0 {
+        invoke(&system_instruction::transfer(challenger.key, dispute.key, t.challenger_bond), &[challenger.clone(), dispute.clone(), system.clone()])?;
+    }
+    let (sequence, deadline) = {
+        let mut r = run.try_borrow_mut_data()?;
+        let open = u32_at(&r, R_OPEN)?.checked_add(1).ok_or(err(8))?;
+        r[R_OPEN..R_OPEN + 4].copy_from_slice(&open.to_le_bytes());
+        let deadline = if waits_on_executor { begin_executor_wait(&mut r, t)? } else { 0 };
+        let seq = u64_at(&r, R_SEQ)?;
+        r[R_SEQ..R_SEQ + 8].copy_from_slice(&seq.checked_add(1).ok_or(err(8))?.to_le_bytes());
+        (seq, deadline)
+    };
+    dispute.try_borrow_mut_data()?[D_SEQ..D_SEQ + 8].copy_from_slice(&sequence.to_le_bytes());
+    Ok((sequence, deadline))
+}
+
+/// The descent instructions act only on descent disputes (kinds 1 and 2).
+fn descent_only(dispute: &AccountInfo) -> ProgramResult {
+    if dispute.try_borrow_data()?[D_KIND] > KIND_OUT_DESCEND {
+        return Err(err(10));
+    }
     Ok(())
 }
 
@@ -846,6 +923,7 @@ fn tree_of(kind: u8) -> D::Tree {
 fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    descent_only(c.dispute)?;
     executor_signed(c.run, executor)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
     expect_phase(&d, PH_NODES, c.run)?;
@@ -905,6 +983,7 @@ fn reveal_nodes(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
 fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [_caller, run, tmpl, dispute, cache, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    descent_only(c.dispute)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
     expect_phase(&d, PH_NODES, c.run)?;
     let k = cache.try_borrow_data()?;
@@ -932,6 +1011,7 @@ fn cache_answer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
 fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [challenger, run, tmpl, dispute, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    descent_only(c.dispute)?;
     let mut d = c.dispute.try_borrow_mut_data()?;
     challenger_signed(&d, challenger)?;
     expect_phase(&d, PH_PICK, c.run)?;
@@ -1155,6 +1235,7 @@ fn staged_leaf_lists(
 fn reveal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [executor, run, tmpl, dispute, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    descent_only(c.dispute)?;
     executor_signed(c.run, executor)?;
     let staged;
     let from_staging = data == [FROM_STAGING];
@@ -1270,6 +1351,7 @@ fn claim(
 ) -> ProgramResult {
     let [challenger, run, tmpl, dispute, executor_acct, _challenger_acct, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
+    descent_only(c.dispute)?;
     let claim_from_staging = data == [FROM_STAGING];
     let staged;
     let data: &[u8] = if claim_from_staging {

@@ -13,6 +13,7 @@
 #![no_std]
 
 pub mod blocks;
+pub mod lx;
 pub mod reductions;
 
 pub type Hash = [u8; 32];
@@ -29,6 +30,10 @@ pub enum Tree {
     Chunk,
     Log,
     Spec,
+    /// LX1 state slots (design `v2.1-lazy-expansion.md`).
+    LxState,
+    /// LX1 checkpoint roots: the run commits one root over them.
+    LxCheckpoint,
     List,
 }
 
@@ -40,6 +45,8 @@ impl Tree {
             Tree::Chunk => b"dcg.chunk.node.v2.1\x00",
             Tree::Log => b"dcg.log.node.v2.1\x00",
             Tree::Spec => b"dcg.spec.node.v2.1\x00",
+            Tree::LxState => b"dcg.lx.state.node.v1\x00",
+            Tree::LxCheckpoint => b"dcg.lx.checkpoint.node.v1\x00",
             Tree::List => b"dcg.list.node.v2.1\x00",
         }
     }
@@ -50,6 +57,8 @@ impl Tree {
             Tree::Chunk => b"dcg.chunk.empty.v2.1\x00",
             Tree::Log => b"dcg.log.empty.v2.1\x00",
             Tree::Spec => b"dcg.spec.empty.v2.1\x00",
+            Tree::LxState => b"dcg.lx.slot.empty.v1\x00",
+            Tree::LxCheckpoint => b"dcg.lx.checkpoint.empty.v1\x00",
             Tree::List => b"dcg.list.empty.v2.1\x00",
         }
     }
@@ -75,12 +84,12 @@ pub const LAYOUT_LIST: u32 = 6;
 pub const TYPE_LIST: u8 = 10;
 pub const MAX_DEPTH: u32 = 5;
 
-pub fn node<H: Sha256>(h: &H, tree: Tree, level: u16, left: &Hash, right: &Hash) -> Hash {
+pub fn node<H: Sha256 + ?Sized>(h: &H, tree: Tree, level: u16, left: &Hash, right: &Hash) -> Hash {
     h.hash(&[tree.node_domain(), &level.to_le_bytes(), left, right])
 }
 
 /// EMPTY_t[level], computed by folding (no table: level is at most ~40).
-pub fn empty<H: Sha256>(h: &H, tree: Tree, level: u16) -> Hash {
+pub fn empty<H: Sha256 + ?Sized>(h: &H, tree: Tree, level: u16) -> Hash {
     let mut acc = h.hash(&[tree.empty_label()]);
     for l in 0..level {
         acc = node(h, tree, l, &acc, &acc);
@@ -89,7 +98,7 @@ pub fn empty<H: Sha256>(h: &H, tree: Tree, level: u16) -> Hash {
 }
 
 /// Fold a leaf (or node at `level0`) with its sibling path up to the root.
-pub fn root_from_path<H: Sha256>(h: &H, tree: Tree, leaf: &Hash, mut position: u64, path: &[Hash]) -> Hash {
+pub fn root_from_path<H: Sha256 + ?Sized>(h: &H, tree: Tree, leaf: &Hash, mut position: u64, path: &[Hash]) -> Hash {
     let mut acc = *leaf;
     for (level, sibling) in path.iter().enumerate() {
         acc = if position & 1 == 1 {

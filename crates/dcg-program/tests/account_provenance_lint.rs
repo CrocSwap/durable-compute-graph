@@ -480,6 +480,7 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "disputes_v21.rs::private finalize", // run_checked binds D21R to D21T; deadline and recorded executor key gate payout.
     "disputes_v21.rs::private moot", // dispute_ctx binds both PDAs; best-win sequence and challenger key gate the ruling.
     "disputes_v21.rs::private move_lamports", // callers authenticate program-owned source and recorded payout recipient before transfer.
+    "disputes_v21.rs::private open", // template and run_checked authenticate the run; the challenger signs; open_record creates the dispute at its derived dcg21dsp address.
     "disputes_v21.rs::private pay_pot", // dispute_ctx binds both PDAs; best sequence, paid flag and payee keys gate payout.
     "disputes_v21.rs::private pick", // dispute_ctx binds both PDAs; recorded challenger signer and phase gate the write.
     "disputes_v21.rs::private retire_template", // template authenticates D21T; recorded payer signer and tracking shape gate retirement.
@@ -487,6 +488,9 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "disputes_v21.rs::private rule", // authenticated Ctx supplies both PDAs; ruling state and recorded payee keys gate writes.
     "disputes_v21.rs::private stage_grow", // dispute_ctx and staging_role bind D21D/D21S; signer-funded growth is bounded.
     "disputes_v21.rs::private stage_write", // dispute_ctx and staging_role bind D21D/D21S; role signer and bounds gate writes.
+    "disputes_v21_lx.rs::restricted midpoints", // lx_ctx (dispute_ctx: derived run, template and dispute) and kind 3; recorded executor signer; phase and deadline.
+    "disputes_v21_lx.rs::restricted open", // only disputes_v21::open calls it, after template and run_checked; challenger signer; committed run in window; checkpoint paths against the committed root.
+    "disputes_v21_lx.rs::restricted pick", // lx_ctx and kind 3; recorded challenger signer; phase and deadline.
     "envelope_seal.rs::private create_pda",
     "envelope_seal.rs::pub admission_step",
     "envelope_seal.rs::pub registry_freeze",
