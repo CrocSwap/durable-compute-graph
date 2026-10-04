@@ -21,6 +21,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Protocol, Sequence
 
+from . import run as R
 from . import trees
 
 SLOT_LEAF_DOMAIN = b"dcg.lx.slot.leaf.v1\x00"
@@ -44,13 +45,120 @@ def slot_leaf(slot: int, value: bytes | None) -> bytes:
 @dataclass(frozen=True)
 class Transition:
     """One finest transition: the slots it reads, the slots it writes (a
-    written slot set to None is cleared), and the integer kernel."""
+    written slot set to None is cleared), and the integer kernel.
+
+    `constants` are the template constant chunks it reads (design §13), as
+    `(constant_id, chunk_index)` in order; a transition that reads any is
+    applied as `apply(values, chunks)` with the chunk bytes in that order."""
 
     coordinate: int
     label: str
     reads: tuple[int, ...]
     writes: tuple[int, ...]
-    apply: Callable[[Mapping[int, bytes | None]], Mapping[int, bytes | None]]
+    apply: Callable[..., Mapping[int, bytes | None]]
+    constants: tuple[tuple[int, int], ...] = ()
+
+
+def apply_transition(t: Transition, values: Mapping[int, bytes | None],
+                     chunks: Sequence[bytes]) -> Mapping[int, bytes | None]:
+    return t.apply(values, list(chunks)) if t.constants else t.apply(values)
+
+
+# --- template constants (design §13) ----------------------------------------------------
+
+CONST_LEAF_DOMAIN = b"dcg.lx.const.leaf.v1\x00"
+CONST_TREE = "lxconst"
+
+
+def const_leaf(constant_id: int, digest: bytes) -> bytes:
+    """The constants tree's leaf at position `constant_id`: the id and the
+    constant's chunk-tree root."""
+    return hashlib.sha256(CONST_LEAF_DOMAIN + struct.pack("<I", constant_id) + digest).digest()
+
+
+@dataclass(frozen=True)
+class ConstantTable:
+    """An LX1 template's committed constants: values by dense id, each split
+    into `2^chunk_log2`-byte chunks (v2.1 §4.2 chunk trees). The template
+    commits `root`; the values are available off chain."""
+
+    values: Mapping[int, bytes]
+    chunk_log2: Mapping[int, int]
+
+    def chunk_tree(self, cid: int) -> trees.Tree:
+        return R.chunk_tree(self.values[cid], 1 << self.chunk_log2[cid])
+
+    def digest(self, cid: int) -> bytes:
+        return self.chunk_tree(cid).root
+
+    def tree(self) -> trees.Tree:
+        n = max(self.values) + 1
+        return trees.build(CONST_TREE, [const_leaf(i, self.digest(i)) if i in self.values
+                                        else trees.EMPTY_LEAVES[CONST_TREE] for i in range(n)])
+
+    @property
+    def root(self) -> bytes:
+        return self.tree().root
+
+    def chunk(self, cid: int, index: int) -> bytes:
+        return R.chunks(self.values[cid], 1 << self.chunk_log2[cid])[index]
+
+
+def constants_root(machine: "Machine") -> bytes:
+    """The root an LX1 template commits for its machine's constants (zero for
+    a machine without any)."""
+    table = constant_table(machine)
+    return table.root if table is not None else bytes(32)
+
+
+def constant_table(machine: "Machine") -> ConstantTable | None:
+    get = getattr(machine, "constant_table", None)
+    return get() if get is not None else None
+
+
+@dataclass(frozen=True)
+class ConstOpening:
+    """One declared constant read in an opening: the chunk, its path to the
+    constant's chunk root, and that root with its path to `constants_root`."""
+
+    chunk: bytes
+    chunk_path: tuple[bytes, ...]
+    digest: bytes
+    const_path: tuple[bytes, ...]
+
+
+def open_constants(machine: "Machine", t: Transition) -> tuple[ConstOpening, ...]:
+    table = constant_table(machine)
+    if not t.constants:
+        return ()
+    ctree = table.tree()
+    return tuple(ConstOpening(table.chunk(cid, j), tuple(table.chunk_tree(cid).path(j)),
+                              table.digest(cid), tuple(ctree.path(cid)))
+                 for cid, j in t.constants)
+
+
+MAX_CHUNK_PATH = 48
+MAX_CONST_PATH = 32
+
+
+def check_constants(t: Transition, opened: Sequence[ConstOpening], root: bytes) -> list[bytes]:
+    """What the replay checks before applying (design §13): one entry per
+    declared read, in order, each chunk verifying against its constant's
+    digest and that digest against the template's `constants_root`. The ids
+    and indices come from the machine, never from the opening."""
+    if len(opened) != len(t.constants):
+        raise LxRefused("the opening does not cover the transition's constant reads")
+    chunks = []
+    for (cid, index), e in zip(t.constants, opened):
+        if (len(e.chunk_path) > MAX_CHUNK_PATH or len(e.const_path) > MAX_CONST_PATH
+                or index >> len(e.chunk_path) or cid >> len(e.const_path)):
+            raise LxRefused("a constant path is too short or too long")
+        if trees.root_from_path("chunk", R.chunk_leaf(index, e.chunk), index, list(e.chunk_path)) != e.digest:
+            raise LxRefused("a chunk does not verify against its constant")
+        if trees.root_from_path(CONST_TREE, const_leaf(cid, e.digest), cid, list(e.const_path)) != root:
+            raise LxRefused("a constant does not verify against constants_root")
+        chunks.append(e.chunk)
+    return chunks
 
 
 class Machine(Protocol):
@@ -71,6 +179,9 @@ class Machine(Protocol):
 
     def output_slots(self) -> tuple[int, ...]:
         """Carried slots holding the run's outputs in the final state (review H3)."""
+
+    # Optional (design §13): `constant_table() -> ConstantTable`, the template
+    # constants that transitions declare in `Transition.constants`.
 
 
 def height(machine: Machine) -> int:
@@ -125,7 +236,9 @@ class Schedule:
 def step(machine: Machine, state: dict[int, bytes], t: Transition) -> dict[int, bytes]:
     """Apply one transition to a full state (an executor's or challenger's)."""
     out = dict(state)
-    for slot, value in t.apply({s: state.get(s) for s in t.reads}).items():
+    table = constant_table(machine)
+    chunks = [table.chunk(cid, j) for cid, j in t.constants]
+    for slot, value in apply_transition(t, {s: state.get(s) for s in t.reads}, chunks).items():
         if slot not in t.writes:
             raise ValueError(f"{t.label} wrote undeclared slot {slot}")
         if value is None:
@@ -240,6 +353,7 @@ class MultiProof:
 
     values: Mapping[int, bytes | None]
     siblings: Mapping[tuple[int, int], bytes]  # (level, position) -> hash
+    constants: tuple[ConstOpening, ...] = ()  # the transition's constant reads (§13)
 
 
 def _needed(slots: set[int], h: int) -> set[tuple[int, int]]:
@@ -371,6 +485,7 @@ class Dispute:
             raise LxRefused("not awaiting an opening")
         t = self.schedule.transition(self.lo)
         slots = set(t.reads) | set(t.writes)
+        chunks = check_constants(t, proof.constants, constants_root(self.machine))
         if not slots:
             # A transition that touches no slot is the identity (LX1 program
             # review M1): the roots must already agree.
@@ -383,7 +498,7 @@ class Dispute:
             raise LxRefused("the opening does not verify against the lower root")
         written = dict(proof.values)
         try:
-            updates = t.apply({s: proof.values[s] for s in t.reads})
+            updates = apply_transition(t, {s: proof.values[s] for s in t.reads}, chunks)
         except Exception:
             # A kernel failure on a verified opening rules for C (review L2):
             # the committed lower state cannot lead to any committed upper root.
@@ -440,7 +555,8 @@ def challenger_pick(mine: Execution, dispute: Dispute) -> int:
 
 def executor_opening(run: Execution, dispute: Dispute) -> MultiProof:
     t = dispute.schedule.transition(dispute.lo)
-    return prove(run.machine, run.states[dispute.lo], sorted(set(t.reads) | set(t.writes)))
+    proof = prove(run.machine, run.states[dispute.lo], sorted(set(t.reads) | set(t.writes)))
+    return MultiProof(proof.values, proof.siblings, open_constants(run.machine, t))
 
 
 def play(machine: Machine, executor: Execution, challenger: Execution, k: int,

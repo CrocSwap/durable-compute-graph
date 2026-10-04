@@ -556,12 +556,13 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
         return Err(err(6));
     }
     // LX1 templates (design v2.1-lazy-expansion §8) append a "DLX1" tail
-    // instead of blocks: one default block of one step, no spec root and no
-    // descent outputs.
+    // instead of blocks: one default block of one step and no descent
+    // outputs. The spec-root field holds the machine's `constants_root`
+    // (§13; zero for a machine without constants).
     let lx_tail = (data.len() == FIXED + lx::LX_TAIL_BYTES && data[FIXED..].starts_with(lx::LX_TAIL_MAGIC))
         .then(|| &data[FIXED..]);
     if let Some(tail) = lx_tail {
-        if lx::parse_tail(tail).is_none() || total_steps != 1 || u64_at(data, 9)? != 0 || data[57..89] != [0; 32] {
+        if lx::parse_tail(tail).is_none() || total_steps != 1 || u64_at(data, 9)? != 0 {
             return Err(err(6));
         }
     }

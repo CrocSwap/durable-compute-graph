@@ -424,6 +424,11 @@ laws above apply unchanged. LX1 adds these:
   slots and verify against the agreed lower root (canonical multi-proof). A
   kernel failure on a verified opening rules `CHALLENGER`, because a
   committed state that cannot step cannot lead to the committed upper root.
+- **Constants.** The constant chunks a transition reads are fixed by the
+  machine, not chosen by the opening. Each must verify against the
+  template's `constants_root` (design §13). A wrong, missing, extra or
+  reordered constant is a refusal, so a run computed with other constants
+  loses at the first transition that reads a changed chunk.
 - **Outputs.** The run commits a digest of its claimed outputs. An OUTPUT
   claim opens the true output slots against `R_T`; C wins exactly when their
   digest differs from the committed one. No preimage of the claim is needed,
