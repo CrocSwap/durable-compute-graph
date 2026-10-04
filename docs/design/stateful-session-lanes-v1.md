@@ -249,3 +249,71 @@ and need copy-on-write (7.1).
    accordingly.
 5. **Roll into v3** as additive subtypes under tag 236; sessions without lanes
    are unchanged.
+
+## 10. Implementation plan (2026-10-04)
+
+Built in slices on DCG `fast/lanes-v1`; each slice is reviewed (rule 10) before
+merge where it touches endings or refunds.
+
+**Slice 1: the program, with a test kernel.**
+- Session: the free tail of the 1,280-byte `DSS3` record (bytes 1267..1279,
+  checked zero today) holds `lanes: u8` (1267), `capture_mask: u8` (1268) and
+  `last_captured: u32` (1269, stored as cursor + 1, zero for none). A session
+  without lanes keeps these bytes zero, so it decodes and behaves as before.
+- `OPEN_SESSION` takes an optional trailing `lanes: u8` (1..=4); 178 bytes
+  means no lanes.
+- Per lane `k`, three accounts, all session children:
+  - the lane record `DLN3` (512 bytes) at `["dcg-lane-v3", session, k]`: status
+    (idle, capturing, rendering), captured cursor, capture and render
+    cursors and totals, the declared compute, and the binding copied at
+    capture begin (session, authority, kernel, resource key, schema and
+    commitment, the view layout);
+  - a lane workspace (`VIEW_SEED`, role `0xE0 + k`) and a lane scratch
+    (role `0xE8 + k`), created small and grown like the v3 workspace.
+- New operations under tag 236 (`PUBLISH_VIEWS`), after v3's 0..3:
+  - 4 `LANE_CREATE`, 5 `LANE_GROW`;
+  - 6 `LANE_CAPTURE_BEGIN`: `cursor == c`, phase `NONE`, lane idle, and
+    `c` newer than the last captured cursor (two lanes never capture the same
+    cursor); sets the lane's bit and records the binding and view layout;
+  - 7 `LANE_CAPTURE_RUN`: reads the state spans (and resource), writes only
+    the lane workspace and record, through a new kernel hook
+    `capture_lane_phase`;
+  - 8 `LANE_CAPTURE_END`: clears the bit;
+  - 9 `LANE_RUN_PHASE`: lane workspace first, then authority, lane record,
+    lane scratch, resource. It reads no session or state account. The new
+    hook `render_lane_phase` sees the workspace (with its header, for
+    fixed-address engines), the resource and the view request;
+  - 10 `LANE_COMMIT`: reads the session, copies the lane scratch into the
+    shared views and stamps them with `c`. It refuses with 2341 unless `c` is
+    newer than every view's stamp;
+  - 11 `LANE_ABORT`: back to idle from either stage, clearing the bit.
+- `ADVANCE` refuses with 2340 while `capture_mask != 0`. A lane session
+  refuses the single-workspace `BEGIN_PHASE`. `HALT_SESSION` clears the mask;
+  lane accounts close as children after halt, with the existing refund rule.
+- Kernel hooks default to refusing, so no existing kernel gains lanes.
+
+**Slice 2: Doom.** The snapshot phase becomes the capture (it already reads
+the live state and copies the engine context into the workspace), and the
+strips become lane renders that check the captured snapshot instead of the
+live state.
+
+**Slice 3: the client.** The Python sequencer drives lanes: advance, capture,
+then renders on lane `N mod L` overlapping the next advance.
+
+**Slice 4: Doom on testnet** at L = 1, 2, 3 against 1.66 frames/s, with
+frame-hash equality.
+
+**Slice 1 review (2026-10-04): merge after fixes; fixed.**
+- M1: a commit refuses (2332) if the session's views changed since capture
+  begin; the lane aborts and recaptures.
+- M2: the first capture call zeroes the lane workspace past the capture, so a
+  render depends only on the state at `c` (kernel contract in `kernel.rs`).
+- Captures use the view-phase compute declaration; there is no separate
+  capture declaration (§5 superseded on this point).
+- An aborted capture forfeits its cursor until the next advance.
+- Renders still run after halt; they write only lane accounts, and commit
+  refuses, so nothing publishes.
+- Strict decode: a session without lanes has all lane tail bytes zero.
+- For slices 2 and 3: an application with several kernels must dispatch lane
+  renders by the lane record's kernel id (they carry no session), and each
+  lane's renders need their own fee payer, or they serialize with `ADVANCE`.

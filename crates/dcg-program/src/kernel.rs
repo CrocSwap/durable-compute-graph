@@ -136,6 +136,16 @@ impl StateSpanMut<'_> {
     }
 }
 
+/// One bounded capture call into a lane workspace (lanes §10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LanePhase {
+    pub state_cursor: u32,
+    pub lane: u8,
+    pub offset: u32,
+    pub len: u32,
+    pub compute_units: u32,
+}
+
 /// A bounded publication phase over one declared output view. `source_offset`
 /// is in the canonical state byte string; `output_offset` is in this view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -569,6 +579,54 @@ pub trait StatefulKernel: Kernel {
         self.render_view_phase_with_resources(
             phase, state, resources, commitment, workspace, output,
         )
+    }
+
+    /// Lanes (design `stateful-session-lanes-v1.md` §10): the bytes one
+    /// capture writes into a lane workspace. Zero (the default) disables
+    /// lanes for this kernel.
+    fn lane_capture_bytes(&self) -> u32 {
+        0
+    }
+
+    /// Largest capture chunk per call; must be nonzero when lanes are enabled.
+    fn lane_capture_phase_bytes(&self) -> u32 {
+        0
+    }
+
+    /// Capture `[phase.offset, phase.offset + phase.len)` of the lane's
+    /// workspace from the committed state at `phase.state_cursor`, writing
+    /// every byte of that range and nothing outside it. The state cannot
+    /// advance while a capture is open. The program zeroes the workspace past
+    /// `lane_capture_bytes` at the first call, so a render may rely only on
+    /// captured bytes, zeros, and what earlier render calls of the same
+    /// publication wrote. The capture's compute is declared with
+    /// `view_phase_compute_units`.
+    fn capture_lane_phase(
+        &self,
+        _phase: LanePhase,
+        _state: &[AccountSpan<'_>],
+        _resources: &[AccountSpan<'_>],
+        _commitment: &[u8; 32],
+        _workspace: &mut [u8],
+    ) -> Result<(), KernelError> {
+        Err(KernelError::Refused)
+    }
+
+    /// Render one bounded part of a view from a lane workspace alone: no
+    /// state account is passed, because the state may already be at a later
+    /// cursor. `workspace_header` is the lane workspace's 128-byte DCG header
+    /// (the account is first, at the invocation's base address); the
+    /// processor refuses if any header byte changes.
+    fn render_lane_phase(
+        &self,
+        _phase: ViewPhase,
+        _resources: &[AccountSpan<'_>],
+        _commitment: &[u8; 32],
+        _workspace_header: &mut [u8],
+        _workspace: &mut [u8],
+        _output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        Err(KernelError::Refused)
     }
 
     /// The output ABIs this application image permits for state views.

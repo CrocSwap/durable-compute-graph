@@ -531,6 +531,10 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "stateful_v3.rs::private grow_headerless_state",
     "stateful_v3.rs::private initialize_resource_header",
     "stateful_v3.rs::private write_anchor",
+    // Lanes: the lane record is a checked PDA (checked_lane); the lane
+    // workspace and scratch are keyed children (lane_child).
+    "stateful_v3_lanes.rs::private encode_lane",
+    "stateful_v3_lanes.rs::private run",
     "test_lifecycle.rs::private admit",
     "test_lifecycle.rs::private bisect",
     "test_lifecycle.rs::private challenge",
