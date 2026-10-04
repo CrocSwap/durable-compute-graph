@@ -534,7 +534,7 @@ async fn data_dependent_constant_reads_rule_like_python_in_both_role_orders() {
     let root = h32(&b["constants_root"]);
     let params = hex(b["params"].as_str().unwrap());
     for p in b["plays"].as_array().unwrap() {
-        let mut ch = Chain::new_full(p["arity"].as_u64().unwrap() as u8, 100_000, None, params.clone(), root).await;
+        let mut ch = Chain::new_full(p["arity"].as_u64().unwrap() as u8, 100_000, None, params.clone(), root, GOLDEN_BOUNDS, 9).await;
         check_play(&mut ch, p).await;
     }
 }
