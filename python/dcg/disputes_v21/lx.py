@@ -71,7 +71,9 @@ def constant_reads(t: Transition, values: Mapping[int, bytes | None]) -> tuple[t
 
 def apply_transition(t: Transition, values: Mapping[int, bytes | None],
                      chunks: Sequence[bytes]) -> Mapping[int, bytes | None]:
-    return t.apply(values, list(chunks)) if t.constants else t.apply(values)
+    # A transition with constant reads, or whose reads depend on values,
+    # takes the chunks (review L1: decided by the declaration, not the count).
+    return t.apply(values, list(chunks)) if (callable(t.constants) or t.constants) else t.apply(values)
 
 
 # --- template constants (design §13) ----------------------------------------------------
@@ -154,12 +156,13 @@ MAX_CONST_PATH = 32
 
 
 def check_constants(t: Transition, opened: Sequence[ConstOpening], root: bytes,
-                    values: Mapping[int, bytes | None]) -> list[bytes]:
+                    values: Mapping[int, bytes | None],
+                    reads: tuple[tuple[int, int], ...] | None = None) -> list[bytes]:
     """What the replay checks before applying (design §13): one entry per
     declared read, in order, each chunk verifying against its constant's
     digest and that digest against the template's `constants_root`. The ids
     and indices come from the machine, never from the opening."""
-    reads = constant_reads(t, values)
+    reads = constant_reads(t, values) if reads is None else reads
     if len(opened) != len(reads):
         raise LxRefused("the opening does not cover the transition's constant reads")
     chunks = []
@@ -504,14 +507,24 @@ class Dispute:
             # review M1): the roots must already agree.
             if proof.values or proof.siblings:
                 raise LxRefused("an identity transition takes an empty opening")
-            check_constants(t, proof.constants, constants_root(self.machine), {})
+            try:
+                reads = constant_reads(t, {})
+            except Exception:
+                return self._rule("C")  # the machine cannot name its reads (review M3)
+            check_constants(t, proof.constants, constants_root(self.machine), {}, reads)
             return self._rule("E" if self.root_lo == self.root_hi else "C")
         if set(proof.values) != slots:
             raise LxRefused("the opening does not cover the transition's slots")
         if root_over(self.machine, proof, proof.values) != self.root_lo:
             raise LxRefused("the opening does not verify against the lower root")
         # Constant reads may depend on the (now verified) read values.
-        chunks = check_constants(t, proof.constants, constants_root(self.machine), proof.values)
+        try:
+            reads = constant_reads(t, proof.values)
+        except Exception:
+            # The machine cannot name its reads for the verified state: like a
+            # kernel failure, this rules for the challenger (review M3).
+            return self._rule("C")
+        chunks = check_constants(t, proof.constants, constants_root(self.machine), proof.values, reads)
         written = dict(proof.values)
         try:
             updates = apply_transition(t, {s: proof.values[s] for s in t.reads}, chunks)

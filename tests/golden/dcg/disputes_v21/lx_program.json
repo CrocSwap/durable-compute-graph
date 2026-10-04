@@ -5,6 +5,13 @@
   "plays": [
    {
     "arity": 16,
+    "by_position": {
+     "chunk": "0500000000000000fdffffffffffffff",
+     "chunk_path": [
+      "ae9b3b30241925605a11e8e6d0639589b23c5cad79c637bd58b5ff13474e0e36",
+      "105bdc9b663c1b4cbe81471773ff29d61f769b79cb35de5d8ba3f97e613831c7"
+     ]
+    },
     "commitment": {
      "checkpoint_root": "44a3a44fce70ad6d8ae433a2c3239879211a729372deff200f7555d733ca717f",
      "k": 1,
@@ -86,6 +93,13 @@
    },
    {
     "arity": 16,
+    "by_position": {
+     "chunk": "0500000000000000fdffffffffffffff",
+     "chunk_path": [
+      "ae9b3b30241925605a11e8e6d0639589b23c5cad79c637bd58b5ff13474e0e36",
+      "105bdc9b663c1b4cbe81471773ff29d61f769b79cb35de5d8ba3f97e613831c7"
+     ]
+    },
     "commitment": {
      "checkpoint_root": "96a6f37a5247d8f8a26d087f65c8ba3825a62117e5a9d49d0e66586057e660e4",
      "k": 1,
@@ -167,6 +181,13 @@
    },
    {
     "arity": 2,
+    "by_position": {
+     "chunk": "0500000000000000fdffffffffffffff",
+     "chunk_path": [
+      "ae9b3b30241925605a11e8e6d0639589b23c5cad79c637bd58b5ff13474e0e36",
+      "105bdc9b663c1b4cbe81471773ff29d61f769b79cb35de5d8ba3f97e613831c7"
+     ]
+    },
     "commitment": {
      "checkpoint_root": "95a0cff4938ee4de8a463a91e1db23a2e65ca0ca298ebce5318ddddb65dba31b",
      "k": 4,
@@ -254,6 +275,13 @@
    },
    {
     "arity": 2,
+    "by_position": {
+     "chunk": "0500000000000000fdffffffffffffff",
+     "chunk_path": [
+      "ae9b3b30241925605a11e8e6d0639589b23c5cad79c637bd58b5ff13474e0e36",
+      "105bdc9b663c1b4cbe81471773ff29d61f769b79cb35de5d8ba3f97e613831c7"
+     ]
+    },
     "commitment": {
      "checkpoint_root": "de533017f7bed08a63ba7be8d37b17674bd71611c86b91e51aea61f8a860b0f0",
      "k": 4,

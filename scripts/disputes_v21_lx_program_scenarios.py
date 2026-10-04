@@ -212,9 +212,19 @@ def build_by_value() -> dict:
                 d.pick(pick)
             proof = L.executor_opening(executor, d)
             ruling = d.submit_opening(proof)
-            plays.append({"name": f"by-value {name} k={k} a={arity}", "arity": arity,
-                          "commitment": commitment(executor, k), "pair": pair, "rounds": rounds,
-                          "terminal": d.lo, "opening": opening(proof), "ruling": ruling})
+            play = {"name": f"by-value {name} k={k} a={arity}", "arity": arity,
+                    "commitment": commitment(executor, k), "pair": pair, "rounds": rounds,
+                    "terminal": d.lo, "opening": opening(proof), "ruling": ruling}
+            # The chunk the position (not h) would select, with its valid path:
+            # must be refused (review M2).
+            p0, _ = L.Schedule(tm).locate(d.lo)
+            table = tm.constant_table()
+            wrong = p0 % 4
+            h_now = struct.unpack("<q", executor.states[d.lo][tm.H])[0]
+            if wrong != h_now % 4:
+                play["by_position"] = {"chunk": h(table.chunk(0, wrong)),
+                                       "chunk_path": [h(x) for x in table.chunk_tree(0).path(wrong)]}
+            plays.append(play)
     return {"params": h(struct.pack("<QQqB", P, W, H0, 2)), "constants_root": h(L.constants_root(tm)),
             "plays": plays}
 

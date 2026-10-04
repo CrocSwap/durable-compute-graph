@@ -354,7 +354,9 @@ pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
         if !siblings.is_empty() {
             return Err(LxRefusal::Proof);
         }
-        check_constants(h, m, p, i, &[], consts, constants_root, s.const_reads, s.const_values)?;
+        if check_constants(h, m, p, i, &[], consts, constants_root, s.const_reads, s.const_values)?.is_none() {
+            return Ok(LxRuling::Challenger); // the machine cannot name its reads (review M3)
+        }
         return Ok(if root_lo == root_hi { LxRuling::Executor } else { LxRuling::Challenger });
     }
     let value = |slot: u32| opened.binary_search_by_key(&slot, |e| e.0).ok().map(|k| opened[k].1);
@@ -374,7 +376,12 @@ pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
     }
     // The constants are exactly the declared reads (a function of the
     // verified read values), in order, each verified.
-    let nc = check_constants(h, m, p, i, &s.read_values[..nr], consts, constants_root, s.const_reads, s.const_values)?;
+    // A machine that cannot name its reads for this verified state rules for
+    // the challenger, as a kernel failure does (review M3).
+    let Some(nc) = check_constants(h, m, p, i, &s.read_values[..nr], consts, constants_root, s.const_reads, s.const_values)?
+    else {
+        return Ok(LxRuling::Challenger);
+    };
     for e in s.write_effects[..nw].iter_mut() {
         *e = Write::Keep;
     }
@@ -402,7 +409,8 @@ pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
 
 /// Check the opened constants against the machine's declared reads for
 /// transition `(p, i)` given its verified read values; returns their count
-/// with `const_values` filled.
+/// with `const_values` filled, or `None` if the machine cannot name its reads
+/// for these values (which rules for the challenger).
 #[allow(clippy::too_many_arguments)]
 fn check_constants<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
     h: &H,
@@ -414,8 +422,10 @@ fn check_constants<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
     constants_root: &Hash,
     const_reads: &mut [(u32, u64)],
     const_values: &mut [&'v [u8]],
-) -> Result<usize, LxRefusal> {
-    let nc = m.constants(p, i, read_values, const_reads).ok_or(LxRefusal::Coverage)?;
+) -> Result<Option<usize>, LxRefusal> {
+    let Some(nc) = m.constants(p, i, read_values, const_reads) else {
+        return Ok(None);
+    };
     if nc > const_reads.len() || const_values.len() < nc {
         return Err(LxRefusal::Coverage); // a machine past its declared maximum (review L3)
     }
@@ -429,7 +439,7 @@ fn check_constants<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
         }
         const_values[k] = e.chunk;
     }
-    Ok(nc)
+    Ok(Some(nc))
 }
 
 /// The OUTPUT claim (design review H3): `opened` covers exactly `output_slots`
