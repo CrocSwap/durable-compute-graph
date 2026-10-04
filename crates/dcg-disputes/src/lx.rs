@@ -284,7 +284,9 @@ pub enum LxRefusal {
     /// The coordinate is outside the schedule.
     Coordinate,
     /// The opening does not cover exactly the transition's slots (or the
-    /// output slots), or a caller buffer is too small.
+    /// output slots), or a caller buffer is too small. (A constant-read
+    /// buffer too small for the machine's reads instead rules for the
+    /// challenger; size scratch from `max_transition`.)
     Coverage,
     /// The opening does not rebuild the agreed root.
     Proof,
