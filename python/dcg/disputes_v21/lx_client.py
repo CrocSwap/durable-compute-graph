@@ -204,3 +204,40 @@ class LxClient(DisputeClient):
                     AccountMeta(template, False, False), AccountMeta(dispute, False, True),
                     AccountMeta(executor, False, True), AccountMeta(buffer, False, False)], [challenger])
         return {"ruling": RULINGS[self.gc.account(dispute)[6]], "dispute": str(dispute)}
+
+    def lx_send_play(self, run: Pubkey, template: Pubkey, play: dict, *, coordinates: Sequence[int],
+                     levels: list[list[bytes]], params: bytes, executor: Keypair, challenger: Keypair,
+                     dispute_nonce: bytes = bytes([1]) * 32) -> dict:
+        """Send a recorded LX1 play (pair, each round's midpoint roots and
+        pick, the staged terminal opening as `opening_hex`), checking that the
+        program's terminal coordinate is the recorded one."""
+        rounds = iter(play["rounds"])
+        current: dict = {}
+
+        def executor_roots(mids: list[int]) -> list[bytes]:
+            current.clear()
+            current.update(next(rounds))
+            roots = [bytes.fromhex(r) for r in current["midpoints"]]
+            if len(roots) != len(mids):
+                raise ValueError("recorded midpoints do not match the interval")
+            return roots
+
+        def challenger_roots(coords: list[int]) -> list[bytes]:
+            # Agree with every upper root before the recorded pick and
+            # differ at it, so the shared pick rule chooses the recorded one.
+            ups = [bytes.fromhex(r) for r in current["midpoints"]]
+            out = []
+            for i in range(len(coords)):
+                theirs = ups[i] if i < len(ups) else None
+                out.append(theirs if (i < current["pick"] and theirs is not None) else bytes(32))
+            return out
+
+        roots = [bytes.fromhex(r) for r in play["commitment"]["roots"]]
+        res = self.lx_play(run, template, coordinates=coordinates, roots=roots, levels=levels, pair=play["pair"],
+                           params=params, arity=play["arity"], executor=executor, challenger=challenger,
+                           executor_roots=executor_roots, challenger_roots=challenger_roots,
+                           executor_opening=lambda c: bytes.fromhex(play["opening_hex"]),
+                           dispute_nonce=dispute_nonce, log=lambda s: None)
+        if res["terminal"] != play["terminal"]:
+            raise RuntimeError(f"terminal {res['terminal']} is not the recorded {play['terminal']}")
+        return res
