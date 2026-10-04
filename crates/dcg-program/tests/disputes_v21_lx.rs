@@ -26,6 +26,7 @@ const SYSTEM: Pubkey = system_program::ID;
 const EXECUTOR_BOND: u64 = 2_000_000;
 const CHALLENGER_BOND: u64 = 1_000_000;
 const PHASE_WINDOW: u64 = 750;
+const LX_MAX_CHUNK_PATH: usize = dcg_disputes::lx::MAX_CHUNK_PATH;
 
 struct Soft;
 impl D::Sha256 for Soft {
@@ -458,12 +459,25 @@ async fn wrong_missing_or_reordered_constants_are_refused_and_the_executor_may_r
         assert_eq!(ch.opening(d).await, Err(custom(50)), "{name}");
         assert_eq!(ch.account(d).await.data[6], V::RULING_OPEN, "{name}: nothing ruled");
     }
-    // A truncated constants section does not decode (46).
-    ch.write(d, V::ROLE_EXECUTOR, 0, &good[..good.len() - 1]).await.unwrap();
-    let mut cut = good[..good.len() - 1].to_vec();
-    cut.extend(std::iter::repeat_n(0xFFu8, 64));
-    ch.write(d, V::ROLE_EXECUTOR, 0, &cut).await.unwrap();
-    assert!(ch.opening(d).await.is_err(), "truncated");
+    // A count above the machine's maximum is refused before decoding (50).
+    let mut many = encode_opening(o);
+    many.extend_from_slice(&3u32.to_le_bytes());
+    ch.write(d, V::ROLE_EXECUTOR, 0, &many).await.unwrap();
+    assert_eq!(ch.opening(d).await, Err(custom(50)), "too many reads");
+    // A section that runs past the buffer does not decode (46): a chunk
+    // length larger than the whole buffer.
+    let mut past = encode_opening(o);
+    past.extend_from_slice(&1u32.to_le_bytes());
+    past.extend_from_slice(&(V::CREATE_STAGE as u32).to_le_bytes());
+    ch.write(d, V::ROLE_EXECUTOR, 0, &past).await.unwrap();
+    assert_eq!(ch.opening(d).await, Err(custom(46)), "truncated");
+    // A path length above its cap is refused before its hashes are read (50).
+    let mut capped = encode_opening(o);
+    capped.extend_from_slice(&1u32.to_le_bytes());
+    capped.extend_from_slice(&0u32.to_le_bytes());
+    capped.push(LX_MAX_CHUNK_PATH as u8 + 1);
+    ch.write(d, V::ROLE_EXECUTOR, 0, &capped).await.unwrap();
+    assert_eq!(ch.opening(d).await, Err(custom(50)), "overlong path");
     // The honest opening still wins before the deadline.
     ch.write(d, V::ROLE_EXECUTOR, 0, &good).await.unwrap();
     ch.opening(d).await.unwrap();

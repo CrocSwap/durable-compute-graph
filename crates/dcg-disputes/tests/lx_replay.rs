@@ -355,9 +355,9 @@ struct Weighted {
     case: Case,
     reads: Vec<(u32, u64)>,
     chunks: Vec<Vec<u8>>,
-    chunk_paths: Vec<Vec<Hash>>,
+    chunk_paths: Vec<Vec<u8>>,
     digests: Vec<Hash>,
-    const_paths: Vec<Vec<Hash>>,
+    const_paths: Vec<Vec<u8>>,
 }
 
 impl Weighted {
@@ -403,9 +403,9 @@ fn weighted(g: &serde_json::Value) -> (Toy, Hash, Vec<Weighted>) {
                     .map(|x| (x[0].as_u64().unwrap() as u32, x[1].as_u64().unwrap()))
                     .collect(),
                 chunks: cs.iter().map(|e| hex(e["chunk"].as_str().unwrap())).collect(),
-                chunk_paths: cs.iter().map(|e| hashes(&e["chunk_path"])).collect(),
+                chunk_paths: cs.iter().map(|e| hashes(&e["chunk_path"]).concat()).collect(),
                 digests: cs.iter().map(|e| h32(&e["digest"])).collect(),
-                const_paths: cs.iter().map(|e| hashes(&e["const_path"])).collect(),
+                const_paths: cs.iter().map(|e| hashes(&e["const_path"]).concat()).collect(),
             }
         })
         .collect();
@@ -425,7 +425,8 @@ fn weighted_replays_rule_like_python() {
         for (k, (cid, _)) in w.reads.iter().enumerate() {
             let digest = g["weighted"]["digests"][cid.to_string()].as_str().unwrap();
             assert_eq!(w.digests[k], h32(&serde_json::Value::from(digest)));
-            assert_eq!(dcg_disputes::root_from_path(&Soft, dcg_disputes::Tree::LxConst, &const_leaf(&Soft, *cid, &w.digests[k]), *cid as u64, &w.const_paths[k]), root);
+            let path: Vec<Hash> = w.const_paths[k].chunks(32).map(|c| c.try_into().unwrap()).collect();
+            assert_eq!(dcg_disputes::root_from_path(&Soft, dcg_disputes::Tree::LxConst, &const_leaf(&Soft, *cid, &w.digests[k]), *cid as u64, &path), root);
         }
         let c = &w.case;
         assert_eq!(run_c(&m, c, &c.opened, &c.siblings, &w.openings(), &root), Ok(c.ruling), "coordinate {}", c.coordinate);
@@ -446,14 +447,18 @@ fn wrong_missing_or_reordered_constants_are_refused() {
         refuse(&[ConstOpening { chunk: &chunk, ..good[0] }, good[1]]);
         // A wrong chunk path, a wrong digest, a wrong or overlong constant path.
         let mut cp = w.chunk_paths[0].clone();
-        cp[0][0] ^= 1;
+        cp[0] ^= 1;
         refuse(&[ConstOpening { chunk_path: &cp, ..good[0] }, good[1]]);
         refuse(&[ConstOpening { digest: [7; 32], ..good[0] }, good[1]]);
         let mut kp = w.const_paths[1].clone();
-        kp[0][0] ^= 1;
+        kp[0] ^= 1;
         refuse(&[good[0], ConstOpening { const_path: &kp, ..good[1] }]);
         let mut long = w.const_paths[1].clone();
-        long.push([0; 32]);
+        long.extend_from_slice(&[0; 32]);
+        refuse(&[good[0], ConstOpening { const_path: &long, ..good[1] }]);
+        // A path that is not whole hashes.
+        let ragged = &w.const_paths[1][..w.const_paths[1].len() - 1];
+        refuse(&[good[0], ConstOpening { const_path: ragged, ..good[1] }]);
         refuse(&[good[0], ConstOpening { const_path: &long, ..good[1] }]);
         // Too short to hold the chunk index or the constant id.
         if w.reads[0].1 > 0 {

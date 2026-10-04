@@ -395,23 +395,39 @@ fn decode_opening<'a>(b: &'a [u8], at: &mut usize) -> Result<(Vec<(u32, Option<&
 
 /// The constants of a replay opening (design §13): `n:u32` then, per declared
 /// read in order, `len:u32 chunk  chunk_path_n:u8 hash*  digest  const_path_n:u8 hash*`.
-fn decode_constants<'a>(b: &'a [u8], at: &mut usize) -> Result<Vec<(&'a [u8], Vec<D::Hash>, D::Hash, Vec<D::Hash>)>, ProgramError> {
+/// Chunks and paths are borrowed from the staged bytes (review M1). A count
+/// above the machine's maximum, or a path above its cap, is refused before
+/// anything is read (review L2); a section past the end does not decode (46).
+fn decode_constants<'a>(b: &'a [u8], at: &mut usize, max_reads: usize) -> Result<Vec<X::ConstOpening<'a>>, ProgramError> {
     let n = u32_at(b, *at)? as usize;
     *at += 4;
-    let mut out = Vec::with_capacity(n.min(256));
+    if n > max_reads {
+        return Err(err(50));
+    }
+    let take = |at: &mut usize, len: usize| -> Result<&'a [u8], ProgramError> {
+        let v = b.get(*at..at.checked_add(len).ok_or(err(46))?).ok_or(err(46))?;
+        *at += len;
+        Ok(v)
+    };
+    let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let len = u32_at(b, *at)? as usize;
-        let start = *at + 4;
-        let chunk = b.get(start..start.checked_add(len).ok_or(err(46))?).ok_or(err(46))?;
-        *at = start + len;
+        *at += 4;
+        let chunk = take(at, len)?;
         let nc = *b.get(*at).ok_or(err(46))? as usize;
-        let chunk_path = read_hashes(b, *at + 1, nc)?;
-        *at += 1 + 32 * nc;
-        let digest = key32(b, *at)?;
-        let nk = *b.get(*at + 32).ok_or(err(46))? as usize;
-        let const_path = read_hashes(b, *at + 33, nk)?;
-        *at += 33 + 32 * nk;
-        out.push((chunk, chunk_path, digest, const_path));
+        *at += 1;
+        if nc > X::MAX_CHUNK_PATH {
+            return Err(err(50));
+        }
+        let chunk_path = take(at, 32 * nc)?;
+        let digest: D::Hash = take(at, 32)?.try_into().unwrap();
+        let nk = *b.get(*at).ok_or(err(46))? as usize;
+        *at += 1;
+        if nk > X::MAX_CONST_PATH {
+            return Err(err(50));
+        }
+        let const_path = take(at, 32 * nk)?;
+        out.push(X::ConstOpening { chunk, chunk_path, digest, const_path });
     }
     Ok(out)
 }
@@ -453,12 +469,8 @@ pub(crate) fn opening(
     let staged = buffer.try_borrow_data()?;
     let mut at = STAGE_HEADER;
     let (opened, siblings) = decode_opening(&staged, &mut at)?;
-    let decoded = decode_constants(&staged, &mut at)?;
-    let consts: Vec<X::ConstOpening> = decoded
-        .iter()
-        .map(|(chunk, cp, digest, kp)| X::ConstOpening { chunk, chunk_path: cp, digest: *digest, const_path: kp })
-        .collect();
     let (nr, nw, nout, nc) = b.machine.max_transition();
+    let consts = decode_constants(&staged, &mut at, nc)?;
     let (mut reads, mut writes) = (vec![0u32; nr], vec![0u32; nw]);
     let mut nodes = vec![(0u64, [0u8; 32]); opened.len()];
     let mut read_values: Vec<Option<&[u8]>> = vec![None; nr];

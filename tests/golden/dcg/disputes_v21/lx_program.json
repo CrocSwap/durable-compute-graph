@@ -2015,6 +2015,326 @@
     ],
     "ruling": "E",
     "terminal": 6
+   },
+   {
+    "arity": 16,
+    "commitment": {
+     "checkpoint_root": "bf995c3b9a3f56047beb1aae8e7e3145cb1a309366dca75e1fc4ab7023cdaec3",
+     "k": 1,
+     "outputs": [
+      "2c85440000000000"
+     ],
+     "outputs_digest": "372407c2d620c41508310085039337ef4c3a56e8f30af444f57a38ab1f0a0e6c",
+     "roots": [
+      "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+      "f6c3251eb65fca64f6005c2bb9295433e7f7923c6d55a277e76f4c2473074e5e",
+      "037ab421d5a780368eba467b71c2df3b5f6e71c72dc139128b291c9d7c7cea33",
+      "9acff166b3a3d06dac09363b977f1cbb78a525db8a39b804077038572f6dce0a",
+      "d6bf84b5bd5eb5993d290dcceab1503bb2669fefe4993e0e76e49ee8bec46413",
+      "907bd43b46b866d2b6f2d6da490b4d71ccd6c716aec9986fdfe92819d5dd2655",
+      "919266b4fc24c2e25c748e96aa15fdab0e9fa045734e05c4425f490041a5e445",
+      "9110a4479cc8cb2009eb38546b37440e8910efbdb9e9f7499bcd1e3829ff66cb",
+      "2d95a750f78c068dd57320baf0d2fe26d71d29429cf840dd8c83c64a0899dc87",
+      "7fd44ef416d37e7f2554eccd36be9f170ab2b11c8038edb1492ff2b736ae3461"
+     ]
+    },
+    "name": "weighted bumped-finish executor-lies k=1 a=16",
+    "opening": {
+     "constants": [],
+     "opened": [
+      [
+       0,
+       "9506000000000000"
+      ],
+      [
+       6,
+       null
+      ],
+      [
+       10,
+       "ca13000000000000"
+      ],
+      [
+       11,
+       "9506000000000000"
+      ],
+      [
+       12,
+       "4018000000000000"
+      ]
+     ],
+     "siblings": [
+      "54ef2346add2beab2f6137d0d940067dadb93562474c2e86cc849977377d43a8",
+      "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+      "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+      "65f774f2ca234b386a685d5124b6e39c6fd6e071f374e3034909e0a459060bac",
+      "ae5a419156c6e83724bd6f777170da2583f2b9f453a6ec93b43bd1cf9cdd2e2b",
+      "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+      "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+     ]
+    },
+    "pair": 5,
+    "rounds": [
+     {
+      "midpoints": [
+       "c1728099839b3c0c0885e4b671080c6c5202161f1bf2f7969f6a237402bda391",
+       "2727678f659ca9c50aa1f023009e801219057bdd68365808087c318558544639",
+       "efac166aad5927fe586fda8ed130c5648bd613a0dd80afbd23c01de7cd6c7cf9",
+       "4f48772a2777a44a8b3b9a35ae7efc55616c955d1abefb2591fdd45f580c2449",
+       "f761fec5c5f48e1f6b510c47d6606eea77e01259d50d3c98419753d1402758bd"
+      ],
+      "pick": 5
+     }
+    ],
+    "ruling": "C",
+    "terminal": 25
+   },
+   {
+    "arity": 16,
+    "commitment": {
+     "checkpoint_root": "7811d672863f66c15af4180dca78dd332dc8c776b04218df50757947924f20af",
+     "k": 1,
+     "outputs": [
+      "5784440000000000"
+     ],
+     "outputs_digest": "31064bca7a4382533c95864a4b0374e2bda8f82bc324498c7b5de3a70b065b66",
+     "roots": [
+      "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+      "f6c3251eb65fca64f6005c2bb9295433e7f7923c6d55a277e76f4c2473074e5e",
+      "037ab421d5a780368eba467b71c2df3b5f6e71c72dc139128b291c9d7c7cea33",
+      "9acff166b3a3d06dac09363b977f1cbb78a525db8a39b804077038572f6dce0a",
+      "d6bf84b5bd5eb5993d290dcceab1503bb2669fefe4993e0e76e49ee8bec46413",
+      "907bd43b46b866d2b6f2d6da490b4d71ccd6c716aec9986fdfe92819d5dd2655",
+      "809c64afa8e27de546a869d3d6192d32876afa559760781aac299304b7c27fb6",
+      "78c36d1daaf56e9bd4d9024fae75c3e7a3b33a73543e7157490b4d336d9a4a0f",
+      "6f699f6a20ba0835da556796e1734b4b5a99828556f92f44952b93b13847cbc7",
+      "5579f27cf035240084e227182af24260626dcc9f164a17a1191b2b6751b2d528"
+     ]
+    },
+    "name": "weighted bumped-finish challenger-lies k=1 a=16",
+    "opening": {
+     "constants": [],
+     "opened": [
+      [
+       0,
+       "9506000000000000"
+      ],
+      [
+       6,
+       null
+      ],
+      [
+       10,
+       "ca13000000000000"
+      ],
+      [
+       11,
+       "9506000000000000"
+      ],
+      [
+       12,
+       "4018000000000000"
+      ]
+     ],
+     "siblings": [
+      "54ef2346add2beab2f6137d0d940067dadb93562474c2e86cc849977377d43a8",
+      "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+      "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+      "65f774f2ca234b386a685d5124b6e39c6fd6e071f374e3034909e0a459060bac",
+      "ae5a419156c6e83724bd6f777170da2583f2b9f453a6ec93b43bd1cf9cdd2e2b",
+      "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+      "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+     ]
+    },
+    "pair": 5,
+    "rounds": [
+     {
+      "midpoints": [
+       "c1728099839b3c0c0885e4b671080c6c5202161f1bf2f7969f6a237402bda391",
+       "2727678f659ca9c50aa1f023009e801219057bdd68365808087c318558544639",
+       "efac166aad5927fe586fda8ed130c5648bd613a0dd80afbd23c01de7cd6c7cf9",
+       "4f48772a2777a44a8b3b9a35ae7efc55616c955d1abefb2591fdd45f580c2449",
+       "f761fec5c5f48e1f6b510c47d6606eea77e01259d50d3c98419753d1402758bd"
+      ],
+      "pick": 5
+     }
+    ],
+    "ruling": "E",
+    "terminal": 25
+   },
+   {
+    "arity": 2,
+    "commitment": {
+     "checkpoint_root": "ff0b0fc91e407df8a15a3ba4d7b86c0e227695d4e8488a726595ba46b5e6479b",
+     "k": 4,
+     "outputs": [
+      "2c85440000000000"
+     ],
+     "outputs_digest": "372407c2d620c41508310085039337ef4c3a56e8f30af444f57a38ab1f0a0e6c",
+     "roots": [
+      "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+      "d6bf84b5bd5eb5993d290dcceab1503bb2669fefe4993e0e76e49ee8bec46413",
+      "2d95a750f78c068dd57320baf0d2fe26d71d29429cf840dd8c83c64a0899dc87",
+      "7fd44ef416d37e7f2554eccd36be9f170ab2b11c8038edb1492ff2b736ae3461"
+     ]
+    },
+    "name": "weighted bumped-finish executor-lies k=4 a=2",
+    "opening": {
+     "constants": [],
+     "opened": [
+      [
+       0,
+       "9506000000000000"
+      ],
+      [
+       6,
+       null
+      ],
+      [
+       10,
+       "ca13000000000000"
+      ],
+      [
+       11,
+       "9506000000000000"
+      ],
+      [
+       12,
+       "4018000000000000"
+      ]
+     ],
+     "siblings": [
+      "54ef2346add2beab2f6137d0d940067dadb93562474c2e86cc849977377d43a8",
+      "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+      "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+      "65f774f2ca234b386a685d5124b6e39c6fd6e071f374e3034909e0a459060bac",
+      "ae5a419156c6e83724bd6f777170da2583f2b9f453a6ec93b43bd1cf9cdd2e2b",
+      "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+      "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+     ]
+    },
+    "pair": 1,
+    "rounds": [
+     {
+      "midpoints": [
+       "0be4565e53fa2bc3a4dd6feb98434a0ca42f927a675f8daa9ab90f9b50dd4b7a"
+      ],
+      "pick": 0
+     },
+     {
+      "midpoints": [
+       "907bd43b46b866d2b6f2d6da490b4d71ccd6c716aec9986fdfe92819d5dd2655"
+      ],
+      "pick": 1
+     },
+     {
+      "midpoints": [
+       "efac166aad5927fe586fda8ed130c5648bd613a0dd80afbd23c01de7cd6c7cf9"
+      ],
+      "pick": 1
+     },
+     {
+      "midpoints": [
+       "f761fec5c5f48e1f6b510c47d6606eea77e01259d50d3c98419753d1402758bd"
+      ],
+      "pick": 1
+     },
+     {
+      "midpoints": [
+       "919266b4fc24c2e25c748e96aa15fdab0e9fa045734e05c4425f490041a5e445"
+      ],
+      "pick": 0
+     }
+    ],
+    "ruling": "C",
+    "terminal": 25
+   },
+   {
+    "arity": 2,
+    "commitment": {
+     "checkpoint_root": "02eee4d4c7974da323523003a46a5f8ce39beff5fdcce9a41a9cae067c020280",
+     "k": 4,
+     "outputs": [
+      "5784440000000000"
+     ],
+     "outputs_digest": "31064bca7a4382533c95864a4b0374e2bda8f82bc324498c7b5de3a70b065b66",
+     "roots": [
+      "c62481e729f687015ca8734c6f18cfb92540f5712ef516789ccd11381831eb8c",
+      "d6bf84b5bd5eb5993d290dcceab1503bb2669fefe4993e0e76e49ee8bec46413",
+      "6f699f6a20ba0835da556796e1734b4b5a99828556f92f44952b93b13847cbc7",
+      "5579f27cf035240084e227182af24260626dcc9f164a17a1191b2b6751b2d528"
+     ]
+    },
+    "name": "weighted bumped-finish challenger-lies k=4 a=2",
+    "opening": {
+     "constants": [],
+     "opened": [
+      [
+       0,
+       "9506000000000000"
+      ],
+      [
+       6,
+       null
+      ],
+      [
+       10,
+       "ca13000000000000"
+      ],
+      [
+       11,
+       "9506000000000000"
+      ],
+      [
+       12,
+       "4018000000000000"
+      ]
+     ],
+     "siblings": [
+      "54ef2346add2beab2f6137d0d940067dadb93562474c2e86cc849977377d43a8",
+      "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+      "cf66c6b4adb6d065fd46624afc7c4a1249955e94a86c3c38d62f151690b6e538",
+      "65f774f2ca234b386a685d5124b6e39c6fd6e071f374e3034909e0a459060bac",
+      "ae5a419156c6e83724bd6f777170da2583f2b9f453a6ec93b43bd1cf9cdd2e2b",
+      "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f",
+      "97a631a22be23a98ddc518185cb2c0ffc954228e1f5f15d1d37cbf44b8ff052f"
+     ]
+    },
+    "pair": 1,
+    "rounds": [
+     {
+      "midpoints": [
+       "1eaf19ada3bb7bd89f9b801201cda470b58ca8d029245b84c5cf444dbd7c2438"
+      ],
+      "pick": 0
+     },
+     {
+      "midpoints": [
+       "907bd43b46b866d2b6f2d6da490b4d71ccd6c716aec9986fdfe92819d5dd2655"
+      ],
+      "pick": 1
+     },
+     {
+      "midpoints": [
+       "efac166aad5927fe586fda8ed130c5648bd613a0dd80afbd23c01de7cd6c7cf9"
+      ],
+      "pick": 1
+     },
+     {
+      "midpoints": [
+       "f761fec5c5f48e1f6b510c47d6606eea77e01259d50d3c98419753d1402758bd"
+      ],
+      "pick": 1
+     },
+     {
+      "midpoints": [
+       "809c64afa8e27de546a869d3d6192d32876afa559760781aac299304b7c27fb6"
+      ],
+      "pick": 0
+     }
+    ],
+    "ruling": "E",
+    "terminal": 25
    }
   ]
  }

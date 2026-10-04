@@ -131,8 +131,19 @@ def build_weighted() -> dict:
             state[tm.A] = struct.pack("<q", struct.unpack("<q", state[tm.A])[0] + 1)
         return state
 
+    finish5 = next(c for c in range(sch.total) if sch.transition(c).label == "p5.finish")
+
+    def bump_h(coord, state):
+        if coord == finish5:
+            state = dict(state)
+            state[tm.H] = struct.pack("<q", struct.unpack("<q", state[tm.H])[0] + 1)
+        return state
+
     plays = []
-    for lie, liar in (("bumped-start", L.execute(tm, bump_a)), ("other-weights", other)):
+    # A bumped start and other weights end at constant-reading starts; a
+    # bumped finish ends at a transition that reads no constants (review L4).
+    for lie, liar in (("bumped-start", L.execute(tm, bump_a)), ("other-weights", other),
+                      ("bumped-finish", L.execute(tm, bump_h))):
         for k, arity in ((1, 16), (4, 2)):
             for name, executor, challenger in (("executor-lies", liar, honest), ("challenger-lies", honest, liar)):
                 com = L.commit(executor, k)
@@ -147,7 +158,7 @@ def build_weighted() -> dict:
                     rounds.append({"midpoints": [h(r) for r in mids], "pick": pick})
                     d.pick(pick)
                 proof = L.executor_opening(executor, d)
-                assert proof.constants, "every weighted play ends at a start"
+                assert bool(proof.constants) == (lie != "bumped-finish")
                 ruling = d.submit_opening(proof)
                 plays.append({
                     "name": f"weighted {lie} {name} k={k} a={arity}",
