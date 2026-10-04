@@ -594,8 +594,13 @@ pub trait StatefulKernel: Kernel {
     }
 
     /// Capture `[phase.offset, phase.offset + phase.len)` of the lane's
-    /// workspace from the committed state at `phase.state_cursor`. The state
-    /// cannot advance while a capture is open.
+    /// workspace from the committed state at `phase.state_cursor`, writing
+    /// every byte of that range and nothing outside it. The state cannot
+    /// advance while a capture is open. The program zeroes the workspace past
+    /// `lane_capture_bytes` at the first call, so a render may rely only on
+    /// captured bytes, zeros, and what earlier render calls of the same
+    /// publication wrote. The capture's compute is declared with
+    /// `view_phase_compute_units`.
     fn capture_lane_phase(
         &self,
         _phase: LanePhase,

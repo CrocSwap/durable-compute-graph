@@ -442,7 +442,8 @@ fn capture_begin(program: &Pubkey, accounts: &[AccountInfo], data: &[u8], kernel
     if l.status != IDLE {
         return Err(refusal(REFUSAL_LANE));
     }
-    // Two lanes never capture the same cursor; captures move forward.
+    // Two lanes never capture the same cursor; captures move forward. An
+    // aborted capture forfeits its cursor until the next advance.
     if session.cursor != c || c.checked_add(1).is_none_or(|next| next <= session.last_captured) {
         return Err(refusal(REFUSAL_LANE_CURSOR));
     }
@@ -584,6 +585,12 @@ fn capture_run(program: &Pubkey, accounts: &[AccountInfo], data: &[u8], kernel: 
         .collect();
     {
         let mut ws = workspace.try_borrow_mut_data()?;
+        if l.capture_cursor == 0 {
+            // Bytes past the capture would otherwise carry over from earlier
+            // renders on this lane; a render sees only the captured state and
+            // zeros (review M2).
+            ws[CHILD_HEADER_BYTES + l.capture_total as usize..CHILD_HEADER_BYTES + ws_len as usize].fill(0);
+        }
         for _ in 0..phases {
             let left = l.capture_total - l.capture_cursor;
             if left == 0 {
@@ -626,7 +633,8 @@ fn capture_end(program: &Pubkey, accounts: &[AccountInfo], data: &[u8], kernel: 
 /// 9 RUN_PHASE: [lane workspace(w), authority(s), lane(w), lane scratch(w),
 /// resource?] lane:u8 cursor:u32 render_cursor:u32 compute:u32 [phases:u8].
 /// The lane workspace is first (the invocation's base address). No session
-/// or state account is read.
+/// or state account is read, so a render also runs after halt; it writes
+/// only lane accounts, and nothing publishes after halt (commit refuses).
 fn run(program: &Pubkey, accounts: &[AccountInfo], data: &[u8], kernel: &dyn StatefulKernel) -> ProgramResult {
     let phases = match data.len() {
         16 => 1u32,
@@ -745,6 +753,11 @@ fn commit(program: &Pubkey, accounts: &[AccountInfo], data: &[u8], kernel: &dyn 
     lane_child(program, scratch, &l, KIND_LANE_SCRATCH, false)?;
     if views.len() != l.views.len() {
         return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    // The views must be the set captured (review M1): a view created since
+    // capture begin would be left unstamped, so the lane aborts instead.
+    if session.view_count as usize != l.views.len() {
+        return Err(refusal(REFUSAL_VIEW));
     }
     let sc = scratch.try_borrow_data()?;
     if u32_at(&sc, 112) != c {

@@ -344,8 +344,8 @@ impl StatefulKernel for V3LaneCounterKernel {
                 workspace[lo..hi].copy_from_slice(&span.data[lo - a..hi - a]);
             }
         }
-        // The capture cursor is recorded too, so a render can check it.
-        workspace[16..20].copy_from_slice(&phase.state_cursor.to_le_bytes());
+        // Only the declared range is written (lanes review L5); the program
+        // stamps the captured cursor in the workspace header.
         Ok(())
     }
 
@@ -358,9 +358,6 @@ impl StatefulKernel for V3LaneCounterKernel {
         workspace: &mut [u8],
         output: &mut [u8],
     ) -> Result<usize, KernelError> {
-        if workspace[16..20] != phase.state_cursor.to_le_bytes() {
-            return Err(KernelError::Refused);
-        }
         let start = (phase.source_offset + phase.output_offset) as usize;
         let end = start + output.len();
         if end > V3_LANE_CAPTURE_BYTES as usize {

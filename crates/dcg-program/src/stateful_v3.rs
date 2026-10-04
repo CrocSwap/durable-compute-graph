@@ -731,6 +731,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || raw[1267] as usize > lanes::MAX_LANES
         || (raw[1268] as u32) >> raw[1267] != 0
         || u32_at(raw, 1269) > u32_at(raw, 112).saturating_add(1)
+        || (raw[1267] == 0 && raw[1268..1273].iter().any(|byte| *byte != 0))
         || !matches!(raw[6], STATUS_ACTIVE | STATUS_HALTED)
         || !matches!(raw[7], POLICY_INDEXED | POLICY_APPEND)
         || raw[8] == 0

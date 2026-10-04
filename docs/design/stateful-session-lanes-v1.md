@@ -302,3 +302,18 @@ then renders on lane `N mod L` overlapping the next advance.
 
 **Slice 4: Doom on testnet** at L = 1, 2, 3 against 1.66 frames/s, with
 frame-hash equality.
+
+**Slice 1 review (2026-10-04): merge after fixes; fixed.**
+- M1: a commit refuses (2332) if the session's views changed since capture
+  begin; the lane aborts and recaptures.
+- M2: the first capture call zeroes the lane workspace past the capture, so a
+  render depends only on the state at `c` (kernel contract in `kernel.rs`).
+- Captures use the view-phase compute declaration; there is no separate
+  capture declaration (§5 superseded on this point).
+- An aborted capture forfeits its cursor until the next advance.
+- Renders still run after halt; they write only lane accounts, and commit
+  refuses, so nothing publishes.
+- Strict decode: a session without lanes has all lane tail bytes zero.
+- For slices 2 and 3: an application with several kernels must dispatch lane
+  renders by the lane record's kernel id (they carry no session), and each
+  lane's renders need their own fee payer, or they serialize with `ADVANCE`.

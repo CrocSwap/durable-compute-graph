@@ -77,6 +77,7 @@ struct Lanes {
     session: Pubkey,
     states: [Pubkey; 2],
     cursor: u32,
+    roles: Vec<u8>,
 }
 
 async fn send(ctx: &mut ProgramTestContext, i: Instruction, signers: &[&Keypair]) -> Result<(), u32> {
@@ -130,6 +131,23 @@ impl Lanes {
     /// A lane-counter session with `lanes` lanes, both views, every lane
     /// created, and inputs 1, 2, 3, ... written ahead.
     async fn new(lanes: u8) -> Self {
+        Self::new_with(lanes, &[VALUE, TOTAL]).await
+    }
+
+    async fn create_view(&mut self, role: u8) {
+        let (abi, offset) = if role == VALUE { (app::VALUE_VIEW_ABI, 0u32) } else { (app::TOTAL_VIEW_ABI, 8) };
+        let mut p = vec![v3::WIRE_VERSION, role];
+        p.extend_from_slice(&abi);
+        p.extend_from_slice(&offset.to_le_bytes());
+        p.extend_from_slice(&8u32.to_le_bytes());
+        let payer = self.ctx.payer.pubkey();
+        let s = self.session;
+        send(&mut self.ctx, ix(sw::TAG_CREATE_VIEW, p, vec![AccountMeta::new(payer, true), w(s), w(view_pda(&s, role)), r(SYSTEM)]), &[]).await.unwrap();
+        self.roles.push(role);
+        self.roles.sort();
+    }
+
+    async fn new_with(lanes: u8, roles: &[u8]) -> Self {
         let mut ctx = start().await;
         let auth = keypair(7);
         let payer = ctx.payer.pubkey();
@@ -143,14 +161,14 @@ impl Lanes {
         cs.extend_from_slice(&8u32.to_le_bytes());
         send(&mut ctx, ix(sw::TAG_CREATE_STATE, cs, vec![AccountMeta::new(payer, true), w(session), w(states[0]), w(states[1]), r(SYSTEM)]), &[]).await.unwrap();
         send(&mut ctx, ix(sw::TAG_CREATE_STATE, vec![v3::WIRE_VERSION, v3::STATE_OP_INITIALIZE], vec![signer(auth.pubkey()), w(session), w(states[0]), w(states[1])]), &[&auth]).await.unwrap();
-        for (role, abi, offset) in [(VALUE, app::VALUE_VIEW_ABI, 0u32), (TOTAL, app::TOTAL_VIEW_ABI, 8)] {
+        for (role, abi, offset) in [(VALUE, app::VALUE_VIEW_ABI, 0u32), (TOTAL, app::TOTAL_VIEW_ABI, 8)].into_iter().filter(|x| roles.contains(&x.0)) {
             let mut p = vec![v3::WIRE_VERSION, role];
             p.extend_from_slice(&abi);
             p.extend_from_slice(&offset.to_le_bytes());
             p.extend_from_slice(&8u32.to_le_bytes());
             send(&mut ctx, ix(sw::TAG_CREATE_VIEW, p, vec![AccountMeta::new(payer, true), w(session), w(view_pda(&session, role)), r(SYSTEM)]), &[]).await.unwrap();
         }
-        let mut me = Lanes { ctx, auth, session, states, cursor: 0 };
+        let mut me = Lanes { ctx, auth, session, states, cursor: 0, roles: roles.to_vec() };
         for k in 0..lanes {
             me.create_lane(k).await.unwrap();
         }
@@ -186,7 +204,7 @@ impl Lanes {
     }
 
     fn views(&self) -> Vec<AccountMeta> {
-        vec![r(view_pda(&self.session, VALUE)), r(view_pda(&self.session, TOTAL))]
+        self.roles.iter().map(|role| r(view_pda(&self.session, *role))).collect()
     }
 
     async fn begin(&mut self, k: u8, c: u32) -> Result<(), u32> {
@@ -227,7 +245,12 @@ impl Lanes {
 
     async fn commit(&mut self, k: u8, c: u32) -> Result<(), u32> {
         let s = self.session;
-        let a = vec![signer(self.auth.pubkey()), r(s), w(lane_pda(&s, k)), r(lane_scratch(&s, k)), w(view_pda(&s, VALUE)), w(view_pda(&s, TOTAL))];
+        let mut a = vec![signer(self.auth.pubkey()), r(s), w(lane_pda(&s, k)), r(lane_scratch(&s, k))];
+        a.extend(self.roles.iter().map(|role| w(view_pda(&s, *role))));
+        self.commit_with(k, c, a).await
+    }
+
+    async fn commit_with(&mut self, k: u8, c: u32, a: Vec<AccountMeta>) -> Result<(), u32> {
         send(&mut self.ctx, ix(sw::TAG_PUBLISH_VIEWS, op(ln::OP_COMMIT, k, &c.to_le_bytes()), a), &[&self.auth]).await
     }
 
@@ -417,4 +440,89 @@ async fn halt_clears_captures_and_every_lane_account_closes_with_its_rent() {
     rent += l.ctx.banks_client.get_balance(s).await.unwrap();
     send(&mut l.ctx, ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, v3::KIND_SESSION], vec![w(s), w(refund)]), &[]).await.unwrap();
     assert_eq!(l.ctx.banks_client.get_balance(refund).await.unwrap(), before + rent, "every lamport returns to the authority");
+}
+
+async fn halt(l: &mut Lanes) {
+    let mut p = vec![v3::WIRE_VERSION];
+    p.extend_from_slice(&l.cursor.to_le_bytes());
+    let s = l.session;
+    send(&mut l.ctx, ix(sw::TAG_HALT_SESSION, p, vec![signer(l.auth.pubkey()), w(s)]), &[&l.auth]).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lane_children_close_only_after_halt_once_each_and_before_the_session() {
+    let mut l = Lanes::new(1).await;
+    let s = l.session;
+    let refund = l.auth.pubkey();
+    // Active session: lane children do not close.
+    let i = ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, ln::KIND_LANE], vec![w(s), w(lane_pda(&s, 0)), w(refund)]);
+    assert_eq!(send(&mut l.ctx, i, &[]).await, Err(v3::REFUSAL_LIVE));
+    halt(&mut l).await;
+    // Close every non-lane child, then the session must still refuse.
+    for (key, kind) in [(view_pda(&s, VALUE), v3::KIND_VIEW), (view_pda(&s, TOTAL), v3::KIND_VIEW), (stream_pda(&s), v3::KIND_STREAM), (l.states[1], v3::KIND_STATE), (l.states[0], v3::KIND_STATE)] {
+        let i = ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, kind], vec![w(s), w(key), w(refund)]);
+        send(&mut l.ctx, i, &[]).await.unwrap();
+    }
+    let i = ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, v3::KIND_SESSION], vec![w(s), w(refund)]);
+    assert_eq!(send(&mut l.ctx, i, &[]).await, Err(v3::REFUSAL_LIVE), "lane children still open");
+    // Wrong refund refused.
+    let other = keypair(9).pubkey();
+    let i = ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, ln::KIND_LANE], vec![w(s), w(lane_pda(&s, 0)), w(other)]);
+    assert!(send(&mut l.ctx, i, &[]).await.is_err());
+    // A lane workspace closed under the wrong kind byte is refused.
+    let i = ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, ln::KIND_LANE], vec![w(s), w(lane_ws(&s, 0)), w(refund)]);
+    assert!(send(&mut l.ctx, i, &[]).await.is_err());
+    // Close lane record twice: second refuses (no child_count double decrement).
+    let i = ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, ln::KIND_LANE], vec![w(s), w(lane_pda(&s, 0)), w(refund)]);
+    send(&mut l.ctx, i.clone(), &[]).await.unwrap();
+    assert!(send(&mut l.ctx, i, &[]).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_capture_forfeits_its_cursor() {
+    let mut l = Lanes::new(2).await;
+    l.advance().await.unwrap();
+    l.begin(0, 1).await.unwrap();
+    l.abort(0, 1).await.unwrap();
+    assert_eq!(l.begin(0, 1).await, Err(v3::REFUSAL_LANE_CURSOR));
+    assert_eq!(l.begin(1, 1).await, Err(v3::REFUSAL_LANE_CURSOR));
+    l.advance().await.unwrap();
+    l.capture_all(0, 2).await;
+    l.publish(0, 2).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn after_halt_renders_are_harmless_and_commits_refuse() {
+    let mut l = Lanes::new(1).await;
+    l.advance().await.unwrap();
+    l.capture_all(0, 1).await;
+    halt(&mut l).await;
+    let r1 = l.render(0, 1, 0, Some(3)).await;
+    let c1 = l.commit(0, 1).await;
+    let a1 = l.abort(0, 1).await;
+    // A render writes only lane accounts; nothing can publish after halt.
+    assert_eq!(r1, Ok(()));
+    assert_eq!(c1, Err(v3::REFUSAL_LANE));
+    assert_eq!(a1, Ok(()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_created_mid_publication_refuses_the_commit() {
+    let mut l = Lanes::new_with(1, &[VALUE]).await;
+    l.advance().await.unwrap();
+    l.begin(0, 1).await.unwrap();
+    l.create_view(TOTAL).await; // views change between capture and commit
+    l.capture(0, 1, 0, Some(2)).await.unwrap();
+    l.end(0, 1).await.unwrap();
+    l.render(0, 1, 0, Some(3)).await.unwrap();
+    let s = l.session;
+    let a = vec![signer(l.auth.pubkey()), r(s), w(lane_pda(&s, 0)), r(lane_scratch(&s, 0)), w(view_pda(&s, VALUE))];
+    // The views changed since capture (review M1): the commit refuses, the
+    // lane aborts, and the next capture covers both views.
+    assert_eq!(l.commit_with(0, 1, a).await, Err(v3::REFUSAL_VIEW));
+    l.abort(0, 1).await.unwrap();
+    l.advance().await.unwrap();
+    l.capture_all(0, 2).await;
+    l.publish(0, 2).await.unwrap();
+    assert_eq!(l.published().await.1, [2, 2]);
 }
