@@ -435,7 +435,8 @@ laws above apply unchanged. LX1 adds these:
   heals before the next checkpoint cannot be disputed. Only checkpoint states
   and outputs are claims.
 
-Status: implemented (tag 227 subs 23 to 26). Native and SBF ProgramTests with
+Status: implemented (tag 227 subs 23 to 26). Native ProgramTests (SBF before
+the review fixes) with
 the registered toy machine replay 16 played Python disputes in both role
 orders, the OUTPUT claim, refusals, timeouts and every ending through the
 shared settlement; the independent program review's findings are fixed

@@ -35,9 +35,6 @@ def build() -> dict:
     for n in (0, 1, 2, 3, 5, 6, 7, 8, 9, 15, 17):
         leaves = [bytes([i + 1]) * 32 for i in range(n)]
         v["trees"][str(n)] = trees.build("step", leaves).root.hex()
-    lazy_leaves = [hashlib.sha256(b"dcg.lazy.vector.leaf.v1\x00" + bytes([i])).digest()
-                   for i in range(3)]
-    v["lazy_tree_3"] = trees.build("lazy", lazy_leaves).root.hex()
     g = tracing.trace(hello)
     sp = S.derive(g.graph_bytes(), g.plan_bytes())
     values = {0: struct.pack("<i", 20), 1: struct.pack("<i", 22)}

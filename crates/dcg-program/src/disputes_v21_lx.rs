@@ -71,7 +71,8 @@ pub trait LxFactory: Sync {
 pub trait LxBound: X::LxMachine {
     /// The root of the admitted initial state (review H1).
     fn initial_root(&self, h: &dyn D::Sha256) -> D::Hash;
-    /// The output slots, ascending.
+    /// The output slots: non-empty and strictly ascending (checked at bind),
+    /// so an OUTPUT claim can always be opened and ruled.
     fn output_slots(&self) -> &[u32];
     /// The most read slots, written slots and output bytes of any transition.
     fn max_transition(&self) -> (usize, usize, usize);
@@ -143,6 +144,8 @@ fn bind(
         || !(lx.k_min..=lx.k_max).contains(&k)
         || machine.positions() != positions
         || machine.height() > 32
+        || machine.output_slots().is_empty()
+        || machine.output_slots().windows(2).any(|w| w[0] >= w[1])
         || root[RR_K + 4..D::RUN_ROOT_BYTES] != [0; 36]
     {
         return Err(err(42));
