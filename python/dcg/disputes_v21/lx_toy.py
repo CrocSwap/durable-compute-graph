@@ -11,6 +11,11 @@ Each position p:
 
 Carried slots: h, then log[0..P). Scratch slots: a, m, s. All values are i64
 little-endian.
+
+With `weights=True` (design §13), `start` also reads two template constant
+chunks, in order: chunk `p mod 4` of constant 0 (16-byte chunks) and chunk
+`p mod 3` of constant 2 (8-byte chunks; id 1 is unused), and adds the first
+i64 of the first minus the first i64 of the second.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from .lx import Transition
+from .lx import ConstantTable, Transition
 
 MOD = 1 << 31
 
@@ -36,6 +41,16 @@ class ToyMachine:
     positions_count: int = 9
     window: int = 3
     h0: int = 7
+    weights: bool = False
+
+    WEIGHTS0 = (5, -3, 11, 2, 7, 0, -9, 4)
+    WEIGHTS2 = (13, 1, 6)
+
+    def constant_table(self) -> ConstantTable | None:
+        if not self.weights:
+            return None
+        pack = lambda xs: b"".join(enc(x) for x in xs)  # noqa: E731
+        return ConstantTable({0: pack(self.WEIGHTS0), 2: pack(self.WEIGHTS2)}, {0: 4, 2: 3})
 
     # Slot layout.
     H = 0
@@ -81,6 +96,13 @@ class ToyMachine:
         c = base + i
         nw = self.windows(p)
         if i == 0:
+            if self.weights:
+                def start_w(r, chunks, p=p):
+                    w = dec(chunks[0][:8]) - dec(chunks[1][:8])
+                    return {self.A: enc((3 * dec(r[self.H]) + p + 1 + w) % MOD)}
+                return Transition(c, f"p{p}.start", (self.H,), (self.A,), start_w,
+                                  ((0, p % 4), (2, p % 3)))
+
             def start(r, p=p):
                 return {self.A: enc((3 * dec(r[self.H]) + p + 1) % MOD)}
             return Transition(c, f"p{p}.start", (self.H,), (self.A,), start)

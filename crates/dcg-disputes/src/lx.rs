@@ -4,9 +4,14 @@
 //! and the OUTPUT claim. Mirrors `python/dcg/disputes_v21/lx.py`;
 //! `tests/lx_goldens.rs` pins it to `tests/golden/dcg/disputes_v21/lx.json`.
 
-use crate::{empty, node, Hash, Sha256, Tree};
+use crate::{empty, node, root_from_path, Hash, Sha256, Tree, CHUNK_LEAF_DOMAIN};
 
 pub const SLOT_LEAF_DOMAIN: &[u8] = b"dcg.lx.slot.leaf.v1\x00";
+pub const CONST_LEAF_DOMAIN: &[u8] = b"dcg.lx.const.leaf.v1\x00";
+/// Longest chunk path (chunk tree height) and constant path (constants tree
+/// height) an opening may carry.
+pub const MAX_CHUNK_PATH: usize = 48;
+pub const MAX_CONST_PATH: usize = 32;
 
 /// The leaf of one slot: its index and value, or the empty-slot leaf.
 pub fn slot_leaf<H: Sha256 + ?Sized>(h: &H, slot: u32, value: Option<&[u8]>) -> Hash {
@@ -14,6 +19,39 @@ pub fn slot_leaf<H: Sha256 + ?Sized>(h: &H, slot: u32, value: Option<&[u8]>) -> 
         None => empty(h, Tree::LxState, 0),
         Some(v) => h.hash(&[SLOT_LEAF_DOMAIN, &slot.to_le_bytes(), &(v.len() as u32).to_le_bytes(), v]),
     }
+}
+
+/// The constants tree's leaf at position `constant_id` (design §13): the id
+/// and the constant's chunk-tree root.
+pub fn const_leaf<H: Sha256 + ?Sized>(h: &H, constant_id: u32, digest: &Hash) -> Hash {
+    h.hash(&[CONST_LEAF_DOMAIN, &constant_id.to_le_bytes(), digest])
+}
+
+/// One declared constant read in an opening (design §13): the chunk, its path
+/// to the constant's chunk root (`digest`), and `digest`'s path to the
+/// template's `constants_root`. The constant id and chunk index are not
+/// carried: they come from the machine.
+#[derive(Clone, Copy, Debug)]
+pub struct ConstOpening<'a> {
+    pub chunk: &'a [u8],
+    pub chunk_path: &'a [Hash],
+    pub digest: Hash,
+    pub const_path: &'a [Hash],
+}
+
+/// Check one opened constant read `(constant_id, index)` against
+/// `constants_root`: the chunk's leaf rebuilds `digest` and the constant's
+/// leaf rebuilds the root. Paths longer than the caps, or too short to hold
+/// the id or index, are refused.
+pub fn check_constant<H: Sha256 + ?Sized>(h: &H, constant_id: u32, index: u64, e: &ConstOpening, constants_root: &Hash) -> bool {
+    let (nc, nk) = (e.chunk_path.len(), e.const_path.len());
+    if nc > MAX_CHUNK_PATH || nk > MAX_CONST_PATH || (nc < 64 && index >> nc != 0) || (constant_id as u64) >> nk != 0 {
+        return false;
+    }
+    let leaf = h.hash(&[CHUNK_LEAF_DOMAIN, &index.to_le_bytes(), e.chunk]);
+    root_from_path(h, Tree::Chunk, &leaf, index, e.chunk_path) == e.digest
+        && root_from_path(h, Tree::LxConst, &const_leaf(h, constant_id, &e.digest), constant_id as u64, e.const_path)
+            == *constants_root
 }
 
 /// Fold opened leaves into the state root.
@@ -154,6 +192,11 @@ impl Outputs<'_> {
 /// consensus code: the template commits to its id and version. Mirrors the
 /// Python `Machine` protocol.
 ///
+/// Constants (design §13): `constants` names the template constant chunks a
+/// transition reads, as `(constant_id, chunk_index)` in order; `apply`
+/// receives those chunks in that order. The set is fixed by the machine, so an
+/// executor cannot choose which constants a replay sees.
+///
 /// Contract (LX1 program review M1): every position has at least one
 /// transition (`transitions_in(p) >= 1`), so no checkpoint interval is empty
 /// and every checkpoint pair can be disputed; `slots` returns distinct slots;
@@ -172,9 +215,17 @@ pub trait LxMachine {
     /// Fill `reads` and `writes` with the slots of transition `(p, i)` and
     /// return their counts, or `None` if they do not fit.
     fn slots(&self, p: u64, i: u64, reads: &mut [u32], writes: &mut [u32]) -> Option<(usize, usize)>;
+    /// Fill `out` with the `(constant_id, chunk_index)` reads of transition
+    /// `(p, i)` and return their count, or `None` if they do not fit. A
+    /// machine without constants reads none.
+    fn constants(&self, p: u64, i: u64, out: &mut [(u32, u64)]) -> Option<usize> {
+        let _ = (p, i, out);
+        Some(0)
+    }
     /// Apply transition `(p, i)`: `reads` holds the read slots' values in the
-    /// order `slots` gave; record outputs through `out` by write index.
-    fn apply(&self, p: u64, i: u64, reads: &[Option<&[u8]>], out: &mut Outputs) -> Result<(), KernelFailure>;
+    /// order `slots` gave and `consts` the constant chunks in the order
+    /// `constants` gave; record outputs through `out` by write index.
+    fn apply(&self, p: u64, i: u64, reads: &[Option<&[u8]>], consts: &[&[u8]], out: &mut Outputs) -> Result<(), KernelFailure>;
 }
 
 /// Map a global coordinate to `(position, index)`. `None` outside the
@@ -218,6 +269,9 @@ pub enum LxRefusal {
     Coverage,
     /// The opening does not rebuild the agreed root.
     Proof,
+    /// The opened constants are not exactly the transition's declared reads,
+    /// in order, each verifying against the template's `constants_root`.
+    Constant,
 }
 
 /// Caller-provided working memory for [`replay`]; each slice must be at least
@@ -229,27 +283,46 @@ pub struct Scratch<'a> {
     pub read_values: &'a mut [Option<&'a [u8]>],
     pub write_effects: &'a mut [Write],
     pub out: &'a mut [u8],
+    pub const_reads: &'a mut [(u32, u64)],
+    pub const_values: &'a mut [&'a [u8]],
 }
 
 /// The terminal replay (design §4.3). `opened` is the executor's opening of the
 /// agreed lower state at transition `coordinate`: `(slot, value)` sorted by
 /// strictly increasing slot, covering exactly the transition's reads and
-/// writes, with `siblings` in canonical order. Refuses an opening that does not
-/// cover the slots or rebuild `root_lo`. Otherwise rules: the executor wins if
-/// the replayed state rebuilds `root_hi`; the challenger wins on a mismatch or
-/// a kernel failure.
+/// writes, with `siblings` in canonical order, and `consts` holds one entry per
+/// declared constant read, in order (design §13). Refuses an opening that does
+/// not cover the slots or rebuild `root_lo`, or whose constants do not verify
+/// against `constants_root`. Otherwise rules: the executor wins if the
+/// replayed state rebuilds `root_hi`; the challenger wins on a mismatch or a
+/// kernel failure.
+#[allow(clippy::too_many_arguments)]
 pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
     h: &H,
     m: &M,
     coordinate: u64,
     opened: &[(u32, Option<&'v [u8]>)],
     siblings: &[Hash],
+    consts: &[ConstOpening<'v>],
+    constants_root: &Hash,
     root_lo: &Hash,
     root_hi: &Hash,
     s: &mut Scratch<'v>,
 ) -> Result<LxRuling, LxRefusal> {
     let (p, i) = locate(m, coordinate).ok_or(LxRefusal::Coordinate)?;
     let (nr, nw) = m.slots(p, i, s.reads, s.writes).ok_or(LxRefusal::Coverage)?;
+    // The constants are exactly the declared reads, in order, each verified.
+    let nc = m.constants(p, i, s.const_reads).ok_or(LxRefusal::Coverage)?;
+    if consts.len() != nc || s.const_values.len() < nc {
+        return Err(LxRefusal::Constant);
+    }
+    for (k, e) in consts.iter().enumerate() {
+        let (cid, index) = s.const_reads[k];
+        if !check_constant(h, cid, index, e, constants_root) {
+            return Err(LxRefusal::Constant);
+        }
+        s.const_values[k] = e.chunk;
+    }
     let (reads, writes) = (&s.reads[..nr], &s.writes[..nw]);
     // The opening covers exactly reads ∪ writes.
     let mut covered = 0usize;
@@ -295,7 +368,7 @@ pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
         *e = Write::Keep;
     }
     let mut out = Outputs { buf: &mut *s.out, used: 0, writes: &mut s.write_effects[..nw] };
-    if m.apply(p, i, &s.read_values[..nr], &mut out).is_err() {
+    if m.apply(p, i, &s.read_values[..nr], &s.const_values[..nc], &mut out).is_err() {
         return Ok(LxRuling::Challenger);
     }
     // Rebuild over the same slots with the written values.

@@ -35,6 +35,8 @@ pub enum Tree {
     /// LX1 checkpoint roots: the run commits one root over them.
     LxCheckpoint,
     List,
+    /// LX1 template constants, by constant id (design §13).
+    LxConst,
 }
 
 impl Tree {
@@ -48,6 +50,7 @@ impl Tree {
             Tree::LxState => b"dcg.lx.state.node.v1\x00",
             Tree::LxCheckpoint => b"dcg.lx.checkpoint.node.v1\x00",
             Tree::List => b"dcg.list.node.v2.1\x00",
+            Tree::LxConst => b"dcg.lx.const.node.v1\x00",
         }
     }
     pub fn empty_label(self) -> &'static [u8] {
@@ -60,6 +63,7 @@ impl Tree {
             Tree::LxState => b"dcg.lx.slot.empty.v1\x00",
             Tree::LxCheckpoint => b"dcg.lx.checkpoint.empty.v1\x00",
             Tree::List => b"dcg.list.empty.v2.1\x00",
+            Tree::LxConst => b"dcg.lx.const.empty.v1\x00",
         }
     }
 }

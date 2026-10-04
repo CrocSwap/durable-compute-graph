@@ -101,6 +101,30 @@ fn encode_opening(o: &serde_json::Value) -> Vec<u8> {
     v
 }
 
+/// A replay opening: the state opening, then its constant reads (design §13):
+/// `n (len chunk cn chunk_path dig kn const_path)*`.
+fn encode_replay(o: &serde_json::Value) -> Vec<u8> {
+    let mut v = encode_opening(o);
+    let cs = o["constants"].as_array().unwrap();
+    v.extend_from_slice(&(cs.len() as u32).to_le_bytes());
+    for e in cs {
+        let chunk = hex(e["chunk"].as_str().unwrap());
+        v.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        v.extend_from_slice(&chunk);
+        for (key, with_digest) in [("chunk_path", true), ("const_path", false)] {
+            let path = e[key].as_array().unwrap();
+            v.push(path.len() as u8);
+            for x in path {
+                v.extend_from_slice(&h32(x));
+            }
+            if with_digest {
+                v.extend_from_slice(&h32(&e["digest"]));
+            }
+        }
+    }
+    v
+}
+
 fn ix(sub: u8, data: &[u8], accounts: Vec<AccountMeta>) -> Instruction {
     let mut d = vec![V::TAG, sub];
     d.extend_from_slice(data);
@@ -133,6 +157,18 @@ impl Chain {
 
     /// `input`: the run's input id; by default the digest of the golden params.
     async fn new_with_input(arity: u8, challenge_window: u64, input: Option<[u8; 32]>) -> Self {
+        let g = golden();
+        Self::new_full(arity, challenge_window, input, hex(g["params"].as_str().unwrap()), [0; 32]).await
+    }
+
+    /// The toy with weights (design §13): the weighted params, and a template
+    /// committing `constants_root`.
+    async fn new_weighted(arity: u8, constants_root: [u8; 32]) -> Self {
+        let g = golden();
+        Self::new_full(arity, 100_000, None, hex(g["weighted"]["params"].as_str().unwrap()), constants_root).await
+    }
+
+    async fn new_full(arity: u8, challenge_window: u64, input: Option<[u8; 32]>, params: Vec<u8>, constants_root: [u8; 32]) -> Self {
         let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
         let mut test = ProgramTest::default();
         test.prefer_bpf(sbf);
@@ -152,7 +188,7 @@ impl Chain {
         }
         data.extend_from_slice(&0u32.to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());
-        data.extend_from_slice(&[0; 32]);
+        data.extend_from_slice(&constants_root);
         data.extend_from_slice(&5_000u16.to_le_bytes());
         data.extend_from_slice(&[0; 32]);
         data.extend_from_slice(LX::LX_TAIL_MAGIC);
@@ -167,7 +203,6 @@ impl Chain {
         let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, admitter.pubkey().as_ref()], &PROGRAM).0;
         send(&mut ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
         let executor = kp(0xE1).pubkey();
-        let params = hex(golden()["params"].as_str().unwrap());
         // The payer admits the machine parameters: an LX1 run's input id is
         // their digest (LX1 program review H1).
         let input = input.unwrap_or_else(|| sha256(&[LX::PARAMS_DOMAIN, &params]));
@@ -312,8 +347,16 @@ async fn played_disputes_rule_like_python_in_both_role_orders() {
     let plays = g["plays"].as_array().unwrap();
     assert!(plays.len() >= 16);
     for p in plays {
-        let name = p["name"].as_str().unwrap();
         let mut ch = Chain::new(p["arity"].as_u64().unwrap() as u8, 100_000).await;
+        check_play(&mut ch, p).await;
+    }
+}
+
+/// Play one golden dispute through the program and check the ruling and the
+/// bond movement.
+async fn check_play(ch: &mut Chain, p: &serde_json::Value) {
+    {
+        let name = p["name"].as_str().unwrap();
         ch.commit(&p["commitment"]).await.unwrap_or_else(|e| panic!("{name}: commit {e:?}"));
         let pair = p["pair"].as_u64().unwrap() as usize;
         let body = ch.state_body(&p["commitment"], pair);
@@ -325,7 +368,7 @@ async fn played_disputes_rule_like_python_in_both_role_orders() {
         }
         let dd = ch.account(d).await.data;
         assert_eq!(u64::from_le_bytes(dd[16..24].try_into().unwrap()), p["terminal"].as_u64().unwrap(), "{name}: terminal coordinate");
-        ch.stage(d, V::ROLE_EXECUTOR, &encode_opening(&p["opening"])).await;
+        ch.stage(d, V::ROLE_EXECUTOR, &encode_replay(&p["opening"])).await;
         let (e0, c0) = (ch.lamports(kp(0xE1).pubkey()).await, ch.lamports(kp(0xC1).pubkey()).await);
         ch.opening(d).await.unwrap_or_else(|e| panic!("{name}: opening {e:?}"));
         let want = ruling_of(p["ruling"].as_str().unwrap());
@@ -344,6 +387,105 @@ async fn played_disputes_rule_like_python_in_both_role_orders() {
     }
 }
 
+// --- constants in openings (design §13) -------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn weighted_disputes_rule_like_python_in_both_role_orders() {
+    let g = golden();
+    let w = &g["weighted"];
+    let root = h32(&w["constants_root"]);
+    let plays = w["plays"].as_array().unwrap();
+    assert!(plays.len() >= 8);
+    for p in plays {
+        let mut ch = Chain::new_weighted(p["arity"].as_u64().unwrap() as u8, root).await;
+        check_play(&mut ch, p).await;
+    }
+}
+
+/// Drive a weighted play to its terminal opening phase.
+async fn weighted_at_opening(p: &serde_json::Value, root: D::Hash) -> (Chain, Pubkey) {
+    let mut ch = Chain::new_weighted(p["arity"].as_u64().unwrap() as u8, root).await;
+    ch.commit(&p["commitment"]).await.unwrap();
+    let body = ch.state_body(&p["commitment"], p["pair"].as_u64().unwrap() as usize);
+    let d = ch.open_raw(1, &body).await.unwrap();
+    for r in p["rounds"].as_array().unwrap() {
+        let mids: Vec<u8> = r["midpoints"].as_array().unwrap().iter().flat_map(h32).collect();
+        ch.midpoints(d, &mids).await.unwrap();
+        ch.pick(d, r["pick"].as_u64().unwrap() as u8).await.unwrap();
+    }
+    (ch, d)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_missing_or_reordered_constants_are_refused_and_the_executor_may_retry() {
+    let g = golden();
+    let w = &g["weighted"];
+    let root = h32(&w["constants_root"]);
+    let p = w["plays"].as_array().unwrap().iter().find(|p| p["ruling"] == "E").unwrap();
+    let (mut ch, d) = weighted_at_opening(p, root).await;
+    let o = &p["opening"];
+    let good = encode_replay(o);
+    ch.stage(d, V::ROLE_EXECUTOR, &good).await;
+    let variant = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut o = o.clone();
+        f(&mut o);
+        encode_replay(&o)
+    };
+    let flip = |v: &mut serde_json::Value| {
+        let mut b = hex(v.as_str().unwrap());
+        b[0] ^= 1;
+        *v = serde_json::Value::String(hex_of(&b));
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("wrong chunk", variant(&|o| flip(&mut o["constants"][0]["chunk"]))),
+        ("wrong chunk path", variant(&|o| flip(&mut o["constants"][0]["chunk_path"][0]))),
+        ("wrong digest", variant(&|o| flip(&mut o["constants"][1]["digest"]))),
+        ("wrong constant path", variant(&|o| flip(&mut o["constants"][1]["const_path"][0]))),
+        ("missing read", variant(&|o| {
+            o["constants"].as_array_mut().unwrap().pop();
+        })),
+        ("extra read", variant(&|o| {
+            let first = o["constants"][0].clone();
+            o["constants"].as_array_mut().unwrap().push(first);
+        })),
+        ("swapped reads", variant(&|o| o["constants"].as_array_mut().unwrap().swap(0, 1))),
+        ("no reads", variant(&|o| o["constants"] = serde_json::json!([]))),
+    ];
+    for (name, bytes) in &cases {
+        // Each variant is staged over the whole buffer prefix; trailing bytes
+        // of a longer earlier staging are ignored after the decoded end.
+        ch.write(d, V::ROLE_EXECUTOR, 0, bytes).await.unwrap();
+        assert_eq!(ch.opening(d).await, Err(custom(50)), "{name}");
+        assert_eq!(ch.account(d).await.data[6], V::RULING_OPEN, "{name}: nothing ruled");
+    }
+    // A truncated constants section does not decode (46).
+    ch.write(d, V::ROLE_EXECUTOR, 0, &good[..good.len() - 1]).await.unwrap();
+    let mut cut = good[..good.len() - 1].to_vec();
+    cut.extend(std::iter::repeat_n(0xFFu8, 64));
+    ch.write(d, V::ROLE_EXECUTOR, 0, &cut).await.unwrap();
+    assert!(ch.opening(d).await.is_err(), "truncated");
+    // The honest opening still wins before the deadline.
+    ch.write(d, V::ROLE_EXECUTOR, 0, &good).await.unwrap();
+    ch.opening(d).await.unwrap();
+    assert_eq!(ch.account(d).await.data[6], V::RULING_EXECUTOR);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn constants_must_be_under_the_template_constants_root() {
+    // The same weighted run on a template that commits other constants (here
+    // none): no opening can verify, so the executor cannot answer and loses
+    // at its deadline.
+    let g = golden();
+    let w = &g["weighted"];
+    let p = w["plays"].as_array().unwrap().iter().find(|p| p["ruling"] == "E").unwrap();
+    let (mut ch, d) = weighted_at_opening(p, [0; 32]).await;
+    ch.stage(d, V::ROLE_EXECUTOR, &encode_replay(&p["opening"])).await;
+    assert_eq!(ch.opening(d).await, Err(custom(50)));
+    ch.warp(PHASE_WINDOW + 5).await;
+    ch.timeout(d).await.unwrap();
+    assert_eq!(ch.account(d).await.data[6], V::RULING_CHALLENGER);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_openings_are_refused_and_the_executor_may_retry() {
     let g = golden();
@@ -357,7 +499,7 @@ async fn malformed_openings_are_refused_and_the_executor_may_retry() {
         ch.midpoints(d, &mids).await.unwrap();
         ch.pick(d, r["pick"].as_u64().unwrap() as u8).await.unwrap();
     }
-    let good = encode_opening(&p["opening"]);
+    let good = encode_replay(&p["opening"]);
     // A changed opened value does not rebuild the agreed lower root (49).
     let mut bad = good.clone();
     let first_value = 4 + 4 + 1 + 4; // n, slot, present, len
@@ -521,7 +663,7 @@ impl Chain {
             self.midpoints(d, &mids).await.unwrap();
             self.pick(d, r["pick"].as_u64().unwrap() as u8).await.unwrap();
         }
-        self.stage(d, V::ROLE_EXECUTOR, &encode_opening(&p["opening"])).await;
+        self.stage(d, V::ROLE_EXECUTOR, &encode_replay(&p["opening"])).await;
         self.opening(d).await.unwrap();
     }
 

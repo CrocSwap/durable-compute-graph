@@ -127,11 +127,60 @@ def build() -> dict:
             "claimed": [None if claimed[s] is None else claimed[s].hex() for s in tm.output_slots()],
             "ruling": d.claim_output(proof),
         })
-    return {"replays": replays, "outputs": outputs,
+    weighted = build_weighted()
+    return {"replays": replays, "outputs": outputs, "weighted": weighted,
             "toy": {"positions": tm.positions_count, "window": tm.window, "h0": tm.h0, "height": L.height(tm),
                     "total": L.Schedule(tm).total},
             "plays": plays, "slot_leaf_domain": L.SLOT_LEAF_DOMAIN.hex(), "cases": cases,
             "schedules": schedules, "midpoints": midpoints}
+
+
+def build_weighted() -> dict:
+    """Constants in openings (design §13): the toy with weights, its
+    constants root, and terminal replays at weighted starts in both role
+    orders (a bumped state, and an executor that used other weights)."""
+    tm = ToyMachine(positions_count=9, window=3, weights=True)
+
+    class OtherWeights(ToyMachine):
+        WEIGHTS0 = (5, -3, 11, 2, 8, 0, -9, 4)
+
+    honest = L.execute(tm)
+    other = L.execute(OtherWeights(positions_count=9, window=3, weights=True))
+    other.machine = tm
+    sch = L.Schedule(tm)
+    start5 = next(c for c in range(sch.total) if sch.transition(c).label == "p5.start")
+
+    def bump(coord, state):
+        if coord == start5:
+            state = dict(state)
+            state[tm.A] = (int.from_bytes(state[tm.A], "little", signed=True) + 1).to_bytes(8, "little", signed=True)
+        return state
+
+    replays = []
+    for liar in (L.execute(tm, bump), other):
+        for executor, challenger, k, arity in ((liar, honest, 1, 16), (honest, liar, 4, 2)):
+            commitment = L.commit(executor, k)
+            pair = L.first_disputed_pair(commitment, challenger)
+            d = L.Dispute(tm, commitment, arity)
+            d.open(pair)
+            while d.phase == L.PH_MIDPOINTS:
+                d.commit_midpoints(L.executor_midpoints(executor, d))
+                d.pick(L.challenger_pick(challenger, d))
+            proof = L.executor_opening(executor, d)
+            replays.append({
+                "coordinate": d.lo,
+                "opened": [[s, None if proof.values[s] is None else proof.values[s].hex()] for s in sorted(proof.values)],
+                "siblings": [proof.siblings[k].hex() for k in sorted(proof.siblings)],
+                "const_reads": [list(r) for r in sch.transition(d.lo).constants],
+                "constants": [{"chunk": e.chunk.hex(), "chunk_path": [x.hex() for x in e.chunk_path],
+                               "digest": e.digest.hex(), "const_path": [x.hex() for x in e.const_path]}
+                              for e in proof.constants],
+                "root_lo": d.root_lo.hex(), "root_hi": d.root_hi.hex(), "ruling": d.submit_opening(proof),
+            })
+    table = tm.constant_table()
+    return {"constants_root": L.constants_root(tm).hex(), "const_leaf_domain": L.CONST_LEAF_DOMAIN.hex(),
+            "digests": {str(c): table.digest(c).hex() for c in sorted(table.values)},
+            "replays": replays}
 
 
 if __name__ == "__main__":

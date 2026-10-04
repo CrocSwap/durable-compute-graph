@@ -74,8 +74,9 @@ pub trait LxBound: X::LxMachine {
     /// The output slots: non-empty and strictly ascending (checked at bind),
     /// so an OUTPUT claim can always be opened and ruled.
     fn output_slots(&self) -> &[u32];
-    /// The most read slots, written slots and output bytes of any transition.
-    fn max_transition(&self) -> (usize, usize, usize);
+    /// The most read slots, written slots, output bytes and constant reads
+    /// of any transition.
+    fn max_transition(&self) -> (usize, usize, usize, usize);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -362,7 +363,8 @@ pub(crate) fn pick(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
 }
 
 /// A staged opening: `n:u32 (slot:u32 present:u8 [len:u32 bytes])*` then
-/// `siblings:u32 hash*`, slots strictly increasing.
+/// `siblings:u32 hash*`, slots strictly increasing. A replay opening is
+/// followed by its constants ([`decode_constants`]).
 fn decode_opening<'a>(b: &'a [u8], at: &mut usize) -> Result<(Vec<(u32, Option<&'a [u8]>)>, Vec<D::Hash>), ProgramError> {
     let n = u32_at(b, *at)? as usize;
     *at += 4;
@@ -391,19 +393,44 @@ fn decode_opening<'a>(b: &'a [u8], at: &mut usize) -> Result<(Vec<(u32, Option<&
     Ok((opened, siblings))
 }
 
+/// The constants of a replay opening (design §13): `n:u32` then, per declared
+/// read in order, `len:u32 chunk  chunk_path_n:u8 hash*  digest  const_path_n:u8 hash*`.
+fn decode_constants<'a>(b: &'a [u8], at: &mut usize) -> Result<Vec<(&'a [u8], Vec<D::Hash>, D::Hash, Vec<D::Hash>)>, ProgramError> {
+    let n = u32_at(b, *at)? as usize;
+    *at += 4;
+    let mut out = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let len = u32_at(b, *at)? as usize;
+        let start = *at + 4;
+        let chunk = b.get(start..start.checked_add(len).ok_or(err(46))?).ok_or(err(46))?;
+        *at = start + len;
+        let nc = *b.get(*at).ok_or(err(46))? as usize;
+        let chunk_path = read_hashes(b, *at + 1, nc)?;
+        *at += 1 + 32 * nc;
+        let digest = key32(b, *at)?;
+        let nk = *b.get(*at + 32).ok_or(err(46))? as usize;
+        let const_path = read_hashes(b, *at + 33, nk)?;
+        *at += 33 + 32 * nk;
+        out.push((chunk, chunk_path, digest, const_path));
+    }
+    Ok(out)
+}
+
 fn refusal(r: X::LxRefusal) -> ProgramError {
     match r {
         X::LxRefusal::Coordinate => err(47),
         X::LxRefusal::Coverage => err(48),
         X::LxRefusal::Proof => err(49),
+        X::LxRefusal::Constant => err(50),
     }
 }
 
 /// 25: [executor(s), run(w), template, dispute(w), challenger(w), E's staging
 /// buffer] params. The executor's opening of the agreed lower state at the
 /// one remaining transition, staged in its buffer, is replayed and ruled in
-/// this instruction (review M5). A malformed opening is refused; the
-/// executor may retry until its deadline.
+/// this instruction (review M5). The opening is followed by the transition's
+/// constant reads, checked against the template's `constants_root` (§13). A
+/// malformed opening is refused; the executor may retry until its deadline.
 pub(crate) fn opening(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -426,12 +453,19 @@ pub(crate) fn opening(
     let staged = buffer.try_borrow_data()?;
     let mut at = STAGE_HEADER;
     let (opened, siblings) = decode_opening(&staged, &mut at)?;
-    let (nr, nw, nout) = b.machine.max_transition();
+    let decoded = decode_constants(&staged, &mut at)?;
+    let consts: Vec<X::ConstOpening> = decoded
+        .iter()
+        .map(|(chunk, cp, digest, kp)| X::ConstOpening { chunk, chunk_path: cp, digest: *digest, const_path: kp })
+        .collect();
+    let (nr, nw, nout, nc) = b.machine.max_transition();
     let (mut reads, mut writes) = (vec![0u32; nr], vec![0u32; nw]);
     let mut nodes = vec![(0u64, [0u8; 32]); opened.len()];
     let mut read_values: Vec<Option<&[u8]>> = vec![None; nr];
     let mut effects = vec![X::Write::Keep; nw];
     let mut out = vec![0u8; nout];
+    let mut const_reads = vec![(0u32, 0u64); nc];
+    let mut const_values: Vec<&[u8]> = vec![&[]; nc];
     let mut s = X::Scratch {
         reads: &mut reads,
         writes: &mut writes,
@@ -439,8 +473,11 @@ pub(crate) fn opening(
         read_values: &mut read_values,
         write_effects: &mut effects,
         out: &mut out,
+        const_reads: &mut const_reads,
+        const_values: &mut const_values,
     };
-    let ruling = X::replay(&H, &*b.machine, coordinate, &opened, &siblings, &root_lo, &root_hi, &mut s).map_err(refusal)?;
+    let ruling = X::replay(&H, &*b.machine, coordinate, &opened, &siblings, &consts, &c.t.spec_root, &root_lo, &root_hi, &mut s)
+        .map_err(refusal)?;
     drop(staged);
     rule(&c, executor, challenger, ruling == X::LxRuling::Challenger)
 }
@@ -498,7 +535,9 @@ pub(crate) fn output(
 
 /// The Python toy machine (`python/dcg/disputes_v21/lx_toy.py`) as a
 /// registered LX1 machine, for tests and the DCG example. Parameters:
-/// `positions:u64 window:u64 h0:i64`.
+/// `positions:u64 window:u64 h0:i64 [weights:u8]`; with `weights = 1` each
+/// start reads two template constant chunks (design §13), as the Python toy's
+/// `weights=True`.
 #[cfg(feature = "test-kernel")]
 pub mod toy {
     use super::*;
@@ -510,6 +549,7 @@ pub mod toy {
         p: u64,
         w: u64,
         h0: i64,
+        weights: bool,
         outputs: [u32; 1],
     }
 
@@ -579,11 +619,22 @@ pub mod toy {
                 return None;
             })
         }
-        fn apply(&self, p: u64, i: u64, r: &[Option<&[u8]>], out: &mut X::Outputs) -> Result<(), X::KernelFailure> {
+        fn constants(&self, p: u64, i: u64, out: &mut [(u32, u64)]) -> Option<usize> {
+            if !self.weights || i != 0 {
+                return Some(0);
+            }
+            out.get_mut(..2)?.copy_from_slice(&[(0, p % 4), (2, p % 3)]);
+            Some(2)
+        }
+        fn apply(&self, p: u64, i: u64, r: &[Option<&[u8]>], c: &[&[u8]], out: &mut X::Outputs) -> Result<(), X::KernelFailure> {
             let nw = self.windows(p);
             let f = X::KernelFailure;
             if i == 0 {
-                let v = (3 * dec(r[0]).ok_or(f)? + p as i64 + 1).rem_euclid(MOD);
+                let w = match c {
+                    [a, b] => dec(a.get(..8)).ok_or(f)?.checked_sub(dec(b.get(..8)).ok_or(f)?).ok_or(f)?,
+                    _ => 0,
+                };
+                let v = (3 * dec(r[0]).ok_or(f)? + p as i64 + 1).checked_add(w).ok_or(f)?.rem_euclid(MOD);
                 return out.set(0, &v.to_le_bytes());
             }
             if i <= nw {
@@ -624,8 +675,8 @@ pub mod toy {
         fn output_slots(&self) -> &[u32] {
             &self.outputs
         }
-        fn max_transition(&self) -> (usize, usize, usize) {
-            (4 + self.w as usize, 5, 16)
+        fn max_transition(&self) -> (usize, usize, usize, usize) {
+            (4 + self.w as usize, 5, 16, 2)
         }
     }
 
@@ -633,9 +684,11 @@ pub mod toy {
 
     impl LxFactory for ToyFactory {
         fn bind(&self, params: &[u8]) -> Option<Box<dyn LxBound>> {
-            if params.len() != 24 {
-                return None;
-            }
+            let weights = match params.len() {
+                24 => false,
+                25 if params[24] == 1 => true,
+                _ => return None,
+            };
             let p = u64::from_le_bytes(params[0..8].try_into().ok()?);
             let w = u64::from_le_bytes(params[8..16].try_into().ok()?);
             let h0 = i64::from_le_bytes(params[16..24].try_into().ok()?);
@@ -643,7 +696,7 @@ pub mod toy {
             if !(1..=1 << 16).contains(&p) || !(1..=64).contains(&w) {
                 return None;
             }
-            Some(Box::new(Toy { p, w, h0, outputs: [0] }))
+            Some(Box::new(Toy { p, w, h0, weights, outputs: [0] }))
         }
     }
 

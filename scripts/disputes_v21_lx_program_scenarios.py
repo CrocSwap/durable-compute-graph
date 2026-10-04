@@ -25,6 +25,8 @@ def opening(proof: L.MultiProof) -> dict:
     return {
         "opened": [[s, None if proof.values[s] is None else h(proof.values[s])] for s in sorted(proof.values)],
         "siblings": [h(proof.siblings[k]) for k in sorted(proof.siblings)],
+        "constants": [{"chunk": h(e.chunk), "chunk_path": [h(x) for x in e.chunk_path], "digest": h(e.digest),
+                       "const_path": [h(x) for x in e.const_path]} for e in proof.constants],
     }
 
 
@@ -100,10 +102,68 @@ def build() -> dict:
             "ruling": d.claim_output(proof),
         })
     return {
+        "weighted": build_weighted(),
         "params": h(struct.pack("<QQq", P, W, H0)),
         "initial_root": h(L.state_root(tm, tm.initial_state())),
         "plays": plays,
         "outputs": outputs,
+    }
+
+
+def build_weighted() -> dict:
+    """Constants in openings (design §13): the toy with weights. Lies at
+    weighted starts (a bumped scratch value, and an executor that used other
+    weights), in both role orders."""
+    tm = ToyMachine(positions_count=P, window=W, h0=H0, weights=True)
+
+    class OtherWeights(ToyMachine):
+        WEIGHTS0 = (5, -3, 11, 2, 8, 0, -9, 4)
+
+    honest = L.execute(tm)
+    other = L.execute(OtherWeights(positions_count=P, window=W, h0=H0, weights=True))
+    other.machine = tm
+    sch = L.Schedule(tm)
+    start5 = next(c for c in range(sch.total) if sch.transition(c).label == "p5.start")
+
+    def bump_a(coord, state):
+        if coord == start5:
+            state = dict(state)
+            state[tm.A] = struct.pack("<q", struct.unpack("<q", state[tm.A])[0] + 1)
+        return state
+
+    plays = []
+    for lie, liar in (("bumped-start", L.execute(tm, bump_a)), ("other-weights", other)):
+        for k, arity in ((1, 16), (4, 2)):
+            for name, executor, challenger in (("executor-lies", liar, honest), ("challenger-lies", honest, liar)):
+                com = L.commit(executor, k)
+                pair = L.first_disputed_pair(com, challenger)
+                d = L.Dispute(tm, com, arity)
+                d.open(pair)
+                rounds = []
+                while d.phase == L.PH_MIDPOINTS:
+                    mids = L.executor_midpoints(executor, d)
+                    d.commit_midpoints(mids)
+                    pick = L.challenger_pick(challenger, d)
+                    rounds.append({"midpoints": [h(r) for r in mids], "pick": pick})
+                    d.pick(pick)
+                proof = L.executor_opening(executor, d)
+                assert proof.constants, "every weighted play ends at a start"
+                ruling = d.submit_opening(proof)
+                plays.append({
+                    "name": f"weighted {lie} {name} k={k} a={arity}",
+                    "arity": arity,
+                    "commitment": commitment(executor, k),
+                    "pair": pair,
+                    "rounds": rounds,
+                    "terminal": d.lo,
+                    "opening": opening(proof),
+                    "ruling": ruling,
+                })
+    return {
+        "params": h(struct.pack("<QQqB", P, W, H0, 1)),
+        "constants_root": h(L.constants_root(tm)),
+        "initial_root": h(L.state_root(tm, tm.initial_state())),
+        "plays": plays,
     }
 
 

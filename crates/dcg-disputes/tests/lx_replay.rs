@@ -2,7 +2,9 @@
 //! by a Rust port of the Python toy machine (`python/dcg/disputes_v21/lx_toy.py`),
 //! reproduce the rulings of played Python disputes.
 
-use dcg_disputes::lx::{locate, output_claim, replay, KernelFailure, LxMachine, LxRefusal, LxRuling, Outputs, Scratch, Write};
+use dcg_disputes::lx::{
+    const_leaf, locate, output_claim, replay, ConstOpening, KernelFailure, LxMachine, LxRefusal, LxRuling, Outputs, Scratch, Write,
+};
 use dcg_disputes::{Hash, Sha256};
 use sha2::Digest;
 
@@ -25,6 +27,9 @@ struct Toy {
     p: u64,
     w: u64,
     fail_finish: bool,
+    /// The Python toy's `weights=True`: each start reads chunk `p mod 4` of
+    /// constant 0 and chunk `p mod 3` of constant 2 (design §13).
+    weights: bool,
 }
 
 impl Toy {
@@ -95,10 +100,18 @@ impl LxMachine for Toy {
             return None;
         })
     }
-    fn apply(&self, p: u64, i: u64, r: &[Option<&[u8]>], out: &mut Outputs) -> Result<(), KernelFailure> {
+    fn constants(&self, p: u64, i: u64, out: &mut [(u32, u64)]) -> Option<usize> {
+        if !self.weights || i != 0 {
+            return Some(0);
+        }
+        out.get_mut(..2)?.copy_from_slice(&[(0, p % 4), (2, p % 3)]);
+        Some(2)
+    }
+    fn apply(&self, p: u64, i: u64, r: &[Option<&[u8]>], c: &[&[u8]], out: &mut Outputs) -> Result<(), KernelFailure> {
         let nw = self.windows(p);
         if i == 0 {
-            let v = (3 * dec(r[0]).ok_or(KernelFailure)? + p as i64 + 1).rem_euclid(MOD);
+            let w = if self.weights { dec(Some(&c[0][..8])).unwrap() - dec(Some(&c[1][..8])).unwrap() } else { 0 };
+            let v = (3 * dec(r[0]).ok_or(KernelFailure)? + p as i64 + 1 + w).rem_euclid(MOD);
             return out.set(0, &v.to_le_bytes());
         }
         if i <= nw {
@@ -146,7 +159,7 @@ fn golden() -> serde_json::Value {
 
 fn toy(g: &serde_json::Value) -> Toy {
     let t = &g["toy"];
-    Toy { p: t["positions"].as_u64().unwrap(), w: t["window"].as_u64().unwrap(), fail_finish: false }
+    Toy { p: t["positions"].as_u64().unwrap(), w: t["window"].as_u64().unwrap(), fail_finish: false, weights: false }
 }
 
 struct Case {
@@ -180,12 +193,25 @@ fn cases(g: &serde_json::Value) -> Vec<Case> {
 }
 
 fn run(m: &Toy, c: &Case, opened: &[(u32, Option<Vec<u8>>)], siblings: &[Hash]) -> Result<LxRuling, LxRefusal> {
+    run_c(m, c, opened, siblings, &[], &[0; 32])
+}
+
+fn run_c(
+    m: &Toy,
+    c: &Case,
+    opened: &[(u32, Option<Vec<u8>>)],
+    siblings: &[Hash],
+    consts: &[ConstOpening],
+    constants_root: &Hash,
+) -> Result<LxRuling, LxRefusal> {
     let view: Vec<(u32, Option<&[u8]>)> = opened.iter().map(|(s, v)| (*s, v.as_deref())).collect();
     let (mut reads, mut writes) = ([0u32; 16], [0u32; 8]);
     let mut nodes = [(0u64, [0u8; 32]); 32];
     let mut read_values: [Option<&[u8]>; 16] = [None; 16];
     let mut effects = [Write::Keep; 8];
     let mut out = [0u8; 256];
+    let mut const_reads = [(0u32, 0u64); 4];
+    let mut const_values: [&[u8]; 4] = [&[]; 4];
     let mut s = Scratch {
         reads: &mut reads,
         writes: &mut writes,
@@ -193,8 +219,10 @@ fn run(m: &Toy, c: &Case, opened: &[(u32, Option<Vec<u8>>)], siblings: &[Hash]) 
         read_values: &mut read_values,
         write_effects: &mut effects,
         out: &mut out,
+        const_reads: &mut const_reads,
+        const_values: &mut const_values,
     };
-    replay(&Soft, m, c.coordinate, &view, siblings, &c.lo, &c.hi, &mut s)
+    replay(&Soft, m, c.coordinate, &view, siblings, consts, constants_root, &c.lo, &c.hi, &mut s)
 }
 
 #[test]
@@ -291,7 +319,7 @@ impl LxMachine for Empty {
     fn transitions_in(&self, _p: u64) -> u64 { 1 }
     fn position_start(&self, p: u64) -> u64 { p }
     fn slots(&self, _p: u64, _i: u64, _r: &mut [u32], _w: &mut [u32]) -> Option<(usize, usize)> { Some((0, 0)) }
-    fn apply(&self, _p: u64, _i: u64, _r: &[Option<&[u8]>], _o: &mut Outputs) -> Result<(), KernelFailure> { Ok(()) }
+    fn apply(&self, _p: u64, _i: u64, _r: &[Option<&[u8]>], _c: &[&[u8]], _o: &mut Outputs) -> Result<(), KernelFailure> { Ok(()) }
 }
 
 #[test]
@@ -301,9 +329,156 @@ fn a_transition_that_touches_no_slot_is_the_identity() {
     let mut rv: [Option<&[u8]>; 4] = [None; 4];
     let mut fx = [Write::Keep; 4];
     let mut out = [0u8; 8];
-    let mut s = Scratch { reads: &mut reads, writes: &mut writes, nodes: &mut nodes, read_values: &mut rv, write_effects: &mut fx, out: &mut out };
-    let (a, b) = ([1u8; 32], [2u8; 32]);
-    assert_eq!(replay(&Soft, &Empty, 0, &[], &[], &a, &a, &mut s), Ok(LxRuling::Executor));
-    assert_eq!(replay(&Soft, &Empty, 0, &[], &[], &a, &b, &mut s), Ok(LxRuling::Challenger));
-    assert_eq!(replay(&Soft, &Empty, 0, &[], &[[0; 32]], &a, &a, &mut s), Err(LxRefusal::Proof));
+    let (mut cr, mut cv) = ([(0u32, 0u64); 1], [&[][..]; 1]);
+    let mut s = Scratch {
+        reads: &mut reads,
+        writes: &mut writes,
+        nodes: &mut nodes,
+        read_values: &mut rv,
+        write_effects: &mut fx,
+        out: &mut out,
+        const_reads: &mut cr,
+        const_values: &mut cv,
+    };
+    let (a, b, z) = ([1u8; 32], [2u8; 32], [0u8; 32]);
+    assert_eq!(replay(&Soft, &Empty, 0, &[], &[], &[], &z, &a, &a, &mut s), Ok(LxRuling::Executor));
+    assert_eq!(replay(&Soft, &Empty, 0, &[], &[], &[], &z, &a, &b, &mut s), Ok(LxRuling::Challenger));
+    assert_eq!(replay(&Soft, &Empty, 0, &[], &[[0; 32]], &[], &z, &a, &a, &mut s), Err(LxRefusal::Proof));
+    // An undeclared constant entry is refused.
+    let e = ConstOpening { chunk: &[], chunk_path: &[], digest: z, const_path: &[] };
+    assert_eq!(replay(&Soft, &Empty, 0, &[], &[], &[e], &z, &a, &a, &mut s), Err(LxRefusal::Constant));
+}
+
+// --- constants in openings (design §13) ---------------------------------------------------
+
+struct Weighted {
+    case: Case,
+    reads: Vec<(u32, u64)>,
+    chunks: Vec<Vec<u8>>,
+    chunk_paths: Vec<Vec<Hash>>,
+    digests: Vec<Hash>,
+    const_paths: Vec<Vec<Hash>>,
+}
+
+impl Weighted {
+    fn openings(&self) -> Vec<ConstOpening<'_>> {
+        (0..self.chunks.len())
+            .map(|k| ConstOpening {
+                chunk: &self.chunks[k],
+                chunk_path: &self.chunk_paths[k],
+                digest: self.digests[k],
+                const_path: &self.const_paths[k],
+            })
+            .collect()
+    }
+}
+
+fn weighted(g: &serde_json::Value) -> (Toy, Hash, Vec<Weighted>) {
+    let w = &g["weighted"];
+    let hashes = |v: &serde_json::Value| -> Vec<Hash> { v.as_array().unwrap().iter().map(h32).collect() };
+    let cases = w["replays"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let cs = r["constants"].as_array().unwrap();
+            Weighted {
+                case: Case {
+                    coordinate: r["coordinate"].as_u64().unwrap(),
+                    opened: r["opened"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|e| (e[0].as_u64().unwrap() as u32, e[1].as_str().map(hex)))
+                        .collect(),
+                    siblings: hashes(&r["siblings"]),
+                    lo: h32(&r["root_lo"]),
+                    hi: h32(&r["root_hi"]),
+                    ruling: if r["ruling"] == "E" { LxRuling::Executor } else { LxRuling::Challenger },
+                },
+                reads: r["const_reads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| (x[0].as_u64().unwrap() as u32, x[1].as_u64().unwrap()))
+                    .collect(),
+                chunks: cs.iter().map(|e| hex(e["chunk"].as_str().unwrap())).collect(),
+                chunk_paths: cs.iter().map(|e| hashes(&e["chunk_path"])).collect(),
+                digests: cs.iter().map(|e| h32(&e["digest"])).collect(),
+                const_paths: cs.iter().map(|e| hashes(&e["const_path"])).collect(),
+            }
+        })
+        .collect();
+    (Toy { weights: true, ..toy(g) }, h32(&w["constants_root"]), cases)
+}
+
+#[test]
+fn weighted_replays_rule_like_python() {
+    let g = golden();
+    let (m, root, cases) = weighted(&g);
+    assert!(cases.iter().any(|c| c.case.ruling == LxRuling::Executor) && cases.iter().any(|c| c.case.ruling == LxRuling::Challenger));
+    for w in &cases {
+        let (p, i) = locate(&m, w.case.coordinate).unwrap();
+        let mut reads = [(0u32, 0u64); 4];
+        let n = m.constants(p, i, &mut reads).unwrap();
+        assert_eq!(&reads[..n], &w.reads[..], "declared reads match Python");
+        for (k, (cid, _)) in w.reads.iter().enumerate() {
+            let digest = g["weighted"]["digests"][cid.to_string()].as_str().unwrap();
+            assert_eq!(w.digests[k], h32(&serde_json::Value::from(digest)));
+            assert_eq!(dcg_disputes::root_from_path(&Soft, dcg_disputes::Tree::LxConst, &const_leaf(&Soft, *cid, &w.digests[k]), *cid as u64, &w.const_paths[k]), root);
+        }
+        let c = &w.case;
+        assert_eq!(run_c(&m, c, &c.opened, &c.siblings, &w.openings(), &root), Ok(c.ruling), "coordinate {}", c.coordinate);
+    }
+}
+
+#[test]
+fn wrong_missing_or_reordered_constants_are_refused() {
+    let g = golden();
+    let (m, root, cases) = weighted(&g);
+    for w in &cases {
+        let c = &w.case;
+        let good = w.openings();
+        let refuse = |consts: &[ConstOpening]| assert_eq!(run_c(&m, c, &c.opened, &c.siblings, consts, &root), Err(LxRefusal::Constant));
+        // A changed chunk byte.
+        let mut chunk = w.chunks[0].clone();
+        chunk[0] ^= 1;
+        refuse(&[ConstOpening { chunk: &chunk, ..good[0] }, good[1]]);
+        // A wrong chunk path, a wrong digest, a wrong or overlong constant path.
+        let mut cp = w.chunk_paths[0].clone();
+        cp[0][0] ^= 1;
+        refuse(&[ConstOpening { chunk_path: &cp, ..good[0] }, good[1]]);
+        refuse(&[ConstOpening { digest: [7; 32], ..good[0] }, good[1]]);
+        let mut kp = w.const_paths[1].clone();
+        kp[0][0] ^= 1;
+        refuse(&[good[0], ConstOpening { const_path: &kp, ..good[1] }]);
+        let mut long = w.const_paths[1].clone();
+        long.push([0; 32]);
+        refuse(&[good[0], ConstOpening { const_path: &long, ..good[1] }]);
+        // Too short to hold the chunk index or the constant id.
+        if w.reads[0].1 > 0 {
+            refuse(&[ConstOpening { chunk_path: &[], ..good[0] }, good[1]]);
+        }
+        refuse(&[good[0], ConstOpening { const_path: &[], ..good[1] }]);
+        // Missing, extra and swapped.
+        refuse(&good[..1]);
+        refuse(&[good[0], good[1], good[1]]);
+        refuse(&[good[1], good[0]]);
+        refuse(&[]);
+        // Against another constants root.
+        assert_eq!(run_c(&m, c, &c.opened, &c.siblings, &good, &[0; 32]), Err(LxRefusal::Constant));
+        // Still accepted afterwards (refusals change nothing).
+        assert_eq!(run_c(&m, c, &c.opened, &c.siblings, &good, &root), Ok(c.ruling));
+    }
+}
+
+#[test]
+fn unweighted_transitions_refuse_constant_entries() {
+    let g = golden();
+    let m = toy(&g);
+    let (_, root, wc) = weighted(&g);
+    let e = wc[0].openings();
+    for c in cases(&g) {
+        assert_eq!(run_c(&m, &c, &c.opened, &c.siblings, &e[..1], &root), Err(LxRefusal::Constant));
+    }
 }
