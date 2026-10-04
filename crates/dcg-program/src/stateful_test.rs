@@ -249,6 +249,130 @@ impl StatefulKernel for V3CounterKernel {
 
 pub static V3_COUNTER: V3CounterKernel = V3CounterKernel;
 
+/// The v3 counter with render lanes (design `stateful-session-lanes-v1.md`
+/// §10): a capture copies the 16 state bytes into the lane workspace in
+/// 8-byte calls; a lane render serves each view's bytes from that copy, so a
+/// published view shows the state at the captured cursor even after later
+/// advances.
+pub struct V3LaneCounterKernel;
+
+static V3_LANE_COUNTER_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-lanectr-v1\0\0"),
+    ..V3_COUNTER_MANIFEST
+};
+pub const V3_LANE_CAPTURE_BYTES: u32 = 16;
+pub const V3_LANE_WORKSPACE_BYTES: u32 = 64;
+
+impl Kernel for V3LaneCounterKernel {
+    fn manifest(&self) -> &'static KernelManifest {
+        &V3_LANE_COUNTER_MANIFEST
+    }
+
+    fn execute(&self, input: &[u8], output: &mut [u8]) -> Result<usize, KernelError> {
+        COUNTER.execute(input, output)
+    }
+}
+
+impl StatefulKernel for V3LaneCounterKernel {
+    fn initial_state(&self, output: &mut [u8]) -> Result<usize, KernelError> {
+        COUNTER.initial_state(output)
+    }
+
+    fn transition(
+        &self,
+        input: &[u8],
+        prior_state: &[u8],
+        output: &mut [u8],
+        next_state: &mut [u8],
+    ) -> Result<(usize, usize), KernelError> {
+        COUNTER.transition(input, prior_state, output, next_state)
+    }
+
+    fn initial_state_spans(&self, spans: &mut [StateSpanMut<'_>]) -> Result<usize, KernelError> {
+        COUNTER.initial_state_spans(spans)
+    }
+
+    fn transition_spans(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        COUNTER.transition_spans(input, state, output)
+    }
+
+    fn view_abis(&self) -> &'static [ViewAbi] {
+        COUNTER.view_abis()
+    }
+
+    fn max_view_phase_bytes(&self) -> u32 {
+        6 // smaller than a view, so render chunks cross view boundaries
+    }
+
+    fn view_phase_compute_units(&self) -> u32 {
+        100_000
+    }
+
+    fn max_view_workspace_bytes(&self) -> u32 {
+        V3_LANE_WORKSPACE_BYTES
+    }
+
+    fn lane_capture_bytes(&self) -> u32 {
+        V3_LANE_CAPTURE_BYTES
+    }
+
+    fn lane_capture_phase_bytes(&self) -> u32 {
+        8
+    }
+
+    fn capture_lane_phase(
+        &self,
+        phase: crate::kernel::LanePhase,
+        state: &[AccountSpan<'_>],
+        _resources: &[AccountSpan<'_>],
+        _commitment: &[u8; 32],
+        workspace: &mut [u8],
+    ) -> Result<(), KernelError> {
+        let (from, to) = (phase.offset as usize, (phase.offset + phase.len) as usize);
+        if to > V3_LANE_CAPTURE_BYTES as usize || workspace.len() < to {
+            return Err(KernelError::InvalidInput);
+        }
+        for span in state {
+            let (a, b) = (span.offset as usize, span.offset as usize + span.data.len());
+            let (lo, hi) = (from.max(a), to.min(b));
+            if lo < hi {
+                workspace[lo..hi].copy_from_slice(&span.data[lo - a..hi - a]);
+            }
+        }
+        // The capture cursor is recorded too, so a render can check it.
+        workspace[16..20].copy_from_slice(&phase.state_cursor.to_le_bytes());
+        Ok(())
+    }
+
+    fn render_lane_phase(
+        &self,
+        phase: ViewPhase,
+        _resources: &[AccountSpan<'_>],
+        _commitment: &[u8; 32],
+        _workspace_header: &mut [u8],
+        workspace: &mut [u8],
+        output: &mut [u8],
+    ) -> Result<usize, KernelError> {
+        if workspace[16..20] != phase.state_cursor.to_le_bytes() {
+            return Err(KernelError::Refused);
+        }
+        let start = (phase.source_offset + phase.output_offset) as usize;
+        let end = start + output.len();
+        if end > V3_LANE_CAPTURE_BYTES as usize {
+            return Err(KernelError::InvalidInput);
+        }
+        output.copy_from_slice(&workspace[start..end]);
+        Ok(output.len())
+    }
+}
+
+pub static V3_LANE_COUNTER: V3LaneCounterKernel = V3LaneCounterKernel;
+
 pub const WORKLOAD_RESOURCE_KEY: [u8; 32] = [0xC1; 32];
 pub const WORKLOAD_RESOURCE_SCHEMA: VersionedId = VersionedId {
     id: 0x5253_5243,
@@ -933,6 +1057,10 @@ pub const V3_WORKSPACE_ENGINE: V3FixedAddressKernel = V3FixedAddressKernel::work
 fn test_session_kernel_id(accounts: &[AccountInfo]) -> Option<KernelId> {
     for account in accounts {
         let raw = account.try_borrow_data().ok()?;
+        // A lane render carries no session; its lane record names the kernel.
+        if raw.len() == crate::stateful::v3::lanes::LANE_BYTES && &raw[..4] == b"DLN3" {
+            return Some(KernelId(raw[234..250].try_into().ok()?));
+        }
         if raw.len() != 1_280 || &raw[..4] != b"DSS3" {
             continue;
         }
@@ -957,6 +1085,8 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_FIXED_ENGINE)
         } else if kernel_id == Some(V3_WORKSPACE_ENGINE.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_WORKSPACE_ENGINE)
+        } else if kernel_id == Some(V3_LANE_COUNTER.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_LANE_COUNTER)
         } else {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_COUNTER)
         }

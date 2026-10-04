@@ -80,6 +80,11 @@ pub const REFUSAL_KERNEL: u32 = 2_334;
 pub const REFUSAL_PHASE_CURSOR: u32 = 2_335;
 pub const REFUSAL_PHASE_STATE_CHANGED: u32 = 2_336;
 pub const REFUSAL_INITIALIZATION: u32 = 2_337;
+/// Lanes (design `stateful-session-lanes-v1.md`).
+pub const REFUSAL_LANE: u32 = 2_338;
+pub const REFUSAL_LANE_CURSOR: u32 = 2_339;
+pub const REFUSAL_CAPTURE_OPEN: u32 = 2_340;
+pub const REFUSAL_STALE_PUBLICATION: u32 = 2_341;
 
 const SESSION_BYTES: usize = 1_280;
 const SESSION_MAGIC: &[u8; 4] = b"DSS3";
@@ -161,7 +166,16 @@ struct Session {
     halt_reason: u32,
     halt_cursor: u32,
     last_advance_start: u32,
+    /// Render lanes declared at open (0: none, the v3 single-workspace path).
+    lanes: u8,
+    /// A bit per lane that is capturing state; `ADVANCE` waits for zero.
+    capture_mask: u8,
+    /// The newest captured cursor plus one (0: none).
+    last_captured: u32,
 }
+
+#[path = "stateful_v3_lanes.rs"]
+pub mod lanes;
 
 #[derive(Clone, Copy, Debug)]
 struct StateSpanMeta {
@@ -335,14 +349,37 @@ fn checked_resource(
     require_sealed: bool,
     writable: bool,
 ) -> Result<ResourceMeta, ProgramError> {
+    checked_resource_bound(
+        program,
+        account,
+        session_account.key,
+        &session.resource_key,
+        &session.resource_commitment,
+        require_sealed,
+        writable,
+    )
+}
+
+/// `checked_resource` against a binding (session key, resource key and
+/// commitment) rather than a decoded session: lane renders read the binding
+/// from their lane record, never the session.
+fn checked_resource_bound(
+    program: &Pubkey,
+    account: &AccountInfo,
+    session_key: &Pubkey,
+    resource_key: &Pubkey,
+    resource_commitment: &[u8; 32],
+    require_sealed: bool,
+    writable: bool,
+) -> Result<ResourceMeta, ProgramError> {
     check_program_owned(account, program, writable)?;
-    if session.resource_key == Pubkey::default() {
+    if *resource_key == Pubkey::default() {
         return Err(refusal(REFUSAL_RESOURCE));
     }
     expect_keyed(
         account,
         program,
-        &session.resource_key,
+        resource_key,
         AccountKind::variable(RESOURCE_MAGIC, RESOURCE_HEADER_BYTES, ACCOUNT_MAX_BYTES)
             .with_version(4, WIRE_VERSION as u16),
         RoleFlags {
@@ -352,14 +389,13 @@ fn checked_resource(
     )
     .map_err(|_| refusal(REFUSAL_RESOURCE))?;
     let raw = account.try_borrow_data()?;
-    if session.resource_key == Pubkey::default()
-        || raw.len() < RESOURCE_HEADER_BYTES
+    if raw.len() < RESOURCE_HEADER_BYTES
         || &raw[..4] != RESOURCE_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
         || raw[6] != KIND_RESOURCE
         || raw[7] != 0
-        || raw[8..40] != session_account.key.to_bytes()
-        || raw[40..72] != session.resource_commitment
+        || raw[8..40] != session_key.to_bytes()
+        || raw[40..72] != *resource_commitment
     {
         return Err(refusal(REFUSAL_RESOURCE));
     }
@@ -663,6 +699,9 @@ fn encode_session(account: &AccountInfo, session: &Session) -> ProgramResult {
     put_u32(&mut raw, 1258, session.halt_cursor);
     raw[1262] = session.bump;
     put_u32(&mut raw, 1263, session.last_advance_start);
+    raw[1267] = session.lanes;
+    raw[1268] = session.capture_mask;
+    put_u32(&mut raw, 1269, session.last_captured);
     Ok(())
 }
 
@@ -688,7 +727,10 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || raw[1164] > PHASE_STATE_ANCHOR
         || raw[1182] > 1
         || raw[1189] > 1
-        || raw[1267..].iter().any(|byte| *byte != 0)
+        || raw[1273..].iter().any(|byte| *byte != 0)
+        || raw[1267] as usize > lanes::MAX_LANES
+        || (raw[1268] as u32) >> raw[1267] != 0
+        || u32_at(raw, 1269) > u32_at(raw, 112).saturating_add(1)
         || !matches!(raw[6], STATUS_ACTIVE | STATUS_HALTED)
         || !matches!(raw[7], POLICY_INDEXED | POLICY_APPEND)
         || raw[8] == 0
@@ -809,6 +851,9 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         halt_reason: u32_at(raw, 1254),
         halt_cursor: u32_at(raw, 1258),
         last_advance_start: u32_at(raw, 1263),
+        lanes: raw[1267],
+        capture_mask: raw[1268],
+        last_captured: u32_at(raw, 1269),
     })
 }
 
@@ -894,7 +939,16 @@ fn open_session(
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
     check_unique(accounts)?;
-    exact_data(data, 178)?;
+    // Optional trailing `lanes: u8` (1..=MAX_LANES); 178 bytes is no lanes.
+    let lanes = match data.len() {
+        178 => 0u8,
+        179 if (1..=lanes::MAX_LANES as u8).contains(&data[178]) => data[178],
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+    if lanes != 0 && kernel.lane_capture_bytes() == 0 {
+        return Err(refusal(REFUSAL_LANE));
+    }
+    let data = &data[..178];
     if data[1] != WIRE_VERSION {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -1080,6 +1134,9 @@ fn open_session(
             halt_reason: 0,
             halt_cursor: 0,
             last_advance_start: 0,
+            lanes,
+            capture_mask: 0,
+            last_captured: 0,
         },
     )
 }
@@ -2574,6 +2631,10 @@ fn advance(
     if session.phase != PHASE_NONE {
         return Err(refusal(REFUSAL_LIVE));
     }
+    // A lane capture reads the state at the current cursor (lanes §3).
+    if session.capture_mask != 0 {
+        return Err(refusal(REFUSAL_CAPTURE_OPEN));
+    }
     let expected_cursor = u32_at(data, 2);
     let steps = data[6];
     if session.cursor != expected_cursor {
@@ -2992,6 +3053,7 @@ fn publish_operation(
         1 => run_view_phase(program, accounts, data, kernel),
         2 => commit_view_phase(program, accounts, data, kernel),
         3 => abort_view_phase(program, accounts, data, kernel),
+        lanes::OP_FIRST..=lanes::OP_LAST => lanes::process(program, accounts, data, kernel),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -3050,6 +3112,9 @@ mod workspace_first_account_tests {
             halt_reason: 0,
             halt_cursor: 0,
             last_advance_start: 0,
+            lanes: 0,
+            capture_mask: 0,
+            last_captured: 0,
         }
     }
 
@@ -3142,6 +3207,9 @@ fn begin_view_phase(
         || session.phase != PHASE_NONE
     {
         return Err(refusal(REFUSAL_LIVE));
+    }
+    if session.lanes != 0 {
+        return Err(refusal(REFUSAL_LANE)); // lane sessions publish through lanes
     }
     let expected_cursor = u32_at(data, 3);
     let declared = u32_at(data, 7);
@@ -3531,6 +3599,7 @@ fn halt_session(
     session.status = STATUS_HALTED;
     session.halt_reason = 0;
     session.halt_cursor = session.cursor;
+    session.capture_mask = 0;
     clear_phase(&mut session);
     store_session(session_account, &session)
 }
@@ -3589,6 +3658,10 @@ fn close_child(
         let kind = raw[6];
         let role = raw[7];
         let state_index = raw[78] as usize;
+        if lanes::is_lane_kind(kind) {
+            drop(raw);
+            return lanes::close_lane_child(program, session_account, &mut session, target, refund);
+        }
         let authority_bound = match kind {
             KIND_STREAM => {
                 raw[40..72] == session.stream_root && raw[88..120] == session.writer.to_bytes()
