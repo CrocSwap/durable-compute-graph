@@ -133,7 +133,29 @@ fn ix(sub: u8, data: &[u8], accounts: Vec<AccountMeta>) -> Instruction {
 }
 
 async fn send(ctx: &mut ProgramTestContext, i: Instruction, signers: &[&Keypair]) -> Result<(), TransactionError> {
-    let blockhash = ctx.get_new_latest_blockhash().await.unwrap();
+    if std::env::var_os("LX_FUZZ_PLAYS").is_some() {
+        // Fuzz campaign: no wait for a new blockhash per transaction; a
+        // per-transaction compute-unit price (paid by the payer only) keeps
+        // repeated identical instructions distinct.
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let price = solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_price(n);
+        let mut all = vec![&ctx.payer];
+        all.extend_from_slice(signers);
+        let tx = Transaction::new(&all, solana_message::Message::new(&[i, price], Some(&ctx.payer.pubkey())), blockhash);
+        return ctx.banks_client.process_transaction_with_metadata(tx).await.map_err(|e| e.unwrap())?.result;
+    }
+    // Many banks at once can starve the slot clock; a blockhash wait that
+    // times out is retried, not a test failure.
+    let mut tries = 0;
+    let blockhash = loop {
+        match ctx.get_new_latest_blockhash().await {
+            Ok(b) => break b,
+            Err(e) if tries < 10 && e.to_string().contains("Unable to get new blockhash") => tries += 1,
+            Err(e) => panic!("{e:?}"),
+        }
+    };
     let mut all = vec![&ctx.payer];
     all.extend_from_slice(signers);
     let tx = Transaction::new(&all, solana_message::Message::new(&[i], Some(&ctx.payer.pubkey())), blockhash);
@@ -146,9 +168,16 @@ struct Chain {
     run: Pubkey,
     run_id: [u8; 32],
     params: Vec<u8>,
+    /// The position count the run root commits (the golden toy's 9 by default).
+    positions: u64,
     levels: Vec<Vec<D::Hash>>,
     count: usize,
 }
+
+/// The template's LX1 tail bounds: k_min, k_max, max_positions.
+#[derive(Clone, Copy)]
+struct Bounds(u32, u32, u64);
+const GOLDEN_BOUNDS: Bounds = Bounds(1, 16, 1 << 16);
 
 impl Chain {
     /// An LX1 template for the toy machine at `arity`, and a run.
@@ -159,17 +188,17 @@ impl Chain {
     /// `input`: the run's input id; by default the digest of the golden params.
     async fn new_with_input(arity: u8, challenge_window: u64, input: Option<[u8; 32]>) -> Self {
         let g = golden();
-        Self::new_full(arity, challenge_window, input, hex(g["params"].as_str().unwrap()), [0; 32]).await
+        Self::new_full(arity, challenge_window, input, hex(g["params"].as_str().unwrap()), [0; 32], GOLDEN_BOUNDS, 9).await
     }
 
     /// The toy with weights (design §13): the weighted params, and a template
     /// committing `constants_root`.
     async fn new_weighted(arity: u8, constants_root: [u8; 32]) -> Self {
         let g = golden();
-        Self::new_full(arity, 100_000, None, hex(g["weighted"]["params"].as_str().unwrap()), constants_root).await
+        Self::new_full(arity, 100_000, None, hex(g["weighted"]["params"].as_str().unwrap()), constants_root, GOLDEN_BOUNDS, 9).await
     }
 
-    async fn new_full(arity: u8, challenge_window: u64, input: Option<[u8; 32]>, params: Vec<u8>, constants_root: [u8; 32]) -> Self {
+    async fn new_full(arity: u8, challenge_window: u64, input: Option<[u8; 32]>, params: Vec<u8>, constants_root: [u8; 32], bounds: Bounds, positions: u64) -> Self {
         let sbf = std::env::var("V21_SBF").is_ok_and(|v| v == "1");
         let mut test = ProgramTest::default();
         test.prefer_bpf(sbf);
@@ -197,9 +226,9 @@ impl Chain {
         data.extend_from_slice(&1u16.to_le_bytes());
         data.extend_from_slice(&1u16.to_le_bytes());
         data.extend_from_slice(&[arity, 0, 0, 0]);
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&16u32.to_le_bytes());
-        data.extend_from_slice(&(1u64 << 16).to_le_bytes());
+        data.extend_from_slice(&bounds.0.to_le_bytes());
+        data.extend_from_slice(&bounds.1.to_le_bytes());
+        data.extend_from_slice(&bounds.2.to_le_bytes());
         let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
         let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, admitter.pubkey().as_ref()], &PROGRAM).0;
         send(&mut ctx, ix(V::SUB_CREATE_TEMPLATE, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
@@ -213,7 +242,7 @@ impl Chain {
         let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &input, &0u32.to_le_bytes(), &[], executor.as_ref()]);
         let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
         send(&mut ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
-        Chain { ctx, template, run, run_id, params, levels: vec![], count: 0 }
+        Chain { ctx, template, run, run_id, params, positions, levels: vec![], count: 0 }
     }
 
     fn commit_data(&mut self, c: &serde_json::Value) -> Vec<u8> {
@@ -226,7 +255,7 @@ impl Chain {
         root[32..64].copy_from_slice(&h32(&c["checkpoint_root"]));
         root[64..96].copy_from_slice(&h32(&c["outputs_digest"]));
         root[96..128].copy_from_slice(&sha256(&[LX::PARAMS_DOMAIN, &self.params]));
-        root[128..136].copy_from_slice(&9u64.to_le_bytes());
+        root[128..136].copy_from_slice(&self.positions.to_le_bytes());
         root[136..140].copy_from_slice(&(c["k"].as_u64().unwrap() as u32).to_le_bytes());
         let mut data = root.to_vec();
         data.extend(path(&self.levels, 0));
@@ -356,36 +385,50 @@ async fn played_disputes_rule_like_python_in_both_role_orders() {
 /// Play one golden dispute through the program and check the ruling and the
 /// bond movement.
 async fn check_play(ch: &mut Chain, p: &serde_json::Value) {
-    {
-        let name = p["name"].as_str().unwrap();
-        ch.commit(&p["commitment"]).await.unwrap_or_else(|e| panic!("{name}: commit {e:?}"));
-        let pair = p["pair"].as_u64().unwrap() as usize;
-        let body = ch.state_body(&p["commitment"], pair);
-        let d = ch.open_raw(1, &body).await.unwrap_or_else(|e| panic!("{name}: open {e:?}"));
-        for r in p["rounds"].as_array().unwrap() {
-            let mids: Vec<u8> = r["midpoints"].as_array().unwrap().iter().flat_map(h32).collect();
-            ch.midpoints(d, &mids).await.unwrap_or_else(|e| panic!("{name}: midpoints {e:?}"));
-            ch.pick(d, r["pick"].as_u64().unwrap() as u8).await.unwrap_or_else(|e| panic!("{name}: pick {e:?}"));
-        }
-        let dd = ch.account(d).await.data;
-        assert_eq!(u64::from_le_bytes(dd[16..24].try_into().unwrap()), p["terminal"].as_u64().unwrap(), "{name}: terminal coordinate");
-        ch.stage(d, V::ROLE_EXECUTOR, &encode_replay(&p["opening"])).await;
-        let (e0, c0) = (ch.lamports(kp(0xE1).pubkey()).await, ch.lamports(kp(0xC1).pubkey()).await);
-        ch.opening(d).await.unwrap_or_else(|e| panic!("{name}: opening {e:?}"));
-        let want = ruling_of(p["ruling"].as_str().unwrap());
-        assert_eq!(ch.account(d).await.data[6], want, "{name}: ruling");
-        let (e1, c1) = (ch.lamports(kp(0xE1).pubkey()).await, ch.lamports(kp(0xC1).pubkey()).await);
-        // The challenger's bond goes to the winner (fees are paid by the payer).
-        if want == V::RULING_EXECUTOR {
-            assert_eq!((e1 - e0, c1), (CHALLENGER_BOND, c0), "{name}: bond to the executor");
-        } else {
-            assert_eq!((e1, c1 - c0), (e0, CHALLENGER_BOND), "{name}: bond back to the challenger");
-            assert_eq!(ch.account(ch.run).await.data[4], V::RUN_REFUTED, "{name}: refuted");
-        }
-        // Only closes may act after the ruling.
-        assert!(ch.opening(d).await.is_err(), "{name}: a second opening");
-        assert!(ch.timeout(d).await.is_err(), "{name}: a timeout after the ruling");
+    let name = p["name"].as_str().unwrap();
+    let d = to_leaf(ch, p, name).await;
+    ch.stage(d, V::ROLE_EXECUTOR, &encode_replay(&p["opening"])).await;
+    rule_and_check(ch, d, p, name, false).await;
+}
+
+/// Commit, open the play's pair and play its rounds; the dispute then owes
+/// the terminal opening.
+async fn to_leaf(ch: &mut Chain, p: &serde_json::Value, name: &str) -> Pubkey {
+    ch.commit(&p["commitment"]).await.unwrap_or_else(|e| panic!("{name}: commit {e:?}"));
+    let pair = p["pair"].as_u64().unwrap() as usize;
+    let body = ch.state_body(&p["commitment"], pair);
+    let d = ch.open_raw(1, &body).await.unwrap_or_else(|e| panic!("{name}: open {e:?}"));
+    for r in p["rounds"].as_array().unwrap() {
+        let mids: Vec<u8> = r["midpoints"].as_array().unwrap().iter().flat_map(h32).collect();
+        ch.midpoints(d, &mids).await.unwrap_or_else(|e| panic!("{name}: midpoints {e:?}"));
+        ch.pick(d, r["pick"].as_u64().unwrap() as u8).await.unwrap_or_else(|e| panic!("{name}: pick {e:?}"));
     }
+    let dd = ch.account(d).await.data;
+    assert_eq!(u64::from_le_bytes(dd[16..24].try_into().unwrap()), p["terminal"].as_u64().unwrap(), "{name}: terminal coordinate");
+    d
+}
+
+/// Submit the staged opening (the executor's replay opening, or with `output`
+/// the challenger's OUTPUT claim) and check the ruling and the bond movement.
+async fn rule_and_check(ch: &mut Chain, d: Pubkey, p: &serde_json::Value, name: &str, output: bool) {
+    let (e0, c0) = (ch.lamports(kp(0xE1).pubkey()).await, ch.lamports(kp(0xC1).pubkey()).await);
+    let r = if output { ch.output(d).await } else { ch.opening(d).await };
+    r.unwrap_or_else(|e| panic!("{name}: opening {e:?}"));
+    let want = ruling_of(p["ruling"].as_str().unwrap());
+    assert_eq!(ch.account(d).await.data[6], want, "{name}: ruling");
+    let (e1, c1) = (ch.lamports(kp(0xE1).pubkey()).await, ch.lamports(kp(0xC1).pubkey()).await);
+    // The challenger's bond goes to the winner (fees are paid by the payer).
+    if want == V::RULING_EXECUTOR {
+        assert_eq!((e1 - e0, c1), (CHALLENGER_BOND, c0), "{name}: bond to the executor");
+        assert_eq!(ch.account(ch.run).await.data[4], V::RUN_COMMITTED, "{name}: still committed");
+    } else {
+        assert_eq!((e1, c1 - c0), (e0, CHALLENGER_BOND), "{name}: bond back to the challenger");
+        assert_eq!(ch.account(ch.run).await.data[4], V::RUN_REFUTED, "{name}: refuted");
+    }
+    // Only closes may act after the ruling.
+    let again = if output { ch.output(d).await } else { ch.opening(d).await };
+    assert!(again.is_err(), "{name}: a second opening");
+    assert!(ch.timeout(d).await.is_err(), "{name}: a timeout after the ruling");
 }
 
 // --- constants in openings (design §13) -------------------------------------------------------
@@ -817,4 +860,161 @@ async fn withheld_false_outputs_are_convicted_from_the_opening_alone() {
     ch.output(d).await.unwrap();
     assert_eq!(ch.account(d).await.data[6], V::RULING_CHALLENGER);
     assert_eq!(ch.lamports(kp(0xC1).pubkey()).await - c0, CHALLENGER_BOND);
+}
+
+// --- generated-scenario fuzz campaign (scripts/disputes_v21_lx_fuzz.py) ----------------------
+
+impl Chain {
+    /// A template and run for one generated play: its machine parameters,
+    /// constants root, arity and LX1 bounds all come from the play.
+    async fn for_play(p: &serde_json::Value) -> Self {
+        let m = &p["machine"];
+        let t = &p["template"];
+        let bounds = Bounds(t["k_min"].as_u64().unwrap() as u32, t["k_max"].as_u64().unwrap() as u32, t["max_positions"].as_u64().unwrap());
+        let params = hex(m["params"].as_str().unwrap());
+        Self::new_full(t["arity"].as_u64().unwrap() as u8, 100_000, None, params, h32(&m["constants_root"]), bounds, m["positions"].as_u64().unwrap()).await
+    }
+
+    /// Everything a refused submission must leave unchanged.
+    async fn snapshot(&mut self, d: Pubkey) -> (Vec<u8>, Vec<u8>, u64, u64, u64) {
+        let (dd, rr) = (self.account(d).await, self.account(self.run).await);
+        (dd.data, rr.data, dd.lamports + rr.lamports, self.lamports(kp(0xE1).pubkey()).await, self.lamports(kp(0xC1).pubkey()).await)
+    }
+}
+
+/// splitmix64, for the byte-level mutations (no dependency).
+struct Mix(u64);
+impl Mix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// Malformed variants of a staged submission: the play's structured
+/// mutations (each refused by the Python reference), then two single-byte
+/// flips and one truncation of the good bytes. A flip changes a hashed value,
+/// a length or a count, and a truncation drops a nonzero byte, so none of
+/// them can decode to an opening that verifies.
+fn malformed(p: &serde_json::Value, good: &[u8], encode: &dyn Fn(&serde_json::Value) -> Vec<u8>) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = p["mutations"].as_array().unwrap().iter().map(|m| (m["kind"].as_str().unwrap().to_string(), encode(&m["opening"]))).collect();
+    let mut rng = Mix(p["raw_seed"].as_u64().unwrap_or(p["index"].as_u64().unwrap()));
+    for _ in 0..2 {
+        let mut b = good.to_vec();
+        let i = rng.below(b.len());
+        b[i] ^= 1 + rng.below(255) as u8;
+        out.push((format!("flip byte {i}"), b));
+    }
+    if let Some(last) = good.iter().rposition(|&x| x != 0) {
+        let cut = rng.below(last + 1);
+        out.push((format!("truncate at {cut}"), good[..cut].to_vec()));
+    }
+    out
+}
+
+/// Stage each malformed variant over the whole used prefix (zero padded, so
+/// no earlier bytes survive) and check it is refused with nothing changed;
+/// then restage the good bytes.
+async fn refuse_all(ch: &mut Chain, d: Pubkey, role: u8, good: &[u8], bad: &[(String, Vec<u8>)], name: &str, output: bool) -> usize {
+    let mut used = good.len();
+    let before = ch.snapshot(d).await;
+    for (kind, bytes) in bad {
+        assert!(bytes.len() <= V::CREATE_STAGE, "{name}: {kind} fits the buffer");
+        let mut padded = bytes.clone();
+        padded.resize(used.max(bytes.len()), 0);
+        used = padded.len();
+        ch.write(d, role, 0, &padded).await.unwrap();
+        let r = if output { ch.output(d).await } else { ch.opening(d).await };
+        assert!(r.is_err(), "{name}: malformed opening ({kind}) was accepted");
+        assert!(ch.snapshot(d).await == before, "{name}: malformed opening ({kind}) changed state");
+    }
+    let mut padded = good.to_vec();
+    padded.resize(used, 0);
+    ch.write(d, role, 0, &padded).await.unwrap();
+    bad.len()
+}
+
+async fn fuzz_state(ch: &mut Chain, p: &serde_json::Value, name: &str) -> usize {
+    let d = to_leaf(ch, p, name).await;
+    let good = encode_replay(&p["opening"]);
+    ch.stage(d, V::ROLE_EXECUTOR, &good).await;
+    let bad = malformed(p, &good, &encode_replay);
+    let n = refuse_all(ch, d, V::ROLE_EXECUTOR, &good, &bad, name, false).await;
+    rule_and_check(ch, d, p, name, false).await;
+    n
+}
+
+async fn fuzz_output(ch: &mut Chain, p: &serde_json::Value, name: &str) -> usize {
+    ch.commit(&p["commitment"]).await.unwrap_or_else(|e| panic!("{name}: commit {e:?}"));
+    let d = ch.open_raw(3, &[LX::KIND_LX_OUTPUT]).await.unwrap_or_else(|e| panic!("{name}: open {e:?}"));
+    let roots = p["commitment"]["roots"].as_array().unwrap();
+    let mut head = h32(roots.last().unwrap()).to_vec();
+    head.extend(path(&ch.levels, ch.count - 1));
+    let encode = |o: &serde_json::Value| {
+        let mut v = head.clone();
+        v.extend(encode_opening(o));
+        v
+    };
+    let good = encode(&p["opening"]);
+    ch.stage(d, V::ROLE_CHALLENGER, &good).await;
+    let bad = malformed(p, &good, &encode);
+    let n = refuse_all(ch, d, V::ROLE_CHALLENGER, &good, &bad, name, true).await;
+    rule_and_check(ch, d, p, name, true).await;
+    n
+}
+
+/// One generated play through the program; returns the malformed openings refused.
+async fn fuzz_play(p: serde_json::Value) -> usize {
+    let name = format!("seed {} index {}: {}", p["seed"], p["index"], p["name"].as_str().unwrap());
+    let mut ch = Chain::for_play(&p).await;
+    match p["kind"].as_str().unwrap() {
+        "state" => fuzz_state(&mut ch, &p, &name).await,
+        "output" => fuzz_output(&mut ch, &p, &name).await,
+        k => panic!("{name}: unknown kind {k}"),
+    }
+}
+
+/// The fuzz campaign: every generated play through the program, its ruling
+/// and bond movement as the Python reference rules, and its malformed
+/// openings refused without changing state. Plays come from
+/// `PYTHONPATH=python python3 scripts/disputes_v21_lx_fuzz.py --seed S --count N`;
+/// run with `LX_FUZZ_PLAYS=<file>[,<file>...] cargo test ... -- --ignored lx_fuzz`.
+/// Each play has its own ProgramTest bank; `LX_FUZZ_JOBS` (default 12) of
+/// them run at once, since each mostly waits for new blockhashes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "fuzz campaign; needs LX_FUZZ_PLAYS"]
+async fn lx_fuzz_plays_rule_like_python() {
+    let files = std::env::var("LX_FUZZ_PLAYS").expect("LX_FUZZ_PLAYS=<plays.json>[,...]");
+    let jobs: usize = std::env::var("LX_FUZZ_JOBS").ok().map_or(12, |j| j.parse().unwrap());
+    let mut all = Vec::new();
+    for file in files.split(',') {
+        let data: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        all.extend(data["plays"].as_array().unwrap().iter().cloned());
+    }
+    let rulings_c = all.iter().filter(|p| p["ruling"] == "C").count();
+    let (plays, mut refused) = (all.len(), 0usize);
+    let mut set = tokio::task::JoinSet::new();
+    let mut queue = all.into_iter();
+    loop {
+        while set.len() < jobs {
+            match queue.next() {
+                Some(p) => {
+                    set.spawn(fuzz_play(p));
+                }
+                None => break,
+            }
+        }
+        match set.join_next().await {
+            Some(Ok(n)) => refused += n,
+            Some(Err(e)) => std::panic::resume_unwind(e.into_panic()),
+            None => break,
+        }
+    }
+    eprintln!("lx fuzz: {plays} plays ({} E, {rulings_c} C), {refused} malformed openings refused", plays - rulings_c);
 }
