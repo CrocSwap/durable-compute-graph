@@ -233,9 +233,12 @@ pub trait LxMachine {
     fn slots(&self, p: u64, i: u64, reads: &mut [u32], writes: &mut [u32]) -> Option<(usize, usize)>;
     /// Fill `out` with the `(constant_id, chunk_index)` reads of transition
     /// `(p, i)` and return their count, or `None` if they do not fit. A
-    /// machine without constants reads none.
-    fn constants(&self, p: u64, i: u64, out: &mut [(u32, u64)]) -> Option<usize> {
-        let _ = (p, i, out);
+    /// machine without constants reads none. `reads` holds the read slots'
+    /// values (as for `apply`), already verified against the agreed root, so
+    /// a read chosen by data (an embedding row by token) is still fixed by
+    /// the committed state, not by the executor.
+    fn constants(&self, p: u64, i: u64, reads: &[Option<&[u8]>], out: &mut [(u32, u64)]) -> Option<usize> {
+        let _ = (p, i, reads, out);
         Some(0)
     }
     /// Apply transition `(p, i)`: `reads` holds the read slots' values in the
@@ -327,21 +330,6 @@ pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
 ) -> Result<LxRuling, LxRefusal> {
     let (p, i) = locate(m, coordinate).ok_or(LxRefusal::Coordinate)?;
     let (nr, nw) = m.slots(p, i, s.reads, s.writes).ok_or(LxRefusal::Coverage)?;
-    // The constants are exactly the declared reads, in order, each verified.
-    let nc = m.constants(p, i, s.const_reads).ok_or(LxRefusal::Coverage)?;
-    if nc > s.const_reads.len() || s.const_values.len() < nc {
-        return Err(LxRefusal::Coverage); // a machine past its declared maximum (review L3)
-    }
-    if consts.len() != nc {
-        return Err(LxRefusal::Constant);
-    }
-    for (k, e) in consts.iter().enumerate() {
-        let (cid, index) = s.const_reads[k];
-        if !check_constant(h, cid, index, e, constants_root) {
-            return Err(LxRefusal::Constant);
-        }
-        s.const_values[k] = e.chunk;
-    }
     let (reads, writes) = (&s.reads[..nr], &s.writes[..nw]);
     // The opening covers exactly reads ∪ writes.
     let mut covered = 0usize;
@@ -366,6 +354,7 @@ pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
         if !siblings.is_empty() {
             return Err(LxRefusal::Proof);
         }
+        check_constants(h, m, p, i, &[], consts, constants_root, s.const_reads, s.const_values)?;
         return Ok(if root_lo == root_hi { LxRuling::Executor } else { LxRuling::Challenger });
     }
     let value = |slot: u32| opened.binary_search_by_key(&slot, |e| e.0).ok().map(|k| opened[k].1);
@@ -383,6 +372,9 @@ pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
     for k in 0..nr {
         s.read_values[k] = value(reads[k]).ok_or(LxRefusal::Coverage)?;
     }
+    // The constants are exactly the declared reads (a function of the
+    // verified read values), in order, each verified.
+    let nc = check_constants(h, m, p, i, &s.read_values[..nr], consts, constants_root, s.const_reads, s.const_values)?;
     for e in s.write_effects[..nw].iter_mut() {
         *e = Write::Keep;
     }
@@ -406,6 +398,38 @@ pub fn replay<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
     }
     let rebuilt = fold(h, m.height(), &mut s.nodes[..covered], siblings).ok_or(LxRefusal::Proof)?;
     Ok(if rebuilt == *root_hi { LxRuling::Executor } else { LxRuling::Challenger })
+}
+
+/// Check the opened constants against the machine's declared reads for
+/// transition `(p, i)` given its verified read values; returns their count
+/// with `const_values` filled.
+#[allow(clippy::too_many_arguments)]
+fn check_constants<'v, H: Sha256 + ?Sized, M: LxMachine + ?Sized>(
+    h: &H,
+    m: &M,
+    p: u64,
+    i: u64,
+    read_values: &[Option<&[u8]>],
+    consts: &[ConstOpening<'v>],
+    constants_root: &Hash,
+    const_reads: &mut [(u32, u64)],
+    const_values: &mut [&'v [u8]],
+) -> Result<usize, LxRefusal> {
+    let nc = m.constants(p, i, read_values, const_reads).ok_or(LxRefusal::Coverage)?;
+    if nc > const_reads.len() || const_values.len() < nc {
+        return Err(LxRefusal::Coverage); // a machine past its declared maximum (review L3)
+    }
+    if consts.len() != nc {
+        return Err(LxRefusal::Constant);
+    }
+    for (k, e) in consts.iter().enumerate() {
+        let (cid, index) = const_reads[k];
+        if !check_constant(h, cid, index, e, constants_root) {
+            return Err(LxRefusal::Constant);
+        }
+        const_values[k] = e.chunk;
+    }
+    Ok(nc)
 }
 
 /// The OUTPUT claim (design review H3): `opened` covers exactly `output_slots`

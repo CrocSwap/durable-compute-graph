@@ -528,6 +528,18 @@ async fn wrong_missing_or_reordered_constants_are_refused_and_the_executor_may_r
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn data_dependent_constant_reads_rule_like_python_in_both_role_orders() {
+    let g = golden();
+    let b = &g["by_value"];
+    let root = h32(&b["constants_root"]);
+    let params = hex(b["params"].as_str().unwrap());
+    for p in b["plays"].as_array().unwrap() {
+        let mut ch = Chain::new_full(p["arity"].as_u64().unwrap() as u8, 100_000, None, params.clone(), root).await;
+        check_play(&mut ch, p).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn constants_must_be_under_the_template_constants_root() {
     // The same weighted run on a template that commits other constants (here
     // none): no opening can verify, so the executor cannot answer and loses

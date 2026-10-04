@@ -100,7 +100,7 @@ impl LxMachine for Toy {
             return None;
         })
     }
-    fn constants(&self, p: u64, i: u64, out: &mut [(u32, u64)]) -> Option<usize> {
+    fn constants(&self, p: u64, i: u64, _reads: &[Option<&[u8]>], out: &mut [(u32, u64)]) -> Option<usize> {
         if !self.weights || i != 0 {
             return Some(0);
         }
@@ -420,7 +420,7 @@ fn weighted_replays_rule_like_python() {
     for w in &cases {
         let (p, i) = locate(&m, w.case.coordinate).unwrap();
         let mut reads = [(0u32, 0u64); 4];
-        let n = m.constants(p, i, &mut reads).unwrap();
+        let n = m.constants(p, i, &[], &mut reads).unwrap();
         assert_eq!(&reads[..n], &w.reads[..], "declared reads match Python");
         for (k, (cid, _)) in w.reads.iter().enumerate() {
             let digest = g["weighted"]["digests"][cid.to_string()].as_str().unwrap();

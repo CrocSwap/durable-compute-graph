@@ -103,6 +103,7 @@ def build() -> dict:
         })
     return {
         "weighted": build_weighted(),
+        "by_value": build_by_value(),
         "params": h(struct.pack("<QQq", P, W, H0)),
         "initial_root": h(L.state_root(tm, tm.initial_state())),
         "plays": plays,
@@ -176,6 +177,46 @@ def build_weighted() -> dict:
         "initial_root": h(L.state_root(tm, tm.initial_state())),
         "plays": plays,
     }
+
+
+def build_by_value() -> dict:
+    """Data-dependent constant reads: the start reads the chunk h selects. A
+    liar that read the next chunk, in both role orders."""
+    tm = ToyMachine(positions_count=P, window=W, h0=H0, weights=True, by_value=True)
+
+    class WrongChunk(ToyMachine):
+        def transition(self, p, i):
+            import dataclasses
+            t = super().transition(p, i)
+            if i == 0:
+                return dataclasses.replace(
+                    t, constants=lambda r, p=p: ((0, (struct.unpack("<q", r[self.H])[0] + 1) % 4), (2, p % 3)))
+            return t
+
+    honest = L.execute(tm)
+    liar = L.execute(WrongChunk(positions_count=P, window=W, h0=H0, weights=True, by_value=True))
+    liar.machine = tm
+    plays = []
+    for k, arity in ((1, 16), (4, 2)):
+        for name, executor, challenger in (("executor-lies", liar, honest), ("challenger-lies", honest, liar)):
+            com = L.commit(executor, k)
+            pair = L.first_disputed_pair(com, challenger)
+            d = L.Dispute(tm, com, arity)
+            d.open(pair)
+            rounds = []
+            while d.phase == L.PH_MIDPOINTS:
+                mids = L.executor_midpoints(executor, d)
+                d.commit_midpoints(mids)
+                pick = L.challenger_pick(challenger, d)
+                rounds.append({"midpoints": [h(r) for r in mids], "pick": pick})
+                d.pick(pick)
+            proof = L.executor_opening(executor, d)
+            ruling = d.submit_opening(proof)
+            plays.append({"name": f"by-value {name} k={k} a={arity}", "arity": arity,
+                          "commitment": commitment(executor, k), "pair": pair, "rounds": rounds,
+                          "terminal": d.lo, "opening": opening(proof), "ruling": ruling})
+    return {"params": h(struct.pack("<QQqB", P, W, H0, 2)), "constants_root": h(L.constants_root(tm)),
+            "plays": plays}
 
 
 if __name__ == "__main__":
