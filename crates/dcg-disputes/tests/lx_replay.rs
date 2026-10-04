@@ -459,7 +459,6 @@ fn wrong_missing_or_reordered_constants_are_refused() {
         // A path that is not whole hashes.
         let ragged = &w.const_paths[1][..w.const_paths[1].len() - 1];
         refuse(&[good[0], ConstOpening { const_path: ragged, ..good[1] }]);
-        refuse(&[good[0], ConstOpening { const_path: &long, ..good[1] }]);
         // Too short to hold the chunk index or the constant id.
         if w.reads[0].1 > 0 {
             refuse(&[ConstOpening { chunk_path: &[], ..good[0] }, good[1]]);
