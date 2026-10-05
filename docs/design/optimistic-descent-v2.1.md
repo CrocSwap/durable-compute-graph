@@ -870,14 +870,16 @@ recorded below with their implementation results.
   the ruled prefix has passed it; the run's lowest challenger win must also
   wait until the pot is paid. It closes the dispute's two staging buffers in
   the same instruction (so there is no separate `CLOSE_STAGING`). Each
-  buffer's creation rent goes to the party that created it, recorded in byte 5
-  of its header. The executor's buffer (role 1) is always created at
-  `CREATE_STAGE` bytes: when the challenger created it, the challenger gets
-  back exactly that creation rent and every lamport above it (growth the
-  executor paid to answer, or pre-funded lamports) goes to the executor. Before
-  the R2 fix (2026-10-05) the creator took the whole balance, so a losing
-  challenger could profit from the executor's growth rent. The challenger's own
-  buffer (role 2) returns whole to the challenger. The dispute's rent goes to
+  buffer's creator is recorded in byte 5 of its header. Anyone may pay for
+  growth (`STAGE_GROW`), and growth paid by the dispute party that did not
+  create the buffer is recorded in header bytes 44..48. At close that party
+  gets exactly its recorded growth back and every other lamport (creation
+  rent, anyone else's growth, pre-funding) goes to the creator. Nothing is
+  inferred from roles or from today's rent, so neither party can collect the
+  other's staging rent in any ending (R2 reviews 2026-10-05: before, the
+  creator took everything, so a losing challenger could profit from the
+  executor's growth; the first fix inferred the split from roles, which the
+  re-review showed leaked challenger-paid growth to the executor). The dispute's rent goes to
   the challenger. The run counts closed
   disputes in a former pad field.
 - **`CLOSE_RUN` (19).** A settled run (final, or refuted with the pot paid)
