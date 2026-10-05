@@ -1,6 +1,6 @@
 # Executor and watchtower services (alpha E3), design v1
 
-Status: proposal, 2026-10-05. Owner questions are in §7.
+Status: accepted, 2026-10-05. Owner answers (§7): Q1 (c), an application-supplied input source now and on-chain input posting before any mainnet use; Q2 (a), the watchtower handles descents only in v1.
 
 ## 1. Why
 
