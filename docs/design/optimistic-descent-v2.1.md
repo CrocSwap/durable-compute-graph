@@ -524,6 +524,32 @@ It refuses:
 - `kernel_step > 1` without a declared decomposition chain;
 - a `max_cu` above the program's replay budget (O2).
 
+**What the program checks at `CREATE_TEMPLATE` (skeleton, owner decisions
+2026-10-05, R2 reviews A and B).** The `spec_root` and everything under it is
+trusted from the admitter (O1); the program enforces only what it can see:
+- a challenge window of at least `MIN_PHASE_WINDOW` (750 slots) and at most
+  `MAX_WINDOW` (a shorter window makes a run effectively undisputable), the
+  phase window in the same range, nonzero bonds and a nonzero slasher share;
+- **one encoding per template**, so one template has one id: a single block
+  equal to the default block is written as no blocks; bytes a block parser
+  ignores (38..40, 65..104, and a kind-1 block's gate fields) are zero; an LX1
+  template's unused skeleton fields are fixed (depth 1, spec bases 0, plan id
+  0).
+Inconsistent spec bases, leaf indices past the spec tree, and a zero
+`total_outputs` mismatch remain admitter promises (review A-M2); `explain()`
+should surface them.
+
+**Kernel binding (alpha limit, owner 2026-10-05, review A-M1).** The skeleton
+template id does not commit to the program image or its kernel manifest:
+kernels are resolved by id and versions when a dispute replays a step. An
+image upgrade that removes or changes a kernel can therefore change the ruling
+of a run already in flight. For the alpha: **no kernel change while any run on
+the image is live** (drain first), built-in reductions and kernels bind only
+at version (1, 1), and an application manifest may not name a kernel after a
+built-in (`ManifestError::BuiltinKernelCollision`). Binding a manifest digest
+in the template is the planned fix (the `app_image_id` /
+`kernel_manifest_root` fields of §12).
+
 An admission cursor computes `spec_root` over several transactions. It keeps
 a scratch producer index and a streaming tree frontier. Enumerated blocks
 cost at most 16,384 steps each (*estimated*: under 30 transactions). Repeated
@@ -844,9 +870,15 @@ recorded below with their implementation results.
   the ruled prefix has passed it; the run's lowest challenger win must also
   wait until the pot is paid. It closes the dispute's two staging buffers in
   the same instruction (so there is no separate `CLOSE_STAGING`). Each
-  buffer's rent goes to the party that created it, recorded in byte 5 of its
-  header; growth funders are not recorded and are refunded through the
-  creator. The dispute's rent goes to the challenger. The run counts closed
+  buffer's creation rent goes to the party that created it, recorded in byte 5
+  of its header. The executor's buffer (role 1) is always created at
+  `CREATE_STAGE` bytes: when the challenger created it, the challenger gets
+  back exactly that creation rent and every lamport above it (growth the
+  executor paid to answer, or pre-funded lamports) goes to the executor. Before
+  the R2 fix (2026-10-05) the creator took the whole balance, so a losing
+  challenger could profit from the executor's growth rent. The challenger's own
+  buffer (role 2) returns whole to the challenger. The dispute's rent goes to
+  the challenger. The run counts closed
   disputes in a former pad field.
 - **`CLOSE_RUN` (19).** A settled run (final, or refuted with the pot paid)
   whose disputes are all closed shrinks to its receipt, and anyone may send
