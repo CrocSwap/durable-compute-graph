@@ -2684,3 +2684,11 @@ async fn staging_growth_returns_to_whoever_paid_it_in_every_ending() {
         assert_eq!((c_gain, e_gain), (want_c, want_e), "creator {creator:#x} funder {funder:#x} executor_wins {executor_wins}");
     }
 }
+
+/// The growth record (u32 lamports) holds a full 128 KiB buffer's rent at
+/// default rent with room to spare; it saturates rather than refusing growth.
+#[test]
+fn the_growth_record_fits_the_largest_buffer() {
+    let rent = solana_program::rent::Rent::default().minimum_balance(V::STAGE_HEADER + V::MAX_STAGE);
+    assert!(rent * 4 < u32::MAX as u64, "{rent}");
+}

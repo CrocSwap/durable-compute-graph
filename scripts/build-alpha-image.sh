@@ -13,6 +13,7 @@ OUT=${1:?usage: $0 OUT_DIR}
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 TOOLS=v1.51
 FEATURES=alpha-image
+git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || { echo "not a git checkout: $ROOT" >&2; exit 2; }
 # Every build input: the crates, the workspace manifest and lockfile, and the
 # pinned toolchain (re-review L5).
 if [ -n "$(git -C "$ROOT" status --porcelain -- crates Cargo.toml Cargo.lock rust-toolchain.toml)" ]; then

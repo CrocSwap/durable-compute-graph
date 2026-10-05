@@ -68,9 +68,11 @@ pub const SUB_PAY_POT: u8 = 13;
 pub const SUB_STAGE_CREATE: u8 = 14;
 pub const SUB_STAGE_WRITE: u8 = 15;
 
-/// Staging buffer "D21S" (design §8.2): magic(4) role(1) pad(3) dispute(32)
-/// len:u32 pad(4) then the staged bytes. PDA ["dcg21stg", dispute, role].
-/// Role 1 is E's buffer, role 2 is C's; C funds both at creation. A reveal or
+/// Staging buffer "D21S" (design §8.2): magic(4) role(1) creator(1: 0 C, 1 E)
+/// pad(2) dispute(32) len:u32 other_growth:u32 (lamports of growth paid by the
+/// party that did not create it) then the staged bytes. PDA ["dcg21stg",
+/// dispute, role]. Role 1 is E's buffer, role 2 is C's; C may create either,
+/// E its own. A reveal or
 /// claim whose data is the single byte `FROM_STAGING` reads its bytes from
 /// the party's buffer instead of the instruction. Skeleton: one CPI
 /// creation, so at most `MAX_STAGE` bytes (growth comes later).
@@ -1225,8 +1227,10 @@ fn stage_grow(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
         invoke(&system_instruction::transfer(funder.key, buffer.key, need), &[funder.clone(), buffer.clone(), system.clone()])?;
         if by_other {
             let mut b = buffer.try_borrow_mut_data()?;
+            // Saturating: growth is never refused for the record's sake (a
+            // 128 KiB buffer's rent is far below u32::MAX at current rent).
             let paid = u32_at(&b, STAGE_OTHER_GROWTH)? as u64;
-            let paid = u32::try_from(paid.checked_add(need).ok_or(err(8))?).map_err(|_| err(8))?;
+            let paid = u32::try_from(paid.saturating_add(need)).unwrap_or(u32::MAX);
             b[STAGE_OTHER_GROWTH..STAGE_OTHER_GROWTH + 4].copy_from_slice(&paid.to_le_bytes());
         }
     }
@@ -2193,9 +2197,9 @@ fn settled(r: &[u8]) -> bool {
 // executor buffer(w), challenger buffer(w)]. A ruled or moot dispute whose
 // sequence the ruled prefix has passed (so `advance` no longer needs it), and,
 // if it is the run's lowest challenger win, after the pot is paid. Closes both
-// staging buffers if they exist (creation rent to the party that created
-// them; growth of the executor's buffer to the executor) and the dispute (its
-// rent to the challenger).
+// staging buffers if they exist (each one's recorded non-creator growth to
+// that party, the rest to its creator) and the dispute (its rent to the
+// challenger).
 fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [_caller, run, tmpl, dispute, challenger, executor, buffer_e, buffer_c, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
