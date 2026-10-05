@@ -295,3 +295,31 @@ class LxClient(DisputeClient):
         if res["terminal"] != play["terminal"]:
             raise RuntimeError(f"terminal {res['terminal']} is not the recorded {play['terminal']}")
         return res
+
+
+def replay_opening_bytes(proof: "L.MultiProof") -> bytes:
+    """The staged LX1 replay opening the program decodes (`decode_opening`
+    then `decode_constants`): `n (slot present [len bytes])* s hash*` then
+    `n (len chunk cn chunk_path digest kn const_path)*`."""
+    out = struct.pack("<I", len(proof.values))
+    for slot in sorted(proof.values):
+        value = proof.values[slot]
+        out += struct.pack("<I", slot)
+        out += b"\x00" if value is None else b"\x01" + struct.pack("<I", len(value)) + value
+    out += struct.pack("<I", len(proof.siblings)) + b"".join(proof.siblings[k] for k in sorted(proof.siblings))
+    out += struct.pack("<I", len(proof.constants))
+    for c in proof.constants:
+        out += struct.pack("<I", len(c.chunk)) + c.chunk
+        out += bytes([len(c.chunk_path)]) + b"".join(c.chunk_path) + c.digest
+        out += bytes([len(c.const_path)]) + b"".join(c.const_path)
+    return out
+
+
+def executor_opening_bytes(run: "L.Execution", coordinate: int) -> bytes:
+    """The executor's opening of the transition at `coordinate` from its own
+    execution (`lx.executor_opening` without a dispute object)."""
+    machine = run.machine
+    t = L.Schedule(machine).transition(coordinate)
+    proof = L.prove(machine, run.states[coordinate], sorted(set(t.reads) | set(t.writes)))
+    return replay_opening_bytes(L.MultiProof(proof.values, proof.siblings,
+                                             L.open_constants(machine, t, run.states[coordinate])))

@@ -198,3 +198,16 @@ if __name__ == "__main__":
     print("The executor service is configured in Python (plans and keys); see "
           "examples/services/ and docs/design/executor-watchtower-v1.md.", file=sys.stderr)
     raise SystemExit(2)
+
+
+class ExecutionAnswerer:
+    """An `LxAnswerer` over an `lx.Execution` (the executor's own run)."""
+
+    def __init__(self, execution, params: bytes, arity: int):
+        self.execution, self.params, self.arity = execution, params, arity
+
+    def roots(self, coordinates: list[int]) -> list[bytes]:
+        return [self.execution.root_at(c) for c in coordinates]
+
+    def opening(self, coordinate: int) -> bytes:
+        return LX.executor_opening_bytes(self.execution, coordinate)
