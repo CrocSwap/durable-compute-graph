@@ -78,7 +78,7 @@ and magic alone where it matters. **R2 is complete.**
 - Admission, the template lifecycle, and every other handler the shared program exposes each get an independent adversarial review (Basanos project rule 10).
 - That includes the staging-buffer question from finding F10: does any handler accept an account by owner and magic alone?
 
-**R3. Put the reviewed image on the shared testnet program.** It runs `7b04f8d5` today, which is pre-review.
+**R3. Put the reviewed image on the shared testnet program.** **Done 2026-10-05** (owner: a fresh address): `J9Eje75v3AgEUZZPJJTJNqKmVxiAjhRhQ7iKYBRo1Hi9` runs the alpha image `e63816cb…` (DCG 69fe0a1; reproducible build; routing and a chunked-kernel dispute measured on chain; `docs/hello-graph.md`). The older test image `FCzAE7…` (`7b04f8d5`) remains for v2.0 and internal replays.
 - Upgrade it to the reviewed image and record the image hash.
 - Publish an upgrade policy: runs created before an upgrade that changes addresses must drain first.
 - Set fee, rent and abuse limits.
