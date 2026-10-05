@@ -133,26 +133,6 @@ class LxClient(DisputeClient):
         self.commit(run, template, bytes(root) + tree_path(levels, 0) + params, executor)
         return levels
 
-    def _stage(self, run: Pubkey, template: Pubkey, dispute: Pubkey, role: int, body: bytes, writer: Keypair,
-               funder: Keypair) -> Pubkey:
-        buffer = self.pda(b"dcg21stg", bytes(dispute), bytes([role]))
-        created = CREATE_STAGE if role == ROLE_EXECUTOR else min(len(body), CREATE_STAGE)
-        grow = [AccountMeta(funder.pubkey(), True, True), AccountMeta(run, False, False),
-                AccountMeta(template, False, False), AccountMeta(dispute, False, False),
-                AccountMeta(buffer, False, True), AccountMeta(SYSTEM, False, False)]
-        self._send("stage_create", bytes([role]) + struct.pack("<I", created), grow, [funder])
-        size = created
-        while size < len(body):
-            add = min(len(body) - size, 10_240)
-            self._send("stage_grow", struct.pack("<I", add), grow, [funder])
-            size += add
-        write = [AccountMeta(writer.pubkey(), True, False), AccountMeta(run, False, False),
-                 AccountMeta(template, False, False), AccountMeta(dispute, False, False),
-                 AccountMeta(buffer, False, True)]
-        self._send_many([("stage_write", struct.pack("<I", at) + body[at:at + STAGE_PIECE], write, [writer])
-                         for at in range(0, len(body), STAGE_PIECE)])
-        return buffer
-
     def lx_prestage(self, run: Pubkey, template: Pubkey, dispute: Pubkey, nonce: bytes, body: bytes,
                     challenger: Keypair, secret: bytes) -> Pubkey:
         """Stage an OPEN body (without its kind byte), masked with `secret`, in
@@ -315,3 +295,31 @@ class LxClient(DisputeClient):
         if res["terminal"] != play["terminal"]:
             raise RuntimeError(f"terminal {res['terminal']} is not the recorded {play['terminal']}")
         return res
+
+
+def replay_opening_bytes(proof: "L.MultiProof") -> bytes:
+    """The staged LX1 replay opening the program decodes (`decode_opening`
+    then `decode_constants`): `n (slot present [len bytes])* s hash*` then
+    `n (len chunk cn chunk_path digest kn const_path)*`."""
+    out = struct.pack("<I", len(proof.values))
+    for slot in sorted(proof.values):
+        value = proof.values[slot]
+        out += struct.pack("<I", slot)
+        out += b"\x00" if value is None else b"\x01" + struct.pack("<I", len(value)) + value
+    out += struct.pack("<I", len(proof.siblings)) + b"".join(proof.siblings[k] for k in sorted(proof.siblings))
+    out += struct.pack("<I", len(proof.constants))
+    for c in proof.constants:
+        out += struct.pack("<I", len(c.chunk)) + c.chunk
+        out += bytes([len(c.chunk_path)]) + b"".join(c.chunk_path) + c.digest
+        out += bytes([len(c.const_path)]) + b"".join(c.const_path)
+    return out
+
+
+def executor_opening_bytes(run: "L.Execution", coordinate: int) -> bytes:
+    """The executor's opening of the transition at `coordinate` from its own
+    execution (`lx.executor_opening` without a dispute object)."""
+    machine = run.machine
+    t = L.Schedule(machine).transition(coordinate)
+    proof = L.prove(machine, run.states[coordinate], sorted(set(t.reads) | set(t.writes)))
+    return replay_opening_bytes(L.MultiProof(proof.values, proof.siblings,
+                                             L.open_constants(machine, t, run.states[coordinate])))

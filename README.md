@@ -90,6 +90,8 @@ Declare the manifest with `KernelDecl` and check the kernel against its Python
 mirror with the kernel kit ([`docs/kernel-kit.md`](docs/kernel-kit.md)).
 To embed the stateful runtime in your own program and run a session, follow
 [`docs/session-quickstart.md`](docs/session-quickstart.md).
+To answer disputes and watch runs in optimistic mode, run the executor
+service and a watchtower ([`docs/services.md`](docs/services.md)).
 
 `Kernel::execute` accepts authenticated canonical bytes and writes canonical
 output bytes. Stateful kernels may additionally implement `StatefulKernel`;

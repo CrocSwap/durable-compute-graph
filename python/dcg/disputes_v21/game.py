@@ -616,31 +616,38 @@ def honest_challenge(record: RunRecord, executor: Executor, honest: R.Commitment
             raise AssertionError("no differing child under a differing node")
         dispute.pick(diff[0])
     dispute.reveal_leaf(executor.leaf(dispute), executor.lists(dispute))
+    name, kw = honest_claim(record, executor, honest, dispute)
+    dispute.claim(name, **kw)
+    return dispute
+
+
+def honest_claim(record: RunRecord, executor, honest: R.Commitment, dispute: Dispute) -> tuple[str, dict]:
+    """The first-divergence challenger's claim at a dispute whose leaf is
+    revealed: its name and arguments (not yet ruled). `executor` supplies
+    `leaf_opening(ordinal)`: the executor itself offline, or a watchtower's
+    committed view of the descent (dcg.services.view)."""
+    kind = dispute.kind
     sp = record.spec
     if kind == "OUT_DESCEND":
         j = dispute.position
         pk, a, _b, c, _d = S.decode_producer(sp.out_specs[j][32:56])
         extra = (_kind6_args(record, executor, honest, a, c) if pk == 6
                  else {"producer_opening": executor.leaf_opening(a)})
-        dispute.claim("OUT", spec_opening=spec_opening(sp, sp.out_leaf_index(j)), **extra)
-        return dispute
+        return "OUT", {"spec_opening": spec_opening(sp, sp.out_leaf_index(j)), **extra}
     k = dispute.ordinal
     bi, block, it, _e = sp.locate(k)
     opening = spec_opening(sp, sp.step_leaf_index(k))
     mine_raw = honest.leaves[k]
     if dispute.leaf is None or mine_raw is None:
         if not sp.gated(k):
-            dispute.claim("SHAPE", spec_opening=opening)
-            return dispute
+            return "SHAPE", {"spec_opening": opening}
         g = sp.ordinal_of(bi, it - 1, block.gate_entry)
-        dispute.claim("GATE", spec_opening=opening, gate_opening=executor.leaf_opening(g),
-                      gate_value=honest.values.get((g, block.gate_port)))
-        return dispute
+        return "GATE", {"spec_opening": opening, "gate_opening": executor.leaf_opening(g),
+                        "gate_value": honest.values.get((g, block.gate_port))}
     d = S.decode_step_spec(sp.step_spec(k))
     leaf = R.parse_leaf(dispute.leaf)
     if leaf is None or dispute._shape_wrong(leaf, d, k):
-        dispute.claim("SHAPE", spec_opening=opening)
-        return dispute
+        return "SHAPE", {"spec_opening": opening}
     mine = R.parse_leaf(mine_raw)
     for i, (got, want) in enumerate(zip(leaf.inputs, mine.inputs)):
         if got != want:
@@ -656,14 +663,11 @@ def honest_challenge(record: RunRecord, executor: Executor, honest: R.Commitment
                 extra = _kind6_args(record, executor, honest, a, c)
             elif pk == S.PRODUCER_LIST:
                 extra = list_edge_args(record, executor, dispute, honest, k, i, a)
-            dispute.claim("EDGE", spec_opening=opening, index=i, **extra)
-            return dispute
+            return "EDGE", {"spec_opening": opening, "index": i, **extra}
     if leaf.prior != mine.prior:
         pk, a, *_ = S.decode_producer(d["state_predecessor"])
-        dispute.claim("STATE", spec_opening=opening,
-                      producer_opening=executor.leaf_opening(a) if pk == 1 else None)
-        return dispute
+        return "STATE", {"spec_opening": opening,
+                         "producer_opening": executor.leaf_opening(a) if pk == 1 else None}
     witness = [honest_value(honest, sp, prod) for _h, prod, _i in d["inputs"]]
     state_witness = honest_state_witness(honest, d)
-    dispute.claim("STEP", spec_opening=opening, witness=witness, state_witness=state_witness)
-    return dispute
+    return "STEP", {"spec_opening": opening, "witness": witness, "state_witness": state_witness}

@@ -29,6 +29,7 @@ SUB = {"create_template": 1, "init_run": 2, "commit": 3, "open": 4, "reveal_node
        "stage_write": 15, "stage_grow": 17, "close_dispute": 18, "close_run": 19, "close_cache": 20,
        "close_template": 21, "retire_template": 22, "timeout": 9, "moot": 12}
 RUN_OPEN, RUN_COMMITTED, RUN_FINAL, RUN_REFUTED = 0, 1, 2, 3
+SUB_CACHE_ANSWER = 16
 # Run, dispute and cache layouts (disputes_v21.rs).
 R_STATUS, R_TEMPLATE, R_PAYER, R_EXECUTOR, R_DEADLINE, R_OPEN = 4, 8, 40, 72, 144, 152
 R_SEQ, R_PREFIX, R_BEST, R_PAID, R_CLOSED = 160, 168, 176, 184, 188
@@ -45,6 +46,7 @@ LIST_HEAP_FRAME = 256 * 1024
 # body keeps it under the 1,232-byte transaction limit.
 STAGE_PIECE = 600
 CREATE_STAGE = 10_240 - 48  # one CPI creation; larger buffers are grown
+STAGE_HEADER = 48
 SYSTEM = Pubkey.from_string("11111111111111111111111111111111")
 RULINGS = {0: "open", 1: "E", 2: "C", 3: "moot"}
 
@@ -52,6 +54,19 @@ RULINGS = {0: "open", 1: "E", 2: "C", 3: "moot"}
 def _list_step_heap_frame(leaf: bytes) -> int | None:
     """Request the expanded SVM heap for a staged list-input leaf."""
     return LIST_HEAP_FRAME if leaf.startswith(b"LVR1") else None
+
+
+def program_tx_keys(tx: dict, program_id: Pubkey) -> list[str]:
+    """The account keys of a `getTransaction` (json) result that invokes
+    `program_id`, including lookup-table accounts; [] for any other
+    transaction (so unrelated transactions naming an account are skipped)."""
+    keys = list(tx["transaction"]["message"]["accountKeys"])
+    loaded = (tx.get("meta") or {}).get("loadedAddresses") or {}
+    keys += list(loaded.get("writable", [])) + list(loaded.get("readonly", []))
+    program = str(program_id)
+    if not any(keys[ix["programIdIndex"]] == program for ix in tx["transaction"]["message"]["instructions"]):
+        return []
+    return keys
 
 
 class DisputeClient:
@@ -211,6 +226,45 @@ class DisputeClient:
         return {"ruling": ruling, "transactions": self.sent - sent0, "wall_s": round(time.monotonic() - t0, 1),
                 "dispute": str(dispute)}
 
+    def stage_body(self, run: Pubkey, template: Pubkey, dispute: Pubkey, role: int, body: bytes, writer: Keypair,
+                   funder: Keypair) -> Pubkey:
+        """Create (or resume) a dispute's staging buffer for `role`, grow it to
+        fit, and write `body` into it; `funder` pays any rent it adds. Returns
+        the buffer. Resumable: a buffer that already exists (left by an
+        interrupted attempt, or created by the other party, which the program
+        allows) is checked and reused, and every piece is rewritten (writes
+        are idempotent; only the role's own party may write)."""
+        buffer = self.pda(b"dcg21stg", bytes(dispute), bytes([role]))
+        grow = [AccountMeta(funder.pubkey(), True, True), AccountMeta(run, False, False),
+                AccountMeta(template, False, False), AccountMeta(dispute, False, False),
+                AccountMeta(buffer, False, True), AccountMeta(SYSTEM, False, False)]
+        existing = self.gc.account(buffer)
+        if existing is None:
+            created = CREATE_STAGE if role == ROLE_EXECUTOR else min(len(body), CREATE_STAGE)
+            try:
+                self._send("stage_create", bytes([role]) + struct.pack("<I", created), grow, [funder])
+            except ChainError:
+                existing = self.gc.account(buffer)  # it may have landed late, or been created meanwhile
+                if existing is None:
+                    raise
+            existing = existing if existing is not None else self.gc.account(buffer)
+        if existing is None or existing[:4] != b"D21S" or existing[4] != role or existing[8:40] != bytes(dispute):
+            raise RuntimeError(f"staging buffer {buffer} is not this dispute's role-{role} buffer")
+        size = len(existing) - STAGE_HEADER
+        while size < len(body):
+            add = min(len(body) - size, 10_240)
+            self._send("stage_grow", struct.pack("<I", add), grow, [funder])
+            size += add
+        write = [AccountMeta(writer.pubkey(), True, False), AccountMeta(run, False, False),
+                 AccountMeta(template, False, False), AccountMeta(dispute, False, False),
+                 AccountMeta(buffer, False, True)]
+        self._send_many([("stage_write", struct.pack("<I", at) + body[at:at + STAGE_PIECE], write, [writer])
+                         for at in range(0, len(body), STAGE_PIECE)])
+        return buffer
+
+    # The LX client's name for it.
+    _stage = stage_body
+
     def run_status(self, run: Pubkey) -> int:
         """A live run's or a receipt's status byte (both keep it at byte 4)."""
         data = self.gc.account(run)
@@ -279,10 +333,11 @@ class DisputeClient:
     # --- the whole lifecycle -------------------------------------------------------------
 
     def accounts_touching(self, run: Pubkey) -> list[Pubkey]:
-        """Every account named by a transaction that touched the run, from
-        the run's signature history (``getProgramAccounts`` is often disabled
-        on public RPC nodes). Disputes and reveal caches are always written
-        in a transaction that names their run."""
+        """Every account named by a tag-227 transaction that touched the run,
+        from the run's signature history (``getProgramAccounts`` is often
+        disabled on public RPC nodes). Disputes and reveal caches are always
+        written in a transaction that names their run. Includes accounts
+        loaded through address lookup tables."""
         sigs, before = [], None
         while True:
             opts = {"limit": 1000, "commitment": "confirmed", **({"before": before} if before else {})}
@@ -301,8 +356,9 @@ class DisputeClient:
         keys: dict[str, None] = {}
         with ThreadPoolExecutor(max_workers=8) as pool:
             for tx in pool.map(fetch, sigs):
-                if tx is not None:
-                    keys.update(dict.fromkeys(tx["transaction"]["message"]["accountKeys"]))
+                if tx is None:
+                    raise ChainError("a transaction of the run's history is not yet readable; retry")
+                keys.update(dict.fromkeys(program_tx_keys(tx, self.gc.program_id)))
         return [Pubkey.from_string(k) for k in keys]
 
     def runs_of(self, template: Pubkey) -> list[Pubkey]:
@@ -412,7 +468,7 @@ class DisputeClient:
         return None
 
     def settle_and_reclaim(self, run: Pubkey, *, timeouts: bool = True, wait: float = 0.0,
-                           max_steps: int = 256) -> dict:
+                           max_steps: int = 256, candidates: list[Pubkey] | None = None) -> dict:
         """Take a run as far through its lifecycle as the chain allows, and
         reclaim every rent it can (alpha plan E4).
 
@@ -424,16 +480,34 @@ class DisputeClient:
         its receipt (or cancel an expired uncommitted run). Anyone may send
         each step; rent goes where the program sends it, not to the caller.
 
+        ``candidates``: the run's known accounts (disputes, caches); by
+        default they are found from the run's signature history.
+
         With ``wait`` > 0, sleeps and retries while the next step is behind
         a deadline, for at most ``wait`` seconds. Returns the steps taken and
         the run's state: ``closed`` (a receipt with nothing left),
-        ``waiting`` (with the reason) or ``stuck``.
+        ``waiting`` (with the reason), ``partial`` (``max_steps`` reached;
+        call again) or ``stuck``.
         """
         steps: list[str] = []
         give_up = time.monotonic() + wait
-        candidates = self.accounts_touching(run)
+        # Callers that already track the run's accounts (the services) pass
+        # them, so a settle does not rescan the run's whole history.
+        candidates = self.accounts_touching(run) if candidates is None else candidates
+        refused = 0
         while len(steps) < max_steps:
-            step = self._settle_once(run, timeouts, candidates)
+            try:
+                step = self._settle_once(run, timeouts, candidates)
+            except ChainError as exc:
+                # Anyone may settle: another party's step may land between our
+                # read and our send (for example RulingOutOfOrder after its
+                # advance). Re-read and continue; give up after three in a row.
+                refused += 1
+                if refused >= 3:
+                    return {"state": "stuck", "reason": str(exc).splitlines()[-1].strip(), "steps": steps}
+                time.sleep(1.0)
+                continue
+            refused = 0
             if step is None:
                 data = self.gc.account(run)
                 state = "closed" if data is None or data[:4] == b"D21P" else "stuck"
@@ -444,4 +518,4 @@ class DisputeClient:
                 time.sleep(2.0)
                 continue
             steps.append(step)
-        return {"state": "stuck", "reason": f"more than {max_steps} steps", "steps": steps}
+        return {"state": "partial", "reason": f"stopped after {max_steps} steps; call again", "steps": steps}
