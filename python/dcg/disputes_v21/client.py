@@ -8,6 +8,7 @@ buffers, as the program's oracle test does.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import struct
 import time
@@ -26,8 +27,15 @@ TAG = 227
 SUB = {"create_template": 1, "init_run": 2, "commit": 3, "open": 4, "reveal_nodes": 5, "pick": 6,
        "reveal_leaf": 7, "claim": 8, "finalize": 10, "advance": 11, "pay_pot": 13, "stage_create": 14,
        "stage_write": 15, "stage_grow": 17, "close_dispute": 18, "close_run": 19, "close_cache": 20,
-       "close_template": 21, "retire_template": 22}
-RUN_COMMITTED, RUN_FINAL, RUN_REFUTED = 1, 2, 3
+       "close_template": 21, "retire_template": 22, "timeout": 9, "moot": 12}
+RUN_OPEN, RUN_COMMITTED, RUN_FINAL, RUN_REFUTED = 0, 1, 2, 3
+# Run, dispute and cache layouts (disputes_v21.rs).
+R_STATUS, R_TEMPLATE, R_PAYER, R_EXECUTOR, R_DEADLINE, R_OPEN = 4, 8, 40, 72, 144, 152
+R_SEQ, R_PREFIX, R_BEST, R_PAID, R_CLOSED = 160, 168, 176, 184, 188
+D_PHASE, D_RULING, D_DEADLINE, D_CHALLENGER, D_RUN, D_SEQ = 4, 6, 24, 32, 64, 136
+PH_RULED, RULING_OPEN, RULING_CHALLENGER = 5, 0, 2
+CACHE_BYTES = 56 + 32 * 32
+CACHE_BYTES_V2 = CACHE_BYTES + 32
 RECEIPT_BYTES = 136 + 176  # a closed run: its first 136 bytes, then its root
 KIND = {"STEP_DESCEND": 1, "OUT_DESCEND": 2}
 ROLE_EXECUTOR, ROLE_CHALLENGER, FROM_STAGING = 1, 2, 0xFF
@@ -267,3 +275,173 @@ class DisputeClient:
         if self.run_status(run) == RUN_REFUTED:
             self.pay_pot(run, template, dispute, challenger, payer)
         self.close_dispute(run, template, dispute, challenger, executor)
+
+    # --- the whole lifecycle -------------------------------------------------------------
+
+    def accounts_touching(self, run: Pubkey) -> list[Pubkey]:
+        """Every account named by a transaction that touched the run, from
+        the run's signature history (``getProgramAccounts`` is often disabled
+        on public RPC nodes). Disputes and reveal caches are always written
+        in a transaction that names their run."""
+        sigs, before = [], None
+        while True:
+            opts = {"limit": 1000, "commitment": "confirmed", **({"before": before} if before else {})}
+            page = self.gc.rpc("getSignaturesForAddress", [str(run), opts])
+            # A failed transaction created nothing.
+            sigs += [p["signature"] for p in page if p.get("err") is None]
+            if len(page) < 1000:
+                break
+            before = page[-1]["signature"]
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fetch(sig: str):
+            return self.gc.rpc("getTransaction", [sig, {"encoding": "json", "commitment": "confirmed",
+                                                        "maxSupportedTransactionVersion": 0}])
+
+        keys: dict[str, None] = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for tx in pool.map(fetch, sigs):
+                if tx is not None:
+                    keys.update(dict.fromkeys(tx["transaction"]["message"]["accountKeys"]))
+        return [Pubkey.from_string(k) for k in keys]
+
+    def runs_of(self, template: Pubkey) -> list[Pubkey]:
+        """The live runs (not receipts) of a template, from its signature
+        history: every run's creation names its template."""
+        return [k for k, d in self._program_accounts(self.accounts_touching(template))
+                if d[:4] == b"D21R" and d[R_TEMPLATE:R_TEMPLATE + 32] == bytes(template)]
+
+    def _program_accounts(self, keys: list[Pubkey]) -> list[tuple[Pubkey, bytes]]:
+        out = []
+        for at in range(0, len(keys), 100):
+            batch = keys[at:at + 100]
+            values = self.gc.rpc("getMultipleAccounts", [[str(k) for k in batch],
+                                                         {"encoding": "base64", "commitment": "confirmed"}])["value"]
+            for key, v in zip(batch, values):
+                if v is not None and v["owner"] == str(self.gc.program_id):
+                    out.append((key, base64.b64decode(v["data"][0])))
+        return out
+
+    def disputes_of(self, run: Pubkey, candidates: list[Pubkey]) -> list[tuple[Pubkey, bytes]]:
+        """The live disputes of a run among the candidate accounts, by sequence."""
+        out = [(k, d) for k, d in self._program_accounts(candidates)
+               if d[:4] == b"D21D" and d[D_RUN:D_RUN + 32] == bytes(run)]
+        return sorted(out, key=lambda kd: struct.unpack_from("<Q", kd[1], D_SEQ)[0])
+
+    def caches_of(self, run: Pubkey, candidates: list[Pubkey]) -> list[tuple[Pubkey, bytes]]:
+        """The live reveal caches of a run among the candidates. A cache does
+        not record its run, so each is matched by re-deriving its address."""
+        return [(k, d) for k, d in self._program_accounts(candidates)
+                if d[:4] == b"D21C" and len(d) in (CACHE_BYTES, CACHE_BYTES_V2)
+                and self.pda(b"dcg21rc", bytes(run), d[4:5], d[8:12], d[16:24]) == k]
+
+    def _settle_once(self, run: Pubkey, timeouts: bool, candidates: list[Pubkey]) -> str | None:
+        """Send the next lifecycle step a run allows, and name it. Returns
+        None when nothing is left, or ``wait: ...`` when the next step needs
+        a deadline to pass."""
+        r = self.gc.account(run)
+        if r is None:
+            return None
+        u64 = lambda d, at: struct.unpack_from("<Q", d, at)[0]  # noqa: E731
+        u32 = lambda d, at: struct.unpack_from("<I", d, at)[0]  # noqa: E731
+        receipt = r[:4] == b"D21P"
+        executor = Pubkey.from_bytes(r[R_EXECUTOR:R_EXECUTOR + 32])
+        if receipt:
+            for cache, k in self.caches_of(run, candidates):
+                payee = Pubkey.from_bytes(k[CACHE_BYTES:]) if len(k) == CACHE_BYTES_V2 else executor
+                self.close_cache(run, cache, payee)
+                return f"close_cache {cache}"
+            return None
+        template = Pubkey.from_bytes(r[R_TEMPLATE:R_TEMPLATE + 32])
+        payer = Pubkey.from_bytes(r[R_PAYER:R_PAYER + 32])
+        status, now = r[R_STATUS], self.gc.slot()
+        deadline = u64(r, R_DEADLINE)
+        if status == RUN_OPEN:
+            if now <= deadline:
+                return f"wait: uncommitted until slot {deadline}"
+            self.close_run(run, template, payer)
+            return "close_run (cancelled: never committed)"
+        disputes = self.disputes_of(run, candidates)
+        best, prefix, paid = u64(r, R_BEST), u64(r, R_PREFIX), r[R_PAID]
+        for dispute, d in disputes:
+            if d[D_RULING] != RULING_OPEN:
+                continue
+            challenger = Pubkey.from_bytes(d[D_CHALLENGER:D_CHALLENGER + 32])
+            if status == RUN_REFUTED and u64(d, D_SEQ) > best:
+                self._send("moot", b"", [self._caller(), AccountMeta(run, False, True),
+                                         AccountMeta(template, False, False), AccountMeta(dispute, False, True),
+                                         AccountMeta(challenger, False, True)], [])
+                return f"moot {dispute}"
+            if timeouts and now > u64(d, D_DEADLINE):
+                self._send("timeout", b"", [self._caller(), AccountMeta(run, False, True),
+                                            AccountMeta(template, False, False), AccountMeta(dispute, False, True),
+                                            AccountMeta(executor, False, True), AccountMeta(challenger, False, True)], [])
+                return f"timeout {dispute}"
+        for dispute, d in disputes:
+            if u64(d, D_SEQ) == prefix and d[D_RULING] != RULING_OPEN:
+                self.advance(run, template, dispute)
+                return f"advance past {dispute}"
+        if status == RUN_REFUTED and not paid and prefix > best:
+            dispute, d = next((dd for dd in disputes if u64(dd[1], D_SEQ) == best))
+            self.pay_pot(run, template, dispute, Pubkey.from_bytes(d[D_CHALLENGER:D_CHALLENGER + 32]), payer)
+            return f"pay_pot {dispute}"
+        for dispute, d in disputes:
+            seq = u64(d, D_SEQ)
+            if d[D_RULING] != RULING_OPEN and seq < prefix and not (status == RUN_REFUTED and seq == best and not paid):
+                self.close_dispute(run, template, dispute, Pubkey.from_bytes(d[D_CHALLENGER:D_CHALLENGER + 32]),
+                                   executor)
+                return f"close_dispute {dispute}"
+        open_disputes = u32(r, R_OPEN)
+        if status == RUN_COMMITTED and open_disputes == 0:
+            if now <= deadline:
+                return f"wait: challenge window open until slot {deadline}"
+            self.finalize(run, template, executor)
+            return "finalize"
+        settled = status == RUN_FINAL or (status == RUN_REFUTED and paid)
+        if settled and open_disputes == 0:
+            for cache, k in self.caches_of(run, candidates):
+                payee = Pubkey.from_bytes(k[CACHE_BYTES:]) if len(k) == CACHE_BYTES_V2 else executor
+                self.close_cache(run, cache, payee)
+                return f"close_cache {cache}"
+            if u32(r, R_CLOSED) == u64(r, R_SEQ):
+                self.close_run(run, template, payer)
+                return "close_run (shrunk to its receipt)"
+        if open_disputes:
+            soonest = min(u64(d, D_DEADLINE) for _k, d in disputes if d[D_RULING] == RULING_OPEN)
+            return f"wait: {open_disputes} open dispute(s), next phase deadline slot {soonest}"
+        return None
+
+    def settle_and_reclaim(self, run: Pubkey, *, timeouts: bool = True, wait: float = 0.0,
+                           max_steps: int = 256) -> dict:
+        """Take a run as far through its lifecycle as the chain allows, and
+        reclaim every rent it can (alpha plan E4).
+
+        In order: time out disputes whose phase deadline passed (unless
+        ``timeouts=False``); rule moot the disputes opened after a refuted
+        run's lowest challenger win; advance the ruled prefix; pay the pot;
+        close ruled disputes with their staging buffers; finalize after the
+        challenge window; close the run's reveal caches; shrink the run to
+        its receipt (or cancel an expired uncommitted run). Anyone may send
+        each step; rent goes where the program sends it, not to the caller.
+
+        With ``wait`` > 0, sleeps and retries while the next step is behind
+        a deadline, for at most ``wait`` seconds. Returns the steps taken and
+        the run's state: ``closed`` (a receipt with nothing left),
+        ``waiting`` (with the reason) or ``stuck``.
+        """
+        steps: list[str] = []
+        give_up = time.monotonic() + wait
+        candidates = self.accounts_touching(run)
+        while len(steps) < max_steps:
+            step = self._settle_once(run, timeouts, candidates)
+            if step is None:
+                data = self.gc.account(run)
+                state = "closed" if data is None or data[:4] == b"D21P" else "stuck"
+                return {"state": state, "steps": steps}
+            if step.startswith("wait: "):
+                if time.monotonic() >= give_up:
+                    return {"state": "waiting", "reason": step[6:], "steps": steps}
+                time.sleep(2.0)
+                continue
+            steps.append(step)
+        return {"state": "stuck", "reason": f"more than {max_steps} steps", "steps": steps}

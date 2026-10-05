@@ -20,9 +20,49 @@ MAX_STAGE = 128 * 1024
 MAX_STAGE_GROW = 10_240
 
 
+#: The program's floor on a phase window, in slots (admission, §5.3).
+MIN_PHASE_WINDOW = 750
+#: Staged-witness upload rate on Fogo testnet: 64 KiB in about 51 s
+#: (measured 2026-10-03). Slots there are about 40 ms (measured 2026-10-05).
+TESTNET_UPLOAD_BYTES_PER_S = 1_285
+TESTNET_SLOT_MS = 40.0
+
+
+def largest_step_witness(sp: S.Spec) -> int:
+    """The most bytes a STEP claim on this plan stages as its witness: the
+    step's declared input lengths (one chunk for a chunked input) plus its
+    state. Openings and proofs add a few hundred bytes, covered by the
+    fixed allowance in `phase_window_for`."""
+    most = 0
+    for k in range(sp.total_steps):
+        d = S.decode_step_spec(sp.step_spec(k))
+        size = sum(struct.unpack_from("<I", header, 19)[0] for header, _prod, _ in d["inputs"]) + d["state_size"]
+        most = max(most, size)
+    return most
+
+
+def phase_window_for(witness_bytes: int, *, slot_ms: float = TESTNET_SLOT_MS,
+                     bytes_per_s: float = TESTNET_UPLOAD_BYTES_PER_S, fixed_s: float = 10.0,
+                     margin: float = 1.5) -> int:
+    """Slots a phase needs so a party can stage `witness_bytes` and send its
+    move in time: (fixed allowance + upload time) times a margin, and never
+    below the program's floor (alpha plan E4)."""
+    seconds = (fixed_s + witness_bytes / bytes_per_s) * margin
+    return max(MIN_PHASE_WINDOW, int(-(-seconds * 1000 // slot_ms)))
+
+
 def template_data(sp: S.Spec, depth: int, plan_id: bytes, *, challenge_window: int = 1_000, phase_window: int = 750,
                   executor_bond: int = 2_000_000, challenger_bond: int = 1_000_000, slasher_bps: int = 5_000,
-                  with_blocks: bool = True) -> bytes:
+                  with_blocks: bool = True, slot_ms: float | None = TESTNET_SLOT_MS) -> bytes:
+    """A tag-227 template. Refuses a phase window too short to stage the
+    plan's largest STEP witness at `slot_ms` (see `phase_window_for`);
+    ``slot_ms=None`` skips that check."""
+    if slot_ms is not None:
+        needed = phase_window_for(largest_step_witness(sp), slot_ms=slot_ms)
+        if phase_window < needed:
+            raise ValueError(f"phase_window {phase_window} slots is too short to stage this plan's largest STEP "
+                             f"witness ({largest_step_witness(sp)} bytes); use at least {needed} "
+                             f"(phase_window_for, at {slot_ms} ms per slot)")
     data = bytes([depth])
     for x in (sp.total_steps, sp.total_outputs, challenge_window, phase_window, executor_bond, challenger_bond):
         data += struct.pack("<Q", x)
