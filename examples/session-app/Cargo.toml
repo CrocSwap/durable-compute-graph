@@ -1,0 +1,37 @@
+[package]
+name = "dcg-session-app"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+description = "Template application program embedding the DCG stateful runtime (alpha plan C0/C1)."
+
+# A standalone workspace, as an application's own repository would be.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+# Build the library without this program's entrypoint (for linking it into
+# another program or into host tools).
+no-entrypoint = []
+# The kernel-kit conformance server (host only).
+conform = []
+
+[dependencies]
+# An application pins DCG by git revision; this example uses the path.
+dcg-program = { path = "../../crates/dcg-program", default-features = false, features = ["no-entrypoint", "revision-8"] }
+solana-program = "=2.3.0"
+
+[[bin]]
+name = "tally-conform"
+required-features = ["conform"]
+
+[patch.crates-io]
+curve25519-dalek = { path = "../../crates/dcg-program/vendor" }
+
+[profile.release]
+overflow-checks = false
+lto = true
+codegen-units = 1

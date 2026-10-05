@@ -51,7 +51,11 @@ class KernelRef:
             raise ValueError("kernel manifest must be a mapping")
         raw_id = manifest.get("id")
         if isinstance(raw_id, str):
+            # A name shorter than 16 bytes is padded with NULs, as KernelDecl
+            # pads it in Rust.
             kernel_id = raw_id.encode("utf-8")
+            if 0 < len(kernel_id) < 16 and b"\x00" not in kernel_id:
+                kernel_id = kernel_id.ljust(16, b"\x00")
         elif isinstance(raw_id, bytes):
             kernel_id = raw_id
         else:

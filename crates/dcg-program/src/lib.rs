@@ -61,7 +61,7 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    let Some(tag) = data.first().copied() else {
+    touch_runtime_marker(); let Some(tag) = data.first().copied() else {
         return Err(ProgramError::InvalidInstructionData);
     }; if !cfg!(feature = "revision-8-lifecycle") && (115..=200).contains(&tag) { return Err(ProgramError::InvalidInstructionData); } // the revision-8 lifecycle routes only with its feature; one line, so linked line numbers do not move
     if matches!(tag, 120..=124 | 126..=129) {
@@ -147,7 +147,7 @@ pub fn process_instruction_with_manifest(
     data: &[u8],
     manifest: &'static kernel::ApplicationManifest,
 ) -> ProgramResult {
-    let Some(tag) = data.first().copied() else {
+    touch_runtime_marker(); let Some(tag) = data.first().copied() else {
         return Err(ProgramError::InvalidInstructionData);
     }; if !cfg!(feature = "revision-8-lifecycle") && (115..=200).contains(&tag) { return Err(ProgramError::InvalidInstructionData); } // the revision-8 lifecycle routes only with its feature; one line, so linked line numbers do not move
     #[cfg(feature = "sbf-lifecycle-test")]
@@ -304,3 +304,21 @@ mod upward_heap {
     static ALLOCATOR: UpwardBump = UpwardBump;
 }
 
+
+/// The DCG runtime version embedded in every program image that links this
+/// crate's entry points (alpha plan C0). It is a NUL-delimited ASCII marker,
+/// `dcg-runtime/1 <crate version> stateful-v3 v21`, so a scanner can read it
+/// from a built `.so` or from a deployed program's ProgramData account
+/// (`dcg.runtime.runtime_version`) without sending a transaction. Security
+/// advisories name affected versions by it; the crate version is bumped on
+/// every runtime release.
+pub const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub static RUNTIME_MARKER: &[u8] =
+    concat!("\0dcg-runtime/1 ", env!("CARGO_PKG_VERSION"), " stateful-v3 v21\0").as_bytes();
+
+/// Keep the marker in the image: one volatile byte read per instruction.
+#[inline(always)]
+pub fn touch_runtime_marker() {
+    // SAFETY: a read of the first byte of a static, non-empty slice.
+    unsafe { core::ptr::read_volatile(RUNTIME_MARKER.as_ptr()) };
+}

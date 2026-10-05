@@ -66,7 +66,9 @@ The v3 builders are checked byte for byte against the program's payload format
 (`tests/test_session_v3.py`); the refusal table covers `stateful_v3.rs` codes
 2321-2341. Not covered: views, lanes, phased initialization and resources
 through the high-level `Session` (use the instruction builders or the Rust
-tests' account lists), and an end-to-end v3 run on a validator.
+tests' account lists). An end-to-end v3 run on a local validator, a rejectable
+session of an application's own program, is `examples/session-app`
+(`docs/session-quickstart.md`).
 
 ## Readable refusals
 

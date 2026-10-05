@@ -80,7 +80,7 @@ An application builds a small conformance server that names its kernels. It
 is a copy of `crates/dcg-kernel-conform/src/main.rs`, about ten lines:
 
 ```rust
-let registry = Registry { app: &MY_MANIFEST_APP, stateful: &[&MY_STATEFUL_KERNEL] };
+let registry = Registry { app: Some(&MY_MANIFEST_APP), stateful: &[&MY_STATEFUL_KERNEL] };
 serve(&registry, std::io::stdin().lock(), std::io::stdout().lock())
 ```
 

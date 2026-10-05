@@ -4486,6 +4486,7 @@ pub fn process_with_kernel(
     data: &[u8],
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
+    crate::touch_runtime_marker();
     let Some(tag) = data.first().copied() else {
         return Err(ProgramError::InvalidInstructionData);
     };
