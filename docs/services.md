@@ -36,8 +36,11 @@ Each tick does three things, in this order:
    - **Timeouts:** it claims a timeout when the challenger is late.
 2. **Finds new disputes** from its runs' transactions.
    - The number of transactions read per tick is bounded.
-   - Only transactions that invoke the program count, so anyone can name
-     the run without slowing the service.
+   - Only transactions that invoke the program count. Unrelated
+     transactions that name the run are still read, so a burst of them can
+     slow routine discovery. But when the run's own count of open disputes
+     shows one the service has not found, it searches newest first until it
+     finds it.
    - Accounts loaded through lookup tables are included.
    - The cursor never skips a transaction that could not be read yet.
 3. **Settles** where a step is possible. It uses the accounts it already
@@ -74,7 +77,8 @@ Each tick does three things, in this order:
    - At the leaf it builds the claim from H plus the nodes the executor
      revealed on chain (the committed view). It checks the claim with the
      local referee in the program's mode before sending, and withholds a
-     claim the program would not uphold. On a LOG-state step the program
+     claim the program would rule for the executor. A claim the program
+     would rule moot is still sent, so the bond returns. On a LOG-state step the program
      rules a STEP or STATE claim moot; such a run is not convicted, which is
      a known gap.
    - It reads list element refs from the executor's buffer only for a leaf
@@ -88,7 +92,8 @@ Each tick does three things, in this order:
    it opens a dispute with a fresh nonce. The open and its checked inputs
    are journaled before it is sent.
 3. **Finds new runs** of the watched templates, with the same bounded
-   discovery as the executor.
+   discovery as the executor. When the template's count of live runs shows
+   one it has not found, it searches newest first.
 
 **What a watchtower can check.** A watchtower checks a run only if the
 application makes that run's inputs available to it. The alpha program
@@ -100,7 +105,10 @@ executor service does answer LX1 disputes.
 - The watchtower rebuilds a dispute from its moves on chain, not from its
   journal: reveals, cache answers and picks, only those on this dispute.
 - It does this after a restart, and whenever its view does not match the
-  chain, as after a move whose confirmation was lost.
+  chain for a reason other than a move it sent.
+- A move whose confirmation was lost is resolved by comparing with that
+  move: it is applied if it landed and resent if not, so a busy dispute
+  history is not re-read every round.
 - It never opens a second dispute for a run it has already journaled.
 
 **Races.** Anyone may settle, and several watchtowers may challenge the same

@@ -121,3 +121,31 @@ def test_dispute_moves_reads_cache_answers_and_ignores_other_disputes():
     gc = FakeGC([{"signature": "s2", "err": None}, {"signature": "s1", "err": None}], txs, {cache: cache_data})
     moves = dispute_moves(client(gc), dispute)
     assert moves == [(CL.SUB["reveal_nodes"], b"SLOTS" + slots), (CL.SUB["pick"], b"\x01")]
+
+
+def test_discovery_returns_an_address_again_once_it_appears_later():
+    """Review N1: a dispute address named (by a prestage, or deliberately)
+    before its account exists must be returned again when a later
+    transaction names it, so the service can adopt it then."""
+    dispute = Pubkey.new_unique()
+    txs = {"s1": json_tx([dispute, PROGRAM], 1)}
+    gc = FakeGC([{"signature": "s1", "err": None}], txs)
+    d = Discovery(client(gc))
+    addr = Pubkey.new_unique()
+    assert dispute in d.new_keys(addr)  # named early; the caller finds no account yet
+    gc.sigs.insert(0, {"signature": "s2", "err": None})
+    gc.txs["s2"] = json_tx([dispute, PROGRAM], 1)  # the open
+    assert dispute in d.new_keys(addr)
+
+
+def test_search_newest_finds_past_a_backlog():
+    """Review R1: an account the chain counts is found newest first, past
+    any backlog the bounded cursor has not reached."""
+    keys = [Pubkey.new_unique() for _ in range(300)]
+    sigs = [{"signature": f"s{i}", "err": None} for i in reversed(range(300))]
+    gc = FakeGC(sigs, {f"s{i}": json_tx([keys[i], PROGRAM], 1) for i in range(300)})
+    d = Discovery(client(gc), max_transactions=4)
+    addr = Pubkey.new_unique()
+    target = keys[299]  # the newest
+    got = d.search_newest(addr, lambda ks: target in ks, page=64)
+    assert target in got and gc.reads <= 64

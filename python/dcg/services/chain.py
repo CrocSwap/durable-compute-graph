@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
+from typing import Callable
 
 from solders.pubkey import Pubkey
 
@@ -167,24 +168,57 @@ class Discovery:
                 break
             before = page[-1]["signature"]
         pending.reverse()  # oldest first
+        # Every key of every newly read transaction is returned, even one
+        # seen before: an address may be named before its account exists
+        # (review N1); callers drop what they already track.
         found: dict[str, None] = {}
         seen = self.state["keys"].setdefault(str(address), [])
-        read = 0
-        for entry in pending:
-            if read >= self.max_transactions:
-                break
+        batch = [e for e in pending[:self.max_transactions]]
+        txs = self._fetch([e["signature"] for e in batch if e.get("err") is None])
+        for entry in batch:
             if entry.get("err") is None:
-                tx = self.cl.gc.rpc("getTransaction", [entry["signature"], {
-                    "encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}])
+                tx = txs.get(entry["signature"])
                 if tx is None:
                     break  # not readable yet: stop here and retry from this signature
-                read += 1
                 for k in CL.program_tx_keys(tx, self.cl.gc.program_id):
-                    if k not in found and k not in seen:
-                        found[k] = None
+                    found[k] = None
             self.state["cursors"][str(address)] = entry["signature"]
-        seen.extend(found)
+        seen.extend(k for k in found if k not in seen)
         return [Pubkey.from_string(k) for k in found]
+
+    def _fetch(self, sigs: list[str]) -> dict[str, dict | None]:
+        """`getTransaction` for each signature, in parallel."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(sig: str):
+            return self.cl.gc.rpc("getTransaction", [sig, {"encoding": "json", "commitment": "confirmed",
+                                                           "maxSupportedTransactionVersion": 0}])
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            return dict(zip(sigs, pool.map(one, sigs)))
+
+    def search_newest(self, address: Pubkey, found: Callable[[list[Pubkey]], bool], page: int = 64) -> list[Pubkey]:
+        """Read the address's history newest first, without the per-call cap,
+        until `found(keys so far)` is true or the history is exhausted (review
+        R1: an account the chain says exists must not wait behind a backlog of
+        unrelated transactions). Does not move the cursor."""
+        keys: dict[str, None] = {}
+        before = None
+        while True:
+            opts = {"limit": page, "commitment": "confirmed", **({"before": before} if before else {})}
+            sigs = self.cl.gc.rpc("getSignaturesForAddress", [str(address), opts])
+            if not sigs:
+                break
+            txs = self._fetch([s["signature"] for s in sigs if s.get("err") is None])
+            for tx in txs.values():
+                if tx is not None:
+                    keys.update(dict.fromkeys(CL.program_tx_keys(tx, self.cl.gc.program_id)))
+            result = [Pubkey.from_string(k) for k in keys]
+            if found(result) or len(sigs) < page:
+                break
+            before = sigs[-1]["signature"]
+        seen = self.state["keys"].setdefault(str(address), [])
+        seen.extend(k for k in keys if k not in seen)
+        return [Pubkey.from_string(k) for k in keys]
 
 
 def dispute_moves(cl: CL.DisputeClient, dispute: Pubkey) -> list[tuple[int, bytes]]:
@@ -207,10 +241,16 @@ def dispute_moves(cl: CL.DisputeClient, dispute: Pubkey) -> list[tuple[int, byte
         if len(page) < 1000:
             break
         before = page[-1]["signature"]
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch(sig: str):
+        return cl.gc.rpc("getTransaction", [sig, {"encoding": "base64", "commitment": "confirmed",
+                                                  "maxSupportedTransactionVersion": 0}])
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        fetched = dict(zip(sigs, pool.map(fetch, sigs)))
     moves = []
     for sig in reversed(sigs):
-        tx = cl.gc.rpc("getTransaction", [sig, {"encoding": "base64", "commitment": "confirmed",
-                                                "maxSupportedTransactionVersion": 0}])
+        tx = fetched[sig]
         if tx is None:
             raise RuntimeError(f"transaction {sig} of dispute {dispute} is not readable yet")
         message = VersionedTransaction.from_bytes(base64.b64decode(tx["transaction"][0])).message

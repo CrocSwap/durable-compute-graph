@@ -138,17 +138,18 @@ class ExecutorService:
             except Exception as exc:  # one dispute's trouble must not stop the others
                 log(event="error", dispute=d_s, error=f"{type(exc).__name__}: {exc}")
         self.journal.save()
-        # 2. Bounded discovery of new disputes.
+        # 2. Bounded discovery of new disputes; if the run counts more open
+        # disputes than we know, search its history newest first until they
+        # are found (review R1).
         for run, entry, state in live:
             if state.status == CL.RUN_OPEN:
                 continue
             try:
-                for key in self.discovery.new_keys(run):
-                    raw = self.cl.gc.account(key)
-                    if raw and raw[:4] == b"D21D" and raw[CL.D_RUN:CL.D_RUN + 32] == bytes(run) \
-                            and str(key) not in entry["disputes"]:
-                        entry["disputes"].append(str(key))
-                        log(event="dispute_seen", run=str(run), dispute=str(key))
+                self._adopt(run, entry, self.discovery.new_keys(run))
+                if state.open > self._known_open(entry):
+                    keys = self.discovery.search_newest(
+                        run, lambda ks: self._adopt(run, entry, ks) >= state.open)
+                    self._adopt(run, entry, keys)
             except Exception as exc:
                 log(event="error", run=str(run), error=f"discovery: {type(exc).__name__}: {exc}")
         self.journal.save()
@@ -177,6 +178,25 @@ class ExecutorService:
         if elapsed > self.tick_budget_s:
             log(event="slow_tick", seconds=round(elapsed, 1), budget=self.tick_budget_s)
         return actions
+
+    def _adopt(self, run: Pubkey, entry: dict, keys: list[Pubkey]) -> int:
+        """Add the run's disputes among `keys`; returns how many open
+        disputes of the run are now known."""
+        for key in keys:
+            if str(key) in entry["disputes"]:
+                continue
+            raw = self.cl.gc.account(key)
+            if raw and raw[:4] == b"D21D" and raw[CL.D_RUN:CL.D_RUN + 32] == bytes(run):
+                entry["disputes"].append(str(key))
+                log(event="dispute_seen", run=str(run), dispute=str(key))
+        return self._known_open(entry)
+
+    def _known_open(self, entry: dict) -> int:
+        n = 0
+        for d_s in entry["disputes"]:
+            raw = self.cl.gc.account(Pubkey.from_string(d_s))
+            n += raw is not None and raw[CL.D_RULING] == CL.RULING_OPEN
+        return n
 
     def _ruled(self, d_s: str) -> bool:
         raw = self.cl.gc.account(Pubkey.from_string(d_s))
@@ -267,5 +287,9 @@ class ExecutionAnswerer:
         run root's checkpoint root at bytes 32..64, k at 136..140)."""
         from ..disputes_v21 import lx as L
 
-        k = struct.unpack_from("<I", run_root, 136)[0]
-        return L.checkpoint_tree(L.commit(self.execution, k).roots).root == run_root[32:64]
+        if getattr(self, "_verified", None) != run_root:
+            k = struct.unpack_from("<I", run_root, 136)[0]
+            if L.checkpoint_tree(L.commit(self.execution, k).roots).root != run_root[32:64]:
+                return False
+            self._verified = run_root  # checked once per run root
+        return True

@@ -76,6 +76,10 @@ class Watchtower:
             self.journal.data.setdefault(k, {})
         self.discovery = Discovery(cl, self.journal.data["discovery"])
         self._live: dict[str, Challenger] = {}
+        # A move sent whose landing is not yet known (review N2): the pick
+        # (level, position, index), or the built claim (to resend as is).
+        self._sent_pick: dict[str, tuple[int, int, int]] = {}
+        self._claims: dict[str, tuple] = {}
         for w in watched:
             self._check_config(w)
 
@@ -147,16 +151,42 @@ class Watchtower:
             log(event="raced", dispute=d_s, note="ruled before our move landed")
         else:
             log(event="error", dispute=d_s, error=f"{type(exc).__name__}: {exc}")
-            self._live.pop(d_s, None)  # rebuild from chain on the next tick
+            if d_s not in self._sent_pick and d_s not in self._claims:
+                self._live.pop(d_s, None)  # rebuild from chain on the next tick
 
     def _discover(self, w: Watched) -> None:
-        for key in self.discovery.new_keys(w.template):
+        self._adopt(w, self.discovery.new_keys(w.template))
+        # The template counts its live runs: if it has more than we know,
+        # search its history newest first until they are found (review R1).
+        t = self.cl.gc.account(w.template)
+        active = struct.unpack_from("<I", t, len(t) - 4)[0] if t is not None and len(t) >= 4 else 0
+        if active > self._known_live(w):
+            self.discovery.search_newest(w.template, lambda ks: self._adopt(w, ks) >= active)
+
+    def _adopt(self, w: Watched, keys: list[Pubkey]) -> int:
+        for key in keys:
             if str(key) in self.journal.data["runs"]:
                 continue
             raw = self.cl.gc.account(key)
             if raw and raw[:4] == b"D21R" and raw[CL.R_TEMPLATE:CL.R_TEMPLATE + 32] == bytes(w.template):
                 self.journal.data["runs"][str(key)] = {"template": str(w.template), "state": "seen"}
                 log(event="run_seen", run=str(key), template=str(w.template))
+        return self._known_live(w)
+
+    def _known_live(self, w: Watched) -> int:
+        n = 0
+        for run_s, entry in self.journal.data["runs"].items():
+            if entry["template"] == str(w.template) and entry["state"] != "closed":
+                raw = self.cl.gc.account(Pubkey.from_string(run_s))
+                n += raw is not None and raw[:4] == b"D21R"
+        return n
+
+    def _run_accounts(self, run: Pubkey, dispute: Pubkey) -> list[Pubkey]:
+        """The run's known accounts for settlement (review M-b): its
+        disputes and caches from bounded discovery, not a full rescan."""
+        self.discovery.new_keys(run)
+        known = self.discovery.known(run)
+        return known + ([dispute] if dispute not in known else [])
 
     def _inputs(self, w: Watched, run: Pubkey, state: RunState) -> dict[int, bytes] | None:
         values = {}
@@ -282,7 +312,7 @@ class Watchtower:
             return None
         d = DisputeState.parse(dispute, raw)
         if d.ruling != CL.RULING_OPEN:
-            out = self.cl.settle_and_reclaim(run, wait=0.0)
+            out = self.cl.settle_and_reclaim(run, wait=0.0, candidates=self._run_accounts(run, dispute))
             log(event="settle", dispute=str(dispute), ruling=CL.RULINGS[d.ruling], **out)
             if out["state"] == "closed" or self.cl.gc.account(dispute) is None:
                 entry["done"] = True
@@ -290,51 +320,73 @@ class Watchtower:
             return f"settle {run}" if out["steps"] else None
         if self.cl.gc.slot() > d.deadline and d.phase not in (PH_PICK, PH_CLAIM):
             # The executor missed its deadline: the timeout rules for us.
-            out = self.cl.settle_and_reclaim(run, wait=0.0)
+            out = self.cl.settle_and_reclaim(run, wait=0.0, candidates=self._run_accounts(run, dispute))
             log(event="executor_timeout", dispute=str(dispute), **out)
             return f"timeout {dispute}" if out["steps"] else None
         if d.phase not in (PH_PICK, PH_CLAIM):
             return None  # the executor's move
-        c = self._replica(str(dispute), entry)
-        # The replica must stand where the chain stands (a move whose
-        # confirmation was lost may have landed): otherwise rebuild it.
-        if (c.replica.level, c.replica.position) != (d.level, d.position):
-            self._live.pop(str(dispute), None)
-            c = self._replica(str(dispute), entry)
-            if (c.replica.level, c.replica.position) != (d.level, d.position):
-                raise RuntimeError("the rebuilt replica does not match the dispute on chain")
+        d_s = str(dispute)
+        c = self._replica(d_s, entry)
         template = Pubkey.from_bytes(self.cl.gc.account(run)[CL.R_TEMPLATE:CL.R_TEMPLATE + 32])
         party = [AccountMeta(self.key.pubkey(), True, False), AccountMeta(run, False, True),
                  AccountMeta(template, False, False), AccountMeta(dispute, False, True)]
+        # A pick sent last time whose landing was not confirmed (review N2):
+        # apply it if the chain moved on, resend it if the chain did not.
+        if d_s in self._sent_pick:
+            lvl, pos, pk = self._sent_pick[d_s]
+            step = min(c.replica.depth, lvl)
+            if (d.level, d.position) == (lvl - step, (pos << step) + pk):
+                c.pick(pk)
+                del self._sent_pick[d_s]
+            elif (d.level, d.position) == (lvl, pos) and d.phase == PH_PICK:
+                self.cl._send("pick", bytes([pk]), party, [self.key])
+                c.pick(pk)
+                del self._sent_pick[d_s]
+                log(event="pick_resent", dispute=d_s, level=lvl, pick=pk)
+                return f"pick {dispute}"
+            else:
+                del self._sent_pick[d_s]
+                self._live.pop(d_s, None)
+                c = self._replica(d_s, entry)
+        # Otherwise the replica must stand where the chain stands; rebuild
+        # from the dispute's moves only when it does not.
+        if (c.replica.level, c.replica.position) != (d.level, d.position) and d_s not in self._claims:
+            self._live.pop(d_s, None)
+            c = self._replica(d_s, entry)
+            if (c.replica.level, c.replica.position) != (d.level, d.position):
+                raise RuntimeError("the rebuilt replica does not match the dispute on chain")
         if d.phase == PH_PICK:
             nodes = d.revealed(c.replica._pickable)
             pick = c.on_nodes(nodes)
-            try:
-                self.cl._send("pick", bytes([pick]), party, [self.key])
-            finally:
-                # Whether or not the confirmation arrived, the next tick
-                # compares with the chain and rebuilds if they differ.
-                self._live.pop(str(dispute), None)
-            log(event="pick", dispute=str(dispute), level=d.level, pick=pick)
+            self._sent_pick[d_s] = (d.level, d.position, pick)
+            self.cl._send("pick", bytes([pick]), party, [self.key])
+            c.pick(pick)
+            del self._sent_pick[d_s]
+            log(event="pick", dispute=d_s, level=d.level, pick=pick)
             return f"pick {dispute}"
         # CLAIM.
         if entry.get("done_claim"):
-            return None  # withheld: the local referee would not uphold it
-        leaf = d.leaf()
-        lists = None
-        parsed = R.parse_leaf(leaf) if (leaf is not None and c.kind == "STEP_DESCEND") else None
-        has_lists = parsed is not None and any(struct.unpack_from("<I", ref, 7)[0] == S.LAYOUT_LIST
-                                               for ref in parsed.inputs)
-        buffer_e = self.cl.pda(b"dcg21stg", bytes(dispute), bytes([CL.ROLE_EXECUTOR]))
-        if has_lists:
-            # Only a list leaf's element refs are read from the executor's
-            # buffer, and only if the buffer's leaf is the revealed one.
-            lists = staged_lists(self.cl.gc.account(buffer_e), expected_leaf=leaf)
-        name, _kw, body, ruling = c.on_leaf(leaf, lists)
-        if ruling != "C":
-            log(event="claim_withheld", dispute=str(dispute), claim=name, local_ruling=ruling)
-            entry["done_claim"] = True
-            return None
+            return None  # withheld: the program would rule against it
+        if d_s not in self._claims:
+            leaf = d.leaf()
+            lists = None
+            parsed = R.parse_leaf(leaf) if (leaf is not None and c.kind == "STEP_DESCEND") else None
+            has_lists = parsed is not None and any(struct.unpack_from("<I", ref, 7)[0] == S.LAYOUT_LIST
+                                                   for ref in parsed.inputs)
+            buffer_e = self.cl.pda(b"dcg21stg", bytes(dispute), bytes([CL.ROLE_EXECUTOR]))
+            if has_lists:
+                # Only a list leaf's element refs are read from the executor's
+                # buffer, and only if the buffer's leaf is the revealed one.
+                lists = staged_lists(self.cl.gc.account(buffer_e), expected_leaf=leaf)
+            name, _kw, body, ruling = c.on_leaf(leaf, lists)
+            # Send a claim the program upholds, or one it rules moot (the
+            # bond returns, review M-a); withhold one it would rule for E.
+            if ruling not in ("C", "moot"):
+                log(event="claim_withheld", dispute=d_s, claim=name, local_ruling=ruling)
+                entry["done_claim"] = True
+                return None
+            self._claims[d_s] = (name, body, buffer_e if has_lists else None)
+        name, body, list_buffer = self._claims[d_s]
         executor = Pubkey.from_bytes(self.cl.gc.account(run)[CL.R_EXECUTOR:CL.R_EXECUTOR + 32])
         metas = [AccountMeta(self.key.pubkey(), True, False), AccountMeta(run, False, True),
                  AccountMeta(template, False, False), AccountMeta(dispute, False, True),
@@ -343,12 +395,9 @@ class Watchtower:
             buffer_c = self.cl.stage_body(run, template, dispute, CL.ROLE_CHALLENGER, body, self.key, self.key)
             body, metas = bytes([CL.FROM_STAGING]), metas + [AccountMeta(buffer_c, False, False)]
         heap = None
-        if has_lists:
-            metas.append(AccountMeta(buffer_e, False, False))
+        if list_buffer is not None:
+            metas.append(AccountMeta(list_buffer, False, False))
             heap = CL.LIST_HEAP_FRAME
-        try:
-            self.cl._send("claim", body, metas, [self.key], heap_frame=heap)
-        finally:
-            self._live.pop(str(dispute), None)
-        log(event="claim", dispute=str(dispute), claim=name)
+        self.cl._send("claim", body, metas, [self.key], heap_frame=heap)
+        log(event="claim", dispute=d_s, claim=name)
         return f"claim {dispute}"

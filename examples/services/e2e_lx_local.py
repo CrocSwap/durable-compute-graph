@@ -46,6 +46,10 @@ HERE = Path(__file__).resolve()
 P, WINDOW, H0, K, ARITY = 9, 3, 7, 4, 4
 # --weighted: the toy with constant weights (design §13), so the terminal
 # opening carries constants (review M6); the lie is at a weighted start.
+# --staged-open: the challenger always prestages its open body, so the
+# dispute address is named in transactions before the dispute exists
+# (review N1: the executor must still find the dispute after it opens).
+STAGED_OPEN = "--staged-open" in sys.argv
 WEIGHTED = "--weighted" in sys.argv or os.environ.get("DCG_LX_WEIGHTED") == "1"
 PARAMS = struct.pack("<QQqB", P, WINDOW, H0, 1) if WEIGHTED else struct.pack("<QQq", P, WINDOW, H0)
 
@@ -157,7 +161,7 @@ def challenge(cfg: dict, case: str, run: Pubkey, log) -> str:
             + LC.tree_path(levels, pair) + LC.tree_path(levels, pair + 1) + PARAMS)
     metas = [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, True),
              AccountMeta(template, False, False), AccountMeta(dispute, False, True), AccountMeta(CL.SYSTEM, False, False)]
-    if len(body) > LC.INLINE_OPEN_MAX:
+    if len(body) > LC.INLINE_OPEN_MAX or STAGED_OPEN:
         secret = os.urandom(32)
         buffer = cl.lx_prestage(run, template, dispute, nonce, body[1:], challenger, secret)
         cl._send("open", nonce + bytes([LC.KIND_LX_STATE, CL.FROM_STAGING]) + secret,
@@ -265,6 +269,7 @@ if __name__ == "__main__":
     ap.add_argument("--config")
     ap.add_argument("--seconds", type=int, default=240)
     ap.add_argument("--weighted", action="store_true")
+    ap.add_argument("--staged-open", action="store_true")
     a = ap.parse_args()
     if a.role:
         raise SystemExit(role_executor(json.loads(Path(a.config).read_text())))
