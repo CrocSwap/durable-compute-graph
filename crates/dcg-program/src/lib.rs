@@ -79,6 +79,22 @@ pub fn process_instruction(
     )
 }
 
+// The alpha shared image carries no test, legacy or v2.0 route (owner 10-05;
+// re-review L4: enforced at build time, not only by the routing test).
+#[cfg(all(
+    feature = "alpha-image",
+    any(
+        feature = "test-kernel",
+        feature = "revision-8-lifecycle",
+        feature = "graph-v2",
+        feature = "test-legacy-template-create",
+        feature = "sbf-lifecycle-test",
+        feature = "sbf-real-lifecycle-test",
+        feature = "legacy-hclosure-handlers"
+    )
+))]
+compile_error!("the alpha-image feature excludes test, legacy and v2.0 features");
+
 #[cfg(feature = "test-kernel")]
 fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
     static NO_INSTRUCTIONS: [app_api::ApplicationInstruction; 0] = [];

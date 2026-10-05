@@ -77,6 +77,10 @@ pub const SUB_STAGE_WRITE: u8 = 15;
 pub const ROLE_EXECUTOR: u8 = 1;
 pub const ROLE_CHALLENGER: u8 = 2;
 pub const STAGE_HEADER: usize = 48;
+/// Staging header bytes 44..48: lamports of growth paid (`STAGE_GROW`) by the
+/// dispute party that did not create the buffer, refunded to it at
+/// `CLOSE_DISPUTE`.
+pub const STAGE_OTHER_GROWTH: usize = 44;
 /// Created by one CPI (10 KiB), then grown by `SUB_STAGE_GROW` in steps of at
 /// most 10 KiB up to `MAX_STAGE` (a 64 KiB witness plus its claim framing).
 pub const CREATE_STAGE: usize = 10_240 - STAGE_HEADER;
@@ -1193,7 +1197,12 @@ fn disputable(program_id: &Pubkey, run: &AccountInfo) -> Result<bool, ProgramErr
 }
 
 // 17: [funder(s,w), run, template, dispute, buffer(w), system] add:u32 (at most
-// 10 KiB). Grows a staging buffer; anyone may pay for the growth.
+// 10 KiB). Grows a staging buffer; anyone may pay for the growth. Growth paid
+// by the dispute party that did not create the buffer (the executor for a
+// challenger-created buffer, the challenger for an executor-created one) is
+// recorded in header bytes 44..48 (lamports) and refunded to that party at
+// CLOSE_DISPUTE; every other lamport goes to the creator (R2 re-review 10-05:
+// who paid is recorded, not inferred from roles).
 fn stage_grow(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [funder, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
@@ -1205,8 +1214,21 @@ fn stage_grow(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
         return Err(err(29));
     }
     let need = Rent::get()?.minimum_balance(new_len).saturating_sub(buffer.lamports());
+    let creator = buffer.try_borrow_data()?[5];
+    let other = if creator == 1 {
+        c.dispute.try_borrow_data()?[D_CHALLENGER..D_CHALLENGER + 32].to_vec()
+    } else {
+        c.run.try_borrow_data()?[R_EXECUTOR..R_EXECUTOR + 32].to_vec()
+    };
+    let by_other = other == funder.key.to_bytes();
     if need > 0 {
         invoke(&system_instruction::transfer(funder.key, buffer.key, need), &[funder.clone(), buffer.clone(), system.clone()])?;
+        if by_other {
+            let mut b = buffer.try_borrow_mut_data()?;
+            let paid = u32_at(&b, STAGE_OTHER_GROWTH)? as u64;
+            let paid = u32::try_from(paid.checked_add(need).ok_or(err(8))?).map_err(|_| err(8))?;
+            b[STAGE_OTHER_GROWTH..STAGE_OTHER_GROWTH + 4].copy_from_slice(&paid.to_le_bytes());
+        }
     }
     buffer.resize(new_len)
 }
@@ -2207,22 +2229,23 @@ fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
             }
             b[5]
         };
-        // The executor's buffer (role 1) is created at exactly CREATE_STAGE
-        // bytes; when the challenger created it, the challenger gets back that
-        // creation rent and every lamport above it (growth the executor paid
-        // to answer, or anything pre-funded) goes to the executor. Before
-        // this, a losing challenger collected the executor's growth rent (R2
-        // reviews 10-05, A-H1 / B-M1).
-        if role == ROLE_EXECUTOR && creator == 0 {
-            let creation = Rent::get()?.minimum_balance(STAGE_HEADER + CREATE_STAGE).min(buffer.lamports());
-            if !challenger.is_writable {
+        // Growth the non-creating party paid (recorded at STAGE_GROW) returns
+        // to it; every other lamport (creation rent, anyone else's growth,
+        // pre-funding) to the creator. Before the R2 fixes the creator took
+        // everything, so a losing challenger could collect the executor's
+        // growth (reviews A-H1 / B-M1; re-review H1).
+        let other_paid = {
+            let b = buffer.try_borrow_data()?;
+            (u32_at(&b, STAGE_OTHER_GROWTH)? as u64).min(buffer.lamports())
+        };
+        let (to_creator, to_other) = if creator == 1 { (executor, challenger) } else { (challenger, executor) };
+        if other_paid > 0 {
+            if !to_other.is_writable {
                 return Err(err(35));
             }
-            move_lamports(buffer, challenger, creation)?;
-            close_into(buffer, executor)?;
-        } else {
-            close_into(buffer, if creator == 1 { executor } else { challenger })?;
+            move_lamports(buffer, to_other, other_paid)?;
         }
+        close_into(buffer, to_creator)?;
     }
     {
         let mut r = c.run.try_borrow_mut_data()?;

@@ -2624,3 +2624,63 @@ async fn lx_templates_have_one_canonical_skeleton() {
     assert!(create_template_raw(&mut ch, &lx(1, 1, 0)).await.is_err(), "nonzero spec bases");
     assert!(create_template_raw(&mut ch, &lx(1, 0, 1)).await.is_err(), "a nonzero plan id");
 }
+
+/// R2 re-review H1: who paid for a staging buffer's growth is recorded, not
+/// inferred from roles. For every creator of the executor's buffer, every
+/// funder of its growth and both endings, the close refunds the funder its
+/// growth exactly, the creator its creation rent, and the challenger the
+/// dispute's rent; no party gains another's rent.
+#[tokio::test(flavor = "multi_thread")]
+async fn staging_growth_returns_to_whoever_paid_it_in_every_ending() {
+    for (creator, funder, executor_wins) in [
+        (0xC1u8, 0xE1u8, true), (0xC1, 0xC1, true), (0xE1, 0xC1, true), (0xE1, 0xE1, true),
+        (0xC1, 0xE1, false), (0xC1, 0xC1, false), (0xE1, 0xC1, false), (0xE1, 0xE1, false),
+    ] {
+        let mut ch = Chain::new(750).await;
+        let c = ch.honest();
+        ch.commit(&c).await;
+        let d = ch.open(90, V::KIND_STEP_DESCEND).await;
+        let (cc, e) = (kp(0xC1), kp(0xE1));
+        let buf = ch.buffer(d, V::ROLE_EXECUTOR);
+        let who = kp(creator);
+        let mut data = vec![V::ROLE_EXECUTOR];
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let create = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(who.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+        send(&mut ch.ctx, create, &[&who]).await.unwrap();
+        let created = r2_bal(&mut ch, buf).await;
+        let payer = kp(funder);
+        for _ in 0..3 {
+            let grow = ix(V::SUB_STAGE_GROW, &10_240u32.to_le_bytes(), vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+            send(&mut ch.ctx, grow, &[&payer]).await.unwrap();
+        }
+        let growth = r2_bal(&mut ch, buf).await - created;
+        assert!(growth > CHALLENGER_BOND);
+        let slot = ch.slot().await;
+        if executor_wins {
+            ch.nodes(d, &c).await.unwrap();
+            ch.ctx.warp_to_slot(slot + 2_000).unwrap();
+            ch.timeout(d).await.unwrap(); // C misses PICK
+            assert_eq!(ch.ruling(d).await, V::RULING_EXECUTOR);
+        } else {
+            ch.ctx.warp_to_slot(slot + 2_000).unwrap();
+            ch.timeout(d).await.unwrap(); // E misses NODES
+            assert_eq!(ch.ruling(d).await, V::RULING_CHALLENGER);
+            ch.advance(d).await.unwrap(); // the pot waits for the ruled prefix
+            let caller = kp(0xA1);
+            let pay = ix(V::SUB_PAY_POT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(cc.pubkey(), false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+            send(&mut ch.ctx, pay, &[&caller]).await.unwrap();
+        }
+        if executor_wins {
+            ch.advance(d).await.unwrap();
+        }
+        let (c0, e0) = (r2_bal(&mut ch, cc.pubkey()).await, r2_bal(&mut ch, e.pubkey()).await);
+        let dispute_rent = r2_bal(&mut ch, d).await;
+        ch.close_dispute(d).await.unwrap();
+        let (c_gain, e_gain) = (r2_bal(&mut ch, cc.pubkey()).await - c0, r2_bal(&mut ch, e.pubkey()).await - e0);
+        let mut want_c = dispute_rent;
+        let mut want_e = 0;
+        if creator == 0xC1 { want_c += created } else { want_e += created }
+        if funder == 0xC1 { want_c += growth } else { want_e += growth }
+        assert_eq!((c_gain, e_gain), (want_c, want_e), "creator {creator:#x} funder {funder:#x} executor_wins {executor_wins}");
+    }
+}
