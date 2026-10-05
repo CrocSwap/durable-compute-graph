@@ -1872,6 +1872,14 @@ impl<'a> Referee<'a> {
         } else {
             None
         };
+        // Built-in reductions and kernels exist at version (1, 1) only; a spec
+        // naming one at another version names no kernel (it rules for C, as
+        // any unknown kernel does) instead of silently binding the built-in
+        // (R2 review A-M1).
+        let builtin = D::reductions::lookup(spec.kernel_id()).is_some() || kernel_code(spec.kernel_id()).is_some();
+        if builtin && (spec.semantic_version(), spec.abi_version()) != (1, 1) {
+            return Ok(true);
+        }
         if D::reductions::lookup(spec.kernel_id()).is_some() {
             // A refused replay cannot carry committed outputs: C wins.
             let Some(r) = D::reductions::replay(spec.kernel_id(), &ins, prior) else { return Ok(true) };
@@ -1923,7 +1931,7 @@ impl<'a> Referee<'a> {
 
 /// The registered kernel whose name equals the spec's 16-byte kernel id
 /// without its NUL padding (for example `identity_i32/v1`).
-fn kernel_code(id: &[u8]) -> Option<u16> {
+pub(crate) fn kernel_code(id: &[u8]) -> Option<u16> {
     let end = id.iter().position(|b| *b == 0).unwrap_or(id.len());
     if id[end..].iter().any(|b| *b != 0) {
         return None; // an interior NUL is not a kernel name (review 10-03, F9)

@@ -80,6 +80,18 @@ impl KernelCapabilities {
     }
 }
 
+/// Whether a 16-byte kernel id names a built-in v2.1 reduction or kernel
+/// (`sumchunk_i32/v1`, `identity_i32/v1`, ... padded with NULs).
+pub fn is_builtin_kernel_name(id: &[u8; 16]) -> bool {
+    let end = id.iter().position(|b| *b == 0).unwrap_or(id.len());
+    if id[end..].iter().any(|b| *b != 0) {
+        return false;
+    }
+    let name = &id[..end];
+    dcg_disputes::reductions::lookup(id).is_some()
+        || (1..=255u16).any(|k| dcg_kernels::info(k).is_some_and(|i| i.name.as_bytes() == name))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelManifest {
     pub id: KernelId,
@@ -1130,6 +1142,9 @@ impl ApplicationManifest {
             {
                 return Err(ManifestError::ResourceExceedsLayout(a.id));
             }
+            if is_builtin_kernel_name(&a.id.0) {
+                return Err(ManifestError::BuiltinKernelCollision(a.id));
+            }
             // Only stateful transitions can reject; a stateless (replay) kernel
             // with the bit would make the rev-8 admission digest silent about it.
             if a.capabilities.0 & !KernelCapabilities::KNOWN != 0
@@ -1280,6 +1295,9 @@ pub enum ManifestError {
     InvalidComputeLimit(KernelId),
     /// An unknown capability bit, or `REJECTS_INPUT` on a stateless kernel.
     InvalidCapabilities(KernelId),
+    /// An application kernel whose id names a built-in reduction or kernel:
+    /// the v2.1 STEP replay would resolve the built-in instead (R2 review A-M1).
+    BuiltinKernelCollision(KernelId),
     DuplicateMode(KernelId, ModeId),
     ReplayNotRegistered(KernelId),
     ReplayModeUnsupported(KernelId, ModeId),
@@ -2106,6 +2124,28 @@ mod tests {
         }));
         let kernels: &'static [&'static dyn Kernel] = Box::leak(Box::new([&*Box::leak(Box::new(CapKernel(manifest))) as &dyn Kernel]));
         ApplicationManifest { kernels, ..INVALID_LIMIT_APP }.validate()
+    }
+
+    #[test]
+    fn manifest_refuses_app_kernels_named_like_builtins() {
+        static BUILTIN_NAMED: KernelManifest = KernelManifest {
+            id: KernelId(*b"identity_i32/v1\0"),
+            ..INVALID_LIMIT_KERNEL_MANIFEST
+        };
+        struct Named;
+        impl Kernel for Named {
+            fn manifest(&self) -> &'static KernelManifest {
+                &BUILTIN_NAMED
+            }
+            fn execute(&self, _input: &[u8], _output: &mut [u8]) -> Result<usize, KernelError> {
+                Err(KernelError::Refused)
+            }
+        }
+        static KERNELS: [&dyn Kernel; 1] = [&Named];
+        let app = ApplicationManifest { kernels: &KERNELS, ..INVALID_LIMIT_APP };
+        assert_eq!(app.validate(), Err(ManifestError::BuiltinKernelCollision(KernelId(*b"identity_i32/v1\0"))));
+        assert!(is_builtin_kernel_name(b"sumchunk_i32/v1\0"));
+        assert!(!is_builtin_kernel_name(b"dcg-counter-v1\0\0"));
     }
 
     #[test]

@@ -261,3 +261,15 @@ class GoldenTests(unittest.TestCase):
         spec_.loader.exec_module(mod)
         stored = json.loads((root / "tests/golden/dcg/disputes_v21/vectors.json").read_text())
         self.assertEqual(mod.build(), stored)
+
+
+def test_builtin_kernels_bind_only_at_version_1_1():
+    """R2 review A-M1: a spec naming a built-in kernel or reduction at another
+    version names no kernel (the program rules for C), never the built-in."""
+    import struct as _struct
+    from dcg.disputes_v21 import run as _R
+    kid = b"identity_i32/v1" + b"\x00"
+    one = _struct.pack("<i", 7)
+    assert _R.replay_step(kid, [one], None, 1, 1) == ([one], None)
+    assert _R.replay_step(kid, [one], None, 2, 1) is None
+    assert _R.replay_step(kid, [one], None, 1, 2) is None

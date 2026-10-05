@@ -139,6 +139,14 @@ def replay(kernel_id: bytes, inputs: list[bytes]) -> list[bytes] | None:
     return [struct.pack("<i", out)]
 
 
+def replay_known(kernel_id: bytes) -> bool:
+    """Whether the id names a registered built-in kernel (``name/v<semantic>``)."""
+    from dcg import kernels
+
+    name = canonical_kernel_name(kernel_id)
+    return any(f"{k.name}/v{k.semantic_version}" == name for k in kernels.REGISTRY.values())
+
+
 def replay_step(kernel_id: bytes, inputs: list[bytes], prior: bytes | None, semantic_version: int = 1,
                 abi_version: int = 1) -> tuple[list[bytes], bytes | None] | None:
     """Replay one step: (outputs by port order, next state or None); None on
@@ -146,6 +154,12 @@ def replay_step(kernel_id: bytes, inputs: list[bytes], prior: bytes | None, sema
     the program resolves them from the image's manifest."""
     from . import appkernels, reductions
 
+    # Built-in reductions and kernels exist at version (1, 1) only; another
+    # version names no kernel (it rules for C, as the program does; R2 review
+    # A-M1).
+    builtin = reductions.lookup(kernel_id) is not None or replay_known(kernel_id)
+    if builtin and (semantic_version, abi_version) != (1, 1):
+        return None
     k = reductions.lookup(kernel_id)
     if k is None:
         if prior is not None:
