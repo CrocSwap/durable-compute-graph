@@ -10,7 +10,7 @@ use dcg_program::stateful_test::{V3_COUNTER, V3_LANE_COUNTER, V3_REJECT_COUNTER,
 
 fn main() -> std::io::Result<()> {
     let registry = Registry {
-        app: &ALPHA_MANIFEST_APP,
+        app: Some(&ALPHA_MANIFEST_APP),
         stateful: &[&V3_COUNTER, &V3_LANE_COUNTER, &V3_REJECT_COUNTER, &V3_UNDECLARED_REJECT],
     };
     serve(&registry, std::io::stdin().lock(), std::io::stdout().lock())

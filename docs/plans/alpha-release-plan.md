@@ -137,8 +137,9 @@ DCG keeps no model code (owner decision, 09-26).
 **C0. The embedding contract.**
 - A documented way to embed the stateful runtime in an application program: a template app program, its build, and its deploy.
 - A runtime version marker readable on chain or from the image, so apps and users can check which DCG runtime a program embeds, and SECURITY advisories can say which versions are affected.
+- *Status (2026-10-05):* built. `examples/session-app` is the template app (one kernel, entrypoint, build script with receipt, mirror and conformance server); `docs/session-quickstart.md` states the contract. Every image carries `dcg-runtime/1 <version> stateful-v3 v21`, read by `python -m dcg.runtime` from a `.so` or a deployed program's ProgramData.
 
-**C1. A session quickstart.** Write a stateful kernel (`StatefulKernel`: initial state, transition, optional views), register it in an application image, open a session from Python, drive it to completion with the sequencer, and read the result. The existing `python-session.md` and `sequencer.md` become its basis.
+**C1. A session quickstart.** Write a stateful kernel (`StatefulKernel`: initial state, transition, optional views), register it in an application image, open a session from Python, drive it to completion with the sequencer, and read the result. The existing `python-session.md` and `sequencer.md` become its basis. *Status (2026-10-05):* built (`docs/session-quickstart.md`): the tally app runs end to end on a local validator through `dcg.session.Session` (rejectable v3 session, 4 inputs with one rejected, mirror agrees, accounts closed with rent back; 11 s, *measured*).
 
 **C2. The sequencer as a product.**
 - A documented, stable Python API: lanes, batching, resend and recovery from the journal, multi-node sends, and pacing.

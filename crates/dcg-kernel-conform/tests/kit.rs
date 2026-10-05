@@ -42,7 +42,7 @@ fn decl_reproduces_hand_written_manifests() {
 
 fn ask(line: &str) -> String {
     let registry = Registry {
-        app: &ALPHA_MANIFEST_APP,
+        app: Some(&ALPHA_MANIFEST_APP),
         stateful: &[&V3_COUNTER, &V3_REJECT_COUNTER, &V3_UNDECLARED_REJECT],
     };
     answer(&registry, line)

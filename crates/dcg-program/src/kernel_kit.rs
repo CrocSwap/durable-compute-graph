@@ -273,7 +273,9 @@ pub mod conformance {
     use std::io::{BufRead, Write};
 
     pub struct Registry<'a> {
-        pub app: &'a ApplicationManifest,
+        /// The image's application manifest (STEP kernels), if it has one;
+        /// a session-only application passes `None`.
+        pub app: Option<&'a ApplicationManifest>,
         pub stateful: &'a [&'static dyn StatefulKernel],
     }
 
@@ -317,7 +319,8 @@ pub mod conformance {
             "step" if crate::kernel::is_builtin_kernel_name(&id.0) => Ok("builtin".into()),
             "step" => {
                 let inputs = rest.iter().map(|w| unhex(w)).collect::<Result<Vec<_>, _>>()?;
-                Ok(match step_kernel_call(registry.app, id, sv, av, &inputs) {
+                let Some(app) = registry.app else { return Ok("not-step".into()) };
+                Ok(match step_kernel_call(app, id, sv, av, &inputs) {
                     StepCall::NotStepKernel => "not-step".into(),
                     StepCall::Refused(e) => format!("refused {e:?}"),
                     call => format!("output {}", hex(call.output().unwrap())),
@@ -355,7 +358,7 @@ pub mod conformance {
     /// `unknown`.
     fn manifest(registry: &Registry<'_>, id: KernelId, sv: u16, av: u16) -> Result<String, String> {
         let stateful = stateful(registry, id, sv, av);
-        let m = match (registry.app.resolve(id, sv, av), stateful) {
+        let m = match (registry.app.and_then(|a| a.resolve(id, sv, av)), stateful) {
             (Some(k), _) => k.manifest(),
             (None, Some(k)) => k.manifest(),
             (None, None) => return Ok("unknown".into()),
