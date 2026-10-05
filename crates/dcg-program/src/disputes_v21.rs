@@ -503,6 +503,7 @@ pub fn process(
         lx::SUB_LX_PICK => lx::pick(program_id, accounts, &data[2..]),
         lx::SUB_LX_OPENING => lx::opening(program_id, accounts, &data[2..], manifest),
         lx::SUB_LX_OUTPUT => lx::output(program_id, accounts, &data[2..], manifest),
+        lx::SUB_LX_PRESTAGE => prestage(program_id, accounts, &data[2..]),
         SUB_REVEAL_NODES => reveal_nodes(program_id, accounts, &data[2..]),
         SUB_PICK => pick(program_id, accounts, &data[2..]),
         SUB_REVEAL_LEAF => reveal_leaf(program_id, accounts, &data[2..]),
@@ -1057,6 +1058,83 @@ fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     b[5] = u8::from(!by_challenger);
     b[8..40].copy_from_slice(c.dispute.key.as_ref());
     Ok(())
+}
+
+// 27: [challenger(s,w), run, template, dispute, buffer(w), system] nonce[32]
+// op:u8, then for op 0 (create) size:u32, op 1 (write) offset:u32 bytes,
+// op 2 (close). The challenger's staging buffer for a dispute it has not
+// opened yet: `dispute` is the address ["dcg21dsp", run, challenger, nonce]
+// and must still be unopened (empty). An LX1 OPEN then reads its body from
+// this buffer; after the open it is the dispute's ordinary challenger buffer
+// (grown by sub 17, written by sub 15, closed with the dispute by sub 18). A
+// buffer whose dispute was never opened is closed here, its rent to the
+// challenger. No dispute state, bond or deadline changes until OPEN.
+fn prestage(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let [challenger, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    if !challenger.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let t = template(program_id, tmpl)?;
+    run_checked(program_id, run, tmpl)?;
+    if t.lx.is_none() {
+        return Err(err(10)); // only an LX1 open reads a staged body
+    }
+    let nonce = data.get(0..32).ok_or(err(1))?;
+    let op = *data.get(32).ok_or(err(1))?;
+    if Pubkey::find_program_address(&[b"dcg21dsp", run.key.as_ref(), challenger.key.as_ref(), nonce], program_id).0 != *dispute.key {
+        return Err(err(2));
+    }
+    if !dispute.data_is_empty() || dispute.owner == program_id {
+        return Err(err(37)); // opened: use the dispute's own staging ops
+    }
+    if Pubkey::find_program_address(&[b"dcg21stg", dispute.key.as_ref(), &[ROLE_CHALLENGER]], program_id).0 != *buffer.key {
+        return Err(err(29));
+    }
+    match op {
+        0 => {
+            let size = u32_at(data, 33)? as usize;
+            if data.len() != 37 || size == 0 || size > CREATE_STAGE {
+                return Err(err(29));
+            }
+            {
+                // Staging for a dispute that can no longer open is refused.
+                let r = run.try_borrow_data()?;
+                if r[R_STATUS] != RUN_COMMITTED || now()? > u64_at(&r, R_DEADLINE)? {
+                    return Err(err(9));
+                }
+            }
+            create_pda(program_id, challenger, buffer, system, &[b"dcg21stg", dispute.key.as_ref(), &[ROLE_CHALLENGER]], STAGE_HEADER + size)?;
+            let mut b = buffer.try_borrow_mut_data()?;
+            b[0..4].copy_from_slice(b"D21S");
+            b[4] = ROLE_CHALLENGER;
+            b[5] = 0; // the challenger paid the creation rent
+            b[8..40].copy_from_slice(dispute.key.as_ref());
+            Ok(())
+        }
+        1 | 2 => {
+            if buffer.owner != program_id || staging_role(program_id, dispute, buffer)? != ROLE_CHALLENGER {
+                return Err(err(29));
+            }
+            if op == 2 {
+                if data.len() != 33 || buffer.try_borrow_data()?[5] != 0 {
+                    return Err(err(29));
+                }
+                return close_into(buffer, challenger);
+            }
+            let offset = u32_at(data, 33)? as usize;
+            let bytes = data.get(37..).ok_or(err(1))?;
+            let mut b = buffer.try_borrow_mut_data()?;
+            let end = offset.checked_add(bytes.len()).ok_or(err(8))?;
+            if STAGE_HEADER + end > b.len() {
+                return Err(err(29));
+            }
+            b[STAGE_HEADER + offset..STAGE_HEADER + end].copy_from_slice(bytes);
+            let len = (u32_at(&b, 40)? as usize).max(end);
+            b[40..44].copy_from_slice(&(len as u32).to_le_bytes());
+            Ok(())
+        }
+        _ => Err(err(29)),
+    }
 }
 
 // 17: [funder(s,w), run, template, dispute, buffer(w), system] add:u32 (at most

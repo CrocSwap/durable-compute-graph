@@ -282,6 +282,41 @@ impl Chain {
         Ok(d)
     }
 
+    /// Sub 27 (staged open): `op` 0 create, 1 write, 2 close, signed by
+    /// `who`, for the dispute `d` the challenger would open with `nonce`.
+    async fn prestage(&mut self, who: u8, nonce: u8, d: Pubkey, op: u8, rest: &[u8]) -> Result<(), TransactionError> {
+        let signer = kp(who);
+        let mut data = vec![nonce; 32];
+        data.push(op);
+        data.extend_from_slice(rest);
+        let accounts = vec![AccountMeta::new(signer.pubkey(), true), AccountMeta::new_readonly(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(self.buffer(d, V::ROLE_CHALLENGER), false), AccountMeta::new_readonly(SYSTEM, false)];
+        send(&mut self.ctx, ix(LX::SUB_LX_PRESTAGE, &data, accounts), &[&signer]).await
+    }
+
+    /// Stage `body` (a state body without its kind byte) before the open, in
+    /// 800-byte writes.
+    async fn prestage_body(&mut self, nonce: u8, body: &[u8]) -> Result<(), TransactionError> {
+        let d = self.dispute(nonce);
+        self.prestage(0xC1, nonce, d, 0, &(V::CREATE_STAGE as u32).to_le_bytes()).await?;
+        for (n, chunk) in body.chunks(800).enumerate() {
+            let mut w = ((800 * n) as u32).to_le_bytes().to_vec();
+            w.extend_from_slice(chunk);
+            self.prestage(0xC1, nonce, d, 1, &w).await?;
+        }
+        Ok(())
+    }
+
+    /// OPEN a state dispute whose body is read from the staged buffer.
+    async fn open_staged(&mut self, nonce: u8) -> Result<Pubkey, TransactionError> {
+        let c = kp(0xC1);
+        let d = self.dispute(nonce);
+        let mut data = vec![nonce; 32];
+        data.extend_from_slice(&[LX::KIND_LX_STATE, V::FROM_STAGING]);
+        let accounts = vec![AccountMeta::new(c.pubkey(), true), AccountMeta::new(self.run, false), AccountMeta::new_readonly(self.template, false), AccountMeta::new(d, false), AccountMeta::new_readonly(SYSTEM, false), AccountMeta::new(self.buffer(d, V::ROLE_CHALLENGER), false)];
+        send(&mut self.ctx, ix(V::SUB_OPEN, &data, accounts), &[&c]).await?;
+        Ok(d)
+    }
+
     fn state_body(&self, c: &serde_json::Value, pair: usize) -> Vec<u8> {
         let roots = c["roots"].as_array().unwrap();
         let mut body = vec![LX::KIND_LX_STATE];
@@ -1057,4 +1092,77 @@ async fn lx_fuzz_plays_rule_like_python() {
         }
     }
     eprintln!("lx fuzz: {plays} plays ({} E, {rulings_c} C), {refused} malformed openings refused", plays - rulings_c);
+}
+
+// --- staged open (owner decision 8a, 2026-10-04) -----------------------------------------------
+
+/// Every golden play, opened from a staged body instead of an inline one,
+/// reaches the same terminal coordinate and the same ruling and bond movement.
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_opens_rule_like_inline_opens_in_both_role_orders() {
+    let g = golden();
+    for p in g["plays"].as_array().unwrap() {
+        let name = p["name"].as_str().unwrap();
+        let mut ch = Chain::new(p["arity"].as_u64().unwrap() as u8, 100_000).await;
+        ch.commit(&p["commitment"]).await.unwrap_or_else(|e| panic!("{name}: commit {e:?}"));
+        let body = ch.state_body(&p["commitment"], p["pair"].as_u64().unwrap() as usize);
+        ch.prestage_body(1, &body[1..]).await.unwrap_or_else(|e| panic!("{name}: prestage {e:?}"));
+        let d = ch.open_staged(1).await.unwrap_or_else(|e| panic!("{name}: staged open {e:?}"));
+        let buffer = ch.account(ch.buffer(d, V::ROLE_CHALLENGER)).await;
+        assert_eq!(&buffer.data[40..44], &[0; 4], "{name}: staged length reset at open");
+        for r in p["rounds"].as_array().unwrap() {
+            let mids: Vec<u8> = r["midpoints"].as_array().unwrap().iter().flat_map(h32).collect();
+            ch.midpoints(d, &mids).await.unwrap_or_else(|e| panic!("{name}: midpoints {e:?}"));
+            ch.pick(d, r["pick"].as_u64().unwrap() as u8).await.unwrap_or_else(|e| panic!("{name}: pick {e:?}"));
+        }
+        let dd = ch.account(d).await.data;
+        assert_eq!(u64::from_le_bytes(dd[16..24].try_into().unwrap()), p["terminal"].as_u64().unwrap(), "{name}: terminal coordinate");
+        ch.stage(d, V::ROLE_EXECUTOR, &encode_replay(&p["opening"])).await;
+        rule_and_check(&mut ch, d, p, name, false).await;
+    }
+}
+
+/// Staging before the open is the challenger's alone, only for an unopened
+/// dispute of a committed run in its window; a staged body is checked exactly
+/// like an inline one; an unused buffer closes with its rent to the challenger.
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_open_refusals_and_close() {
+    let g = golden();
+    let p = &g["plays"][0];
+    let mut ch = Chain::new(p["arity"].as_u64().unwrap() as u8, 100_000).await;
+    let size = (V::CREATE_STAGE as u32).to_le_bytes();
+    // Before commit: no dispute can open, so no staging (9).
+    let d1 = ch.dispute(1);
+    assert_eq!(ch.prestage(0xC1, 1, d1, 0, &size).await, Err(custom(9)));
+    ch.commit(&p["commitment"]).await.unwrap();
+    // A dispute address that is not the signer's (the executor signing for
+    // the challenger's dispute) is refused (2).
+    assert_eq!(ch.prestage(0xE1, 1, d1, 0, &size).await, Err(custom(2)));
+    // Oversized and malformed creates (29); an unknown op (29).
+    assert_eq!(ch.prestage(0xC1, 1, d1, 0, &((V::CREATE_STAGE + 1) as u32).to_le_bytes()).await, Err(custom(29)));
+    assert_eq!(ch.prestage(0xC1, 1, d1, 3, &[]).await, Err(custom(29)));
+    // Writing or opening from a buffer that does not exist is refused.
+    assert!(ch.prestage(0xC1, 1, d1, 1, &[0, 0, 0, 0, 1]).await.is_err());
+    assert!(ch.open_staged(1).await.is_err());
+    // A staged body with a root that is not committed is refused (44), as inline.
+    let mut body = ch.state_body(&p["commitment"], 0);
+    body[5] ^= 1;
+    ch.prestage_body(1, &body[1..]).await.unwrap();
+    assert_eq!(ch.open_staged(1).await.err(), Some(custom(44)));
+    // The unused buffer closes; its rent returns to the challenger.
+    let buffer = ch.buffer(d1, V::ROLE_CHALLENGER);
+    let (c0, b0) = (ch.lamports(kp(0xC1).pubkey()).await, ch.lamports(buffer).await);
+    assert!(b0 > 0);
+    ch.prestage(0xC1, 1, d1, 2, &[]).await.unwrap();
+    assert_eq!((ch.lamports(buffer).await, ch.lamports(kp(0xC1).pubkey()).await - c0), (0, b0));
+    // After an open, pre-open staging is refused (37): the dispute's own
+    // staging ops apply.
+    let good = ch.state_body(&p["commitment"], 0);
+    ch.prestage_body(2, &good[1..]).await.unwrap();
+    let d2 = ch.open_staged(2).await.unwrap();
+    assert_eq!(ch.prestage(0xC1, 2, d2, 2, &[]).await, Err(custom(37)));
+    assert_eq!(ch.prestage(0xC1, 2, d2, 1, &[0, 0, 0, 0, 1]).await, Err(custom(37)));
+    // After the challenge window, no new staging (9).
+    ch.warp(100_001).await;
+    assert_eq!(ch.prestage(0xC1, 3, ch.dispute(3), 0, &size).await, Err(custom(9)));
 }
