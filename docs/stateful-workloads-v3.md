@@ -204,6 +204,44 @@ requires zero lamports at the session address.
 Tests: `tests/stateful_v3_creators.rs` (native ProgramTest, or the
 feature-built SBF image with `V3_SBF=1` and `BPF_OUT_DIR`).
 
+### Session features: ring streams and declared rejection
+
+Design [`design/session-reject-and-ring-v1.md`](design/session-reject-and-ring-v1.md)
+(owner decisions 2026-10-05, sessions review H4 and M2). `OPEN_SESSION`
+accepts a 180-byte payload: the 178-byte body, a `lanes` byte (now 0 allowed),
+and a nonzero `features` byte. The 178- and 179-byte forms mean `features = 0`
+and behave, hash and serialize exactly as before.
+
+| Bit | Feature | Contract |
+|---:|---|---|
+| 0 | `FEATURE_RING_STREAM` | Slot of sequence `s` is `s mod capacity`; capacity at least `MIN_RING_CAPACITY` (128) and fixed (`GROW_STREAM` refuses with 2326); a slot is reused only when it holds a consumed sequence of an earlier lap; writes stop at `RING_SEQUENCE_CEILING` (`u32::MAX - 64`). Consumed inputs are overwritten after one lap: the input chain and the application's journal are the archive. |
+| 1 | `FEATURE_REJECTABLE` | Must equal the kernel's `KernelCapabilities::REJECTS_INPUT` (else 2326 at open). `TransitionDisposition::Reject { code }` consumes the input with state and output unchanged; a `Reject` from a session without the flag, with code 0, with output, or with changed state (checked up to the 8 KiB snapshot cap) refuses with 2334. |
+
+Records: session byte 1273 is `features`, bytes 1274..1278 `rejected_count`
+(zero unless rejectable), 1278..1280 reserved zero. The stream header's bytes
+120..124 and 124..128 hold the last rejected sequence and code (zero unless
+rejectable). A rejectable session's input chain is
+`sha256("dcg/input-chain/3" || root || sequence:u32 || disposition:u8 [|| code:u32] || command)`
+with disposition 0 applied, 1 rejected (followed by the code); other sessions
+keep `dcg/input-chain/2`.
+
+A `Reject` needs both the session flag and the kernel's current declaration.
+A declaring kernel must answer every input-dependent refusal with `Reject`
+(`Err` is for faults), and above the 8 KiB snapshot cap must itself keep state
+unchanged on `Reject`. The stream's last-rejection words carry a code exactly
+when `rejected_count > 0`, at a sequence below the cursor. No DCG Python client
+speaks wire v3 yet; clients that address slots must use `s mod capacity` on a
+ring.
+
+v2.1 has no rejection outcome yet: an LX1 run cannot bind a kernel declaring
+`REJECTS_INPUT` (manifests also refuse the bit on stateless kernels), and the
+`DLX1` tail's flags byte stays zero.
+
+Tests: `tests/stateful_v3_reject_ring.rs` (7, native and SBF); the session
+fuzzer (`tests/stateful_v3_fuzz.rs`) draws ring and rejectable sessions,
+bursts rings past full laps, and checks every physical slot, the `/3` chain,
+the counters and the last-rejection words after every transaction.
+
 ## Scaled SBF mechanics demonstration
 
 `tests/stateful_v3_sbf_workload.rs` runs the feature-built SBF image in

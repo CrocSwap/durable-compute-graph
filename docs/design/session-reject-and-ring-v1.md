@@ -1,6 +1,14 @@
 # Declared input rejection and ring-buffer streams (design v1)
 
-**Status: designed (2026-10-05), not implemented.** Owner decisions of
+**Status: program side implemented and reviewed (2026-10-05, branch
+`fast/session-reject-ring`; owner answers: Q1 features byte, Q2 v2.1 flag only
+with rejecting kernels refused, Q3 last-lap history accepted).** Rule-10 review
+(fix-then-merge, no critical or high) and its fixes are recorded in §8. **Not
+yet done (to-do before an app relies on them):** the client work of §3.3 (no
+DCG Python client speaks wire v3 today; the Basanos Doom drivers address v3
+slots themselves and adopt features with the Doom repin) and the
+"rejectable: yes/no" display of §2.4. Contract summary in
+[`stateful-workloads-v3.md`](../stateful-workloads-v3.md). Owner decisions of
 2026-10-05 on the sessions review
 ([`experiments/sessions-v3-review-2026-10-05.md`](../experiments/sessions-v3-review-2026-10-05.md)):
 H4 is fixed by a reject outcome that only kernels declaring the capability may
@@ -30,8 +38,10 @@ bit 0 is `REJECTS_INPUT`. Every existing manifest is `KernelCapabilities::NONE`
 (a mechanical change to each manifest literal in DCG and the apps). Unknown
 bits are refused by `ApplicationManifest::validate`. The capability is part of
 the kernel's promised behaviour, so it is covered by the kernel's semantic
-version: turning it on is a semantic-version bump, and it is included in
-`admission_identity_digest` so an admitted document cannot silently gain it.
+version: turning it on is a semantic-version bump. *Implemented:* the bit is
+refused on stateless kernels, and the revision-8 admission digest covers only
+stateless (legacy-form) kernels, so no admitted document can gain it and the
+digest is unchanged; sessions record it at open.
 
 The off-chain `DCKC` manifest (spec `kernel-capability-v2.md`) is frozen at
 format 1 with `flags = 0`. It gets the same bit in a format-2 record only when a
@@ -57,7 +67,13 @@ truth. (Recorded so nobody reinterprets format 1's flags in place.)
 | kernel error | refused, rolled back (unchanged) | refused, rolled back (unchanged) |
 
 So a declaring kernel converts "I will not apply this well-formed input" into a
-committed, visible outcome; genuine faults still refuse. A session whose
+committed, visible outcome; genuine faults still refuse. **Kernel contract
+(review L2):** a declaring kernel must map every input-dependent refusal to
+`Reject` and reserve `Err` for faults (a bug, an invariant breach); otherwise a
+writer under the APPEND policy can still wedge the session with an input the
+kernel answers with `Err`. Above the 8 KiB snapshot cap, "state unchanged on
+`Reject`" is a kernel obligation the program cannot check (review M1): test it
+off chain (the app's replay or a purity check around each `Reject`). A session whose
 kernel never rejects behaves byte for byte as today.
 
 ### 2.3 Input chain
@@ -87,9 +103,11 @@ template whether "rejected" is a possible outcome.
   `rejected_count` and `last_reject`; the Python client's session view and the
   docs' "explain" output show "rejectable: yes/no".
 - **v2.1 LX templates.** The `DLX1` tail names its one kernel. Tail byte 25
-  (reserved, zero today) becomes `flags`, bit 0 `REJECTABLE`; `create_template`
-  requires it to equal the named kernel's capability. The template id hashes
-  the creation data, so the id commits to the flag.
+  (reserved, zero today) is where a `REJECTABLE` flag goes once v2.1 has a
+  rejection outcome; the template id hashes the creation data, so the id would
+  commit to it. *Implemented for now (Q2):* the byte stays zero and an LX1 run
+  cannot bind a kernel declaring the capability (`create_template` does not
+  resolve kernels; `bind` does).
 - **v2.1 block templates.** The program does not see the step kernels at
   creation (they are opened from the spec root during a dispute), so the
   template **declares** the flag in a creation-data flags field (zero today)
@@ -197,3 +215,26 @@ records in block templates: separate work, after Q2.
    refused for now (recommended), or design the rejection record path now.
 3. **Q3 Stream history:** accept that a ring stream keeps only the last lap of
    inputs, with the input chain and app journals as the archive.
+
+## 8. Review (2026-10-05) and fixes
+
+Rule-10 review of 8ece4a6 + 9287c88: fix-then-merge, no critical or high. It
+confirmed ring overwrite safety (a slot is reused only below the cursor; the
+window keeps live inputs apart), no new griefing or call-first gain,
+byte-identical records and `/2` chains for old opens, and consistent prefixes
+when Reject mixes with halts. Fixes:
+
+- **M1** the reject test kernels are the lane counter plus the capability, so
+  lanes and rejection are tested together (ProgramTest and fuzzer); the kernel
+  obligation above 8 KiB is documented (§2.2).
+- **M2** tests for Reject mixed with HaltBefore/HaltAfter, a ring gap after a
+  lap (refuses 2330, not the old lap's input), the sequence ceiling (counters
+  set near `u32::MAX`), and the LX1 bind refusal (unit test).
+- **M3** status above lists the client work still to do.
+- **L1** a Reject needs both the session flag and the kernel's current
+  capability.
+- **L2** kernel contract stated (§2.2).
+- **L3** the stream's last-rejection words are checked: a code exactly when
+  `rejected_count > 0`, at a sequence below the cursor.
+- **L4** comment on why `rejected_count` cannot overflow.
+- **L5** `fuzz_smoke` runs 48 sequences and asserts ring laps and rejections.
