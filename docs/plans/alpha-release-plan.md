@@ -65,8 +65,15 @@ session's children). H4 and M2 are fixed by session features (merged 10-05,
 (`docs/design/session-reject-and-ring-v1.md`; rule-10 reviewed, fix-then-merge;
 fuzzed 1,500 native + 300 SBF sequences with ring laps and rejections, clean).
 Still to do there: client support for v3 features (no DCG Python client speaks
-v3; Doom adopts them with its repin). Admission, the template lifecycle and the
-other handlers are still to review.
+v3; Doom adopts them with its repin). **Admission, the template lifecycle, the
+closes and routing reviewed 10-05** (two independent reviews, fixes, two
+re-reviews; merged 69fe0a1): staging growth refunded by recorded payer,
+admission floors and canonical template ids, built-ins bound at version (1, 1),
+LX staged length, and a named `alpha-image` (only tag 227 routes; image
+`e63816cb…`, 344,096 bytes, reproducible). Known alpha limits: kernels resolve
+against the live image (no kernel change while runs are live); template promises
+under the trusted spec root. F10 answered: no handler trusts an account by owner
+and magic alone where it matters. **R2 is complete.**
 - Stateful sessions (v3) get the same treatment tag 227 had, including a run-level fuzzer of their own: random interleavings of steps, resends, failed and duplicated transactions, view publications and closes, with invariants (each step applied once and in order, state digests match a host replay, lamports conserved) checked after every step.
 - Admission, the template lifecycle, and every other handler the shared program exposes each get an independent adversarial review (Basanos project rule 10).
 - That includes the staging-buffer question from finding F10: does any handler accept an account by owner and magic alone?
