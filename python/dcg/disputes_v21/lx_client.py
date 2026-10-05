@@ -23,10 +23,14 @@ from solders.pubkey import Pubkey
 
 from . import lx as L
 from . import wire as W
-from .client import CREATE_STAGE, ROLE_CHALLENGER, ROLE_EXECUTOR, RULINGS, STAGE_PIECE, SUB, SYSTEM, DisputeClient
+from .client import (CREATE_STAGE, FROM_STAGING, ROLE_CHALLENGER, ROLE_EXECUTOR, RULINGS, STAGE_PIECE, SUB, SYSTEM,
+                     DisputeClient)
 
-SUB.update({"lx_midpoints": 23, "lx_pick": 24, "lx_opening": 25, "lx_output": 26})
+SUB.update({"lx_midpoints": 23, "lx_pick": 24, "lx_opening": 25, "lx_output": 26, "lx_prestage": 27})
 KIND_LX_STATE, KIND_LX_OUTPUT = 3, 4
+# An inline OPEN body above this size does not fit one packet with the open's
+# accounts and signature; it is staged first (tag 227 sub 27, decision 8a).
+INLINE_OPEN_MAX = 800
 LX_TAIL_MAGIC = b"DLX1"
 PARAMS_DOMAIN = b"dcg.lx.params.v1\x00"
 RUN_ROOT_BYTES = 176
@@ -133,24 +137,49 @@ class LxClient(DisputeClient):
                          for at in range(0, len(body), STAGE_PIECE)])
         return buffer
 
+    def lx_prestage(self, run: Pubkey, template: Pubkey, dispute: Pubkey, nonce: bytes, body: bytes,
+                    challenger: Keypair) -> Pubkey:
+        """Stage an OPEN body (without its kind byte) in the challenger's
+        buffer for the dispute it is about to open (sub 27: op 0 create, op 1
+        write). OPEN then reads it with the body byte FROM_STAGING."""
+        if not 0 < len(body) <= CREATE_STAGE:
+            raise ValueError(f"staged open body of {len(body)} bytes")
+        buffer = self.pda(b"dcg21stg", bytes(dispute), bytes([ROLE_CHALLENGER]))
+        metas = [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, False),
+                 AccountMeta(template, False, False), AccountMeta(dispute, False, False),
+                 AccountMeta(buffer, False, True), AccountMeta(SYSTEM, False, False)]
+        self._send("lx_prestage", nonce + bytes([0]) + struct.pack("<I", len(body)), metas, [challenger])
+        self._send_many([("lx_prestage", nonce + bytes([1]) + struct.pack("<I", at) + body[at:at + STAGE_PIECE],
+                          metas, [challenger]) for at in range(0, len(body), STAGE_PIECE)])
+        return buffer
+
     def lx_play(self, run: Pubkey, template: Pubkey, *, coordinates: Sequence[int], roots: Sequence[bytes],
                 levels: list[list[bytes]], pair: int, params: bytes, arity: int,
                 executor: Keypair, challenger: Keypair,
                 executor_roots: Callable[[list[int]], list[bytes]],
                 challenger_roots: Callable[[list[int]], list[bytes]],
                 executor_opening: Callable[[int], bytes],
-                dispute_nonce: bytes = bytes([1]) * 32, log: Callable[[str], None] = print) -> dict:
+                dispute_nonce: bytes = bytes([1]) * 32, log: Callable[[str], None] = print,
+                staged_open: bool | None = None) -> dict:
         """C opens checkpoint pair `pair` of E's commitment; the parties bisect
         it from their executions; E opens the terminal transition. Returns the
-        ruling, the terminal coordinate and the transaction count."""
+        ruling, the terminal coordinate and the transaction count.
+        ``staged_open``: stage the OPEN body first (default: when it is larger
+        than one packet allows)."""
         t0, sent0 = time.monotonic(), self.sent
         dispute = self.pda(b"dcg21dsp", bytes(run), bytes(challenger.pubkey()), dispute_nonce)
         body = (bytes([KIND_LX_STATE]) + struct.pack("<I", pair) + roots[pair] + roots[pair + 1]
                 + tree_path(levels, pair) + tree_path(levels, pair + 1) + params)
-        self._send("open", dispute_nonce + body,
-                   [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, True),
-                    AccountMeta(template, False, False), AccountMeta(dispute, False, True),
-                    AccountMeta(SYSTEM, False, False)], [challenger])
+        open_metas = [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, True),
+                      AccountMeta(template, False, False), AccountMeta(dispute, False, True),
+                      AccountMeta(SYSTEM, False, False)]
+        if staged_open if staged_open is not None else len(body) > INLINE_OPEN_MAX:
+            buffer = self.lx_prestage(run, template, dispute, dispute_nonce, body[1:], challenger)
+            self._send("open", dispute_nonce + bytes([KIND_LX_STATE, FROM_STAGING]),
+                       open_metas + [AccountMeta(buffer, False, True)], [challenger])
+            log(f"  open staged ({len(body) - 1} bytes)")
+        else:
+            self._send("open", dispute_nonce + body, open_metas, [challenger])
 
         def party(who: Keypair) -> list[AccountMeta]:
             return [AccountMeta(who.pubkey(), True, False), AccountMeta(run, False, True),
