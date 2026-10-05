@@ -142,7 +142,7 @@ impl Lanes {
         p.extend_from_slice(&8u32.to_le_bytes());
         let payer = self.ctx.payer.pubkey();
         let s = self.session;
-        send(&mut self.ctx, ix(sw::TAG_CREATE_VIEW, p, vec![AccountMeta::new(payer, true), w(s), w(view_pda(&s, role)), r(SYSTEM)]), &[]).await.unwrap();
+        send(&mut self.ctx, ix(sw::TAG_CREATE_VIEW, p, vec![AccountMeta::new(payer, true), w(s), signer(self.auth.pubkey()), w(view_pda(&s, role)), r(SYSTEM)]), &[&self.auth]).await.unwrap();
         self.roles.push(role);
         self.roles.sort();
     }
@@ -155,18 +155,18 @@ impl Lanes {
         let states = [state_pda(&session, 0), state_pda(&session, 1)];
         let open = ix(sw::TAG_OPEN_SESSION, open_payload(1, &app::V3_LANE_COUNTER, Some(lanes)), vec![AccountMeta::new(payer, true), signer(auth.pubkey()), w(session), r(SYSTEM)]);
         send(&mut ctx, open, &[&auth]).await.unwrap();
-        send(&mut ctx, ix(sw::TAG_CREATE_STREAM, vec![v3::WIRE_VERSION, 0], vec![AccountMeta::new(payer, true), w(session), w(stream_pda(&session)), r(SYSTEM)]), &[]).await.unwrap();
+        send(&mut ctx, ix(sw::TAG_CREATE_STREAM, vec![v3::WIRE_VERSION, 0], vec![AccountMeta::new(payer, true), w(session), signer(auth.pubkey()), w(stream_pda(&session)), r(SYSTEM)]), &[&auth]).await.unwrap();
         let mut cs = vec![v3::WIRE_VERSION, 2];
         cs.extend_from_slice(&8u32.to_le_bytes());
         cs.extend_from_slice(&8u32.to_le_bytes());
-        send(&mut ctx, ix(sw::TAG_CREATE_STATE, cs, vec![AccountMeta::new(payer, true), w(session), w(states[0]), w(states[1]), r(SYSTEM)]), &[]).await.unwrap();
+        send(&mut ctx, ix(sw::TAG_CREATE_STATE, cs, vec![AccountMeta::new(payer, true), w(session), signer(auth.pubkey()), w(states[0]), w(states[1]), r(SYSTEM)]), &[&auth]).await.unwrap();
         send(&mut ctx, ix(sw::TAG_CREATE_STATE, vec![v3::WIRE_VERSION, v3::STATE_OP_INITIALIZE], vec![signer(auth.pubkey()), w(session), w(states[0]), w(states[1])]), &[&auth]).await.unwrap();
         for (role, abi, offset) in [(VALUE, app::VALUE_VIEW_ABI, 0u32), (TOTAL, app::TOTAL_VIEW_ABI, 8)].into_iter().filter(|x| roles.contains(&x.0)) {
             let mut p = vec![v3::WIRE_VERSION, role];
             p.extend_from_slice(&abi);
             p.extend_from_slice(&offset.to_le_bytes());
             p.extend_from_slice(&8u32.to_le_bytes());
-            send(&mut ctx, ix(sw::TAG_CREATE_VIEW, p, vec![AccountMeta::new(payer, true), w(session), w(view_pda(&session, role)), r(SYSTEM)]), &[]).await.unwrap();
+            send(&mut ctx, ix(sw::TAG_CREATE_VIEW, p, vec![AccountMeta::new(payer, true), w(session), signer(auth.pubkey()), w(view_pda(&session, role)), r(SYSTEM)]), &[&auth]).await.unwrap();
         }
         let mut me = Lanes { ctx, auth, session, states, cursor: 0, roles: roles.to_vec() };
         for k in 0..lanes {
