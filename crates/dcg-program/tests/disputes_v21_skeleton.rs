@@ -2445,3 +2445,82 @@ async fn rr_n7_burst_fifo_feasible() {
         ch.leaf1(*d, &c).await.unwrap();
     }
 }
+
+// ---- R2 reviews 10-05 (A-H1 / B-M1): staging growth rent ----
+
+async fn r2_bal(ch: &mut Chain, k: Pubkey) -> u64 {
+    ch.ctx.banks_client.get_balance(k).await.unwrap()
+}
+
+/// The challenger creates the executor's staging buffer (paying its creation
+/// rent), the executor grows it to answer and then wins on a PICK timeout. At
+/// close the challenger gets back exactly its creation rent and the executor
+/// gets every lamport of its growth back: a frivolous challenge no longer
+/// pays (before the fix the challenger collected the growth).
+#[tokio::test(flavor = "multi_thread")]
+async fn executor_growth_rent_returns_to_the_executor_at_close() {
+    let mut ch = Chain::new(30).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let d = ch.open(70, V::KIND_STEP_DESCEND).await;
+    let (cc, e) = (kp(0xC1), kp(0xE1));
+    let buf = ch.buffer(d, V::ROLE_EXECUTOR);
+    let mut data = vec![V::ROLE_EXECUTOR];
+    data.extend_from_slice(&0u32.to_le_bytes());
+    let create = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(cc.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    send(&mut ch.ctx, create, &[&cc]).await.unwrap();
+    let created_rent = r2_bal(&mut ch, buf).await;
+    let e0 = r2_bal(&mut ch, e.pubkey()).await;
+    for _ in 0..11 {
+        let grow = ix(V::SUB_STAGE_GROW, &10_240u32.to_le_bytes(), vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+        send(&mut ch.ctx, grow, &[&e]).await.unwrap();
+    }
+    let e_paid = e0 - r2_bal(&mut ch, e.pubkey()).await;
+    assert!(e_paid > CHALLENGER_BOND, "growth larger than the bond: the case that used to pay the challenger");
+    let mut nodes = Vec::new();
+    nodes.extend_from_slice(&c.step[0][0]);
+    nodes.extend_from_slice(&c.step[0][1]);
+    let reveal = ix(V::SUB_REVEAL_NODES, &nodes, ch.party(0xE1, d));
+    send(&mut ch.ctx, reveal, &[&e]).await.unwrap();
+    ch.ctx.warp_to_slot(5_000).unwrap();
+    let caller = kp(0xA1);
+    let timeout = ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false), AccountMeta::new(e.pubkey(), false), AccountMeta::new(cc.pubkey(), false)]);
+    send(&mut ch.ctx, timeout, &[&caller]).await.unwrap(); // C abandons PICK: E wins
+    assert_eq!(ch.ruling(d).await, V::RULING_EXECUTOR);
+    ch.advance(d).await.unwrap();
+    let (c1, e1) = (r2_bal(&mut ch, cc.pubkey()).await, r2_bal(&mut ch, e.pubkey()).await);
+    let dispute_rent = r2_bal(&mut ch, d).await;
+    ch.close_dispute(d).await.unwrap();
+    let c_gain = r2_bal(&mut ch, cc.pubkey()).await - c1;
+    let e_gain = r2_bal(&mut ch, e.pubkey()).await - e1;
+    assert_eq!(e_gain, e_paid, "the executor's growth rent comes back to it");
+    assert_eq!(c_gain, dispute_rent + created_rent, "the challenger gets only the dispute and its creation rent");
+}
+
+/// Routing on the alpha SBF image (V21_SBF=1, BPF_OUT_DIR naming an image built
+/// with `--features alpha-image`): every tag other than 227 refuses before any
+/// account is read, including the test-only subtype 250. Native builds cannot
+/// check this, because dcg-test-support turns on revision-8-lifecycle for every
+/// dcg-program dev build (R2 review B, M2/M3).
+#[tokio::test(flavor = "multi_thread")]
+async fn alpha_image_routes_only_tag_227() {
+    if !std::env::var("V21_SBF").is_ok_and(|v| v == "1") {
+        return;
+    }
+    use solana_instruction::error::InstructionError;
+    let mut test = ProgramTest::default();
+    test.prefer_bpf(true);
+    test.add_program("dcg_program", PROGRAM, None);
+    let mut ctx = test.start_with_context().await;
+    let mut reached = Vec::new();
+    for tag in 0u8..=255 {
+        for sub in [1u8, 18, 250] {
+            let i = Instruction { program_id: PROGRAM, accounts: vec![], data: vec![tag, sub, 0, 0, 0, 0] };
+            let r = send(&mut ctx, i, &[]).await;
+            if r != Err(TransactionError::InstructionError(0, InstructionError::InvalidInstructionData)) {
+                reached.push((tag, sub, format!("{r:?}")));
+            }
+        }
+    }
+    assert!(reached.iter().all(|(t, s, _)| *t == 227 && *s != 250), "{reached:?}");
+}

@@ -2139,8 +2139,9 @@ fn settled(r: &[u8]) -> bool {
 // executor buffer(w), challenger buffer(w)]. A ruled or moot dispute whose
 // sequence the ruled prefix has passed (so `advance` no longer needs it), and,
 // if it is the run's lowest challenger win, after the pot is paid. Closes both
-// staging buffers if they exist (their rent to the party that created them)
-// and the dispute (its rent to the challenger).
+// staging buffers if they exist (creation rent to the party that created
+// them; growth of the executor's buffer to the executor) and the dispute (its
+// rent to the challenger).
 fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [_caller, run, tmpl, dispute, challenger, executor, buffer_e, buffer_c, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -2174,7 +2175,22 @@ fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
             }
             b[5]
         };
-        close_into(buffer, if creator == 1 { executor } else { challenger })?;
+        // The executor's buffer (role 1) is created at exactly CREATE_STAGE
+        // bytes; when the challenger created it, the challenger gets back that
+        // creation rent and every lamport above it (growth the executor paid
+        // to answer, or anything pre-funded) goes to the executor. Before
+        // this, a losing challenger collected the executor's growth rent (R2
+        // reviews 10-05, A-H1 / B-M1).
+        if role == ROLE_EXECUTOR && creator == 0 {
+            let creation = Rent::get()?.minimum_balance(STAGE_HEADER + CREATE_STAGE).min(buffer.lamports());
+            if !challenger.is_writable {
+                return Err(err(35));
+            }
+            move_lamports(buffer, challenger, creation)?;
+            close_into(buffer, executor)?;
+        } else {
+            close_into(buffer, if creator == 1 { executor } else { challenger })?;
+        }
     }
     {
         let mut r = c.run.try_borrow_mut_data()?;
