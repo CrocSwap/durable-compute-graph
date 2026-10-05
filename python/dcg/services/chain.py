@@ -103,9 +103,11 @@ class RunState:
                    bytes(d[R_ROOT:R_ROOT + RUN_ROOT_BYTES]), refs)
 
 
-def staged_lists(buffer_data: bytes | None) -> dict[int, list[bytes]] | None:
+def staged_lists(buffer_data: bytes | None, expected_leaf: bytes | None = None) -> dict[int, list[bytes]] | None:
     """The element refs of a staged LVR1 leaf body in an executor buffer, or
-    None if the buffer holds no LVR1 body."""
+    None if the buffer holds no LVR1 body, or (with `expected_leaf`) one
+    whose leaf is not the revealed leaf (review H6: a buffer the executor
+    wrote but did not reveal from proves nothing)."""
     if buffer_data is None or len(buffer_data) < STAGE_HEADER:
         return None
     n = _u32(buffer_data, 40)
@@ -113,6 +115,8 @@ def staged_lists(buffer_data: bytes | None) -> dict[int, list[bytes]] | None:
     if body[:4] != b"LVR1":
         return None
     leaf_len = struct.unpack_from("<H", body, 5)[0]
+    if expected_leaf is not None and (body[4] != 1 or body[7:7 + leaf_len] != expected_leaf):
+        return None
     at = 7 + leaf_len
     count, at = body[at], at + 1
     out = {}
@@ -125,16 +129,32 @@ def staged_lists(buffer_data: bytes | None) -> dict[int, list[bytes]] | None:
 
 
 class Discovery:
-    """New accounts named by transactions touching an address, since the last
-    signature seen (in signature order, oldest first)."""
+    """Accounts named by tag-227 transactions touching an address, found
+    incrementally from its signature history (oldest first).
 
-    def __init__(self, cl: CL.DisputeClient, cursors: dict[str, str] | None = None):
+    - The cursor advances only past transactions that were read; a
+      transaction the RPC cannot return yet is retried on the next call.
+    - Lookup-table accounts are included; transactions that do not invoke
+      the program are ignored (anyone may name an address in a transaction).
+    - Each call reads at most `max_transactions` new transactions, so a burst
+      of transactions cannot stall deadline-bound work; the rest follow on
+      later calls.
+    - `known(address)` is every account seen so far for that address.
+    """
+
+    def __init__(self, cl: CL.DisputeClient, state: dict | None = None, max_transactions: int = 64):
         self.cl = cl
-        self.cursors = cursors if cursors is not None else {}
+        self.state = state if state is not None else {}
+        self.state.setdefault("cursors", {})
+        self.state.setdefault("keys", {})
+        self.max_transactions = max_transactions
+
+    def known(self, address: Pubkey) -> list[Pubkey]:
+        return [Pubkey.from_string(k) for k in self.state["keys"].get(str(address), [])]
 
     def new_keys(self, address: Pubkey) -> list[Pubkey]:
-        last = self.cursors.get(str(address))
-        sigs, before = [], None
+        last = self.state["cursors"].get(str(address))
+        pending, before = [], None
         while True:
             opts = {"limit": 1000, "commitment": "confirmed"}
             if last:
@@ -142,27 +162,39 @@ class Discovery:
             if before:
                 opts["before"] = before
             page = self.cl.gc.rpc("getSignaturesForAddress", [str(address), opts])
-            sigs += page
+            pending += page
             if len(page) < 1000:
                 break
             before = page[-1]["signature"]
-        if not sigs:
-            return []
-        self.cursors[str(address)] = sigs[0]["signature"]
-        keys: dict[str, None] = {}
-        for sig in reversed([s["signature"] for s in sigs if s.get("err") is None]):
-            tx = self.cl.gc.rpc("getTransaction", [sig, {"encoding": "json", "commitment": "confirmed",
-                                                         "maxSupportedTransactionVersion": 0}])
-            if tx is not None:
-                keys.update(dict.fromkeys(tx["transaction"]["message"]["accountKeys"]))
-        return [Pubkey.from_string(k) for k in keys]
+        pending.reverse()  # oldest first
+        found: dict[str, None] = {}
+        seen = self.state["keys"].setdefault(str(address), [])
+        read = 0
+        for entry in pending:
+            if read >= self.max_transactions:
+                break
+            if entry.get("err") is None:
+                tx = self.cl.gc.rpc("getTransaction", [entry["signature"], {
+                    "encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}])
+                if tx is None:
+                    break  # not readable yet: stop here and retry from this signature
+                read += 1
+                for k in CL.program_tx_keys(tx, self.cl.gc.program_id):
+                    if k not in found and k not in seen:
+                        found[k] = None
+            self.state["cursors"][str(address)] = entry["signature"]
+        seen.extend(found)
+        return [Pubkey.from_string(k) for k in found]
 
 
 def dispute_moves(cl: CL.DisputeClient, dispute: Pubkey) -> list[tuple[int, bytes]]:
-    """The successful tag-227 moves on a dispute, oldest first, as
-    (sub-tag, body), read from its transaction history. A watchtower rebuilds
-    its replica from these after a restart, so recovery does not depend on
-    its journal having been saved."""
+    """The successful descent moves on one dispute, oldest first, as
+    (sub-tag, body), read from its transaction history: reveal_nodes (5),
+    pick (6), and a cache answer (16) returned as a reveal_nodes body read
+    from the cache account (slots in order, pickable ones only are used by
+    the caller). Only instructions whose dispute account (index 3) is this
+    dispute count, so batched transactions do not mix disputes. A watchtower
+    rebuilds its replica from these after a restart."""
     import base64
 
     from solders.transaction import VersionedTransaction
@@ -180,11 +212,22 @@ def dispute_moves(cl: CL.DisputeClient, dispute: Pubkey) -> list[tuple[int, byte
         tx = cl.gc.rpc("getTransaction", [sig, {"encoding": "base64", "commitment": "confirmed",
                                                 "maxSupportedTransactionVersion": 0}])
         if tx is None:
-            continue
+            raise RuntimeError(f"transaction {sig} of dispute {dispute} is not readable yet")
         message = VersionedTransaction.from_bytes(base64.b64decode(tx["transaction"][0])).message
-        keys = message.account_keys
+        loaded = (tx.get("meta") or {}).get("loadedAddresses") or {}
+        keys = list(message.account_keys) + [Pubkey.from_string(k) for k in
+                                            loaded.get("writable", []) + loaded.get("readonly", [])]
         for ix in message.instructions:
             data = bytes(ix.data)
-            if keys[ix.program_id_index] == cl.gc.program_id and len(data) >= 2 and data[0] == CL.TAG:
+            accounts = list(ix.accounts)
+            if (keys[ix.program_id_index] != cl.gc.program_id or len(data) < 2 or data[0] != CL.TAG
+                    or len(accounts) < 4 or keys[accounts[3]] != dispute):
+                continue
+            if data[1] == CL.SUB_CACHE_ANSWER:
+                cache = cl.gc.account(keys[accounts[4]]) if len(accounts) > 4 else None
+                if cache is None:
+                    raise RuntimeError(f"the cache answering dispute {dispute} is gone; cannot rebuild")
+                moves.append((CL.SUB["reveal_nodes"], b"SLOTS" + bytes(cache[56:56 + 32 * 32])))
+            else:
                 moves.append((data[1], data[2:]))
     return moves

@@ -11,15 +11,16 @@ Each watched template names its plan and an input source: the application
 supplies each run's external inputs, and the watchtower checks them against
 the run's refs (owner 10-05: inputs come from the application until they
 are posted on chain). A run whose inputs are not available is reported, not
-checked.
+checked. The plan is checked against the template on chain at start-up.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 from solders.instruction import AccountMeta
@@ -36,6 +37,9 @@ from .journal import Journal
 
 #: (run, external id, its 52-byte ref) -> the input bytes, or None if unknown.
 InputSource = Callable[[Pubkey, int, bytes], "bytes | None"]
+
+# Template account layout (disputes_v21.rs `template`).
+T_DEPTH, T_STEPS, T_OUTPUTS, T_SPEC_ROOT, T_PLAN_ID = 4, 8, 16, 64, 136
 
 
 @dataclass
@@ -58,33 +62,58 @@ def log(**fields) -> None:
     print(json.dumps({"t": round(time.time(), 1), **fields}, default=str), flush=True)
 
 
-@dataclass
-class _Live:
-    challenger: Challenger
-    fed_rounds: int = 0
-    claimed: bool = False
-    extra: dict = field(default_factory=dict)
+class ConfigError(ValueError):
+    """A watched plan does not match its template on chain."""
 
 
 class Watchtower:
     def __init__(self, cl: CL.DisputeClient, challenger: Keypair, journal: str, watched: list[Watched],
-                 budget: Budget = Budget()):
-        self.cl, self.key, self.budget = cl, challenger, budget
+                 budget: Budget = Budget(), tick_budget_s: float = 10.0):
+        self.cl, self.key, self.budget, self.tick_budget_s = cl, challenger, budget, tick_budget_s
         self.watched = {str(w.template): w for w in watched}
         self.journal = Journal(journal)
-        for k in ("runs", "disputes", "cursors"):
+        for k in ("runs", "disputes", "discovery"):
             self.journal.data.setdefault(k, {})
-        self.discovery = Discovery(cl, self.journal.data["cursors"])
-        self._live: dict[str, _Live] = {}
+        self.discovery = Discovery(cl, self.journal.data["discovery"])
+        self._live: dict[str, Challenger] = {}
+        for w in watched:
+            self._check_config(w)
+
+    def _check_config(self, w: Watched) -> None:
+        """The plan must be the one the template commits to: a wrong plan
+        makes H wrong, and the watchtower would challenge honest runs."""
+        t = self.cl.gc.account(w.template)
+        if t is None or t[:4] != b"D21T":
+            raise ConfigError(f"{w.template} is not a v2.1 template")
+        if w.lx:
+            return
+        got = (t[T_DEPTH], struct.unpack_from("<Q", t, T_STEPS)[0], struct.unpack_from("<Q", t, T_OUTPUTS)[0],
+               bytes(t[T_SPEC_ROOT:T_SPEC_ROOT + 32]), bytes(t[T_PLAN_ID:T_PLAN_ID + 32]))
+        want = (w.depth, w.spec.total_steps, w.spec.total_outputs, w.spec.root, w.plan_id)
+        if got != want:
+            raise ConfigError(f"the plan for template {w.template} does not match the template on chain")
 
     # --- the loop -------------------------------------------------------------------------
     def tick(self) -> list[str]:
+        """One pass. Own disputes come first (soonest deadline first), then
+        checks of committed runs, then bounded discovery of new runs."""
+        t0 = time.monotonic()
         actions: list[str] = []
-        for t_s, w in self.watched.items():
+        disputes = []
+        for d_s, entry in self.journal.data["disputes"].items():
+            if entry.get("done"):
+                continue
+            raw = self._safe(lambda d_s=d_s: self.cl.gc.account(Pubkey.from_string(d_s)))
+            deadline = struct.unpack_from("<Q", raw, CL.D_DEADLINE)[0] if raw else 0
+            disputes.append((deadline, d_s, entry))
+        for _deadline, d_s, entry in sorted(disputes, key=lambda x: x[0]):
             try:
-                self._discover(w)
+                act = self._play(Pubkey.from_string(d_s), entry)
+                if act:
+                    actions.append(act)
             except Exception as exc:
-                log(event="error", template=t_s, error=f"{type(exc).__name__}: {exc}")
+                self._report(d_s, exc)
+            self.journal.save()
         for run_s, entry in self.journal.data["runs"].items():
             if entry["state"] in ("ok", "closed", "skipped", "disputed", "missed"):
                 continue
@@ -92,24 +121,33 @@ class Watchtower:
                 actions += self._check(Pubkey.from_string(run_s), entry)
             except Exception as exc:
                 log(event="error", run=run_s, error=f"{type(exc).__name__}: {exc}")
-        for d_s, entry in self.journal.data["disputes"].items():
-            if entry.get("done"):
-                continue
+        for t_s, w in self.watched.items():
             try:
-                act = self._play(Pubkey.from_string(d_s), entry)
-                if act:
-                    actions.append(act)
+                self._discover(w)
             except Exception as exc:
-                # A move refused because the dispute was ruled meanwhile (moot
-                # after another challenger's win, or a timeout) is a race,
-                # not a fault; the next tick settles it.
-                raw = self.cl.gc.account(Pubkey.from_string(d_s))
-                if raw is not None and DisputeState.parse(Pubkey.from_string(d_s), raw).ruling != CL.RULING_OPEN:
-                    log(event="raced", dispute=d_s, note="ruled before our move landed")
-                else:
-                    log(event="error", dispute=d_s, error=f"{type(exc).__name__}: {exc}")
+                log(event="error", template=t_s, error=f"{type(exc).__name__}: {exc}")
         self.journal.save()
+        elapsed = time.monotonic() - t0
+        if elapsed > self.tick_budget_s:
+            log(event="slow_tick", seconds=round(elapsed, 1), budget=self.tick_budget_s)
         return actions
+
+    @staticmethod
+    def _safe(fn):
+        try:
+            return fn()
+        except Exception:
+            return None
+
+    def _report(self, d_s: str, exc: Exception) -> None:
+        """A move refused because the dispute was ruled meanwhile (moot after
+        another challenger's win, or a timeout) is a race, not a fault."""
+        raw = self._safe(lambda: self.cl.gc.account(Pubkey.from_string(d_s)))
+        if raw is not None and raw[CL.D_RULING] != CL.RULING_OPEN:
+            log(event="raced", dispute=d_s, note="ruled before our move landed")
+        else:
+            log(event="error", dispute=d_s, error=f"{type(exc).__name__}: {exc}")
+            self._live.pop(d_s, None)  # rebuild from chain on the next tick
 
     def _discover(self, w: Watched) -> None:
         for key in self.discovery.new_keys(w.template):
@@ -119,6 +157,17 @@ class Watchtower:
             if raw and raw[:4] == b"D21R" and raw[CL.R_TEMPLATE:CL.R_TEMPLATE + 32] == bytes(w.template):
                 self.journal.data["runs"][str(key)] = {"template": str(w.template), "state": "seen"}
                 log(event="run_seen", run=str(key), template=str(w.template))
+
+    def _inputs(self, w: Watched, run: Pubkey, state: RunState) -> dict[int, bytes] | None:
+        values = {}
+        for eid, ref in sorted(state.refs.items()):
+            value = w.inputs(run, eid, ref)
+            if value is None or R.external_ref(eid, w.spec.in_specs[eid][8:31],
+                                               R.input_digest(w.spec.in_specs[eid], value)) != ref:
+                log(event="inputs_unavailable", run=str(run), external_id=eid)
+                return None
+            values[eid] = value
+        return values
 
     def _check(self, run: Pubkey, entry: dict) -> list[str]:
         raw = self.cl.gc.account(run)
@@ -138,13 +187,9 @@ class Watchtower:
             entry["state"] = "skipped"
             log(event="skipped", run=str(run), reason="LX1 runs are not checked in v1")
             return []
-        values = {}
-        for eid, ref in sorted(state.refs.items()):
-            value = w.inputs(run, eid, ref)
-            if value is None or R.external_ref(eid, w.spec.in_specs[eid][8:31], R.input_digest(w.spec.in_specs[eid], value)) != ref:
-                log(event="inputs_unavailable", run=str(run), external_id=eid)
-                return []  # retried next tick, until the window closes
-            values[eid] = value
+        values = self._inputs(w, run, state)
+        if values is None:
+            return []  # retried next tick, until the window closes
         honest = R.execute(w.spec, w.plan_id, state.run_id, values)
         record = G.RunRecord(w.plan_id, state.run_id, w.spec, state.root, state.refs)
         kind = dispute_kind(record, honest)
@@ -158,16 +203,17 @@ class Watchtower:
             return []
         nonce = os.urandom(32)
         dispute = self.cl.pda(b"dcg21dsp", bytes(run), bytes(self.key.pubkey()), nonce)
-        # Write ahead: a crash after the open lands must not open a second
-        # dispute on restart (the journal names this one first).
+        # Write ahead, with the checked inputs: a crash after the open lands
+        # must neither open a second dispute nor depend on the input source.
         entry["state"] = "disputed"
-        self.journal.data["disputes"][str(dispute)] = {"run": str(run), "kind": kind, "nonce": nonce.hex(),
-                                                        "done": False}
+        self.journal.data["disputes"][str(dispute)] = {
+            "run": str(run), "kind": kind, "nonce": nonce.hex(), "done": False, "opened": False,
+            "inputs": {str(k): v.hex() for k, v in values.items()}}
         self.journal.save()
         self._open(run, state.template, dispute, nonce, kind)
         self.journal.data["disputes"][str(dispute)]["opened"] = True
         self.journal.save()
-        self._live[str(dispute)] = _Live(Challenger(record, honest, kind, w.depth))
+        self._live[str(dispute)] = Challenger(record, honest, kind, w.depth)
         log(event="open", run=str(run), dispute=str(dispute), kind=kind)
         return [f"open {dispute}"]
 
@@ -178,33 +224,34 @@ class Watchtower:
                        AccountMeta(CL.SYSTEM, False, False)], [self.key])
 
     # --- playing a dispute ------------------------------------------------------------------
-    def _replica(self, d_s: str, entry: dict) -> _Live:
-        """The in-memory challenger, rebuilt from the journal after a restart."""
+    def _replica(self, d_s: str, entry: dict) -> Challenger:
+        """The in-memory challenger, rebuilt from the dispute's own moves on
+        chain (not from the journal) whenever it is missing."""
         if d_s not in self._live:
             run = Pubkey.from_string(entry["run"])
             state = RunState.parse(run, self.cl.gc.account(run))
             w = self.watched[self.journal.data["runs"][entry["run"]]["template"]]
-            values = {eid: w.inputs(run, eid, ref) for eid, ref in state.refs.items()}
+            values = {int(k): bytes.fromhex(v) for k, v in entry["inputs"].items()}
             honest = R.execute(w.spec, w.plan_id, state.run_id, values)
             record = G.RunRecord(w.plan_id, state.run_id, w.spec, state.root, state.refs)
-            live = _Live(Challenger(record, honest, entry["kind"], w.depth))
-            # Replay the dispute's own moves from chain: each reveal and the
-            # pick that followed it (a reveal still awaiting its pick is
-            # handled by the PICK phase below).
-            c, pending = live.challenger, None
+            c, pending = Challenger(record, honest, entry["kind"], w.depth), None
             for sub, body in dispute_moves(self.cl, Pubkey.from_string(d_s)):
                 if sub == CL.SUB["reveal_nodes"]:
                     r = c.replica
                     d = min(r.depth, r.level)
                     base, first = r.level - d, r.position << d
                     slots = [i for i in range(1 << d) if r._pickable(base, first + i)]
-                    pending = {i: body[32 * n:32 * (n + 1)] for n, i in enumerate(slots)}
+                    if body.startswith(b"SLOTS"):  # a cache answer: slot-indexed nodes
+                        raw = body[5:]
+                        pending = {i: raw[32 * i:32 * (i + 1)] for i in slots}
+                    else:
+                        pending = {i: body[32 * n:32 * (n + 1)] for n, i in enumerate(slots)}
                 elif sub == CL.SUB["pick"] and pending is not None:
                     c.on_nodes(pending)
                     c.pick(body[0])
                     pending = None
             log(event="replica_rebuilt", dispute=d_s, level=c.replica.level, position=c.replica.position)
-            self._live[d_s] = live
+            self._live[d_s] = c
         return self._live[d_s]
 
     def _play(self, dispute: Pubkey, entry: dict) -> str | None:
@@ -218,12 +265,11 @@ class Watchtower:
             if state and state.status == CL.RUN_COMMITTED and self.cl.gc.slot() <= state.deadline:
                 self._open(run, state.template, dispute, bytes.fromhex(entry["nonce"]), entry["kind"])
                 entry["opened"] = True
-                self.journal.save()
                 log(event="open_retried", dispute=str(dispute))
                 return f"open {dispute}"
             entry["done"] = True
             return None
-        if raw is not None and not entry.get("opened"):
+        if raw is not None:
             entry["opened"] = True
         if raw is None:
             # Closed by someone else's settlement: the run's receipt says how
@@ -247,41 +293,62 @@ class Watchtower:
             out = self.cl.settle_and_reclaim(run, wait=0.0)
             log(event="executor_timeout", dispute=str(dispute), **out)
             return f"timeout {dispute}" if out["steps"] else None
-        live = self._replica(str(dispute), entry)
-        c = live.challenger
+        if d.phase not in (PH_PICK, PH_CLAIM):
+            return None  # the executor's move
+        c = self._replica(str(dispute), entry)
+        # The replica must stand where the chain stands (a move whose
+        # confirmation was lost may have landed): otherwise rebuild it.
+        if (c.replica.level, c.replica.position) != (d.level, d.position):
+            self._live.pop(str(dispute), None)
+            c = self._replica(str(dispute), entry)
+            if (c.replica.level, c.replica.position) != (d.level, d.position):
+                raise RuntimeError("the rebuilt replica does not match the dispute on chain")
         template = Pubkey.from_bytes(self.cl.gc.account(run)[CL.R_TEMPLATE:CL.R_TEMPLATE + 32])
         party = [AccountMeta(self.key.pubkey(), True, False), AccountMeta(run, False, True),
                  AccountMeta(template, False, False), AccountMeta(dispute, False, True)]
-        if d.phase == PH_PICK and c.replica.level == d.level and c.replica.position == d.position:
+        if d.phase == PH_PICK:
             nodes = d.revealed(c.replica._pickable)
             pick = c.on_nodes(nodes)
-            self.cl._send("pick", bytes([pick]), party, [self.key])
-            c.pick(pick)
-            self.journal.save()
+            try:
+                self.cl._send("pick", bytes([pick]), party, [self.key])
+            finally:
+                # Whether or not the confirmation arrived, the next tick
+                # compares with the chain and rebuilds if they differ.
+                self._live.pop(str(dispute), None)
             log(event="pick", dispute=str(dispute), level=d.level, pick=pick)
             return f"pick {dispute}"
-        if d.phase == PH_CLAIM and not live.claimed:
-            buffer_e = self.cl.pda(b"dcg21stg", bytes(dispute), bytes([CL.ROLE_EXECUTOR]))
-            lists = staged_lists(self.cl.gc.account(buffer_e))
-            name, _kw, body, ruling = c.on_leaf(d.leaf(), lists)
-            if ruling != "C":
-                log(event="claim_withheld", dispute=str(dispute), claim=name, local_ruling=ruling)
-                live.claimed = True
-                return None
-            executor = Pubkey.from_bytes(self.cl.gc.account(run)[CL.R_EXECUTOR:CL.R_EXECUTOR + 32])
-            metas = [AccountMeta(self.key.pubkey(), True, False), AccountMeta(run, False, True),
-                     AccountMeta(template, False, False), AccountMeta(dispute, False, True),
-                     AccountMeta(executor, False, True), AccountMeta(self.key.pubkey(), False, True)]
-            if len(body) > CL.DIRECT_LIMIT:
-                buffer_c = self.cl.stage_body(run, template, dispute, CL.ROLE_CHALLENGER, body, self.key, self.key)
-                body, metas = bytes([CL.FROM_STAGING]), metas + [AccountMeta(buffer_c, False, False)]
-            heap = None
-            if lists is not None:
-                metas.append(AccountMeta(buffer_e, False, False))
-                heap = CL.LIST_HEAP_FRAME
+        # CLAIM.
+        if entry.get("done_claim"):
+            return None  # withheld: the local referee would not uphold it
+        leaf = d.leaf()
+        lists = None
+        parsed = R.parse_leaf(leaf) if (leaf is not None and c.kind == "STEP_DESCEND") else None
+        has_lists = parsed is not None and any(struct.unpack_from("<I", ref, 7)[0] == S.LAYOUT_LIST
+                                               for ref in parsed.inputs)
+        buffer_e = self.cl.pda(b"dcg21stg", bytes(dispute), bytes([CL.ROLE_EXECUTOR]))
+        if has_lists:
+            # Only a list leaf's element refs are read from the executor's
+            # buffer, and only if the buffer's leaf is the revealed one.
+            lists = staged_lists(self.cl.gc.account(buffer_e), expected_leaf=leaf)
+        name, _kw, body, ruling = c.on_leaf(leaf, lists)
+        if ruling != "C":
+            log(event="claim_withheld", dispute=str(dispute), claim=name, local_ruling=ruling)
+            entry["done_claim"] = True
+            return None
+        executor = Pubkey.from_bytes(self.cl.gc.account(run)[CL.R_EXECUTOR:CL.R_EXECUTOR + 32])
+        metas = [AccountMeta(self.key.pubkey(), True, False), AccountMeta(run, False, True),
+                 AccountMeta(template, False, False), AccountMeta(dispute, False, True),
+                 AccountMeta(executor, False, True), AccountMeta(self.key.pubkey(), False, True)]
+        if len(body) > CL.DIRECT_LIMIT:
+            buffer_c = self.cl.stage_body(run, template, dispute, CL.ROLE_CHALLENGER, body, self.key, self.key)
+            body, metas = bytes([CL.FROM_STAGING]), metas + [AccountMeta(buffer_c, False, False)]
+        heap = None
+        if has_lists:
+            metas.append(AccountMeta(buffer_e, False, False))
+            heap = CL.LIST_HEAP_FRAME
+        try:
             self.cl._send("claim", body, metas, [self.key], heap_frame=heap)
-            live.claimed = True
-            self.journal.save()
-            log(event="claim", dispute=str(dispute), claim=name)
-            return f"claim {dispute}"
-        return None
+        finally:
+            self._live.pop(str(dispute), None)
+        log(event="claim", dispute=str(dispute), claim=name)
+        return f"claim {dispute}"

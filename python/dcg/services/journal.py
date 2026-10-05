@@ -18,5 +18,12 @@ class Journal:
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".")
         with os.fdopen(fd, "w") as f:
             json.dump(self.data, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
+        dirfd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)

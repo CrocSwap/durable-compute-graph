@@ -172,6 +172,40 @@ Options:
   Recommended.
 - **(b) Both in v1.**
 
+## 7a. Built (2026-10-05) and review fixes
+
+The services are built (`docs/services.md`). The independent review found six
+HIGH and seven MEDIUM issues; all are fixed and covered by adversarial
+scenarios or unit tests:
+
+- **Staging** is resumable (a pre-created or partly written buffer).
+- **Discovery:**
+  - the cursor never passes a transaction that could not be read;
+  - accounts loaded through lookup tables are included;
+  - transactions that do not invoke the program are skipped;
+  - reads per call are bounded.
+- **Ticks** are ordered: answers and plays first, soonest deadline first.
+- **Watchtower replica:**
+  - it is rebuilt from the dispute's on-chain moves (including cache
+    answers, filtered by dispute) whenever it disagrees with the chain;
+  - list refs are read from the executor's buffer only for the revealed
+    list leaf;
+  - the plan is checked against the template at start-up;
+  - the checked inputs are journaled with the open.
+- **Executor service:**
+  - runs are journaled before their commit;
+  - each dispute is isolated from the others;
+  - LX answerers are checked against the committed checkpoints.
+- **Local referee:** it runs in the program's mode.
+- **Journal:** written with fsync.
+
+Departures from §3 and §6:
+- The executor journal keeps the run id and inputs, not the spec (plans
+  are configured per template).
+- The watchtower journal keeps its disputes' nonces and checked inputs, not
+  each round's reveal (they are re-read from chain).
+- The budget is a count of open disputes, not lamports.
+
 ## 8. Not in v1
 
 - Choosing which runs are worth checking by value at stake: v1 checks every

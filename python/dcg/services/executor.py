@@ -16,6 +16,7 @@ whose recomputed root is not the one on chain.
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import time
 from dataclasses import dataclass
@@ -61,16 +62,20 @@ def log(**fields) -> None:
 
 class ExecutorService:
     def __init__(self, cl: CL.DisputeClient, executor: Keypair, journal: str, plans: dict[str, Plan], *,
-                 execute: Callable[..., R.Commitment] = R.execute):
+                 execute: Callable[..., R.Commitment] = R.execute, tick_budget_s: float = 10.0):
         self.cl, self.executor, self.plans, self.execute = cl, executor, plans, execute
+        self.tick_budget_s = tick_budget_s
         self.journal = Journal(journal)
         self.journal.data.setdefault("runs", {})
-        self.journal.data.setdefault("cursors", {})
-        self.discovery = Discovery(cl, self.journal.data["cursors"])
+        self.journal.data.setdefault("discovery", {})
+        self.discovery = Discovery(cl, self.journal.data["discovery"])
         self._commitments: dict[str, R.Commitment] = {}
 
     # --- runs ----------------------------------------------------------------------------
     def add_run(self, run: Pubkey, template: Pubkey, run_id: bytes, values: dict[int, bytes]) -> None:
+        """Journal a run. Call it before committing (write ahead): the
+        service ignores a run until its commit lands, and a run whose commit
+        never lands is cancelled after its deadline."""
         self.journal.data["runs"][str(run)] = {"template": str(template), "run_id": run_id.hex(),
                                                "values": {str(k): v.hex() for k, v in values.items()},
                                                "disputes": [], "done": False}
@@ -88,52 +93,94 @@ class ExecutorService:
 
     # --- the loop -------------------------------------------------------------------------
     def tick(self) -> list[str]:
-        """One pass over every live run. Returns the actions taken."""
-        actions = []
+        """One pass. Deadline-bound answers come first, soonest deadline
+        first across all runs; then bounded discovery of new disputes; then
+        settlement where a step is possible. Returns the actions taken."""
+        t0 = time.monotonic()
+        actions: list[str] = []
+        live: list[tuple[Pubkey, dict, RunState]] = []
         for run_s, entry in self.journal.data["runs"].items():
             if entry["done"]:
                 continue
+            run = Pubkey.from_string(run_s)
             try:
-                actions += self._tick_run(Pubkey.from_string(run_s), entry)
-            except Exception as exc:  # one run's trouble must not stop the others
+                data = self.cl.gc.account(run)
+                if data is None or data[:4] == b"D21P":
+                    entry["done"] = True
+                    log(event="run_closed", run=run_s)
+                    continue
+                live.append((run, entry, RunState.parse(run, data)))
+            except Exception as exc:
                 log(event="error", run=run_s, error=f"{type(exc).__name__}: {exc}")
+        # 1. Answers, soonest deadline first.
+        due = []
+        for run, entry, state in live:
+            if state.status == CL.RUN_OPEN:
+                continue
+            for d_s in entry["disputes"]:
+                try:
+                    raw = self.cl.gc.account(Pubkey.from_string(d_s))
+                    if raw is not None:
+                        d = DisputeState.parse(Pubkey.from_string(d_s), raw)
+                        if d.ruling == CL.RULING_OPEN:
+                            due.append((d.deadline, d_s, run, entry, state, d))
+                except Exception as exc:
+                    log(event="error", dispute=d_s, error=f"{type(exc).__name__}: {exc}")
+        now = self.cl.gc.slot()
+        challenger_late: set[str] = set()
+        for _deadline, d_s, run, entry, state, d in sorted(due, key=lambda x: x[0]):
+            try:
+                act = self._answer(state, entry, d)
+                if act:
+                    actions.append(act)
+                elif d.phase in (PH_PICK, PH_CLAIM) and now > d.deadline:
+                    challenger_late.add(str(run))
+            except Exception as exc:  # one dispute's trouble must not stop the others
+                log(event="error", dispute=d_s, error=f"{type(exc).__name__}: {exc}")
         self.journal.save()
+        # 2. Bounded discovery of new disputes.
+        for run, entry, state in live:
+            if state.status == CL.RUN_OPEN:
+                continue
+            try:
+                for key in self.discovery.new_keys(run):
+                    raw = self.cl.gc.account(key)
+                    if raw and raw[:4] == b"D21D" and raw[CL.D_RUN:CL.D_RUN + 32] == bytes(run) \
+                            and str(key) not in entry["disputes"]:
+                        entry["disputes"].append(str(key))
+                        log(event="dispute_seen", run=str(run), dispute=str(key))
+            except Exception as exc:
+                log(event="error", run=str(run), error=f"discovery: {type(exc).__name__}: {exc}")
+        self.journal.save()
+        # 3. Settlement, only where a step is possible.
+        for run, entry, state in live:
+            settleable = (
+                str(run) in challenger_late
+                or state.status in (CL.RUN_FINAL, CL.RUN_REFUTED)
+                or (state.status == CL.RUN_COMMITTED and state.open == 0 and now > state.deadline)
+                or (state.status == CL.RUN_OPEN and now > state.deadline)
+                or any(self._ruled(d_s) for d_s in entry["disputes"])
+            )
+            if not settleable:
+                continue
+            try:
+                out = self.cl.settle_and_reclaim(run, wait=0.0, candidates=self.discovery.known(run))
+                if out["steps"]:
+                    log(event="settle", run=str(run), **out)
+                    actions += out["steps"]
+                if out["state"] == "closed":
+                    entry["done"] = True
+            except Exception as exc:
+                log(event="error", run=str(run), error=f"settle: {type(exc).__name__}: {exc}")
+        self.journal.save()
+        elapsed = time.monotonic() - t0
+        if elapsed > self.tick_budget_s:
+            log(event="slow_tick", seconds=round(elapsed, 1), budget=self.tick_budget_s)
         return actions
 
-    def _tick_run(self, run: Pubkey, entry: dict) -> list[str]:
-        data = self.cl.gc.account(run)
-        if data is None or data[:4] == b"D21P":
-            entry["done"] = True
-            log(event="run_closed", run=str(run))
-            return []
-        state = RunState.parse(run, data)
-        for key in self.discovery.new_keys(run):
-            raw = self.cl.gc.account(key)
-            if raw and raw[:4] == b"D21D" and raw[CL.D_RUN:CL.D_RUN + 32] == bytes(run) and str(key) not in entry["disputes"]:
-                entry["disputes"].append(str(key))
-                log(event="dispute_seen", run=str(run), dispute=str(key))
-        actions, challenger_late = [], False
-        now = self.cl.gc.slot()
-        for d_s in entry["disputes"]:
-            raw = self.cl.gc.account(Pubkey.from_string(d_s))
-            if raw is None:
-                continue
-            d = DisputeState.parse(Pubkey.from_string(d_s), raw)
-            if d.ruling != CL.RULING_OPEN:
-                continue
-            act = self._answer(state, entry, d)
-            if act:
-                actions.append(act)
-            elif d.phase in (PH_PICK, PH_CLAIM) and now > d.deadline:
-                challenger_late = True
-        if challenger_late or (not actions and state.open == 0):
-            out = self.cl.settle_and_reclaim(run, wait=0.0)
-            if out["steps"]:
-                log(event="settle", run=str(run), **out)
-                actions += out["steps"]
-            if out["state"] == "closed":
-                entry["done"] = True
-        return actions
+    def _ruled(self, d_s: str) -> bool:
+        raw = self.cl.gc.account(Pubkey.from_string(d_s))
+        return raw is not None and raw[CL.D_RULING] != CL.RULING_OPEN
 
     def _party(self, state: RunState, d: DisputeState) -> list[AccountMeta]:
         return [AccountMeta(self.executor.pubkey(), True, False), AccountMeta(state.address, False, True),
@@ -169,6 +216,9 @@ class ExecutorService:
             return f"reveal_leaf {d.address}"
         if d.kind == LX.KIND_LX_STATE and plan.lx is not None:
             machine = plan.lx(state.address)
+            verify = getattr(machine, "verify", None)
+            if verify is not None and not verify(state.root):
+                raise RuntimeError(f"run {state.address}: the LX answerer does not reproduce the committed checkpoints")
             lo, hi = d.position, d.lx_hi
             if d.phase == PH_NODES:
                 roots = machine.roots(LX.midpoint_coordinates(lo, hi, machine.arity))
@@ -211,3 +261,11 @@ class ExecutionAnswerer:
 
     def opening(self, coordinate: int) -> bytes:
         return LX.executor_opening_bytes(self.execution, coordinate)
+
+    def verify(self, run_root: bytes) -> bool:
+        """Whether this execution's checkpoints are the committed ones (the
+        run root's checkpoint root at bytes 32..64, k at 136..140)."""
+        from ..disputes_v21 import lx as L
+
+        k = struct.unpack_from("<I", run_root, 136)[0]
+        return L.checkpoint_tree(L.commit(self.execution, k).roots).root == run_root[32:64]

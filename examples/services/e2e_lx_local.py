@@ -44,15 +44,21 @@ from dcg.graph_client import GraphClient
 
 HERE = Path(__file__).resolve()
 P, WINDOW, H0, K, ARITY = 9, 3, 7, 4, 4
-PARAMS = struct.pack("<QQq", P, WINDOW, H0)
-TEMPLATE = LC.LxTemplate(kernel=b"dcg-lx-toy-v1\x00\x00\x00", semantic=1, abi=1, arity=ARITY, k_min=1, k_max=16,
-                         max_positions=1 << 16)
-D_REVEALED, D_REVEALED_N = 144, 128
-D_LX_ROOT_HI = 144 + 32 * 32 + 8 + 8
+# --weighted: the toy with constant weights (design §13), so the terminal
+# opening carries constants (review M6); the lie is at a weighted start.
+WEIGHTED = "--weighted" in sys.argv or os.environ.get("DCG_LX_WEIGHTED") == "1"
+PARAMS = struct.pack("<QQqB", P, WINDOW, H0, 1) if WEIGHTED else struct.pack("<QQq", P, WINDOW, H0)
 
 
 def machine():
-    return ToyMachine(positions_count=P, window=WINDOW, h0=H0)
+    return ToyMachine(positions_count=P, window=WINDOW, h0=H0, weights=WEIGHTED)
+
+
+TEMPLATE = LC.LxTemplate(kernel=b"dcg-lx-toy-v1\x00\x00\x00", semantic=1, abi=1, arity=ARITY, k_min=1, k_max=16,
+                         max_positions=1 << 16,
+                         constants_root=L.constants_root(machine()) if WEIGHTED else bytes(32))
+D_REVEALED, D_REVEALED_N = 144, 128
+D_LX_ROOT_HI = 144 + 32 * 32 + 8 + 8
 
 
 def bump(tm, c):
@@ -74,6 +80,16 @@ def lx_client(cfg: dict, payer: Keypair) -> LC.LxClient:
 
 def execution(case: str):
     tm = machine()
+    if case == "executor-lies" and WEIGHTED:
+        sch = L.Schedule(tm)
+        start5 = next(c for c in range(sch.total) if sch.transition(c).label == "p5.start")
+
+        def bump_a(coord, state):
+            if coord == start5:
+                state = dict(state)
+                state[tm.A] = struct.pack("<q", struct.unpack("<q", state[tm.A])[0] + 1)
+            return state
+        return L.execute(tm, bump_a)
     if case == "executor-lies":
         total = L.Schedule(tm).total
         fault = next(c for c in range(total // 2, total)
@@ -102,10 +118,10 @@ def role_executor(cfg: dict) -> int:
         case_payer = key(run_dir / f"{payer_name}.json")
         run, run_id = cl.init_lx_run(template, TEMPLATE.template_id(), params, executor.pubkey(), case_payer)
         com = L.commit(run_exec, K)
+        answerers[str(run)] = ExecutionAnswerer(run_exec, params, ARITY)
+        service.add_run(run, template, run_id, {})  # write ahead of the commit
         cl.lx_commit(run, template, run_id, com.roots, L.outputs_digest([com.outputs[s] for s in run_exec.machine.output_slots()]),
                      params, P, K, executor)
-        answerers[str(run)] = ExecutionAnswerer(run_exec, params, ARITY)
-        service.add_run(run, template, run_id, {})
         runs[case] = str(run)
         log(event="committed", case=case, run=str(run))
     (run_dir / "runs.json").write_text(json.dumps(runs))
@@ -220,7 +236,8 @@ def driver(image: Path, seconds: int) -> int:
         template = LC.LxClient(gc).create_template(TEMPLATE.data(), admin)
         cfg = {"rpc": rpc, "program": str(program), "dir": str(run_dir), "template": str(template), "seconds": seconds}
         (run_dir / "config.json").write_text(json.dumps(cfg))
-        proc = subprocess.Popen([sys.executable, str(HERE), "--role", "executor", "--config", str(run_dir / "config.json")],
+        proc = subprocess.Popen([sys.executable, str(HERE), "--role", "executor", "--config", str(run_dir / "config.json")]
+                                + (["--weighted"] if WEIGHTED else []),
                                 stdout=(run_dir / "executor.log").open("w"), stderr=subprocess.STDOUT)
         while not (run_dir / "runs.json").exists():
             if proc.poll() is not None:
@@ -231,7 +248,7 @@ def driver(image: Path, seconds: int) -> int:
         code = proc.wait(timeout=seconds + 60)
         errors = [line for line in (run_dir / "executor.log").read_text().splitlines() if '"error"' in line]
         ok = rulings == {"executor-lies": "C", "challenger-lies": "E"} and code == 0 and not errors
-        print(json.dumps({"ok": ok, "rulings": rulings, "executor_exit": code, "errors": errors[:3],
+        print(json.dumps({"ok": ok, "weighted": WEIGHTED, "rulings": rulings, "executor_exit": code, "errors": errors[:3],
                           "seconds": round(time.monotonic() - t0, 1), "dir": str(run_dir)}, indent=1))
         return 0 if ok else 1
     finally:
@@ -247,6 +264,7 @@ if __name__ == "__main__":
     ap.add_argument("--role")
     ap.add_argument("--config")
     ap.add_argument("--seconds", type=int, default=240)
+    ap.add_argument("--weighted", action="store_true")
     a = ap.parse_args()
     if a.role:
         raise SystemExit(role_executor(json.loads(Path(a.config).read_text())))

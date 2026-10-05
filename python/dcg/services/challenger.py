@@ -55,7 +55,9 @@ class Challenger:
         r.reveal_leaf(leaf, lists)
         name, kw = G.honest_claim(self.record, self.view, self.honest, r)
         body = W.claim_body(self.record.spec, self.kind, r.position, name, kw)
-        ruling = G.Dispute.claim(_copy(r), name, **kw)
+        # As the program rules it (onchain: LOG-state STEP/STATE claims are
+        # moot there), so a claim the program would not uphold is withheld.
+        ruling = G.Dispute.claim(_copy(r), name, **kw, onchain=True)
         return name, kw, body, ruling
 
 
