@@ -258,20 +258,32 @@ def write_key(path: Path, k: Keypair) -> None:
     os.chmod(path, 0o600)
 
 
-def driver(image: Path, seconds: int, towers: int, restart: bool, adversary: dict) -> int:
-    run_dir = Path(tempfile.mkdtemp(prefix="dcg-e3-", dir="/private/tmp" if sys.platform == "darwin" else None))
-    program = Keypair().pubkey()
-    rpc_port, faucet_port, base = _port(), _port(), random.randrange(30_000, 60_000, 100)
-    rpc = f"http://127.0.0.1:{rpc_port}"
-    validator = subprocess.Popen(
-        [shutil.which("solana-test-validator") or "solana-test-validator", "--reset", "--ledger", str(run_dir / "ledger"),
-         "--upgradeable-program", str(program), str(image), "none", "--ticks-per-slot", "8",
-         "--rpc-port", str(rpc_port), "--faucet-port", str(faucet_port), "--gossip-port", str(_port()),
-         "--dynamic-port-range", f"{base}-{base + 25}", "--quiet"],
-        stdout=(run_dir / "validator.log").open("wb"), stderr=subprocess.STDOUT)
+def driver(image: Path | None, seconds: int, towers: int, restart: bool, adversary: dict,
+           network: dict | None = None) -> int:
+    """`network` (testnet mode): {"rpc", "program", "payer_key", "dir"}; no
+    local validator, party keys funded by transfer from the payer."""
+    if network:
+        run_dir = Path(network["dir"])
+        run_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(run_dir, 0o700)
+        program, rpc, validator = Pubkey.from_string(network["program"]), network["rpc"], None
+        slot_ms = 40.0
+    else:
+        run_dir = Path(tempfile.mkdtemp(prefix="dcg-e3-", dir="/private/tmp" if sys.platform == "darwin" else None))
+        program = Keypair().pubkey()
+        rpc_port, faucet_port, base = _port(), _port(), random.randrange(30_000, 60_000, 100)
+        rpc = f"http://127.0.0.1:{rpc_port}"
+        validator = subprocess.Popen(
+            [shutil.which("solana-test-validator") or "solana-test-validator", "--reset", "--ledger",
+             str(run_dir / "ledger"), "--upgradeable-program", str(program), str(image), "none", "--ticks-per-slot", "8",
+             "--rpc-port", str(rpc_port), "--faucet-port", str(faucet_port), "--gossip-port", str(_port()),
+             "--dynamic-port-range", f"{base}-{base + 25}", "--quiet"],
+            stdout=(run_dir / "validator.log").open("wb"), stderr=subprocess.STDOUT)
+        slot_ms = 50.0
     procs = []
+    templates = {}
     try:
-        admin = Keypair()
+        admin = key(Path(network["payer_key"])) if network else Keypair()
         gc = GraphClient(rpc, program, admin, timeout=30)
         t0 = time.monotonic()
         while True:
@@ -279,20 +291,23 @@ def driver(image: Path, seconds: int, towers: int, restart: bool, adversary: dic
                 gc.slot()
                 break
             except Exception:
-                if validator.poll() is not None or time.monotonic() - t0 > 60:
+                if validator is None or validator.poll() is not None or time.monotonic() - t0 > 60:
                     raise RuntimeError(f"validator did not start; see {run_dir / 'validator.log'}")
                 time.sleep(0.25)
         names = ["challenger"] + [f"challenger{i}" for i in range(2, towers + 1)]
         keys = {name: Keypair() for name in ("executor", "payer", *names)}
         for name, k in keys.items():
             write_key(run_dir / f"{name}.json", k)
-        for k in [admin, *keys.values()]:
-            gc.rpc("requestAirdrop", [str(k.pubkey()), 50_000_000_000])
-        time.sleep(2)
         cl = CL.DisputeClient(gc)
-        templates = {}
+        if network:
+            for k in keys.values():
+                cl.fund(k.pubkey(), 500_000_000)  # 0.5 FOGO each, testnet
+        else:
+            for k in [admin, *keys.values()]:
+                gc.rpc("requestAirdrop", [str(k.pubkey()), 50_000_000_000])
+            time.sleep(2)
         for p, (sp, _values) in plans().items():
-            tdata = W.template_data(sp, DEPTHS[p], PLAN_IDS[p], slot_ms=50.0)
+            tdata = W.template_data(sp, DEPTHS[p], PLAN_IDS[p], slot_ms=slot_ms)
             templates[p] = {"template": str(cl.create_template(tdata, admin)),
                             "template_id": hashlib.sha256(W.TEMPLATE_DOMAIN + tdata).digest().hex()}
         cfg = {"rpc": rpc, "program": str(program), "dir": str(run_dir), "templates": templates,
@@ -323,8 +338,21 @@ def driver(image: Path, seconds: int, towers: int, restart: bool, adversary: dic
         for p in procs:
             if p.poll() is None:
                 p.terminate()
-        validator.terminate()
-        validator.wait(timeout=20)
+        if network:
+            # Retire and close the templates (their runs are closed by now).
+            cl = CL.DisputeClient(GraphClient(rpc, program, admin, timeout=30))
+            for t in templates.values():
+                try:
+                    template = Pubkey.from_string(t["template"])
+                    if cl.gc.account(template)[134] == 0:
+                        cl.retire_template(template, admin)
+                    cl.close_template(template, admin)
+                    print(json.dumps({"event": "template_closed", "template": t["template"]}), flush=True)
+                except Exception as exc:
+                    print(json.dumps({"event": "template_left", "template": t["template"], "error": str(exc)[:200]}))
+        if validator is not None:
+            validator.terminate()
+            validator.wait(timeout=20)
 
 
 def report(run_dir: Path, codes: list[int], seconds: float, names: list[str], restarted: bool | None,
@@ -399,10 +427,16 @@ if __name__ == "__main__":
     ap.add_argument("--precreate", action="store_true")
     ap.add_argument("--plant-buffer", action="store_true")
     ap.add_argument("--drop-pick-confirm", action="store_true")
+    ap.add_argument("--rpc", help="testnet mode: an RPC URL (no local validator)")
+    ap.add_argument("--program", help="testnet mode: the deployed alpha program")
+    ap.add_argument("--payer-key", help="testnet mode: the funding and template payer key")
+    ap.add_argument("--run-dir", help="testnet mode: where keys, journals and logs go (mode 700)")
     a = ap.parse_args()
     if a.role:
         cfg = json.loads(Path(a.config).read_text())
         raise SystemExit(role_executor(cfg) if a.role == "executor" else role_watchtower(cfg, a.name))
-    raise SystemExit(driver(Path(a.image), a.seconds, a.watchtowers, a.restart_watchtower,
+    network = ({"rpc": a.rpc, "program": a.program, "payer_key": a.payer_key, "dir": a.run_dir}
+               if a.rpc else None)
+    raise SystemExit(driver(Path(a.image) if a.image else None, a.seconds, a.watchtowers, a.restart_watchtower,
                             {"precreate": a.precreate, "plant_buffer": a.plant_buffer,
-                             "drop_pick_confirm": a.drop_pick_confirm}))
+                             "drop_pick_confirm": a.drop_pick_confirm}, network))
