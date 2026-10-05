@@ -1269,7 +1269,20 @@ impl Fuzz {
                 live && *auth == A && m.phase == PH_ANCHOR && *cursor == m.ph_state && a.open && a.progress == m.ph_at
             }
             Op::Close { child, kind, refund } => {
-                m.open && !m.active && *refund == A && m.has(*child) && *kind == child.kind() && match child {
+                // Finding F1 (observed, 10-05): `close_account` checks the kind
+                // byte against the target's byte 6, which for the anchor is its
+                // open flag and for the headerless primary is application state;
+                // `close_child` then closes either by address. A wrong kind equal
+                // to that byte (and not 0, the session path) is accepted.
+                let byte6 = match child {
+                    Child::Anchor => m.anchor.as_ref().map_or(0, |a| u8::from(a.open)),
+                    Child::State(0) if p.ws => {
+                        if m.initialized { self.state_at(m, m.cursor)[6] } else { 0 }
+                    }
+                    _ => child.kind(),
+                };
+                let kind_ok = *kind == child.kind() || (*kind != v3::KIND_SESSION && *kind == byte6);
+                m.open && !m.active && *refund == A && m.has(*child) && kind_ok && match child {
                     Child::State(i) => *i + 1 == m.states,
                     _ => true,
                 }
@@ -2474,4 +2487,45 @@ async fn fuzz_catches_a_planted_kernel_error() {
     for index in 0..20 {
         run_sequence(11, index, false, false, 3).await;
     }
+}
+
+// ------------------------------------------------------------ findings ----
+
+/// Finding F1 reproducer (fuzz seed 1001 index 316, native): a close of an
+/// open anchor (session halted mid-anchor) with kind byte 1 (`KIND_STREAM`)
+/// is accepted, because `close_account` compares the kind byte with the
+/// target's byte 6 (the anchor's open flag) and `close_child` then recognizes
+/// the anchor by its address. The effect equals a correct close (rent to the
+/// authority, child count decremented); the kind byte is just not enforced.
+/// The same holds for a headerless primary whose application byte 6 equals the
+/// kind. Ignored: it asserts the strict behavior the program does not have.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "finding F1: close kind byte not enforced for the anchor and the headerless primary"]
+async fn finding_f1_open_anchor_closes_under_a_wrong_kind() {
+    let ctx = start(false, &[]).await;
+    let mut rng = Rng::new(0xF1, 0);
+    let p = Params { ws: false, lanes: 0, append: false, width: 1, capacity: 4, max_steps: 1, root: [7; 32], id: 1, resource: Vec::new(), state_len: 1_280, view_len: 16 };
+    let k = Keys::new(&mut rng, p.id);
+    let mut f = Fuzz { ctx, p, k, m: M::default(), rng, cfg: Config { sbf: false, verbose: true, plant: 0 }, stats: Stats::default(), nonce: 0, history: Vec::new(), tag: "F1".into(), log: Vec::new(), keys_tracked: Vec::new(), rent0: 0, halt_late: false, last_logs: String::new(), res_writable: false };
+    let auth = f.auth();
+    let payer = f.ctx.payer.pubkey();
+    let fund = system_instruction::transfer(&payer, &auth, 10_000_000_000);
+    let blockhash = f.ctx.banks_client.get_latest_blockhash().await.unwrap();
+    f.ctx.banks_client.process_transaction(Transaction::new_signed_with_payer(&[fund], Some(&payer), &[&f.ctx.payer], blockhash)).await.unwrap();
+    use Actor::{Authority as A, Payer as P};
+    for op in [
+        Op::Open { payer: P, auth: A, lanes: None },
+        Op::CreateStream { payer: P, auth: A, signed: true },
+        Op::CreateState { payer: P, auth: A, signed: true },
+        Op::InitOneCall { auth: A },
+        Op::AnchorBegin { payer: P, auth: A, cursor: 0 },
+        Op::Halt { actor: A, cursor: 0 },
+    ] {
+        let (outcome, _) = f.send(f.build(&op), None).await;
+        assert_eq!(outcome, Outcome::Ok, "{op:?}");
+    }
+    // The anchor is still open (byte 6 == 1); close it as a stream.
+    let wrong = Op::Close { child: Child::Anchor, kind: v3::KIND_STREAM, refund: A };
+    let (outcome, _) = f.send(f.build(&wrong), None).await;
+    assert_ne!(outcome, Outcome::Ok, "an anchor closed under kind {} (stream)", v3::KIND_STREAM);
 }
