@@ -29,8 +29,10 @@ class Chain:
     """A cursor-guarded program: step k succeeds only when the cursor is k."""
 
     def __init__(self, reject_sends: bool = False, drop: set[int] | None = None, independent: bool = False,
-                 drop_times: dict[int, int] | None = None):
+                 drop_times: dict[int, int] | None = None, refuse: set[int] | None = None):
         self.cursor = 0
+        # refuse: step k is always refused (a guard other than the cursor).
+        self.refuse = refuse or set()
         # independent: step k succeeds once, in any order; a second copy is refused.
         self.independent = independent
         self.done: set[int] = set()
@@ -54,7 +56,7 @@ class Chain:
         with self.lock:
             if sig in self.status:
                 return None  # the same signature dedupes
-            ok = (k not in self.done) if self.independent else k == self.cursor
+            ok = ((k not in self.done) if self.independent else k == self.cursor) and k not in self.refuse
             if simulate:
                 return {"err": None if ok else {"InstructionError": [2, {"Custom": 2325}]},
                         "unitsConsumed": 1_000 * (k + 1)}
@@ -166,6 +168,21 @@ class OrderedLaneTests(unittest.TestCase):
         # Steps 4.. were refused out of order; repair resends 3..7 in order.
         self.assertEqual(result.repaired, 5)
         self.assertEqual(chain.cursor, 8)
+
+    def test_dropped_step_is_repaired_without_a_repair_delay(self):
+        chain = Chain(drop={3})
+        lane = self.lane(self.serve(chain))
+        result = asyncio.run(lane.wait(asyncio.run(lane.send(self.steps(8))), repair_delay=0))
+        self.assertEqual((result.failed_first, result.repaired, chain.cursor), (3, 5, 8))
+
+    def test_a_step_refused_by_another_guard_is_not_counted_as_landed(self):
+        # Step 2 can never run: before this check, repair skipped it and every
+        # later step (their simulations are refused too) and the lane looked done.
+        chain = Chain(refuse={2})
+        lane = self.lane(self.serve(chain))
+        with self.assertRaisesRegex(RuntimeError, "s2 is refused .* never landed"):
+            asyncio.run(lane.run(self.steps(5), repair_delay=0))
+        self.assertEqual(chain.cursor, 2)
 
     def test_repair_skips_steps_already_landed(self):
         chain = Chain()

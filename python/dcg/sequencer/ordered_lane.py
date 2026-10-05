@@ -18,7 +18,10 @@ per frame): per-step confirm waits gave 0.025 frames/s; this lane gave about
 4. **Simulate-and-skip repair.** Applications must make each step refuse when
    it is not the next step (cursor/sequence guards). After a lane, any failed
    or missing step is replayed in order: a step whose simulation passes is sent
-   and awaited; one whose simulation is refused has already landed.
+   and awaited; one whose simulation is refused is done only if its original
+   signature succeeded, and otherwise the lane raises. (A refused simulation
+   alone does not mean "landed": on 2026-10-04 a Doom driver counted frames
+   whose every step was refused by a stream-capacity guard as committed.)
 
 The lane does not journal packets; exactly-once comes from the application's
 on-chain guards, which is why those guards are a precondition.
@@ -377,13 +380,16 @@ class OrderedLane:
 
     async def wait(self, handle: "LaneHandle", *, wait_seconds: float = 20.0, repair: bool = True,
                    watch_last: bool = False, poll_seconds: float = 0.1,
-                   resend_after_seconds: float = 0.5, max_resends: int = 3) -> LaneResult:
+                   resend_after_seconds: float = 0.5, max_resends: int = 3,
+                   repair_delay: float = 1.0) -> LaneResult:
         """Wait for a sent lane.
 
         ``watch_last`` polls only the final step: valid when the application's
         guards make the final step impossible unless every earlier step landed
         (e.g. a commit that checks a cursor). Any failure or timeout falls back
-        to reading every status, then to repair."""
+        to reading every status, then to repair. ``repair_delay`` lets steps
+        still in flight land before repair; repair checks each skipped step's
+        own signature, so a short delay costs resends, not correctness."""
         steps, built, t0 = handle.steps, handle.built, handle.started
         n = len(built)
         sigs = [sig for sig, _raw in built]
@@ -421,11 +427,12 @@ class OrderedLane:
                             (statuses[bad[0]] or {}).get("err", "missing") if bad else None,
                             sigs, statuses)
         if bad and repair:
-            time.sleep(1.0)
+            if repair_delay > 0:
+                time.sleep(repair_delay)
             # Walk from the start: a step's simulation also fails while an
             # earlier step is still missing, so starting at the first failure
             # can skip work that never landed.
-            result.repaired, result.skipped = await self.repair(steps, 0)
+            result.repaired, result.skipped = await self.repair(steps, 0, signatures=sigs)
         if self.journal is not None and handle.journal_lane is not None and (not bad or repair):
             # repair() raises unless every step is resolved, so reaching here
             # with repair on means the lane's outcome is known.
@@ -456,20 +463,46 @@ class OrderedLane:
     async def run(self, steps: Sequence[LaneStep], *, wait_seconds: float = 20.0, repair: bool = True,
                   monotonic_limits: bool = True, blockhash: str | None = None,
                   watch_last: bool = False, poll_seconds: float = 0.1,
-                  resend_after_seconds: float = 0.5, max_resends: int = 3, salt: int = 0) -> LaneResult:
+                  resend_after_seconds: float = 0.5, max_resends: int = 3, salt: int = 0,
+                  repair_delay: float = 1.0) -> LaneResult:
         """Send ``steps`` in order and wait for them (``send`` then ``wait``)."""
         handle = await self.send(steps, monotonic_limits=monotonic_limits, blockhash=blockhash, salt=salt)
         return await self.wait(handle, wait_seconds=wait_seconds, repair=repair, watch_last=watch_last,
                                poll_seconds=poll_seconds, resend_after_seconds=resend_after_seconds,
-                               max_resends=max_resends)
+                               max_resends=max_resends, repair_delay=repair_delay)
 
-    async def repair(self, steps: Sequence[LaneStep], start: int = 0) -> tuple[int, int]:
+    def _landed(self, signature: str, settle_seconds: float = 0.5) -> bool:
+        """Whether ``signature`` succeeded, polling briefly in case it is
+        about to land."""
+        end = time.monotonic() + settle_seconds
+        while True:
+            status = self.rpc("getSignatureStatuses", [[signature]])["value"][0]
+            if status is not None:
+                return not status.get("err")
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.05)
+
+    async def repair(self, steps: Sequence[LaneStep], start: int = 0,
+                     signatures: Sequence[str] | None = None) -> tuple[int, int]:
+        """Replay ``steps[start:]`` in order: send each step whose simulation
+        passes; skip one whose simulation is refused.
+
+        A refused simulation means "already landed" only if the step did land.
+        With ``signatures`` (the lane's original signatures, as ``wait``
+        passes them) a refused step counts as landed only when its original
+        signature succeeded; otherwise it raises, since the step can no longer
+        run (e.g. a guard refuses it for a reason other than "already done")
+        and the lane did not do its work. Without ``signatures`` every refused
+        step is assumed landed (the caller verifies on chain)."""
         sent = skipped = 0
-        for step in list(steps)[start:]:
+        for index, step in enumerate(list(steps)[start:], start):
             sig, raw = await self._build(step, self.blockhash("processed"), 0)
             sim = self.rpc("simulateTransaction", [base64.b64encode(raw).decode(),
                                                    {"encoding": "base64", "commitment": "processed"}])["value"]
             if sim.get("err"):
+                if signatures is not None and not self._landed(signatures[index]):
+                    raise RuntimeError(f"lane step {step.step_id} is refused ({sim['err']}) and never landed")
                 skipped += 1
                 continue
             self.rpc("sendTransaction", [base64.b64encode(raw).decode(),
@@ -479,6 +512,12 @@ class OrderedLane:
                 status = self.rpc("getSignatureStatuses", [[sig]])["value"][0]
                 if status is not None:
                     if status.get("err"):
+                        # The original may have landed meanwhile (a short
+                        # repair delay): then the step is done.
+                        if signatures is not None and self._landed(signatures[index], 0):
+                            sent -= 1
+                            skipped += 1
+                            break
                         raise RuntimeError(f"lane repair step {step.step_id} failed: {status['err']}")
                     break
                 time.sleep(0.05)
