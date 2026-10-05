@@ -457,8 +457,20 @@ class DisputeClient:
         steps: list[str] = []
         give_up = time.monotonic() + wait
         candidates = self.accounts_touching(run)
+        refused = 0
         while len(steps) < max_steps:
-            step = self._settle_once(run, timeouts, candidates)
+            try:
+                step = self._settle_once(run, timeouts, candidates)
+            except ChainError as exc:
+                # Anyone may settle: another party's step may land between our
+                # read and our send (for example RulingOutOfOrder after its
+                # advance). Re-read and continue; give up after three in a row.
+                refused += 1
+                if refused >= 3:
+                    return {"state": "stuck", "reason": str(exc).splitlines()[-1].strip(), "steps": steps}
+                time.sleep(1.0)
+                continue
+            refused = 0
             if step is None:
                 data = self.gc.account(run)
                 state = "closed" if data is None or data[:4] == b"D21P" else "stuck"

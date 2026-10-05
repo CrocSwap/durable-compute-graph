@@ -30,7 +30,7 @@ from ..disputes_v21 import client as CL
 from ..disputes_v21 import game as G
 from ..disputes_v21 import run as R
 from ..disputes_v21 import spec as S
-from .chain import PH_CLAIM, PH_PICK, Discovery, DisputeState, RunState, staged_lists
+from .chain import PH_CLAIM, PH_PICK, Discovery, DisputeState, RunState, dispute_moves, staged_lists
 from .challenger import Challenger, dispute_kind
 from .journal import Journal
 
@@ -100,7 +100,14 @@ class Watchtower:
                 if act:
                     actions.append(act)
             except Exception as exc:
-                log(event="error", dispute=d_s, error=f"{type(exc).__name__}: {exc}")
+                # A move refused because the dispute was ruled meanwhile (moot
+                # after another challenger's win, or a timeout) is a race,
+                # not a fault; the next tick settles it.
+                raw = self.cl.gc.account(Pubkey.from_string(d_s))
+                if raw is not None and DisputeState.parse(Pubkey.from_string(d_s), raw).ruling != CL.RULING_OPEN:
+                    log(event="raced", dispute=d_s, note="ruled before our move landed")
+                else:
+                    log(event="error", dispute=d_s, error=f"{type(exc).__name__}: {exc}")
         self.journal.save()
         return actions
 
@@ -151,16 +158,24 @@ class Watchtower:
             return []
         nonce = os.urandom(32)
         dispute = self.cl.pda(b"dcg21dsp", bytes(run), bytes(self.key.pubkey()), nonce)
-        self.cl._send("open", nonce + bytes([CL.KIND[kind]]),
-                      [AccountMeta(self.key.pubkey(), True, True), AccountMeta(run, False, True),
-                       AccountMeta(state.template, False, False), AccountMeta(dispute, False, True),
-                       AccountMeta(CL.SYSTEM, False, False)], [self.key])
+        # Write ahead: a crash after the open lands must not open a second
+        # dispute on restart (the journal names this one first).
         entry["state"] = "disputed"
         self.journal.data["disputes"][str(dispute)] = {"run": str(run), "kind": kind, "nonce": nonce.hex(),
-                                                        "rounds": [], "done": False}
+                                                        "done": False}
+        self.journal.save()
+        self._open(run, state.template, dispute, nonce, kind)
+        self.journal.data["disputes"][str(dispute)]["opened"] = True
+        self.journal.save()
         self._live[str(dispute)] = _Live(Challenger(record, honest, kind, w.depth))
         log(event="open", run=str(run), dispute=str(dispute), kind=kind)
         return [f"open {dispute}"]
+
+    def _open(self, run: Pubkey, template: Pubkey, dispute: Pubkey, nonce: bytes, kind: str) -> None:
+        self.cl._send("open", nonce + bytes([CL.KIND[kind]]),
+                      [AccountMeta(self.key.pubkey(), True, True), AccountMeta(run, False, True),
+                       AccountMeta(template, False, False), AccountMeta(dispute, False, True),
+                       AccountMeta(CL.SYSTEM, False, False)], [self.key])
 
     # --- playing a dispute ------------------------------------------------------------------
     def _replica(self, d_s: str, entry: dict) -> _Live:
@@ -173,16 +188,43 @@ class Watchtower:
             honest = R.execute(w.spec, w.plan_id, state.run_id, values)
             record = G.RunRecord(w.plan_id, state.run_id, w.spec, state.root, state.refs)
             live = _Live(Challenger(record, honest, entry["kind"], w.depth))
-            for rnd in entry["rounds"]:
-                live.challenger.on_nodes({int(i): bytes.fromhex(h) for i, h in rnd["nodes"].items()})
-                live.challenger.pick(rnd["pick"])
-                live.fed_rounds += 1
+            # Replay the dispute's own moves from chain: each reveal and the
+            # pick that followed it (a reveal still awaiting its pick is
+            # handled by the PICK phase below).
+            c, pending = live.challenger, None
+            for sub, body in dispute_moves(self.cl, Pubkey.from_string(d_s)):
+                if sub == CL.SUB["reveal_nodes"]:
+                    r = c.replica
+                    d = min(r.depth, r.level)
+                    base, first = r.level - d, r.position << d
+                    slots = [i for i in range(1 << d) if r._pickable(base, first + i)]
+                    pending = {i: body[32 * n:32 * (n + 1)] for n, i in enumerate(slots)}
+                elif sub == CL.SUB["pick"] and pending is not None:
+                    c.on_nodes(pending)
+                    c.pick(body[0])
+                    pending = None
+            log(event="replica_rebuilt", dispute=d_s, level=c.replica.level, position=c.replica.position)
             self._live[d_s] = live
         return self._live[d_s]
 
     def _play(self, dispute: Pubkey, entry: dict) -> str | None:
         raw = self.cl.gc.account(dispute)
         run = Pubkey.from_string(entry["run"])
+        if raw is None and not entry.get("opened"):
+            # Written ahead but the open never landed: open it now, while the
+            # run can still be disputed (else give up on this entry).
+            run_raw = self.cl.gc.account(run)
+            state = RunState.parse(run, run_raw) if run_raw else None
+            if state and state.status == CL.RUN_COMMITTED and self.cl.gc.slot() <= state.deadline:
+                self._open(run, state.template, dispute, bytes.fromhex(entry["nonce"]), entry["kind"])
+                entry["opened"] = True
+                self.journal.save()
+                log(event="open_retried", dispute=str(dispute))
+                return f"open {dispute}"
+            entry["done"] = True
+            return None
+        if raw is not None and not entry.get("opened"):
+            entry["opened"] = True
         if raw is None:
             # Closed by someone else's settlement: the run's receipt says how
             # it ended (refuted means a challenger won).
@@ -215,7 +257,7 @@ class Watchtower:
             pick = c.on_nodes(nodes)
             self.cl._send("pick", bytes([pick]), party, [self.key])
             c.pick(pick)
-            entry["rounds"].append({"nodes": {str(i): h.hex() for i, h in nodes.items()}, "pick": pick})
+            self.journal.save()
             log(event="pick", dispute=str(dispute), level=d.level, pick=pick)
             return f"pick {dispute}"
         if d.phase == PH_CLAIM and not live.claimed:
@@ -239,6 +281,7 @@ class Watchtower:
                 heap = CL.LIST_HEAP_FRAME
             self.cl._send("claim", body, metas, [self.key], heap_frame=heap)
             live.claimed = True
+            self.journal.save()
             log(event="claim", dispute=str(dispute), claim=name)
             return f"claim {dispute}"
         return None

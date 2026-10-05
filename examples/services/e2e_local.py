@@ -140,11 +140,11 @@ def role_executor(cfg: dict) -> int:
 
 
 # --- the watchtower process --------------------------------------------------------------------
-def role_watchtower(cfg: dict) -> int:
+def role_watchtower(cfg: dict, name: str = "challenger") -> int:
     from dcg.services.watchtower import Watched, Watchtower, log
 
     run_dir = Path(cfg["dir"])
-    challenger = key(run_dir / "challenger.json")
+    challenger = key(run_dir / f"{name}.json")
     cl = client(cfg, challenger)
     sp = plan()
 
@@ -152,7 +152,7 @@ def role_watchtower(cfg: dict) -> int:
         path = run_dir / "inputs" / str(run) / f"{eid}.bin"
         return path.read_bytes() if path.exists() else None
 
-    tower = Watchtower(cl, challenger, str(run_dir / "watchtower-journal.json"),
+    tower = Watchtower(cl, challenger, str(run_dir / f"{name}-journal.json"),
                        [Watched(Pubkey.from_string(cfg["template"]), sp, PLAN_ID, inputs, DEPTH)])
     deadline = time.monotonic() + cfg["seconds"]
     while time.monotonic() < deadline:
@@ -180,7 +180,7 @@ def write_key(path: Path, k: Keypair) -> None:
     os.chmod(path, 0o600)
 
 
-def driver(image: Path, seconds: int) -> int:
+def driver(image: Path, seconds: int, towers: int = 1, restart: bool = False) -> int:
     run_dir = Path(tempfile.mkdtemp(prefix="dcg-e3-", dir="/private/tmp" if sys.platform == "darwin" else None))
     program = Keypair().pubkey()
     rpc_port, faucet_port, base = _port(), _port(), random.randrange(30_000, 60_000, 100)
@@ -204,7 +204,8 @@ def driver(image: Path, seconds: int) -> int:
                 if validator.poll() is not None or time.monotonic() - t0 > 60:
                     raise RuntimeError(f"validator did not start; see {run_dir / 'validator.log'}")
                 time.sleep(0.25)
-        keys = {name: Keypair() for name in ("executor", "challenger", "payer")}
+        names = ["challenger"] + [f"challenger{i}" for i in range(2, towers + 1)]
+        keys = {name: Keypair() for name in ("executor", "payer", *names)}
         for name, k in keys.items():
             write_key(run_dir / f"{name}.json", k)
         for k in [admin, *keys.values()]:
@@ -219,11 +220,29 @@ def driver(image: Path, seconds: int) -> int:
                "template_id": hashlib.sha256(W.TEMPLATE_DOMAIN + tdata).digest().hex(), "seconds": seconds}
         (run_dir / "config.json").write_text(json.dumps(cfg))
         env = {**os.environ}
-        for role in ("watchtower", "executor"):
-            procs.append(subprocess.Popen([sys.executable, str(HERE), "--role", role, "--config", str(run_dir / "config.json")],
-                                          stdout=(run_dir / f"{role}.log").open("w"), stderr=subprocess.STDOUT, env=env))
+
+        def start(role: str, name: str = "", mode: str = "w") -> subprocess.Popen:
+            log_name = name or role
+            args = [sys.executable, str(HERE), "--role", role, "--config", str(run_dir / "config.json")]
+            if name:
+                args += ["--name", name]
+            return subprocess.Popen(args, stdout=(run_dir / f"{log_name}.log").open(mode), stderr=subprocess.STDOUT,
+                                    env=env)
+
+        towers_p = {n: start("watchtower", n) for n in names}
+        executor_p = start("executor")
+        restarted = False
+        while restart and not restarted and time.monotonic() - t0 < seconds:
+            if '"event": "pick"' in (run_dir / "challenger.log").read_text():
+                towers_p["challenger"].kill()
+                towers_p["challenger"].wait()
+                towers_p["challenger"] = start("watchtower", "challenger", mode="a")
+                restarted = True
+                print(json.dumps({"event": "watchtower_restarted"}), flush=True)
+            time.sleep(0.2)
+        procs.extend([*towers_p.values(), executor_p])
         codes = [p.wait(timeout=seconds + 60) for p in procs]
-        return report(run_dir, codes, time.monotonic() - t0)
+        return report(run_dir, codes, time.monotonic() - t0, names, restarted if restart else None)
     finally:
         for p in procs:
             if p.poll() is None:
@@ -232,9 +251,9 @@ def driver(image: Path, seconds: int) -> int:
         validator.wait(timeout=20)
 
 
-def report(run_dir: Path, codes: list[int], seconds: float) -> int:
+def report(run_dir: Path, codes: list[int], seconds: float, names: list[str], restarted: bool | None) -> int:
     lines = {}
-    for role in ("executor", "watchtower"):
+    for role in ("executor", *names):
         lines[role] = []
         for line in (run_dir / f"{role}.log").read_text().splitlines():
             try:
@@ -242,34 +261,37 @@ def report(run_dir: Path, codes: list[int], seconds: float) -> int:
             except json.JSONDecodeError:
                 lines[role].append({"event": "text", "line": line})
     runs = {e["run"]: e["scenario"] for e in lines["executor"] if e.get("event") == "committed"}
-    outcome = {name: {"run": run} for run, name in runs.items()}
-    for e in lines["watchtower"]:
+    outcome = {name: {"run": run, "disputes": {}} for run, name in runs.items()}
+    by_dispute = {}
+    for e in [e for n in names for e in lines[n]]:
         name = runs.get(e.get("run"))
         if e.get("event") == "run_ok" and name:
             outcome[name]["watchtower"] = "ok"
         if e.get("event") == "open" and name:
             outcome[name]["watchtower"] = "challenged"
-            outcome[name]["dispute"] = e["dispute"]
-        if e.get("event") in ("settle", "executor_timeout") and e.get("ruling"):
-            for o in outcome.values():
-                if o.get("dispute") == e.get("dispute"):
-                    o["ruling"] = e["ruling"]
-        if e.get("event") == "settled_elsewhere" and e.get("outcome") == "refuted":
-            for o in outcome.values():
-                if o.get("dispute") == e.get("dispute"):
-                    o["ruling"] = "C"
+            outcome[name]["disputes"][e["dispute"]] = None
+            by_dispute[e["dispute"]] = name
+        d = e.get("dispute")
+        if d not in by_dispute:
+            continue
+        disputes = outcome[by_dispute[d]]["disputes"]
+        if e.get("event") == "settle" and e.get("ruling"):
+            disputes[d] = e["ruling"]
+        if e.get("event") == "settled_elsewhere":
+            disputes[d] = disputes[d] or ("C" if e.get("outcome") == "refuted" else e.get("outcome"))
         if e.get("event") == "executor_timeout":
-            for o in outcome.values():
-                if o.get("dispute") == e.get("dispute"):
-                    o["timeout"] = True
-                    if e.get("state") == "closed":
-                        o["ruling"] = "C"
+            outcome[by_dispute[d]]["timeout"] = True
+            if e.get("state") == "closed":
+                disputes[d] = disputes[d] or "C"
     errors = [e for role in lines for e in lines[role] if e.get("event") in ("error", "text")]
     ok = (all(c == 0 for c in codes)
           and outcome["honest"].get("watchtower") == "ok"
-          and all(outcome[n].get("watchtower") == "challenged" and outcome[n].get("ruling") == "C"
+          and all(outcome[n].get("watchtower") == "challenged" and "C" in outcome[n]["disputes"].values()
+                  and all(r in ("C", "moot", "refuted", "closed") for r in outcome[n]["disputes"].values())
                   for n in ("state-lie", "input-lie", "silent")))
-    print(json.dumps({"ok": ok, "exit_codes": codes, "seconds": round(seconds, 1), "outcome": outcome,
+    if restarted is False:
+        ok = False
+    print(json.dumps({"ok": ok, "restarted": restarted, "watchtowers": len(names), "exit_codes": codes, "seconds": round(seconds, 1), "outcome": outcome,
                       "errors": errors[:10], "dir": str(run_dir)}, indent=1))
     return 0 if ok else 1
 
@@ -280,8 +302,12 @@ if __name__ == "__main__":
     ap.add_argument("--role")
     ap.add_argument("--config")
     ap.add_argument("--seconds", type=int, default=300)
+    ap.add_argument("--name", default="challenger")
+    ap.add_argument("--watchtowers", type=int, default=1)
+    ap.add_argument("--restart-watchtower", action="store_true",
+                    help="kill the first watchtower after its first pick and restart it from its journal")
     a = ap.parse_args()
     if a.role:
         cfg = json.loads(Path(a.config).read_text())
-        raise SystemExit(role_executor(cfg) if a.role == "executor" else role_watchtower(cfg))
-    raise SystemExit(driver(Path(a.image), a.seconds))
+        raise SystemExit(role_executor(cfg) if a.role == "executor" else role_watchtower(cfg, a.name))
+    raise SystemExit(driver(Path(a.image), a.seconds, a.watchtowers, a.restart_watchtower))

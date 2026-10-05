@@ -156,3 +156,35 @@ class Discovery:
             if tx is not None:
                 keys.update(dict.fromkeys(tx["transaction"]["message"]["accountKeys"]))
         return [Pubkey.from_string(k) for k in keys]
+
+
+def dispute_moves(cl: CL.DisputeClient, dispute: Pubkey) -> list[tuple[int, bytes]]:
+    """The successful tag-227 moves on a dispute, oldest first, as
+    (sub-tag, body), read from its transaction history. A watchtower rebuilds
+    its replica from these after a restart, so recovery does not depend on
+    its journal having been saved."""
+    import base64
+
+    from solders.transaction import VersionedTransaction
+
+    sigs, before = [], None
+    while True:
+        opts = {"limit": 1000, "commitment": "confirmed", **({"before": before} if before else {})}
+        page = cl.gc.rpc("getSignaturesForAddress", [str(dispute), opts])
+        sigs += [p["signature"] for p in page if p.get("err") is None]
+        if len(page) < 1000:
+            break
+        before = page[-1]["signature"]
+    moves = []
+    for sig in reversed(sigs):
+        tx = cl.gc.rpc("getTransaction", [sig, {"encoding": "base64", "commitment": "confirmed",
+                                                "maxSupportedTransactionVersion": 0}])
+        if tx is None:
+            continue
+        message = VersionedTransaction.from_bytes(base64.b64decode(tx["transaction"][0])).message
+        keys = message.account_keys
+        for ix in message.instructions:
+            data = bytes(ix.data)
+            if keys[ix.program_id_index] == cl.gc.program_id and len(data) >= 2 and data[0] == CL.TAG:
+                moves.append((data[1], data[2:]))
+    return moves
