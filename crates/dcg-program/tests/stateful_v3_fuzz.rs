@@ -1535,26 +1535,29 @@ impl Fuzz {
     /// Run one transaction of `ops`, predict and check it. `must`: a
     /// refusal is an oracle failure.
     async fn step(&mut self, ops: Vec<Op>, cu: Option<u32>, label: &str, must: bool) -> bool {
+        // A signature is per transaction: an account meta marked unsigned is
+        // still a signer if its key signs anywhere in the message. Writability
+        // is per transaction too: the fixed engine refuses a resource copy that
+        // any instruction in the message marks writable. Neither set depends
+        // on the model-derived parts of the account lists (views, lanes).
+        let draft: Vec<Instruction> = ops.iter().flat_map(|o| self.build(o)).collect();
+        let mut signing: Vec<Pubkey> = draft.iter().flat_map(|i| i.accounts.iter().filter(|a| a.is_signer).map(|a| a.pubkey)).collect();
+        signing.push(self.ctx.payer.pubkey());
+        self.res_writable = draft.iter().any(|i| i.accounts.iter().any(|a| a.pubkey == self.k.resource && a.is_writable));
         // Each instruction's account list (views, lanes) follows the state its
         // predecessors in the same transaction leave.
         let saved = self.m.clone();
         let mut ixs: Vec<Instruction> = Vec::new();
         for op in &ops {
             ixs.extend(self.build(op));
-            if self.valid(&self.m, op) {
+            let op = self.effective(op, &signing);
+            if self.valid(&self.m, &op) {
                 let mut next = self.m.clone();
-                self.apply(&mut next, op);
+                self.apply(&mut next, &op);
                 self.m = next;
             }
         }
         self.m = saved;
-        // A signature is per transaction: an account meta marked unsigned is
-        // still a signer if its key signs anywhere in the message.
-        let mut signing: Vec<Pubkey> = ixs.iter().flat_map(|i| i.accounts.iter().filter(|a| a.is_signer).map(|a| a.pubkey)).collect();
-        signing.push(self.ctx.payer.pubkey());
-        // Writability is per transaction too: the fixed engine refuses a
-        // resource copy that any instruction in the message marks writable.
-        self.res_writable = ixs.iter().any(|i| i.accounts.iter().any(|a| a.pubkey == self.k.resource && a.is_writable));
         let mut sim = self.m.clone();
         let mut predicted = true;
         for op in &ops {
