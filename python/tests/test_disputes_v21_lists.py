@@ -372,8 +372,10 @@ def test_list_wire_goldens_and_legacy_template_bytes():
     legacy = (bytes([4]) + struct.pack("<6Q", plain.total_steps, plain.total_outputs, 1_000, 750,
                                        2_000_000, 1_000_000)
               + struct.pack("<II", plain.first_out_record, plain.first_step_record) + plain.root
-              + struct.pack("<H", 5_000) + PLAN_ID + bytes([len(plain.blocks)])
-              + b"".join(block.record() for block in plain.blocks))
+              + struct.pack("<H", 5_000) + PLAN_ID)
+    # One enumerated block over every step is the default: the canonical
+    # template carries no block list (program admission, owner 10-05).
+    assert len(plain.blocks) == 1
     assert W.template_data(plain, 4, PLAN_ID) == legacy
     assert W.stage_create_body(W.ROLE_EXECUTOR) == bytes([1, 0, 0, 0, 0])
     assert W.stage_create_body(W.ROLE_CHALLENGER, 512) == bytes([2]) + struct.pack("<I", 512)

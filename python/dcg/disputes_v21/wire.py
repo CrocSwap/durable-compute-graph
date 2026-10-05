@@ -11,6 +11,7 @@ from __future__ import annotations
 import struct
 
 from . import spec as S
+from . import trees
 
 TEMPLATE_DOMAIN = b"dcg.template.id.v2.1-skeleton\x00"
 ROLE_EXECUTOR, ROLE_CHALLENGER = 1, 2
@@ -27,7 +28,12 @@ def template_data(sp: S.Spec, depth: int, plan_id: bytes, *, challenge_window: i
         data += struct.pack("<Q", x)
     data += struct.pack("<II", sp.first_out_record, sp.first_step_record) + sp.root
     data += struct.pack("<H", slasher_bps) + plan_id
-    if with_blocks:
+    # Canonical form (program, owner 10-05): a lone block equal to the default
+    # block (one enumerated block over every step) is written as no blocks,
+    # so one template has one id.
+    default = S.block_spec(1, 0, sp.total_steps, 0, 0, 0, 0, sp.first_step_record, sp.total_steps, 0,
+                           trees.height_for(sp.total_steps))
+    if with_blocks and not (len(sp.blocks) == 1 and sp.blocks[0].record() == default):
         data += bytes([len(sp.blocks)]) + b"".join(b.record() for b in sp.blocks)
     # Spec openings identify ListSpecs by their authenticated record type/id;
     # there is no separate caller-supplied first-list boundary in a template.

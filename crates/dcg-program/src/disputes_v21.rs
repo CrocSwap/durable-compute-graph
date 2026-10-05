@@ -544,8 +544,12 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     let (cw, pw) = (u64_at(data, 17)?, u64_at(data, 25)?);
     let total_steps = u64_at(data, 1)?;
     if !(1..=MAX_REVEAL_DEPTH).contains(&depth)
-        || !(MIN_WINDOW..=MAX_WINDOW).contains(&cw)
+        // A challenge window shorter than a response phase makes the run
+        // effectively undisputable; the slasher share pays the challenger
+        // (owner 10-05, R2 review A-M2: admission floors).
+        || !(MIN_PHASE_WINDOW..=MAX_WINDOW).contains(&cw)
         || !(MIN_PHASE_WINDOW..=MAX_WINDOW).contains(&pw)
+        || u16_at(data, 89)? == 0
         || total_steps == 0
         || total_steps > 1 << 40
         || u16_at(data, 89)? >= 10_000
@@ -563,7 +567,15 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     let lx_tail = (data.len() == FIXED + lx::LX_TAIL_BYTES && data[FIXED..].starts_with(lx::LX_TAIL_MAGIC))
         .then(|| &data[FIXED..]);
     if let Some(tail) = lx_tail {
-        if lx::parse_tail(tail).is_none() || total_steps != 1 || u64_at(data, 9)? != 0 {
+        // Canonical LX1 skeleton: the fields an LX1 template does not use are
+        // fixed, so one template has one id (owner 10-05, R2 review A-L1).
+        if lx::parse_tail(tail).is_none()
+            || total_steps != 1
+            || u64_at(data, 9)? != 0
+            || depth != 1
+            || data[49..57] != [0; 8]
+            || data[91..123] != [0; 32]
+        {
             return Err(err(6));
         }
     }
@@ -580,6 +592,18 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     };
     let blocks: Vec<Block> = if block_data_end > FIXED {
         let count = data[FIXED] as usize;
+        // Canonical blocks (owner 10-05, R2 review A-L1 / B-L2): bytes the
+        // parser ignores are zero, a single block that equals the default is
+        // written as no blocks, so the same template cannot take two ids.
+        for i in 0..count {
+            let raw = &data[FIXED + 1 + Block::BYTES * i..FIXED + 1 + Block::BYTES * (i + 1)];
+            if raw[38..40] != [0; 2] || raw[65..Block::BYTES] != [0; Block::BYTES - 65] || (raw[4] == 1 && raw[32..38] != [0; 6]) {
+                return Err(err(6));
+            }
+        }
+        if count == 1 && data[FIXED + 1..block_data_end] == default_block(total_steps, u32_at(data, 53)? as u64) {
+            return Err(err(6));
+        }
         (0..count)
             .map(|i| Block::parse(&data[FIXED + 1 + Block::BYTES * i..FIXED + 1 + Block::BYTES * (i + 1)]))
             .collect::<Option<Vec<Block>>>()
