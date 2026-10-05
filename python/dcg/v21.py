@@ -185,18 +185,29 @@ def call(kernel: str | bytes, *args: Value | ListValue, out: Sequence[tuple[int,
     return values[0] if len(values) == 1 else values
 
 
-def reduce(kernel: str, data: ChunkedValue, *extra: Value) -> Value:
+class _Iteration:
+    """``v21.ITERATION``: the iteration index ``i`` (a u32 scalar, kind 7), as an
+    extra input of ``reduce``."""
+
+    def __repr__(self):
+        return "v21.ITERATION"
+
+
+ITERATION = _Iteration()
+
+
+def reduce(kernel: str, data: ChunkedValue, *extra: Value | _Iteration) -> Value:
     """A chunked kernel: a repeated block whose iteration ``i`` reads chunk ``i``
     of ``data`` (with ``extra`` plain inputs), its running state exported on
     port 0. Returns the final state, read through kind 6."""
     t = _current()
-    t.check(data, *extra)
+    t.check(data, *(e for e in extra if e is not ITERATION))
     if not isinstance(data, ChunkedValue):
         raise TraceError("TYPE", "reduce reads a v21.Chunked input or a chunked v21.constant", _caller())
     if kernel not in _red.REGISTRY or not _red.REGISTRY[kernel].state_bytes:
         raise TraceError("KERNEL", f"{kernel!r} is not a registered stateful reduction", _caller())
     t.flush()
-    ex = tuple(e._input() for e in extra)
+    ex = tuple(P.Input(S.producer(7), 4, scalar=True) if e is ITERATION else e._input() for e in extra)
     if data.source == "input":
         block = t.builder.chunked_reduce(kernel, data.ident, ex)
     else:
@@ -244,8 +255,13 @@ class Traced:
     def _declarations(self) -> list[object]:
         if self.inputs is not None:
             return [*self.inputs]
-        # eval_str: annotations are strings under `from __future__ import annotations`
-        params = inspect.signature(self.fn, eval_str=True).parameters.values()
+        # eval_str: annotations are strings under `from __future__ import annotations`;
+        # they are evaluated in the function's module, not its enclosing scope.
+        try:
+            params = inspect.signature(self.fn, eval_str=True).parameters.values()
+        except NameError as exc:
+            raise TraceError("INPUT", f"an input annotation names something outside the module ({exc}); "
+                                      "use module-level sizes or pass inputs=[...] to v21.trace", self.fn.__name__) from exc
         out = []
         for p in params:
             if p.annotation is inspect.Parameter.empty:

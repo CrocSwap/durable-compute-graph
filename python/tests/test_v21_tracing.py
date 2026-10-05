@@ -101,8 +101,59 @@ def test_trace_refusals():
         def k(a: v21.Raw(16)):
             return v21.call(SHA, a)
         k.plan()
+    size = 64
+    with pytest.raises(TraceError, match="outside the module"):
+        @v21.trace
+        def loc(a: v21.Raw(size)):
+            return a
+        loc.plan()
     with pytest.raises(TraceError, match="TYPE"):
         @v21.trace
         def r(a: v21.Raw(64)):
             return v21.reduce("sumchunk_i32", a)
         r.plan()
+
+
+def _words(ws):
+    return struct.pack(f"<{len(ws)}i", *ws)
+
+
+def test_iteration_index_extras_match_the_scan_plan():
+    n = 5
+    b = P.PlanBuilder()
+    b.chunked_input(0, n << 6, 6)
+    needle = b.scalar_input(1)
+    s = b.chunked_reduce("sumchunk_i32", 0)
+    b.chunked_reduce("scan_i32c", 0, extra=(P.Input(S.producer(7), 4, scalar=True), P.Input(needle, 4, scalar=True)))
+    b.enumerated([P.Step("head_i32", (P.Input(S.producer(6, s, 0, 0), 8),), ((0, 4, True),))])
+    b.output(S.producer(6, s, 0, 0), 8)
+
+    @v21.trace
+    def scan(data: v21.Chunked(bytes=320, chunk=64), needle: v21.Scalar):
+        total = v21.reduce("sumchunk_i32", data)
+        v21.reduce("scan_i32c", data, v21.ITERATION, needle)
+        v21.call("head_i32", total)
+        return total
+
+    same(scan, b.build())
+
+
+def test_matvec_over_a_chunked_constant_matches():
+    import random
+    rng = random.Random(0)
+    w = _words([rng.randint(-50, 50) for _ in range(4 * 16)])
+    b = P.PlanBuilder()
+    b.committed_constant(0, w, 6)
+    x = b.raw_input(0, 64)
+    blk = b.chunked_reduce_const("rowdot_i32c", 0, extra=(P.Input(x, 64), P.Input(S.producer(7), 4, scalar=True)))
+    b.output(S.producer(6, blk, 0, 0), 512)
+
+    @v21.trace
+    def matvec(x: v21.Raw(64)):
+        weights = v21.constant(w, chunk=64)
+        return v21.reduce("rowdot_i32c", weights, x, v21.ITERATION)
+
+    same(matvec, b.build())
+    xs = _words(list(range(16)))
+    y = matvec.execute({0: xs})
+    assert y.values  # executes under the reference executor

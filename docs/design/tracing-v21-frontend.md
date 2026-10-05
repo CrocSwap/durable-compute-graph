@@ -1,6 +1,19 @@
 # Tracing frontend for v2.1 (alpha E1) — API proposal
 
-**Status: proposal (2026-10-05), not implemented.** Alpha plan item E1: write a
+**Status: first cut implemented (2026-10-05, `python/dcg/v21.py`; owner left
+the API to the proposal's defaults: `dcg.v21.trace`, `explain()` without cost
+estimates).** Implemented: Scalar/Raw/Chunked inputs (annotations or
+`inputs=[...]`), `call` (built-ins know their shapes; app kernels take `out=`),
+`reduce` over chunked inputs and chunked constants with plain and
+`v21.ITERATION` extras, `constant`, `list`, `explain`, `template`,
+`template_id`, `execute` (reference executor). Checked byte-identical against
+the hand-built chunked, mixed-list, scan and matvec plans
+(`python/tests/test_v21_tracing.py`), and a traced plan ruled as the oracle on
+the alpha testnet program (`examples/hello-graph/traced_dispute.py`: lie → C,
+control → E; 16 transactions, 19 s; Basanos
+`out/runs/dcg-alpha-testnet-2026-10-05/traced-dispute.log`). **Not yet:**
+`v21.repeat` (general multi-step repeated bodies with kind-4 producers and
+gates); annotations must use module-level names (a clear error says so). Alpha plan item E1: write a
 Python function with loops, constants and wide reads, and get a v2.1 plan
 (repeated blocks, gates, constants, chunked and list inputs). Today a v2.1 plan
 is assembled by hand with `dcg.disputes_v21.plans.PlanBuilder` and packed
