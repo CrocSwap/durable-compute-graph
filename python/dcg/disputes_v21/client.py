@@ -17,9 +17,10 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 
-from dcg.graph_client import GraphClient
+from dcg.graph_client import ChainError, GraphClient
 
 from . import wire as W
+from .errors import explain
 
 TAG = 227
 SUB = {"create_template": 1, "init_run": 2, "commit": 3, "open": 4, "reveal_nodes": 5, "pick": 6,
@@ -53,7 +54,13 @@ class DisputeClient:
     def _send(self, sub: str, body: bytes, metas: list[AccountMeta], signers: list[Keypair],
               *, heap_frame: int | None = None) -> str:
         self.sent += 1
-        return self.gc.send(bytes([TAG, SUB[sub]]) + body, metas, signers, cu=1_400_000, heap_frame=heap_frame)
+        try:
+            return self.gc.send(bytes([TAG, SUB[sub]]) + body, metas, signers, cu=1_400_000, heap_frame=heap_frame)
+        except ChainError as exc:
+            named = explain(exc)
+            if named is None:
+                raise
+            raise ChainError(f"{sub}: {exc}\n  {named}") from None
 
     def _send_many(self, items: list[tuple[str, bytes, list[AccountMeta], list[Keypair]]], cap: float = 60.0) -> None:
         """Send order-independent instructions together (staged writes),
@@ -87,7 +94,8 @@ class DisputeClient:
                 for sig, st in zip(batch, gc.rpc("getSignatureStatuses", [batch])["value"]):
                     if st and st.get("confirmationStatus") in ("confirmed", "finalized"):
                         if st.get("err"):
-                            raise RuntimeError(f"staged write {sig} failed: {st['err']}")
+                            named = explain(st["err"])
+                            raise RuntimeError(f"staged write {sig} failed: {st['err']}" + (f"\n  {named}" if named else ""))
                         pending.pop(sig)
         if pending:
             raise RuntimeError(f"{len(pending)} staged writes not confirmed within {cap}s")

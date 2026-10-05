@@ -115,7 +115,7 @@ DCG keeps no model code (owner decision, 09-26).
 - `settle_and_reclaim(run)`: advance, pay the pot, close disputes with their buffers, finalize after the window, shrink the run to its receipt, close caches.
 - Phase windows sized from the largest witness a template needs, so a template cannot be set too short. A 64 KiB upload takes about 51 s on testnet (*measured* 10-03), longer than the 750-slot minimum.
 
-**E5. Named errors.** A table in the client that maps every tag-227 error code to its name and meaning: `0x660d` becomes "phase deadline passed".
+**E5. Named errors.** A table in the client that maps every tag-227 error code to its name and meaning: `0x660d` becomes "phase deadline passed". *Status (2026-10-05):* built: `dcg.disputes_v21.errors` (48 codes, each with a meaning and a usual fix; a test keeps it equal to the codes the program source raises); the dispute client appends the name to every refusal.
 
 **E6. Developer commands.**
 - `dcg dev`: a local validator, the program deployed, a funded payer.
