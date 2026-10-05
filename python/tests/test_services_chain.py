@@ -149,3 +149,23 @@ def test_search_newest_finds_past_a_backlog():
     target = keys[299]  # the newest
     got = d.search_newest(addr, lambda ks: target in ks, page=64)
     assert target in got and gc.reads <= 64
+
+
+def test_search_newest_is_bounded_per_call_and_resumes():
+    """Review H-1: a search that cannot finish is bounded per call and
+    resumes where it stopped."""
+    keys = [Pubkey.new_unique() for _ in range(300)]
+    sigs = [{"signature": f"s{i}", "err": None} for i in reversed(range(300))]
+    gc = FakeGC(sigs, {f"s{i}": json_tx([keys[i], PROGRAM], 1) for i in range(300)})
+    d = Discovery(client(gc))
+    addr = Pubkey.new_unique()
+    target = keys[0]  # the oldest
+    calls = 0
+    while True:
+        calls += 1
+        before = gc.reads
+        got = d.search_newest(addr, lambda ks: target in ks, page=64, max_pages=2)
+        assert gc.reads - before <= 128
+        if target in got:
+            break
+    assert calls == 3 and str(addr) not in d.state.get("search", {})

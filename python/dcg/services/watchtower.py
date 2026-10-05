@@ -159,7 +159,11 @@ class Watchtower:
         # The template counts its live runs: if it has more than we know,
         # search its history newest first until they are found (review R1).
         t = self.cl.gc.account(w.template)
-        active = struct.unpack_from("<I", t, len(t) - 4)[0] if t is not None and len(t) >= 4 else 0
+        # Only a tracked template counts its live runs (a 40-byte tracking
+        # trailer, magic D21O, ending in the count); in a legacy template the
+        # last bytes are block data (review H-1).
+        tracked = t is not None and len(t) >= 40 and t[len(t) - 40:len(t) - 36] == b"D21O"
+        active = struct.unpack_from("<I", t, len(t) - 4)[0] if tracked else 0
         if active > self._known_live(w):
             self.discovery.search_newest(w.template, lambda ks: self._adopt(w, ks) >= active)
 
@@ -175,8 +179,11 @@ class Watchtower:
 
     def _known_live(self, w: Watched) -> int:
         n = 0
+        # Every journaled run whose account is still a live run counts,
+        # whatever its journal state: the template counts it until close_run
+        # (review H-1).
         for run_s, entry in self.journal.data["runs"].items():
-            if entry["template"] == str(w.template) and entry["state"] != "closed":
+            if entry["template"] == str(w.template):
                 raw = self.cl.gc.account(Pubkey.from_string(run_s))
                 n += raw is not None and raw[:4] == b"D21R"
         return n

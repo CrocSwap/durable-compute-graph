@@ -196,26 +196,38 @@ class Discovery:
         with ThreadPoolExecutor(max_workers=16) as pool:
             return dict(zip(sigs, pool.map(one, sigs)))
 
-    def search_newest(self, address: Pubkey, found: Callable[[list[Pubkey]], bool], page: int = 64) -> list[Pubkey]:
-        """Read the address's history newest first, without the per-call cap,
-        until `found(keys so far)` is true or the history is exhausted (review
-        R1: an account the chain says exists must not wait behind a backlog of
-        unrelated transactions). Does not move the cursor."""
+    def search_newest(self, address: Pubkey, found: Callable[[list[Pubkey]], bool], page: int = 64,
+                      max_pages: int = 4) -> list[Pubkey]:
+        """Read the address's history newest first until `found(keys so far)`
+        is true (review R1: an account the chain says exists must not wait
+        behind a backlog of unrelated transactions). At most `max_pages`
+        pages per call (review H-1: one tick must not scan an unbounded
+        history); a search that has not finished resumes where it stopped on
+        the next call, and restarts from the newest once it reaches the end
+        or succeeds. Does not move the forward cursor."""
         keys: dict[str, None] = {}
-        before = None
+        resume = self.state.setdefault("search", {})
+        before = resume.get(str(address))
+        pages = 0
         while True:
             opts = {"limit": page, "commitment": "confirmed", **({"before": before} if before else {})}
             sigs = self.cl.gc.rpc("getSignaturesForAddress", [str(address), opts])
             if not sigs:
+                resume.pop(str(address), None)
                 break
             txs = self._fetch([s["signature"] for s in sigs if s.get("err") is None])
             for tx in txs.values():
                 if tx is not None:
                     keys.update(dict.fromkeys(CL.program_tx_keys(tx, self.cl.gc.program_id)))
             result = [Pubkey.from_string(k) for k in keys]
+            pages += 1
             if found(result) or len(sigs) < page:
+                resume.pop(str(address), None)
                 break
             before = sigs[-1]["signature"]
+            if pages >= max_pages:
+                resume[str(address)] = before  # continue from here next call
+                break
         seen = self.state["keys"].setdefault(str(address), [])
         seen.extend(k for k in keys if k not in seen)
         return [Pubkey.from_string(k) for k in keys]

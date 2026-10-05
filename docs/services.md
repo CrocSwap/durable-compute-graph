@@ -153,6 +153,19 @@ win are ruled moot, and their bonds return.
     chunked disputes and 5 list lies);
   - discovery and history reading are unit-tested against a fake RPC.
 
+**Known limits (alpha):**
+- **Discovery cost scales with spam.** Anyone can send cheap transactions
+  that name a run or template. The services find an account the chain
+  counts by searching newest first, with each search bounded per tick and
+  resumed on the next. A large flood (estimated tens of thousands of
+  transactions) can still delay the executor's first sight of a new dispute
+  past its first phase deadline. Mitigations: an RPC that serves
+  `getProgramAccounts` with filters, or a phase window that is generous
+  relative to the expected spam.
+- **A restart rebuild reads the whole dispute history.** It stops if any
+  transaction in it cannot be read. This matters only after a restart or a
+  real mismatch.
+
 **Not yet measured:**
 - a run on the testnet alpha program;
 - many runs at once, and ticks under load;
