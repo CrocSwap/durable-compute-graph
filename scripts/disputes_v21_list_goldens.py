@@ -32,7 +32,9 @@ def build() -> dict:
     sp, values = TESTS.mixed_plan()
     refs = {eid: R.external_ref(eid, sp.in_specs[eid][8:31], R.input_digest(sp.in_specs[eid], value))
             for eid, value in values.items()}
-    template_data = W.template_data(sp, 4, PLAN_ID)
+    # Program-test goldens at the 750-slot floor: the staging-time check of
+    # live templates (phase_window_for) does not apply.
+    template_data = W.template_data(sp, 4, PLAN_ID, slot_ms=None)
     template_id = hashlib.sha256(W.TEMPLATE_DOMAIN + template_data).digest()
     run_id = R.run_id(template_id, NONCE, [refs[e] for e in sorted(refs)], EXECUTOR)
     committed = R.execute(sp, PLAN_ID, run_id, values)

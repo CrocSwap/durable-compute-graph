@@ -52,7 +52,9 @@ _t.loader.exec_module(T)
 
 
 def context(sp, values, nonce):
-    tdata = W.template_data(sp, DEPTH, PLAN_ID)
+    # Program-test goldens at the 750-slot floor: the staging-time check of
+    # live templates (phase_window_for) does not apply.
+    tdata = W.template_data(sp, DEPTH, PLAN_ID, slot_ms=None)
     template_id = hashlib.sha256(W.TEMPLATE_DOMAIN + tdata).digest()
     refs = {eid: R.external_ref(eid, sp.in_specs[eid][8:31], R.input_digest(sp.in_specs[eid], v))
             for eid, v in values.items()}

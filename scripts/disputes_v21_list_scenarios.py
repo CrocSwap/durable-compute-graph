@@ -37,7 +37,9 @@ def refs_for(sp, values):
 
 def setup_for(name, sp, values):
     refs = refs_for(sp, values)
-    template_data = W.template_data(sp, 4, PLAN_ID)
+    # Program-test goldens at the 750-slot floor: the staging-time check of
+    # live templates (phase_window_for) does not apply.
+    template_data = W.template_data(sp, 4, PLAN_ID, slot_ms=None)
     template_id = hashlib.sha256(W.TEMPLATE_DOMAIN + template_data).digest()
     run_id = R.run_id(template_id, NONCE, [refs[e] for e in sorted(refs)], EXECUTOR)
     return {"name": name, "template_data": template_data.hex(), "template_id": template_id.hex(),
