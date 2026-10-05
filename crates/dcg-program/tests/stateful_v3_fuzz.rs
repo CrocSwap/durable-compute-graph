@@ -2521,4 +2521,8 @@ async fn finding_f1_open_anchor_closes_under_a_wrong_kind() {
     let wrong = Op::Close { child: Child::Anchor, kind: v3::KIND_STREAM, refund: A };
     let (outcome, _) = f.send(f.build(&wrong), None).await;
     assert_ne!(outcome, Outcome::Ok, "an anchor closed under kind {} (stream)", v3::KIND_STREAM);
+    // The refusal is about the kind, not the anchor: its own kind closes it.
+    let right = Op::Close { child: Child::Anchor, kind: v3::KIND_ANCHOR, refund: A };
+    let (outcome, _) = f.send(f.build(&right), None).await;
+    assert_eq!(outcome, Outcome::Ok, "the anchor closes under its own kind");
 }

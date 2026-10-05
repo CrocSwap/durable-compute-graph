@@ -1,7 +1,8 @@
 # Sessions v3 and lanes run-level fuzz campaign (2026-10-05)
 
-**Status: built and run (alpha R2 item); one low finding (F1), no invariant,
-liveness or closability failure.** Test-only: no program source changed. Spec:
+**Status: built and run (alpha R2 item); one low finding (F1), fixed in the
+program (977ae49, see "F1 fixed"); no invariant, liveness or closability
+failure, including a 500-sequence SBF re-run on the fixed image.** Spec:
 "Fuzzer scope" in
 [`sessions-v3-review-2026-10-05.md`](sessions-v3-review-2026-10-05.md).
 Program at DCG `d8108bc` (after the H1–H3 fixes); branch
@@ -175,7 +176,8 @@ cargo test -p dcg-program --features sbf-real-lifecycle-test \
 The anchor case is measured (native reproducer); the primary case is from the
 code path and the model (the model accepts both so the campaign could
 continue). A fix would check the kind against the address-derived kind before
-`close_child`; it changes refusal behavior, so it needs a version decision.
+`close_child`. It changes refusal behavior only (stricter, testnet-only v3,
+like H1), so no wire version; fixed 977ae49.
 
 ## Not covered
 
@@ -194,19 +196,37 @@ continue). A fix would check the kind against the address-derived kind before
 - **Independence.** The model was written from the code and design docs; where
   the program's intended semantics were unclear (renders and aborts after halt,
   forfeited capture cursors) it encodes the documented behavior, so a bug
-  shared by the code and its documentation would not show. Invariants 1–11 and
-  both oracles do not depend on the model's acceptance rules.
+  shared by the code and its documentation would not show. **Independent of
+  the model's acceptance rules** (review 10-05): the counter and window bounds,
+  child count equal to live accounts, refused transactions byte-identical,
+  lamport conservation, view stamps equal and never ahead of the cursor,
+  captured cursors distinct, and the closability oracle's end state.
+  **Dependent on the model's state** (it moves only on predicted acceptances):
+  written slots (4), state against the host replay (5), lane records (7), the
+  newest captured cursor (9) and child existence (10). The model is strict on
+  authorization, so a wrong acceptance mostly cannot hide; where it is
+  permissive by design (closes need no signer, render and lane abort after
+  halt, any payer, prefunding) a bug shared with the program would not show.
+  Its limits come from the program's constants (e.g. the 64-slot window), so a
+  wrong constant would be agreed with. Accepted transactions are not checked
+  for writes to accounts the model expects unchanged (review M-c); resends
+  rebuild the same operation rather than replay its bytes (review L7).
 - Live validators, testnet, the v1/v2 stateful paths, the revision-8 image
   composition constraint, and sequences longer than 140 steps or cursors past
   43 (M2's 655,352-input ceiling is not approached).
 
 ## What remains for R2 sign-off
 
-- Owner decision on F1 (fix with a version note, or document that the anchor
-  and headerless primary are closed by address).
-- H4 and M2 owner decisions (unchanged by this campaign; the fuzzer shows the
-  fixed engine's 0xED wedge and recovers only by halt and close).
-- An independent rule-10 review of this harness and note.
+Reviewed 10-05 (keep; no critical or high). R2 for sessions v3 + lanes can be
+signed as a **mechanics claim for accepting kernels**, with these exclusions
+stated: H4 (an input the kernel refuses wedges the session; the fixed engine
+and Doom have no liveness evidence), M2 (session lifetime), L3 (anyone may
+close a halted session's children and the session; rent to the authority, but
+final views and anchors can vanish before readers fetch them), and the
+independence statement above. Worth doing, not blocking: unchanged-account
+checks on accepted transactions (M-c), planted checks for lamport
+conservation, byte-identical refusal, closability and liveness (L2), a test of
+the headerless-primary F1 case.
 
 ## F1 fixed (10-05, host)
 
@@ -218,3 +238,10 @@ ignored, and the model's F1 allowance is removed (strict kind). Re-run after
 the fix: native seed 1001, sequences 0..1000 (includes index 316), 79,164
 transactions, 111 s, no failure; smoke, planted checks, creators 5/5 and lanes
 9/9 pass. A stricter refusal on testnet-only v3, like H1 (no wire version).
+
+SBF re-run on the fixed program (review M-a): image built from 977ae49
+(`cargo-build-sbf --tools-version v1.51 --features sbf-real-lifecycle-test`),
+SHA-256 `1a1e53167a515b1b48b8be2133ba30f8f6c831016980c21defad8bd3e3e78807`;
+seed 3000, 500 sequences, 40,317 transactions (358 injected compute
+failures), 66.6 s, no failure. The F1 test now also closes the anchor under
+its own kind after the wrong-kind refusal (review L1).
