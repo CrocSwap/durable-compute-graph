@@ -13,7 +13,12 @@ with a STEP claim at the same chunk-step: the program must rule for the
 executor.
 
     export DCG_PAYER_KEYPAIR=... DCG_PROGRAM_ID=... DCG_RPC_URL=https://testnet.fogo.io
-    PYTHONPATH=python python/.venv/bin/python examples/hello-graph/traced_dispute.py
+    PYTHONPATH=python python/.venv/bin/python examples/hello-graph/traced_dispute.py [--settle]
+
+With --settle (alpha E4), a third, unchallenged run is added, and every run
+is then settled with `settle_and_reclaim` (rulings advanced, pot paid,
+disputes, caches and runs closed, the honest run finalized after its
+window), and the template is retired and closed.
 """
 
 from __future__ import annotations
@@ -70,8 +75,10 @@ def main() -> int:
     template_id = hashlib.sha256(W.TEMPLATE_DOMAIN + tdata).digest()
     template = cl.create_template(tdata, gc.payer)
     refs = {e: R.external_ref(e, sp.in_specs[e][8:31], R.input_digest(sp.in_specs[e], v)) for e, v in values.items()}
-    results = []
-    for case in ("lie", "honest"):
+    settle = "--settle" in sys.argv
+    balance0 = gc.rpc("getBalance", [str(gc.payer.pubkey()), {"commitment": "confirmed"}])["value"]
+    results, runs = [], []
+    for case in ("lie", "honest") + (("unchallenged",) if settle else ()):
         nonce = os.urandom(32)
         run_id = R.run_id(template_id, nonce, list(refs.values()), bytes(executor.pubkey()))
         honest = R.execute(sp, PLAN_ID, run_id, values)
@@ -92,12 +99,32 @@ def main() -> int:
                          claim=step_claim(sp, honest, LIED_STEP))
         run = cl.init_run(template, template_id, nonce, executor.pubkey(), list(refs.values()), gc.payer)
         cl.commit(run, template, committed.root_bytes, executor)
+        runs.append(run)
+        if case == "unchallenged":
+            results.append(True)
+            continue
         out = cl.play(run, template, t, executor, challenger)
         out.update(case=case, claim=t["claim_name"], oracle=t["ruling"], rounds=len(t["rounds"]),
                    claim_bytes=len(t["claim"]) // 2, run=str(run), run_status=cl.run_status(run),
                    sum=sum(words))
         print(json.dumps(out), flush=True)
         results.append(out["ruling"] == out["oracle"] == ("C" if case == "lie" else "E"))
+    if settle:
+        # E4: settle every run and reclaim its rent (the challenge window is
+        # the template's, so the unchallenged run waits for it).
+        # The template's address is fixed by its plan, so earlier runs of
+        # this example may still hold it open: settle those too.
+        for run in runs + [r for r in cl.runs_of(template) if r not in runs]:
+            out = cl.settle_and_reclaim(run, wait=80.0)
+            print(json.dumps({"run": str(run), **out}), flush=True)
+            results.append(out["state"] == "closed")
+        if gc.account(template)[134] == 0:
+            cl.retire_template(template, gc.payer)
+        cl.close_template(template, gc.payer)
+        balance1 = gc.rpc("getBalance", [str(gc.payer.pubkey()), {"commitment": "confirmed"}])["value"]
+        print(json.dumps({"template_closed": gc.account(template) is None,
+                          "payer_net_lamports": balance1 - balance0}), flush=True)
+        results.append(gc.account(template) is None)
     print(json.dumps({"transactions": cl.sent, "all_agree": all(results)}))
     return 0 if all(results) else 1
 
