@@ -86,6 +86,9 @@ implement `Kernel`. A kernel manifest declares:
 2. versioned input/output layouts, optional state schema, and resource limits;
 3. the versioned `ModeId` values the application enables for that kernel.
 
+Declare the manifest with `KernelDecl` and check the kernel against its Python
+mirror with the kernel kit ([`docs/kernel-kit.md`](docs/kernel-kit.md)).
+
 `Kernel::execute` accepts authenticated canonical bytes and writes canonical
 output bytes. Stateful kernels may additionally implement `StatefulKernel`;
 optimistically replayable kernels may implement `OptimisticReplay`. An
