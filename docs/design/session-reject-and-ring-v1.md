@@ -1,6 +1,6 @@
 # Declared input rejection and ring-buffer streams (design v1)
 
-**Status: designed (2026-10-05), not implemented.** Owner decisions of
+**Status: session half implemented (2026-10-05, branch `fast/session-reject-ring`; owner answers: Q1 features byte, Q2 v2.1 flag only with rejecting kernels refused, Q3 last-lap history accepted); rule-10 review pending.** Contract summary in [`stateful-workloads-v3.md`](../stateful-workloads-v3.md). Owner decisions of
 2026-10-05 on the sessions review
 ([`experiments/sessions-v3-review-2026-10-05.md`](../experiments/sessions-v3-review-2026-10-05.md)):
 H4 is fixed by a reject outcome that only kernels declaring the capability may
@@ -30,8 +30,10 @@ bit 0 is `REJECTS_INPUT`. Every existing manifest is `KernelCapabilities::NONE`
 (a mechanical change to each manifest literal in DCG and the apps). Unknown
 bits are refused by `ApplicationManifest::validate`. The capability is part of
 the kernel's promised behaviour, so it is covered by the kernel's semantic
-version: turning it on is a semantic-version bump, and it is included in
-`admission_identity_digest` so an admitted document cannot silently gain it.
+version: turning it on is a semantic-version bump. *Implemented:* the bit is
+refused on stateless kernels, and the revision-8 admission digest covers only
+stateless (legacy-form) kernels, so no admitted document can gain it and the
+digest is unchanged; sessions record it at open.
 
 The off-chain `DCKC` manifest (spec `kernel-capability-v2.md`) is frozen at
 format 1 with `flags = 0`. It gets the same bit in a format-2 record only when a
@@ -87,9 +89,11 @@ template whether "rejected" is a possible outcome.
   `rejected_count` and `last_reject`; the Python client's session view and the
   docs' "explain" output show "rejectable: yes/no".
 - **v2.1 LX templates.** The `DLX1` tail names its one kernel. Tail byte 25
-  (reserved, zero today) becomes `flags`, bit 0 `REJECTABLE`; `create_template`
-  requires it to equal the named kernel's capability. The template id hashes
-  the creation data, so the id commits to the flag.
+  (reserved, zero today) is where a `REJECTABLE` flag goes once v2.1 has a
+  rejection outcome; the template id hashes the creation data, so the id would
+  commit to it. *Implemented for now (Q2):* the byte stays zero and an LX1 run
+  cannot bind a kernel declaring the capability (`create_template` does not
+  resolve kernels; `bind` does).
 - **v2.1 block templates.** The program does not see the step kernels at
   creation (they are opened from the spec root during a dispute), so the
   template **declares** the flag in a creation-data flags field (zero today)

@@ -168,6 +168,10 @@ struct Params {
     resource: Vec<u8>,
     state_len: u32,
     view_len: u32,
+    /// Ring-buffer stream (design session-reject-and-ring-v1 §3).
+    ring: bool,
+    /// The rejecting counter (declares REJECTS_INPUT; no lanes) opened rejectable.
+    reject: bool,
 }
 
 impl Params {
@@ -200,7 +204,28 @@ impl Params {
                 _ => 20_000,
             },
             view_len: if rng.pct(80) { 16 } else { 32 },
+            ring: false,
+            reject: false,
         }
+        .with_features(rng)
+    }
+    fn with_features(mut self, rng: &mut Rng) -> Self {
+        self.ring = rng.pct(25);
+        if self.ring {
+            self.capacity = rng.range(v3::MIN_RING_CAPACITY, v3::MIN_RING_CAPACITY + 8);
+        }
+        self.reject = !self.ws && self.width == 1 && rng.pct(30);
+        if self.reject {
+            self.lanes = 0;
+        }
+        self
+    }
+    fn features(&self) -> u8 {
+        (if self.ring { v3::FEATURE_RING_STREAM } else { 0 }) | (if self.reject { v3::FEATURE_REJECTABLE } else { 0 })
+    }
+    /// The counter's rejected command (rejecting sessions only).
+    fn rejected(&self, cmd: &[u8]) -> bool {
+        self.reject && cmd.first() == Some(&app::V3_REJECT_COMMAND)
     }
     fn state_bytes(&self) -> u32 {
         if self.ws { self.state_len } else { 16 }
@@ -209,7 +234,13 @@ impl Params {
         if self.ws { 1 } else { 2 }
     }
     fn kernel_id(&self) -> [u8; 16] {
-        if self.ws { app::V3_WORKSPACE_ENGINE.manifest().id.0 } else { app::V3_LANE_COUNTER.manifest().id.0 }
+        if self.ws {
+            app::V3_WORKSPACE_ENGINE.manifest().id.0
+        } else if self.reject {
+            app::V3_REJECT_COUNTER.manifest().id.0
+        } else {
+            app::V3_LANE_COUNTER.manifest().id.0
+        }
     }
     fn schema(&self) -> (u32, u16) {
         let s = if self.ws { app::V3_STATE_SCHEMA } else { app::COUNTER_SCHEMA };
@@ -487,6 +518,12 @@ struct Stats {
     reopened: u64,
     ws_sequences: u64,
     lane_sequences: u64,
+    ring_sequences: u64,
+    reject_sequences: u64,
+    /// Inputs consumed by a Reject outcome, across the campaign.
+    rejected_inputs: u64,
+    /// Ring bursts that carried the cursor a full lap.
+    ring_laps: u64,
     max_cursor: u32,
     commits: u64,
     lane_commits: u64,
@@ -524,6 +561,10 @@ impl Stats {
         self.reopened += o.reopened;
         self.ws_sequences += o.ws_sequences;
         self.lane_sequences += o.lane_sequences;
+        self.ring_sequences += o.ring_sequences;
+        self.reject_sequences += o.reject_sequences;
+        self.rejected_inputs += o.rejected_inputs;
+        self.ring_laps += o.ring_laps;
         self.max_cursor = self.max_cursor.max(o.max_cursor);
         self.commits += o.commits;
         self.lane_commits += o.lane_commits;
@@ -729,7 +770,13 @@ impl Fuzz {
         d.extend_from_slice(&[u8::from(p.append), p.width]);
         d.extend_from_slice(&p.capacity.to_le_bytes());
         d.push(p.max_steps);
-        let manifest = if p.ws { app::V3_WORKSPACE_ENGINE.manifest() } else { app::V3_LANE_COUNTER.manifest() };
+        let manifest = if p.ws {
+            app::V3_WORKSPACE_ENGINE.manifest()
+        } else if p.reject {
+            app::V3_REJECT_COUNTER.manifest()
+        } else {
+            app::V3_LANE_COUNTER.manifest()
+        };
         d.extend_from_slice(&manifest.id.0);
         d.extend_from_slice(&manifest.semantic_version.to_le_bytes());
         d.extend_from_slice(&manifest.abi_version.to_le_bytes());
@@ -754,7 +801,11 @@ impl Fuzz {
             d.extend_from_slice(&[0; 32]);
             d.push(0);
         }
-        d.extend(lanes);
+        if p.features() != 0 {
+            d.extend([lanes.unwrap_or(0), p.features()]);
+        } else {
+            d.extend(lanes);
+        }
         d
     }
 
@@ -1052,10 +1103,23 @@ impl Fuzz {
     }
 
     fn input_root(&self, m: &M) -> [u8; 32] {
-        let domain: &[u8] = if self.cfg.plant == 1 { b"dcg/input-chain/X" } else { b"dcg/input-chain/2" };
+        let domain: &[u8] = if self.cfg.plant == 1 {
+            b"dcg/input-chain/X"
+        } else if self.p.reject {
+            v3::INPUT_CHAIN_V3
+        } else {
+            b"dcg/input-chain/2"
+        };
         let mut root = self.p.root;
         for (seq, cmd) in self.consumed(m).iter().enumerate() {
-            root = sha256(&[domain, &root, &(seq as u32).to_le_bytes(), cmd]);
+            let seq = (seq as u32).to_le_bytes();
+            root = if !self.p.reject {
+                sha256(&[domain, &root, &seq, cmd])
+            } else if self.p.rejected(cmd) {
+                sha256(&[domain, &root, &seq, &[1], &app::V3_REJECT_CODE.to_le_bytes(), cmd])
+            } else {
+                sha256(&[domain, &root, &seq, &[0], cmd])
+            };
         }
         root
     }
@@ -1081,7 +1145,11 @@ impl Fuzz {
         } else {
             let (mut value, mut total) = (0u64, 0u64);
             for i in 0..cursor as usize {
-                value += m.slots[i].as_ref().unwrap()[0] as u64 + u64::from(self.cfg.plant == 3);
+                let cmd = m.slots[i].as_ref().unwrap();
+                if self.p.rejected(cmd) {
+                    continue;
+                }
+                value += cmd[0] as u64 + u64::from(self.cfg.plant == 3);
                 total += value;
             }
             let mut st = value.to_le_bytes().to_vec();
@@ -1095,9 +1163,13 @@ impl Fuzz {
     fn kernel_advance(&self, m: &M, steps: u8) -> Option<(u32, Option<u32>)> {
         let mut c = m.cursor;
         for seq in m.cursor..m.cursor + steps as u32 {
-            let cmd = m.slots[seq as usize].as_ref()?;
+            let cmd = m.slots.get(seq as usize)?.as_ref()?;
             if !self.p.ws {
                 if cmd.len() != 1 {
+                    return None;
+                }
+                // The rejecting counter: a dirty or codeless rejection refuses.
+                if self.p.reject && matches!(cmd[0], app::V3_REJECT_DIRTY_COMMAND | app::V3_REJECT_ZERO_COMMAND) {
                     return None;
                 }
                 c += 1;
@@ -1128,13 +1200,13 @@ impl Fuzz {
             Op::Open { payer, auth, lanes } => {
                 let lanes_ok = match lanes {
                     None => true,
-                    Some(n) => !p.ws && (1..=4).contains(n),
+                    Some(n) => !p.ws && !p.reject && (1..=4).contains(n),
                 };
                 !m.open && *auth == A && *payer != A && lanes_ok
             }
             Op::CreateStream { auth, signed, .. } => live && *auth == A && *signed && !m.stream,
             Op::GrowStream { cap, .. } => {
-                live && m.stream && m.cursor == m.capacity && *cap > m.capacity && *cap - m.capacity <= v3::MAX_STREAM_GROWTH_SLOTS
+                !p.ring && live && m.stream && m.cursor == m.capacity && *cap > m.capacity && *cap - m.capacity <= v3::MAX_STREAM_GROWTH_SLOTS
             }
             Op::CreateState { auth, signed, .. } => live && *auth == A && *signed && m.states == 0,
             // Only the fixed engine's 20,000-byte primary is created short.
@@ -1156,7 +1228,8 @@ impl Fuzz {
             Op::CreateView { auth, signed, role, bad_abi, .. } => {
                 live && *auth == A && *signed && m.initialized && m.states > 0 && m.stream && !m.views.contains_key(role) && !bad_abi && p.view_roles().contains(role)
             }
-            Op::CreateWorkspace { auth, len, .. } => live && *auth == A && m.initialized && m.workspace.is_none() && (1..=64).contains(len),
+            // The rejecting counter declares no renderer workspace.
+            Op::CreateWorkspace { auth, len, .. } => !p.reject && live && *auth == A && m.initialized && m.workspace.is_none() && (1..=64).contains(len),
             Op::CreateScratch { auth, len, .. } => live && *auth == A && m.initialized && m.states > 0 && !m.views.is_empty() && m.scratch.is_none() && *len > 0,
             Op::GrowView { .. } => false,
             Op::Write { actor, seq, bytes } => {
@@ -1164,7 +1237,8 @@ impl Fuzz {
                     return false;
                 }
                 let seq = *seq;
-                if seq < m.cursor || seq >= m.capacity || seq - m.cursor >= v3::MAX_STREAM_WINDOW {
+                let ceiling = if p.ring { v3::RING_SEQUENCE_CEILING } else { m.capacity };
+                if seq < m.cursor || seq >= ceiling || seq - m.cursor >= v3::MAX_STREAM_WINDOW {
                     return false;
                 }
                 let next = if p.append {
@@ -1175,7 +1249,7 @@ impl Fuzz {
                 } else {
                     m.frontier.max(seq + 1)
                 };
-                next - m.cursor <= v3::MAX_STREAM_WINDOW && m.slots[seq as usize].is_none()
+                next - m.cursor <= v3::MAX_STREAM_WINDOW && m.slots.get(seq as usize).is_none_or(|slot| slot.is_none())
             }
             Op::Advance { actor, cursor, steps } => {
                 let end = m.cursor + *steps as u32;
@@ -1187,10 +1261,10 @@ impl Fuzz {
                     && *steps <= p.max_steps
                     && m.stream
                     && m.states > 0
-                    && end <= m.capacity
+                    && (p.ring || end <= m.capacity)
                     && end <= m.frontier
                     && m.initialized
-                    && (m.cursor..end).all(|i| m.slots[i as usize].is_some())
+                    && (m.cursor..end).all(|i| m.slots.get(i as usize).is_some_and(|slot| slot.is_some()))
                     && self.kernel_advance(m, *steps).is_some()
             }
             Op::Begin { actor, cursor } => {
@@ -1300,7 +1374,8 @@ impl Fuzz {
             }
             Op::CreateStream { .. } => {
                 m.stream = true;
-                m.slots = vec![None; m.capacity as usize];
+                // A ring keeps the model's absolute history; it grows on write.
+                m.slots = if p.ring { Vec::new() } else { vec![None; m.capacity as usize] };
             }
             Op::GrowStream { cap, .. } => {
                 m.capacity = *cap;
@@ -1335,6 +1410,9 @@ impl Fuzz {
             Op::CreateWorkspace { len, .. } => m.workspace = Some(*len),
             Op::CreateScratch { len, .. } => m.scratch = Some(*len),
             Op::Write { seq, bytes, .. } => {
+                if m.slots.len() <= *seq as usize {
+                    m.slots.resize(*seq as usize + 1, None);
+                }
                 m.slots[*seq as usize] = Some(bytes.clone());
                 m.frontier = if p.append { seq + 1 } else { m.frontier.max(seq + 1) };
             }
@@ -1593,6 +1671,11 @@ impl Fuzz {
                 if !predicted {
                     fail!(self, "unexpected acceptance of {:?}", names);
                 }
+                // Inputs this accepted transaction consumed by rejection.
+                if self.p.reject && sim.cursor > self.m.cursor && sim.open && self.m.open {
+                    self.stats.rejected_inputs +=
+                        (self.m.cursor..sim.cursor).filter(|i| self.p.rejected(sim.slots[*i as usize].as_ref().unwrap())).count() as u64;
+                }
                 self.m = sim;
             }
             _ => {
@@ -1677,7 +1760,7 @@ impl Fuzz {
         let frontier = u32_at(d, 116);
         let capacity = u32_at(d, 10);
         // Counters and window.
-        if !(cursor <= frontier && frontier <= capacity && frontier - cursor <= v3::MAX_STREAM_WINDOW) {
+        if !(cursor <= frontier && (self.p.ring || frontier <= capacity) && frontier - cursor <= v3::MAX_STREAM_WINDOW) {
             fail!(self, "counters: cursor {cursor} frontier {frontier} capacity {capacity}");
         }
         if u16_at(d, 120) != live {
@@ -1712,6 +1795,10 @@ impl Fuzz {
         }
         if u32_at(d, 1263) != m.last_start {
             fail!(self, "last advance start");
+        }
+        let rejected = self.consumed(&m).iter().filter(|c| self.p.rejected(c)).count() as u32;
+        if d[1273] != self.p.features() || u32_at(d, 1274) != rejected {
+            fail!(self, "features {} rejected {} != host {} {rejected}", d[1273], u32_at(d, 1274), self.p.features());
         }
         // The input root is the host hash chain of the consumed inputs.
         if d[156..188] != self.input_root(&m) {
@@ -1760,17 +1847,30 @@ impl Fuzz {
             {
                 fail!(self, "stream header does not mirror the session");
             }
+            // Each physical slot holds the newest written sequence that maps to
+            // it (linear: itself; ring: seq mod capacity, design §3).
+            let mut want_slots = vec![[0u8; 16]; capacity as usize];
             for (seq, slot) in m.slots.iter().enumerate() {
-                let raw = &s[128 + 16 * seq..128 + 16 * seq + 16];
-                let mut want = [0u8; 16];
                 if let Some(bytes) = slot {
+                    let at = if self.p.ring { seq % capacity as usize } else { seq };
+                    let want = &mut want_slots[at];
+                    *want = [0u8; 16];
                     want[..4].copy_from_slice(&(seq as u32).to_le_bytes());
                     want[4] = 1;
                     want[8..8 + bytes.len()].copy_from_slice(bytes);
                 }
+            }
+            for (at, want) in want_slots.iter().enumerate() {
+                let raw = &s[128 + 16 * at..128 + 16 * at + 16];
                 if raw != want {
-                    fail!(self, "stream slot {seq} {raw:?} != host {want:?}");
+                    fail!(self, "stream slot {at} {raw:?} != host {want:?}");
                 }
+            }
+            // The last rejection (rejectable sessions), else zero.
+            let last = self.consumed(&m).iter().enumerate().rev().find(|(_, c)| self.p.rejected(c)).map(|(i, _)| i as u32);
+            let want_last = last.map_or((0, 0), |seq| (seq, app::V3_REJECT_CODE));
+            if (u32_at(s, 120), u32_at(s, 124)) != want_last {
+                fail!(self, "stream last rejection {:?} != host {want_last:?}", (u32_at(s, 120), u32_at(s, 124)));
             }
         }
         // State equals the host replay of the test kernel.
@@ -1882,7 +1982,7 @@ impl Fuzz {
                 let seq = if p.append || self.rng.pct(50) {
                     m.frontier
                 } else {
-                    let hi = m.capacity.min(m.cursor + v3::MAX_STREAM_WINDOW);
+                    let hi = if p.ring { m.cursor + v3::MAX_STREAM_WINDOW } else { m.capacity.min(m.cursor + v3::MAX_STREAM_WINDOW) };
                     if hi <= m.cursor { m.cursor } else { self.rng.range(m.cursor, hi - 1) }
                 };
                 let bytes = if p.ws {
@@ -1890,6 +1990,13 @@ impl Fuzz {
                         0..=3 => 0xEE,
                         4..=7 => 0xEF,
                         8..=11 => 0xED,
+                        _ => self.rng.range(0, 0x40) as u8,
+                    }]
+                } else if p.reject {
+                    vec![match self.rng.below(100) {
+                        0..=24 => app::V3_REJECT_COMMAND,
+                        25..=27 => app::V3_REJECT_DIRTY_COMMAND,
+                        28..=30 => app::V3_REJECT_ZERO_COMMAND,
                         _ => self.rng.range(0, 0x40) as u8,
                     }]
                 } else {
@@ -2148,12 +2255,47 @@ impl Fuzz {
 
     // ------------------------------------------------------ sequence ----
 
+    /// Write and advance until the cursor has moved more than one lap, if the
+    /// session can advance at all (live, initialized, no open phase or capture).
+    async fn ring_burst(&mut self) {
+        use Actor::Authority as A;
+        let start = self.m.cursor;
+        let mut guard = 0;
+        while self.m.cursor < start + self.m.capacity + 9 && guard < 600 {
+            guard += 1;
+            let m = self.m.clone();
+            if !(m.open && m.active && m.stream && m.initialized && m.states > 0 && m.phase == PH_NONE && m.mask == 0) {
+                return;
+            }
+            let seq = m.frontier;
+            if seq - m.cursor < v3::MAX_STREAM_WINDOW / 2 {
+                let cmd = if self.p.reject && self.rng.pct(20) { app::V3_REJECT_COMMAND } else { self.rng.range(1, 0x20) as u8 };
+                let bytes = vec![cmd; self.p.width as usize];
+                self.step(vec![Op::Write { actor: self.writer(), seq, bytes }], None, "ring-burst", false).await;
+                if self.m.frontier == seq {
+                    return; // the write refused (e.g. width 2 kernels); stop
+                }
+            } else {
+                let steps = (m.frontier - m.cursor).min(self.p.max_steps as u32) as u8;
+                self.step(vec![Op::Advance { actor: A, cursor: m.cursor, steps }], None, "ring-burst", false).await;
+                if self.m.cursor == m.cursor {
+                    return; // refused (a halting or refusing input); stop
+                }
+            }
+        }
+        self.stats.ring_laps += u64::from(self.m.cursor >= start + self.m.capacity);
+    }
+
     async fn run(&mut self) {
         let len = self.rng.range(25, 140) as usize;
         let mut step = 0usize;
         while step < len {
             let roll = self.rng.below(100);
-            if roll < 6 && !self.history.is_empty() {
+            if self.p.ring && roll < 3 {
+                // Carry a ring past at least one lap (design §3): the random
+                // walk alone rarely reaches 128 consumed inputs.
+                self.ring_burst().await;
+            } else if roll < 6 && !self.history.is_empty() {
                 // Resend an earlier transaction (stale duplicate or replay).
                 let i = self.rng.below(self.history.len() as u64) as usize;
                 let ops = self.history[i].clone();
@@ -2234,6 +2376,14 @@ impl Fuzz {
             Some("refusing kernel (width 2)")
         } else if m.phase == PH_INIT {
             Some("authority began phased init on a one-call kernel")
+        } else if self.p.reject
+            && m.slots.get(m.cursor as usize).and_then(|s| s.as_ref()).is_some_and(|c| {
+                matches!(c[0], app::V3_REJECT_DIRTY_COMMAND | app::V3_REJECT_ZERO_COMMAND)
+            })
+        {
+            // A buggy rejection refuses by design; a plain rejected input at
+            // the cursor (0xEE) must still advance, which this oracle checks.
+            Some("buggy rejection at the cursor (refuses by design)")
         } else {
             None
         };
@@ -2265,12 +2415,12 @@ impl Fuzz {
         if !self.m.initialized {
             self.step(vec![Op::InitOneCall { auth: A }], None, "live", true).await;
         }
-        if self.m.cursor == self.m.capacity {
+        if !self.p.ring && self.m.cursor == self.m.capacity {
             let cap = self.m.capacity + 1;
             self.step(vec![Op::GrowStream { payer, cap }], None, "live", true).await;
         }
         let cursor = self.m.cursor;
-        if self.m.slots[cursor as usize].is_none() {
+        if self.m.slots.get(cursor as usize).is_none_or(|slot| slot.is_none()) {
             self.step(vec![Op::Write { actor: self.writer(), seq: cursor, bytes: vec![1] }], None, "live", true).await;
         }
         self.step(vec![Op::Advance { actor: A, cursor, steps: 1 }], None, "live", true).await;
@@ -2381,7 +2531,7 @@ async fn run_sequence(seed: u64, index: u64, sbf: bool, verbose: bool, plant: u8
     let mut keys_tracked = vec![ctx.payer.pubkey(), RESOURCE_SRC];
     keys_tracked.extend(k.actors.iter().map(|a| a.pubkey()));
     keys_tracked.extend(k.derived().into_iter().map(|(_, key)| key));
-    let tag = format!("seed {seed} index {index} ({} lanes {} append {} width {} cap {} steps {} sbf {sbf})", if p.ws { "fixed-engine" } else { "lane-counter" }, p.lanes, p.append, p.width, p.capacity, p.max_steps);
+    let tag = format!("seed {seed} index {index} ({} lanes {} append {} width {} cap {} steps {} ring {} sbf {sbf})", if p.ws { "fixed-engine" } else if p.reject { "reject-counter" } else { "lane-counter" }, p.lanes, p.append, p.width, p.capacity, p.max_steps, p.ring);
     let mut f = Fuzz { ctx, p, k, m: M::default(), rng, cfg: Config { sbf, verbose, plant }, stats: Stats::default(), nonce: 0, history: Vec::new(), tag, log: Vec::new(), keys_tracked, rent0, halt_late: false, last_logs: String::new(), res_writable: false };
     f.halt_late = f.rng.pct(50);
     f.stats.sequences = 1;
@@ -2390,6 +2540,8 @@ async fn run_sequence(seed: u64, index: u64, sbf: bool, verbose: bool, plant: u8
     } else {
         f.stats.lane_sequences = 1;
     }
+    f.stats.ring_sequences = u64::from(f.p.ring);
+    f.stats.reject_sequences = u64::from(f.p.reject);
     f.run().await;
     f.stats.commits = f.stats.ops.get("commit_phase").map_or(0, |e| e.0);
     f.stats.lane_commits = f.stats.ops.get("lane_commit").map_or(0, |e| e.0);
@@ -2431,6 +2583,7 @@ fn report(s: &Stats) {
         "v3 fuzz stats: sequences {} (lane-counter {}, fixed-engine {}), txs {} (accepted {}, refused {}, not run {}), compute failures {}, resends {}, reordered pairs {}, bundles {}, invariant checks {}, max cursor {}, non-lane commits {}, lane commits {}, chunked anchors {}, one-shot anchors {}, prefunds {}, reopened {}, liveness {} (publish {}), closability {}",
         s.sequences, s.lane_sequences, s.ws_sequences, s.txs, s.accepted, s.refused, s.not_run, s.cu_failures, s.resends, s.reorders, s.bundles, s.checks, s.max_cursor, s.commits, s.lane_commits, s.anchors_finished, s.one_shot_anchors, s.prefunds, s.reopened, s.liveness_runs, s.liveness_publish, s.closability_runs
     );
+    eprintln!("v3 fuzz features: ring sequences {}, full laps {}, reject sequences {}, rejected inputs {}", s.ring_sequences, s.ring_laps, s.reject_sequences, s.rejected_inputs);
     eprintln!("v3 fuzz liveness skipped: {:?}", s.liveness_skipped);
     eprintln!("v3 fuzz halts: {:?}", s.halts);
     let ops: Vec<String> = s.ops.iter().map(|(k, (a, r))| format!("{k} {a}/{r}")).collect();
@@ -2497,7 +2650,7 @@ async fn fuzz_catches_a_planted_kernel_error() {
 async fn finding_f1_open_anchor_closes_under_a_wrong_kind() {
     let ctx = start(false, &[]).await;
     let mut rng = Rng::new(0xF1, 0);
-    let p = Params { ws: false, lanes: 0, append: false, width: 1, capacity: 4, max_steps: 1, root: [7; 32], id: 1, resource: Vec::new(), state_len: 1_280, view_len: 16 };
+    let p = Params { ws: false, lanes: 0, append: false, width: 1, capacity: 4, max_steps: 1, root: [7; 32], id: 1, resource: Vec::new(), state_len: 1_280, view_len: 16, ring: false, reject: false };
     let k = Keys::new(&mut rng, p.id);
     let mut f = Fuzz { ctx, p, k, m: M::default(), rng, cfg: Config { sbf: false, verbose: true, plant: 0 }, stats: Stats::default(), nonce: 0, history: Vec::new(), tag: "F1".into(), log: Vec::new(), keys_tracked: Vec::new(), rent0: 0, halt_late: false, last_logs: String::new(), res_writable: false };
     let auth = f.auth();
