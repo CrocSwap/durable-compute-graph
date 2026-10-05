@@ -157,6 +157,14 @@ PDAs, PT2S signer initialization, and the selected template, admission,
 registry, and plan readers. Existing direct checks remain where they also
 enforce lifecycle-specific rules.
 
+Stateful sessions v3 (review 10-05): every child creator (stream, state,
+views, scratch, workspace) requires the session authority's signature at
+account 2, and creation adopts pre-funded empty system addresses. Lane records
+are self-seeded: `checked_lane` derives the record's address from the session
+key stored in the record itself, which is sound because only the program can
+create an account at that derived address (lane creation requires the
+authority).
+
 The source audit `account_provenance_lint.rs` discovers Rust files under
 `src/` and checks direct account-write calls in functions, trait defaults, and
 `impl` methods of every visibility. It compares findings with a reviewed

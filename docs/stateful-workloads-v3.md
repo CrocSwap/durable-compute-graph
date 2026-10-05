@@ -164,6 +164,45 @@ abandoned anchor can be closed as a child account to recover its rent.
 State spans are closed from the highest index down. Each close subtracts that
 span's declared length and then reduces the live span count, keeping the
 remaining session record decodable until the final span and session are closed.
+A halted session closes its headerless primary at any length from 1 byte up to
+the declared length, so a primary halted part-way through its growth does not
+strand its rent or the session's (sessions review 2026-10-05, H3).
+
+### Child creation: authority signature and pre-funded addresses
+
+Since the sessions review fixes of 2026-10-05 (H1 and H2,
+[`experiments/sessions-v3-review-2026-10-05.md`](experiments/sessions-v3-review-2026-10-05.md)),
+every v3 child creator requires the session authority's signature at account
+index 2. This is a wire change from the earlier v3 account lists, which had no
+authority slot:
+
+| Creation | Accounts |
+|---|---|
+| `CREATE_STREAM` (231, op 0) | `[payer, session, authority, stream, system]` |
+| `CREATE_STATE` (232, create) | `[payer, session, authority, resource copy?, state spans..., system]`; the resource copy is present only when the session names a resource |
+| `CREATE_VIEW` (233, output role) | `[payer, session, authority, view, system]` |
+| `CREATE_WORKSPACE` (233, workspace role) | `[payer, session, authority, workspace, system]` |
+| `CREATE_VIEW` scratch (233, scratch role) | `[payer, session, authority, scratch, system]` |
+
+The authority must sign and equal the session's stored authority, or the
+creation refuses with `REFUSAL_AUTHORITY` (2322). The authority may be the same
+key as the payer; the program then skips that repeated slot in its alias
+check. (`OPEN_SESSION` itself still refuses a payer equal to the authority with
+2323.) `GROW_STATE` and `GROW_VIEW` stay open to any payer: they only extend
+toward the lengths fixed at creation. `GROW_STREAM` is open too and lets the
+payer choose the new capacity (at most `MAX_STREAM_GROWTH_SLOTS` more, only at
+`cursor == capacity`); the payer's rent returns to the authority at close.
+`RESOURCE_GROW` requires the authority's signature.
+
+Session and child creation (stream, state, views, scratch, workspace, lanes,
+the resource copy and the anchor) accept an address that someone pre-funded with
+a plain lamport transfer, provided it is still an empty system-owned account.
+Creation tops the account up to rent if needed and keeps any excess, which is
+returned to the authority when the account closes. `OPEN_SESSION` no longer
+requires zero lamports at the session address.
+
+Tests: `tests/stateful_v3_creators.rs` (native ProgramTest, or the
+feature-built SBF image with `V3_SBF=1` and `BPF_OUT_DIR`).
 
 ## Scaled SBF mechanics demonstration
 

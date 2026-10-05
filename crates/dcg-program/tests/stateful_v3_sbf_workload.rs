@@ -197,24 +197,25 @@ fn grow_resource_copy(
     )
 }
 
-fn create_stream(payer: Pubkey, session: Pubkey) -> Instruction {
+fn create_stream(payer: Pubkey, authority: Pubkey, session: Pubkey) -> Instruction {
     instruction(
         sw::TAG_CREATE_STREAM,
         vec![v3::WIRE_VERSION, 0],
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new(stream_pda(&session), false),
             AccountMeta::new_readonly(SYSTEM, false),
         ],
     )
 }
 
-fn create_primary_state(payer: Pubkey, session: Pubkey) -> Instruction {
-    create_primary_state_len(payer, session, app::V3_FIXED_STATE_LEN)
+fn create_primary_state(payer: Pubkey, authority: Pubkey, session: Pubkey) -> Instruction {
+    create_primary_state_len(payer, authority, session, app::V3_FIXED_STATE_LEN)
 }
 
-fn create_primary_state_len(payer: Pubkey, session: Pubkey, len: u32) -> Instruction {
+fn create_primary_state_len(payer: Pubkey, authority: Pubkey, session: Pubkey, len: u32) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, 1];
     payload.extend_from_slice(&len.to_le_bytes());
     instruction(
@@ -223,6 +224,7 @@ fn create_primary_state_len(payer: Pubkey, session: Pubkey, len: u32) -> Instruc
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new_readonly(resource_pda(&session), false),
             AccountMeta::new(state_pda(&session, 0), false),
             AccountMeta::new_readonly(SYSTEM, false),
@@ -449,7 +451,7 @@ fn finish_anchor(authority: Pubkey, session: Pubkey, cursor: u32) -> Instruction
     )
 }
 
-fn create_view(payer: Pubkey, session: Pubkey) -> Instruction {
+fn create_view(payer: Pubkey, authority: Pubkey, session: Pubkey) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, 0];
     payload.extend_from_slice(&app::V3_VIEW_ABI);
     payload.extend_from_slice(&0u32.to_le_bytes());
@@ -460,13 +462,14 @@ fn create_view(payer: Pubkey, session: Pubkey) -> Instruction {
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new(view_pda(&session, 0), false),
             AccountMeta::new_readonly(SYSTEM, false),
         ],
     )
 }
 
-fn create_workspace(payer: Pubkey, session: Pubkey) -> Instruction {
+fn create_workspace(payer: Pubkey, authority: Pubkey, session: Pubkey) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, v3::WORKSPACE_ROLE];
     payload.extend_from_slice(&app::V3_VIEW_WORKSPACE_BYTES.to_le_bytes());
     instruction(
@@ -475,13 +478,14 @@ fn create_workspace(payer: Pubkey, session: Pubkey) -> Instruction {
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new(view_pda(&session, v3::WORKSPACE_ROLE), false),
             AccountMeta::new_readonly(SYSTEM, false),
         ],
     )
 }
 
-fn create_staging_scratch(payer: Pubkey, session: Pubkey) -> Instruction {
+fn create_staging_scratch(payer: Pubkey, authority: Pubkey, session: Pubkey) -> Instruction {
     let mut payload = vec![v3::WIRE_VERSION, v3::SCRATCH_ROLE];
     payload.extend_from_slice(&[0; 32]);
     payload.extend_from_slice(&0u32.to_le_bytes());
@@ -492,6 +496,7 @@ fn create_staging_scratch(payer: Pubkey, session: Pubkey) -> Instruction {
         vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(session, false),
+            AccountMeta::new_readonly(authority, true),
             AccountMeta::new(view_pda(&session, v3::SCRATCH_ROLE), false),
             AccountMeta::new_readonly(SYSTEM, false),
         ],
@@ -848,8 +853,8 @@ async fn open_fixed_small_with_workspace_mode(
     .await;
     send(
         context,
-        create_stream(payer, session),
-        &[],
+        create_stream(payer, authority.pubkey(), session),
+        &[authority],
         "CREATE_STREAM-v3-small",
         Ok(()),
         false,
@@ -857,8 +862,8 @@ async fn open_fixed_small_with_workspace_mode(
     .await;
     send(
         context,
-        create_primary_state_len(payer, session, 1_280),
-        &[],
+        create_primary_state_len(payer, authority.pubkey(), session, 1_280),
+        &[authority],
         "CREATE_STATE-v3-small",
         Ok(()),
         false,
@@ -930,8 +935,8 @@ async fn stateful_v3_primary_prefix_halt_resource_views_and_phased_init() {
     .await;
     send(
         &mut context,
-        create_stream(payer, session),
-        &[],
+        create_stream(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_STREAM-v3",
         Ok(()),
         true,
@@ -952,8 +957,8 @@ async fn stateful_v3_primary_prefix_halt_resource_views_and_phased_init() {
     .await;
     send(
         &mut context,
-        create_primary_state(payer, session),
-        &[],
+        create_primary_state(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_STATE-v3-headerless-10mb",
         Ok(()),
         true,
@@ -1150,8 +1155,8 @@ async fn stateful_v3_primary_prefix_halt_resource_views_and_phased_init() {
 
     send(
         &mut context,
-        create_view(payer, session),
-        &[],
+        create_view(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_VIEW-v3-resource-output",
         Ok(()),
         true,
@@ -1159,8 +1164,8 @@ async fn stateful_v3_primary_prefix_halt_resource_views_and_phased_init() {
     .await;
     send(
         &mut context,
-        create_workspace(payer, session),
-        &[],
+        create_workspace(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_VIEW-v3-render-workspace",
         Ok(()),
         true,
@@ -1168,8 +1173,8 @@ async fn stateful_v3_primary_prefix_halt_resource_views_and_phased_init() {
     .await;
     send(
         &mut context,
-        create_staging_scratch(payer, session),
-        &[],
+        create_staging_scratch(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_VIEW-v3-publication-staging",
         Ok(()),
         true,
@@ -1410,17 +1415,17 @@ async fn stateful_v3_workspace_first_ordering_refusals_header_and_clear_policy()
     )
     .await;
     for (label, ix) in [
-        ("ordinary-output", create_view(payer, ordinary_session)),
+        ("ordinary-output", create_view(payer, ordinary_authority.pubkey(), ordinary_session)),
         (
             "ordinary-workspace",
-            create_workspace(payer, ordinary_session),
+            create_workspace(payer, ordinary_authority.pubkey(), ordinary_session),
         ),
         (
             "ordinary-scratch",
-            create_staging_scratch(payer, ordinary_session),
+            create_staging_scratch(payer, ordinary_authority.pubkey(), ordinary_session),
         ),
     ] {
-        send(&mut context, ix, &[], label, Ok(()), false).await;
+        send(&mut context, ix, &[&ordinary_authority], label, Ok(()), false).await;
     }
     send(
         &mut context,
@@ -1454,11 +1459,11 @@ async fn stateful_v3_workspace_first_ordering_refusals_header_and_clear_policy()
     let (session, stream, _) =
         open_fixed_small_with_workspace_mode(&mut context, &authority, 82, &resource, true).await;
     for (label, ix) in [
-        ("workspace-output", create_view(payer, session)),
-        ("workspace-child", create_workspace(payer, session)),
-        ("workspace-scratch", create_staging_scratch(payer, session)),
+        ("workspace-output", create_view(payer, authority.pubkey(), session)),
+        ("workspace-child", create_workspace(payer, authority.pubkey(), session)),
+        ("workspace-scratch", create_staging_scratch(payer, authority.pubkey(), session)),
     ] {
-        send(&mut context, ix, &[], label, Ok(()), false).await;
+        send(&mut context, ix, &[&authority], label, Ok(()), false).await;
     }
     let workspace_key = view_pda(&session, v3::WORKSPACE_ROLE);
     let before_live_close = account(&mut context, workspace_key).await;
@@ -1616,8 +1621,8 @@ async fn stateful_v3_default_layout_remains_headered() {
     .await;
     send(
         &mut context,
-        create_stream(payer, session),
-        &[],
+        create_stream(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_STREAM-v3-default",
         Ok(()),
         true,
@@ -1634,12 +1639,13 @@ async fn stateful_v3_default_layout_remains_headered() {
             vec![
                 AccountMeta::new(payer, true),
                 AccountMeta::new(session, false),
+                AccountMeta::new_readonly(authority.pubkey(), true),
                 AccountMeta::new(states[0], false),
                 AccountMeta::new(states[1], false),
                 AccountMeta::new_readonly(SYSTEM, false),
             ],
         ),
-        &[],
+        &[&authority],
         "CREATE_STATE-v3-default-headered",
         Ok(()),
         true,
@@ -1704,8 +1710,8 @@ async fn stateful_v3_default_layout_remains_headered() {
     .await;
     send(
         &mut context,
-        create_stream(payer, second_session),
-        &[],
+        create_stream(payer, second_authority.pubkey(), second_session),
+        &[&second_authority],
         "CREATE_STREAM-v3-second-headered-state-instance",
         Ok(()),
         true,
@@ -1722,12 +1728,13 @@ async fn stateful_v3_default_layout_remains_headered() {
             vec![
                 AccountMeta::new(payer, true),
                 AccountMeta::new(second_session, false),
+                AccountMeta::new_readonly(second_authority.pubkey(), true),
                 AccountMeta::new(second_states[0], false),
                 AccountMeta::new(second_states[1], false),
                 AccountMeta::new_readonly(SYSTEM, false),
             ],
         ),
-        &[],
+        &[&second_authority],
         "CREATE_STATE-v3-second-headered-state-instance",
         Ok(()),
         true,
@@ -1816,8 +1823,8 @@ async fn stateful_v3_primary_and_headered_spans_advance_twice() {
     .await;
     send(
         &mut context,
-        create_stream(payer, session),
-        &[],
+        create_stream(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_STREAM-v3-counter-primary",
         Ok(()),
         true,
@@ -1834,12 +1841,13 @@ async fn stateful_v3_primary_and_headered_spans_advance_twice() {
             vec![
                 AccountMeta::new(payer, true),
                 AccountMeta::new(session, false),
+                AccountMeta::new_readonly(authority.pubkey(), true),
                 AccountMeta::new(states[0], false),
                 AccountMeta::new(states[1], false),
                 AccountMeta::new_readonly(SYSTEM, false),
             ],
         ),
-        &[],
+        &[&authority],
         "CREATE_STATE-v3-primary-plus-span",
         Ok(()),
         true,
@@ -1954,8 +1962,8 @@ async fn stateful_v3_closes_two_spans_in_order_and_recovers_all_rent() {
         .await;
         send(
             &mut context,
-            create_stream(payer, session),
-            &[],
+            create_stream(payer, authority.pubkey(), session),
+            &[&authority],
             &format!("CREATE_STREAM-v3-close-two-spans-{id}"),
             Ok(()),
             false,
@@ -1973,12 +1981,13 @@ async fn stateful_v3_closes_two_spans_in_order_and_recovers_all_rent() {
                 vec![
                     AccountMeta::new(payer, true),
                     AccountMeta::new(session, false),
+                    AccountMeta::new_readonly(authority.pubkey(), true),
                     AccountMeta::new(states[0], false),
                     AccountMeta::new(states[1], false),
                     AccountMeta::new_readonly(SYSTEM, false),
                 ],
             ),
-            &[],
+            &[&authority],
             &format!("CREATE_STATE-v3-close-two-spans-{id}"),
             Ok(()),
             false,
@@ -2092,8 +2101,8 @@ async fn stateful_v3_halt_before_at_snapshot_cap_with_eight_step_advance() {
     .await;
     send(
         &mut context,
-        create_stream(payer, session),
-        &[],
+        create_stream(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_STREAM-v3-halt-before-snapshot-cap",
         Ok(()),
         false,
@@ -2101,8 +2110,8 @@ async fn stateful_v3_halt_before_at_snapshot_cap_with_eight_step_advance() {
     .await;
     send(
         &mut context,
-        create_primary_state_len(payer, session, SNAPSHOT_CAP_BYTES),
-        &[],
+        create_primary_state_len(payer, authority.pubkey(), session, SNAPSHOT_CAP_BYTES),
+        &[&authority],
         "CREATE_STATE-v3-halt-before-snapshot-cap",
         Ok(()),
         false,
@@ -2192,8 +2201,8 @@ async fn stateful_v3_begin_initialization_requires_sealed_resource() {
     .await;
     send(
         &mut context,
-        create_stream(payer, session),
-        &[],
+        create_stream(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_STREAM-v3-unsealed-init",
         Ok(()),
         false,
@@ -2201,8 +2210,8 @@ async fn stateful_v3_begin_initialization_requires_sealed_resource() {
     .await;
     send(
         &mut context,
-        create_primary_state_len(payer, session, 1_280),
-        &[],
+        create_primary_state_len(payer, authority.pubkey(), session, 1_280),
+        &[&authority],
         "CREATE_STATE-v3-unsealed-init",
         Ok(()),
         false,
@@ -2385,22 +2394,22 @@ async fn stateful_v3_forged_session_and_other_primary_are_refused() {
     assert_ne!(session, victim_session);
 
     let payer = context.payer.pubkey();
-    for child_session in [session, victim_session] {
+    for (child_authority, child_session) in [(&authority, session), (&victim_authority, victim_session)] {
         for (ix, label) in [
             (
-                create_view(payer, child_session),
+                create_view(payer, child_authority.pubkey(), child_session),
                 "CREATE_VIEW-v3-provenance",
             ),
             (
-                create_workspace(payer, child_session),
+                create_workspace(payer, child_authority.pubkey(), child_session),
                 "CREATE_WORKSPACE-v3-provenance",
             ),
             (
-                create_staging_scratch(payer, child_session),
+                create_staging_scratch(payer, child_authority.pubkey(), child_session),
                 "CREATE_SCRATCH-v3-provenance",
             ),
         ] {
-            send(&mut context, ix, &[], label, Ok(()), false).await;
+            send(&mut context, ix, &[child_authority], label, Ok(()), false).await;
         }
     }
     // Session and stream substitutions reach their actual writers. A second
@@ -2845,8 +2854,8 @@ async fn stateful_v3_failed_initialization_can_halt_and_recover_rent() {
     .await;
     send(
         &mut context,
-        create_stream(payer, session),
-        &[],
+        create_stream(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_STREAM-v3-failure",
         Ok(()),
         false,
@@ -2854,8 +2863,8 @@ async fn stateful_v3_failed_initialization_can_halt_and_recover_rent() {
     .await;
     send(
         &mut context,
-        create_primary_state_len(payer, session, 1_280),
-        &[],
+        create_primary_state_len(payer, authority.pubkey(), session, 1_280),
+        &[&authority],
         "CREATE_STATE-v3-failure",
         Ok(()),
         false,
@@ -2950,19 +2959,19 @@ async fn stateful_v3_halt_with_view_phase_open_still_allows_closing_children() {
     let resource_copy = resource_pda(&session);
     for (ix, label) in [
         (
-            create_view(payer, session),
+            create_view(payer, authority.pubkey(), session),
             "CREATE_VIEW-v3-halt-open-phase",
         ),
         (
-            create_workspace(payer, session),
+            create_workspace(payer, authority.pubkey(), session),
             "CREATE_WORKSPACE-v3-halt-open-phase",
         ),
         (
-            create_staging_scratch(payer, session),
+            create_staging_scratch(payer, authority.pubkey(), session),
             "CREATE_SCRATCH-v3-halt-open-phase",
         ),
     ] {
-        send(&mut context, ix, &[], label, Ok(()), true).await;
+        send(&mut context, ix, &[&authority], label, Ok(()), true).await;
     }
     send(
         &mut context,
@@ -3299,8 +3308,8 @@ async fn stateful_v3_sealed_resource_accepts_4_4mb_chunks_once() {
     context.set_account(&RESOURCE, &AccountSharedData::from(changed_source));
     send(
         &mut context,
-        create_stream(payer, session),
-        &[],
+        create_stream(payer, authority.pubkey(), session),
+        &[&authority],
         "CREATE_STREAM-v3-4_4mb-resource",
         Ok(()),
         true,
@@ -3308,8 +3317,8 @@ async fn stateful_v3_sealed_resource_accepts_4_4mb_chunks_once() {
     .await;
     send(
         &mut context,
-        create_primary_state_len(payer, session, 1_280),
-        &[],
+        create_primary_state_len(payer, authority.pubkey(), session, 1_280),
+        &[&authority],
         "CREATE_STATE-v3-4_4mb-resource",
         Ok(()),
         true,

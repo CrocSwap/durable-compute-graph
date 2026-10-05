@@ -6,7 +6,7 @@
 //! phases before one atomic publication transaction.
 
 use crate::account_provenance::{
-    create_derived_account, expect_derived, expect_derived_with_bump, expect_keyed, AccountKind,
+    allocate_derived_account, expect_derived, expect_derived_with_bump, expect_keyed, AccountKind,
     CanonicalBump, RoleFlags,
 };
 use crate::kernel::{
@@ -237,6 +237,26 @@ fn exact_data(data: &[u8], len: usize) -> ProgramResult {
     } else {
         Err(ProgramError::InvalidInstructionData)
     }
+}
+
+/// The session authority's signature on a child creation (sessions review
+/// 10-05 H1: the creators were open to any fee payer, who chose lengths, view
+/// roles and ranges). The authority is account 2; it may also be the payer.
+/// Returns the account list for `check_unique` with that slot left out when it
+/// repeats the payer.
+fn creator_authority<'a, 'b>(
+    accounts: &'a [AccountInfo<'b>],
+    session: &Session,
+) -> Result<Vec<AccountInfo<'b>>, ProgramError> {
+    let (payer, authority) = (&accounts[0], &accounts[2]);
+    if !authority.is_signer || authority.key != &session.authority {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let mut rest: Vec<AccountInfo<'b>> = accounts.to_vec();
+    if authority.key == payer.key {
+        rest.remove(2);
+    }
+    Ok(rest)
 }
 
 fn check_unique(accounts: &[AccountInfo]) -> ProgramResult {
@@ -927,7 +947,11 @@ fn create_pda<'a>(
     if data_len > ACCOUNT_MAX_BYTES {
         return Err(refusal(REFUSAL_SESSION));
     }
-    create_derived_account(
+    // `allocate_derived_account` (not `create_derived_account`): a target
+    // someone pre-funded with lamports is still allocated, topped up to rent
+    // as needed (sessions review 10-05 H2: a plain transfer to any session or
+    // child address otherwise blocked its creation forever).
+    allocate_derived_account(
         program, payer, target, system, seeds, bump, data_len, data_len,
     )
     .map_err(|_| refusal(REFUSAL_SESSION))
@@ -1032,8 +1056,9 @@ fn open_session(
         .resources
         .max_compute_units
         .checked_mul(max_steps as u64);
+    // Pre-funded lamports are allowed (review H2); the address must still be
+    // an empty system account.
     if session_account.owner != &system_program::id()
-        || session_account.lamports() != 0
         || !session_account.data_is_empty()
         || kernel_id != manifest.id
         || semantic != manifest.semantic_version
@@ -1196,14 +1221,14 @@ fn create_stream(
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
     exact_data(data, 3)?;
-    let [payer, session_account, stream, system] = accounts else {
+    let [payer, session_account, _authority, stream, system] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
-    check_unique(accounts)?;
     if data[1] != WIRE_VERSION || data[2] != 0 || !payer.is_signer || !payer.is_writable {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
     let mut session = checked_session(program, session_account, true, kernel)?;
+    check_unique(&creator_authority(accounts, &session)?)?;
     if session.status != STATUS_ACTIVE || session.stream_key != Pubkey::default() {
         return Err(refusal(REFUSAL_LIVE));
     }
@@ -1303,10 +1328,11 @@ fn create_state(
     if data.len() < 7 || data[1] != WIRE_VERSION {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let [payer, session_account, remainder @ ..] = accounts else {
+    let [payer, session_account, _authority, remainder @ ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     let mut session = checked_session(program, session_account, true, kernel)?;
+    let unique = creator_authority(accounts, &session)?;
     let count = data[2] as usize;
     if count == 0 || count > MAX_STATE_SPANS || data.len() != 3 + count * 4 {
         return Err(refusal(REFUSAL_RESOURCE));
@@ -1321,7 +1347,7 @@ fn create_state(
     let [system] = system_items else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
-    check_unique(accounts)?;
+    check_unique(&unique)?;
     if !payer.is_signer || !payer.is_writable || *system.key != system_program::id() {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
@@ -2198,14 +2224,14 @@ fn create_view(
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
     exact_data(data, 43)?;
-    let [payer, session_account, view, system] = accounts else {
+    let [payer, session_account, _authority, view, system] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
-    check_unique(accounts)?;
     if data[1] != WIRE_VERSION || !payer.is_signer || !payer.is_writable {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
     let mut session = checked_session(program, session_account, true, kernel)?;
+    check_unique(&creator_authority(accounts, &session)?)?;
     if session.status != STATUS_ACTIVE
         || !session.state_initialized
         || session.state_span_count == 0
@@ -2287,15 +2313,15 @@ fn create_scratch(
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
     exact_data(data, 43)?;
-    let [payer, session_account, scratch, system] = accounts else {
+    let [payer, session_account, _authority, scratch, system] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
-    check_unique(accounts)?;
     if data[1] != WIRE_VERSION || data[2] != SCRATCH_ROLE || !payer.is_signer || !payer.is_writable
     {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
     let mut session = checked_session(program, session_account, true, kernel)?;
+    check_unique(&creator_authority(accounts, &session)?)?;
     if session.status != STATUS_ACTIVE
         || !session.state_initialized
         || session.state_span_count == 0
@@ -2355,10 +2381,9 @@ fn create_workspace(
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
     exact_data(data, 7)?;
-    let [payer, session_account, workspace, system] = accounts else {
+    let [payer, session_account, _authority, workspace, system] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
-    check_unique(accounts)?;
     if data[1] != WIRE_VERSION
         || data[2] != WORKSPACE_ROLE
         || !payer.is_signer
@@ -2367,6 +2392,7 @@ fn create_workspace(
         return Err(refusal(REFUSAL_AUTHORITY));
     }
     let mut session = checked_session(program, session_account, true, kernel)?;
+    check_unique(&creator_authority(accounts, &session)?)?;
     let len = u32_at(data, 3);
     let limit = kernel.max_view_workspace_bytes();
     // A workspace is a view payload; publication scratch has its own smaller
@@ -3646,7 +3672,10 @@ fn close_child(
     let is_anchor = target.key == &anchor_address;
     let raw = target.try_borrow_data()?;
     let (kind, role, state_index, authority_bound) = if is_headerless_primary {
-        if raw.len() != session.state_lengths[0] as usize {
+        // Any length from 1 byte to the declared one (review H3): a primary
+        // halted part-way through its growth must still close, or its rent
+        // and the session's are stranded (growth needs an active session).
+        if raw.is_empty() || raw.len() > session.state_lengths[0] as usize {
             return Err(refusal(REFUSAL_SESSION));
         }
         (KIND_STATE, 0, 0, true)
@@ -3971,10 +4000,10 @@ fn begin_anchor(
     if anchor_account.key != &expected || *system.key != system_program::id() {
         return Err(refusal(REFUSAL_SESSION));
     }
-    if anchor_account.owner == &system_program::id()
-        && anchor_account.lamports() == 0
-        && anchor_account.data_is_empty()
-    {
+    // An empty system-owned address is a new anchor whatever lamports it
+    // holds (sessions re-review 10-05: a pre-funded anchor address otherwise
+    // fell through to `checked_anchor` and refused every multi-chunk anchor).
+    if anchor_account.owner == &system_program::id() && anchor_account.data_is_empty() {
         create_pda(
             program,
             payer,
