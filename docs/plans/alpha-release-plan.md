@@ -102,6 +102,7 @@ DCG keeps no model code (owner decision, 09-26).
 - Today a v2.1 plan is assembled by hand from packed producer tuples, which only the authors can do.
 
 **E2. A kernel kit.**
+- *Status (2026-10-05):* the declaration (`KernelDecl`) and the conformance harness are built for STEP and stateful kernels (`docs/kernel-kit.md`); the application-image template moves to C0.
 - One way to declare an application kernel.
 - A conformance harness that runs the Rust kernel and its Python mirror on generated inputs, including every edge limit and refusal, and fails on any disagreement. It would have caught review finding F2.
 - A template for an application image that embeds custom kernels, with its build command.
@@ -143,7 +144,7 @@ DCG keeps no model code (owner decision, 09-26).
 - What it guarantees, and what it does not.
 - Measured throughput guidance per workload shape (Doom's numbers are the first data point).
 
-**C3. Stateful kernel kit.** The E2 conformance harness extended to stateful kernels: the Rust transition and its host reference agree on generated inputs, including state at its size limits and every refusal.
+**C3. Stateful kernel kit.** The E2 conformance harness extended to stateful kernels: the Rust transition and its host reference agree on generated inputs, including state at its size limits and every refusal. *Status (2026-10-05):* built with E2; the example v3 counters, including the rejecting ones, conform.
 
 **C4. Lanes (throughput); an alpha gate.** Lanes (`docs/design/stateful-session-lanes-v1.md`, owner decisions recorded) let independent parts of a session advance in parallel. They are consensus mode's main throughput lever.
 - **The alpha's hook (owner, 2026-10-03; program clarified 2026-10-05):** Doom runs on DCG at 3.0 frames per second on testnet, on **Doom's own program** built on the reviewed DCG runtime (the consensus runtime is a library embedded in each application's program, owner decision 2026-10-03; the shared program does not route sessions).

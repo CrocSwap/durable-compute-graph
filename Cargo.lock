@@ -1082,6 +1082,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcg-kernel-conform"
+version = "0.1.0"
+dependencies = [
+ "dcg-program",
+]
+
+[[package]]
 name = "dcg-kernels"
 version = "0.1.0"
 

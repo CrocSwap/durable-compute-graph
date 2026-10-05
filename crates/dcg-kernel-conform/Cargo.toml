@@ -1,0 +1,15 @@
+[package]
+name = "dcg-kernel-conform"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+description = "Conformance server for the DCG example kernels (kernel kit, alpha plan E2/C3)."
+
+# Not a default workspace member: its features (test kernels, no-entrypoint)
+# would unify into the other crates under `cargo test --workspace`.
+#
+# An application copies this crate, names its own kernels in main.rs, and
+# drives the binary with `python -m dcg.kernel_kit check`.
+[dependencies]
+dcg-program = { path = "../dcg-program", features = ["no-entrypoint", "graph-v21", "example-kernels", "sbf-real-lifecycle-test"] }
