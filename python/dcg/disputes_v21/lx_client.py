@@ -29,9 +29,11 @@ from .client import (CREATE_STAGE, FROM_STAGING, ROLE_CHALLENGER, ROLE_EXECUTOR,
 
 SUB.update({"lx_midpoints": 23, "lx_pick": 24, "lx_opening": 25, "lx_output": 26, "lx_prestage": 27})
 KIND_LX_STATE, KIND_LX_OUTPUT = 3, 4
-# An inline OPEN body above this size does not fit one packet with the open's
-# accounts and signature; it is staged first (tag 227 sub 27, decision 8a).
-INLINE_OPEN_MAX = 800
+# An inline OPEN body above this size may not fit one packet with the open's
+# accounts and signatures (with a separate fee payer, 2 signatures and 8 keys
+# leave about 740 bytes; re-review 10-05); it is staged first (tag 227 sub 27,
+# decision 8a).
+INLINE_OPEN_MAX = 700
 PRESTAGE_MASK_DOMAIN = b"dcg.lx.prestage.mask.v1\x00"
 
 
@@ -160,6 +162,10 @@ class LxClient(DisputeClient):
         if not 0 < len(body) <= CREATE_STAGE or len(secret) != 32:
             raise ValueError(f"staged open body of {len(body)} bytes")
         buffer = self.pda(b"dcg21stg", bytes(dispute), bytes([ROLE_CHALLENGER]))
+        if self.gc.account(buffer) is not None:
+            # A buffer left by an earlier, partial staging: close it first (its
+            # rent returns to the challenger), then stage afresh.
+            self.lx_prestage_close(run, template, dispute, nonce, challenger.pubkey(), challenger)
         masked = prestage_mask(secret, dispute, body)
         metas = [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, False),
                  AccountMeta(template, False, False), AccountMeta(dispute, False, False),
@@ -207,9 +213,15 @@ class LxClient(DisputeClient):
                 self._send("open", dispute_nonce + bytes([KIND_LX_STATE, FROM_STAGING]) + secret,
                            open_metas + [AccountMeta(buffer, False, True)], [challenger])
             except Exception:
-                # The open failed: recover the buffer's rent, then report.
-                self.lx_prestage_close(run, template, dispute, dispute_nonce, challenger.pubkey(), challenger)
-                raise
+                # An unconfirmed open may still land: if the dispute exists it
+                # is live (bond posted, phase clock running), so play on rather
+                # than abandon it. Otherwise recover the buffer's rent and
+                # report. A failed open that landed published its secret: a
+                # retry re-stages with a fresh one (re-review 10-05).
+                if self.gc.account(dispute) is None:
+                    self.lx_prestage_close(run, template, dispute, dispute_nonce, challenger.pubkey(), challenger)
+                    raise
+                log("  open confirmed late: the dispute exists; continuing")
             log(f"  open staged ({len(body) - 1} bytes)")
         else:
             self._send("open", dispute_nonce + body, open_metas, [challenger])
