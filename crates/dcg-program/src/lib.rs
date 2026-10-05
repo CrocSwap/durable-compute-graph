@@ -79,6 +79,22 @@ pub fn process_instruction(
     )
 }
 
+// The alpha shared image carries no test, legacy or v2.0 route (owner 10-05;
+// re-review L4: enforced at build time, not only by the routing test).
+#[cfg(all(
+    feature = "alpha-image",
+    any(
+        feature = "test-kernel",
+        feature = "revision-8-lifecycle",
+        feature = "graph-v2",
+        feature = "test-legacy-template-create",
+        feature = "sbf-lifecycle-test",
+        feature = "sbf-real-lifecycle-test",
+        feature = "legacy-hclosure-handlers"
+    )
+))]
+compile_error!("the alpha-image feature excludes test, legacy and v2.0 features");
+
 #[cfg(feature = "test-kernel")]
 fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
     static NO_INSTRUCTIONS: [app_api::ApplicationInstruction; 0] = [];
@@ -92,7 +108,16 @@ fn application_program_manifest() -> &'static app_api::ApplicationProgramManifes
     &TEST_APPLICATION
 }
 
-#[cfg(not(feature = "test-kernel"))]
+/// The alpha shared program (owner 10-05): the example kernels under
+/// `dcg-alpha/1`, the default dispute hooks, no application instructions.
+#[cfg(all(not(feature = "test-kernel"), feature = "example-kernels"))]
+fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
+    static ALPHA_PROGRAM: app_api::ApplicationProgramManifest =
+        app_api::ApplicationProgramManifest::new(&kernel::test_kernel::ALPHA_MANIFEST_APP, &[]);
+    &ALPHA_PROGRAM
+}
+
+#[cfg(all(not(feature = "test-kernel"), not(feature = "example-kernels")))]
 fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
     static EMPTY_KERNELS: [&'static dyn kernel::Kernel; 0] = [];
     static EMPTY_REPLAYS: [kernel::OptimisticReplayBinding; 0] = [];
@@ -192,7 +217,12 @@ pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     &kernel::test_kernel::MANIFEST_APP
 }
 
-#[cfg(not(feature = "test-kernel"))]
+#[cfg(all(not(feature = "test-kernel"), feature = "example-kernels"))]
+pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
+    &kernel::test_kernel::ALPHA_MANIFEST_APP
+}
+
+#[cfg(all(not(feature = "test-kernel"), not(feature = "example-kernels")))]
 pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     static EMPTY_KERNELS: [&'static dyn kernel::Kernel; 0] = [];
     static EMPTY_REPLAYS: [kernel::OptimisticReplayBinding; 0] = [];

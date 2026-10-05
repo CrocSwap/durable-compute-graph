@@ -302,11 +302,11 @@ async fn send(ctx: &mut ProgramTestContext, i: Instruction, signers: &[&Keypair]
 
 #[tokio::test(flavor = "multi_thread")]
 async fn honest_run_finalizes_and_returns_the_bond() {
-    let mut ch = Chain::new(10).await;
+    let mut ch = Chain::new(750).await;
     let c = ch.honest();
     ch.commit(&c).await;
     let before = ch.ctx.banks_client.get_balance(kp(0xE1).pubkey()).await.unwrap();
-    ch.ctx.warp_to_slot(40).unwrap();
+    ch.ctx.warp_to_slot(800).unwrap();
     let caller = kp(0xA1);
     send(&mut ch.ctx, ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(kp(0xE1).pubkey(), false)]), &[&caller]).await.unwrap();
     assert_eq!(ch.run_status().await, V::RUN_FINAL);
@@ -1266,7 +1266,7 @@ async fn l6_endings_matrix_native_and_sbf() {
             // owed moves, so this logical cell has no honest role order.
             if executor_truthful && matches!(ending, Ending::Moot) { continue; }
             let cell = format!("{ending:?}/executor_truthful={executor_truthful}");
-            let mut ch = Chain::new(30).await;
+            let mut ch = Chain::new(750).await;
             let h = ch.honest();
             let c = if executor_truthful { h } else {
                 let mut leaf = h.leaves[1].clone().unwrap();
@@ -1381,7 +1381,7 @@ async fn l6_endings_matrix_native_and_sbf() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn l6_finding_staging_after_proof_ruling() {
-    let mut ch = Chain::new(30).await;
+    let mut ch = Chain::new(750).await;
     let c = ch.honest();
     ch.commit(&c).await;
     let d = ch.open(221, V::KIND_STEP_DESCEND).await;
@@ -1501,7 +1501,7 @@ impl Chain {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_honest_run_closes_every_account_and_returns_all_rent() {
-    let mut ch = Chain::new(30).await;
+    let mut ch = Chain::new(750).await;
     let c = ch.honest();
     let d = ch.dispute(50);
     let cache = Pubkey::find_program_address(&[b"dcg21rc", ch.run.as_ref(), &[V::KIND_STEP_DESCEND], &1u32.to_le_bytes(), &0u64.to_le_bytes()], &PROGRAM).0;
@@ -1555,7 +1555,7 @@ async fn an_honest_run_closes_every_account_and_returns_all_rent() {
     assert!(ch.close_dispute(d).await.is_err(), "closed once");
     assert!(ch.close_run(0xC1).await.is_err(), "every dispute is closed, but the run is not final yet");
     // Finalize, then the payer (only) closes the run.
-    ch.ctx.warp_to_slot(100).unwrap();
+    ch.ctx.warp_to_slot(800).unwrap();
     let caller = kp(0xA1);
     send(&mut ch.ctx, ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(e.pubkey(), false)]), &[&caller]).await.unwrap();
     assert!(ch.close_template().await.is_err(), "a finalized run still needs its template until it becomes a receipt");
@@ -1642,15 +1642,15 @@ async fn a_refuted_run_closes_after_the_pot_and_buffers_refund_their_creator() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_uncommitted_run_cancels_for_its_payer_after_the_commit_deadline() {
-    // The commit deadline is the init slot plus the challenge window (30).
-    let mut ch = Chain::new(30).await;
+    // The commit deadline is the init slot plus the challenge window (750).
+    let mut ch = Chain::new(750).await;
     let other = kp(0xC1);
     let theirs = Pubkey::find_program_address(&[b"dcg21run", &ch.run_id, other.pubkey().as_ref()], &PROGRAM).0;
     let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), other.pubkey(), ch.template, ch.run, theirs];
     let before = total_lamports(&mut ch.ctx, &tracked).await;
     assert!(ch.close_template().await.is_err(), "a live uncommitted run needs its template");
     assert!(ch.close_run(0xA1).await.is_err(), "not before the commit deadline");
-    ch.ctx.warp_to_slot(100).unwrap();
+    ch.ctx.warp_to_slot(800).unwrap();
     // A late commit is refused (review 10-03, F5).
     let c = ch.honest();
     let e = kp(0xE1);
@@ -1681,7 +1681,7 @@ async fn an_uncommitted_run_cancels_for_its_payer_after_the_commit_deadline() {
     send(&mut ch.ctx, i, &[&other]).await.unwrap();
     assert!(send(&mut ch.ctx, commit(ch.run, ch.template), &[&e]).await.is_err(), "the cancelled address is gone");
     assert!(ch.close_template().await.is_err(), "the other live run still needs the template");
-    ch.ctx.warp_to_slot(200).unwrap();
+    ch.ctx.warp_to_slot(1_600).unwrap();
     let close_theirs = ix(V::SUB_CLOSE_RUN, &[], vec![AccountMeta::new(other.pubkey(), true), AccountMeta::new(theirs, false), AccountMeta::new(ch.template, false), AccountMeta::new(other.pubkey(), false)]);
     send(&mut ch.ctx, close_theirs, &[&other]).await.unwrap();
     ch.close_template().await.unwrap();
@@ -1711,7 +1711,7 @@ async fn an_existing_template_keeps_its_read_only_account_lists_and_cannot_be_cl
 #[tokio::test(flavor = "multi_thread")]
 async fn both_timeout_winners_can_close_their_run_and_template() {
     // C misses PICK, so E wins the dispute and the run can finalize.
-    let mut executor_win = Chain::new(30).await;
+    let mut executor_win = Chain::new(750).await;
     let committed = executor_win.honest();
     let d = executor_win.dispute(90);
     let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), executor_win.run, executor_win.template, d];
@@ -1740,7 +1740,7 @@ async fn both_timeout_winners_can_close_their_run_and_template() {
 
     // E misses NODES, so C wins; after the ruled prefix passes, the pot and
     // the refuted receipt can close, followed by the now-unused template.
-    let mut challenger_win = Chain::new(30).await;
+    let mut challenger_win = Chain::new(750).await;
     let committed = challenger_win.honest();
     let d = challenger_win.dispute(91);
     let tracked = [kp(0xA1).pubkey(), kp(0xE1).pubkey(), kp(0xC1).pubkey(), challenger_win.run, challenger_win.template, d];
@@ -1908,7 +1908,7 @@ async fn ended_puppets_do_not_extend_a_fresh_dispute() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retiring_a_template_blocks_new_runs_and_anyone_can_cancel_an_expired_run() {
-    let mut ch = Chain::new(30).await;
+    let mut ch = Chain::new(750).await;
     let bystander = kp(0xB1);
     let executor = kp(0xE1);
     let mut init = vec![7u8; 32];
@@ -1970,7 +1970,7 @@ async fn retiring_a_template_blocks_new_runs_and_anyone_can_cancel_an_expired_ru
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prefunded_template_is_adopted_and_its_lamports_go_to_the_recorded_payer() {
-    let mut ch = Chain::new(30).await;
+    let mut ch = Chain::new(750).await;
     ch.ctx.warp_to_slot(10_000).unwrap();
     ch.close_run(0xA1).await.unwrap();
     ch.close_template().await.unwrap();
@@ -1981,7 +1981,7 @@ async fn a_prefunded_template_is_adopted_and_its_lamports_go_to_the_recorded_pay
     let before_admitter = ch.ctx.banks_client.get_balance(kp(0xA1).pubkey()).await.unwrap();
     let transfer = solana_program::system_instruction::transfer(&prefunder.pubkey(), &ch.template, gift);
     send(&mut ch.ctx, transfer, &[&prefunder]).await.unwrap();
-    let data = template_body(&ch.g, 30);
+    let data = template_body(&ch.g, 750);
     let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
     assert_eq!(Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, kp(0xA1).pubkey().as_ref()], &PROGRAM).0, ch.template);
     let admitter = kp(0xA1);
@@ -1997,11 +1997,11 @@ async fn a_prefunded_template_is_adopted_and_its_lamports_go_to_the_recorded_pay
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_front_runner_cannot_squat_on_another_payers_template() {
-    let mut ch = Chain::new(30).await;
+    let mut ch = Chain::new(750).await;
     ch.ctx.warp_to_slot(10_000).unwrap();
     ch.close_run(0xA1).await.unwrap();
     ch.close_template().await.unwrap();
-    let data = template_body(&ch.g, 30);
+    let data = template_body(&ch.g, 750);
     let front_runner = kp(0xB1);
     let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
     let squat = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, front_runner.pubkey().as_ref()], &PROGRAM).0;
@@ -2043,8 +2043,8 @@ async fn a_front_runner_cannot_squat_on_another_payers_template() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_existing_tracked_template_at_the_old_address_remains_readable() {
-    let mut ch = Chain::new(30).await;
-    let template_id = sha256(&[V::TEMPLATE_DOMAIN, &template_body(&ch.g, 30)]);
+    let mut ch = Chain::new(750).await;
+    let template_id = sha256(&[V::TEMPLATE_DOMAIN, &template_body(&ch.g, 750)]);
     let old = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id], &PROGRAM).0;
     assert_ne!(old, ch.template);
     let account = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap();
@@ -2070,14 +2070,14 @@ async fn an_existing_tracked_template_at_the_old_address_remains_readable() {
 #[cfg(all(feature = "test-kernel", not(feature = "test-legacy-template-create")))]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_shared_test_kernel_image_does_not_dispatch_legacy_create_subtype_250() {
-    let mut ch = Chain::new(30).await;
+    let mut ch = Chain::new(750).await;
     ch.ctx.warp_to_slot(10_000).unwrap();
     ch.close_run(0xA1).await.unwrap();
     ch.close_template().await.unwrap();
     assert!(ch.gone(ch.template).await);
 
     let attacker = kp(0xB1);
-    let data = template_body(&ch.g, 30);
+    let data = template_body(&ch.g, 750);
     let i = ix(250, &data, vec![
         AccountMeta::new(attacker.pubkey(), true), AccountMeta::new(ch.template, false),
         AccountMeta::new_readonly(SYSTEM, false),
@@ -2444,4 +2444,251 @@ async fn rr_n7_burst_fifo_feasible() {
         ch.ctx.warp_to_slot(s + 750 * (k as u64 + 1) - 2).unwrap();
         ch.leaf1(*d, &c).await.unwrap();
     }
+}
+
+// ---- R2 reviews 10-05 (A-H1 / B-M1): staging growth rent ----
+
+async fn r2_bal(ch: &mut Chain, k: Pubkey) -> u64 {
+    ch.ctx.banks_client.get_balance(k).await.unwrap()
+}
+
+/// The challenger creates the executor's staging buffer (paying its creation
+/// rent), the executor grows it to answer and then wins on a PICK timeout. At
+/// close the challenger gets back exactly its creation rent and the executor
+/// gets every lamport of its growth back: a frivolous challenge no longer
+/// pays (before the fix the challenger collected the growth).
+#[tokio::test(flavor = "multi_thread")]
+async fn executor_growth_rent_returns_to_the_executor_at_close() {
+    let mut ch = Chain::new(750).await;
+    let c = ch.honest();
+    ch.commit(&c).await;
+    let d = ch.open(70, V::KIND_STEP_DESCEND).await;
+    let (cc, e) = (kp(0xC1), kp(0xE1));
+    let buf = ch.buffer(d, V::ROLE_EXECUTOR);
+    let mut data = vec![V::ROLE_EXECUTOR];
+    data.extend_from_slice(&0u32.to_le_bytes());
+    let create = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(cc.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    send(&mut ch.ctx, create, &[&cc]).await.unwrap();
+    let created_rent = r2_bal(&mut ch, buf).await;
+    let e0 = r2_bal(&mut ch, e.pubkey()).await;
+    for _ in 0..11 {
+        let grow = ix(V::SUB_STAGE_GROW, &10_240u32.to_le_bytes(), vec![AccountMeta::new(e.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+        send(&mut ch.ctx, grow, &[&e]).await.unwrap();
+    }
+    let e_paid = e0 - r2_bal(&mut ch, e.pubkey()).await;
+    assert!(e_paid > CHALLENGER_BOND, "growth larger than the bond: the case that used to pay the challenger");
+    let mut nodes = Vec::new();
+    nodes.extend_from_slice(&c.step[0][0]);
+    nodes.extend_from_slice(&c.step[0][1]);
+    let reveal = ix(V::SUB_REVEAL_NODES, &nodes, ch.party(0xE1, d));
+    send(&mut ch.ctx, reveal, &[&e]).await.unwrap();
+    ch.ctx.warp_to_slot(5_000).unwrap();
+    let caller = kp(0xA1);
+    let timeout = ix(V::SUB_TIMEOUT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(d, false), AccountMeta::new(e.pubkey(), false), AccountMeta::new(cc.pubkey(), false)]);
+    send(&mut ch.ctx, timeout, &[&caller]).await.unwrap(); // C abandons PICK: E wins
+    assert_eq!(ch.ruling(d).await, V::RULING_EXECUTOR);
+    ch.advance(d).await.unwrap();
+    let (c1, e1) = (r2_bal(&mut ch, cc.pubkey()).await, r2_bal(&mut ch, e.pubkey()).await);
+    let dispute_rent = r2_bal(&mut ch, d).await;
+    ch.close_dispute(d).await.unwrap();
+    let c_gain = r2_bal(&mut ch, cc.pubkey()).await - c1;
+    let e_gain = r2_bal(&mut ch, e.pubkey()).await - e1;
+    assert_eq!(e_gain, e_paid, "the executor's growth rent comes back to it");
+    assert_eq!(c_gain, dispute_rent + created_rent, "the challenger gets only the dispute and its creation rent");
+}
+
+/// Routing on the alpha SBF image (V21_SBF=1, BPF_OUT_DIR naming an image built
+/// with `--features alpha-image`): every tag other than 227 refuses before any
+/// account is read, including the test-only subtype 250. Native builds cannot
+/// check this, because dcg-test-support turns on revision-8-lifecycle for every
+/// dcg-program dev build (R2 review B, M2/M3).
+#[tokio::test(flavor = "multi_thread")]
+async fn alpha_image_routes_only_tag_227() {
+    if !std::env::var("V21_SBF").is_ok_and(|v| v == "1") {
+        return;
+    }
+    use solana_instruction::error::InstructionError;
+    let mut test = ProgramTest::default();
+    test.prefer_bpf(true);
+    test.add_program("dcg_program", PROGRAM, None);
+    let mut ctx = test.start_with_context().await;
+    let mut reached = Vec::new();
+    for tag in 0u8..=255 {
+        for sub in [1u8, 18, 250] {
+            let i = Instruction { program_id: PROGRAM, accounts: vec![], data: vec![tag, sub, 0, 0, 0, 0] };
+            let r = send(&mut ctx, i, &[]).await;
+            if r != Err(TransactionError::InstructionError(0, InstructionError::InvalidInstructionData)) {
+                reached.push((tag, sub, format!("{r:?}")));
+            }
+        }
+    }
+    assert!(reached.iter().all(|(t, s, _)| *t == 227 && *s != 250), "{reached:?}");
+}
+
+// ---- R2 reviews 10-05 (A-M2, A-L1, B-L2): admission floors and canonical ids ----
+
+/// The default block for `total_steps` with its first record at STEP_BASE, as
+/// the program derives it for a template written without blocks.
+fn default_block_bytes(total_steps: u64) -> Vec<u8> {
+    let mut b = vec![0u8; D::blocks::Block::BYTES];
+    b[0..4].copy_from_slice(b"DBK1");
+    b[4] = 1;
+    b[16..24].copy_from_slice(&total_steps.to_le_bytes());
+    b[40..48].copy_from_slice(&(STEP_BASE as u64).to_le_bytes());
+    b[48..56].copy_from_slice(&total_steps.to_le_bytes());
+    b[64] = D::blocks::height_for(total_steps) as u8;
+    b
+}
+
+async fn create_template_raw(ch: &mut Chain, data: &[u8]) -> Result<(), TransactionError> {
+    let admitter = kp(0xB1);
+    let id = sha256(&[V::TEMPLATE_DOMAIN, data]);
+    let address = Pubkey::find_program_address(&[b"dcg21tmpl", &id, admitter.pubkey().as_ref()], &PROGRAM).0;
+    send(&mut ch.ctx, ix(V::SUB_CREATE_TEMPLATE, data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(address, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await
+}
+
+/// Admission refuses an effectively undisputable window and a zero slasher
+/// share, and every non-canonical encoding of an otherwise valid template, so
+/// one template has one id (owner 10-05).
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_enforces_floors_and_canonical_encodings() {
+    let mut ch = Chain::new(750).await;
+    let g = golden();
+    let shape = |r: Result<(), TransactionError>| match r {
+        Err(TransactionError::InstructionError(0, solana_instruction::error::InstructionError::Custom(c))) => c,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    // Floors.
+    assert!(shape(create_template_raw(&mut ch, &template_body(&g, 1)).await) != 0, "a one-slot challenge window");
+    assert!(shape(create_template_raw(&mut ch, &template_body(&g, 749)).await) != 0, "below the phase floor");
+    let mut zero_share = template_body(&g, 800);
+    zero_share[89..91].copy_from_slice(&0u16.to_le_bytes());
+    assert!(shape(create_template_raw(&mut ch, &zero_share).await) != 0, "a zero slasher share");
+    // Canonical blocks: the explicit default block, and ignored bytes.
+    let mut explicit = template_body(&g, 800);
+    explicit.push(1);
+    explicit.extend_from_slice(&default_block_bytes(2));
+    assert!(shape(create_template_raw(&mut ch, &explicit).await) != 0, "an explicit default block");
+    // Two one-step blocks (a non-default block list), admitted as a control,
+    // then the same list with each ignored byte set.
+    let two_blocks = |flip: Option<usize>| {
+        let mut data = template_body(&g, 900);
+        let mut first = default_block_bytes(1);
+        first[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let mut second = default_block_bytes(1);
+        second[8..16].copy_from_slice(&1u64.to_le_bytes());
+        second[40..48].copy_from_slice(&(STEP_BASE as u64 + 1).to_le_bytes());
+        second[56..64].copy_from_slice(&1u64.to_le_bytes());
+        if let Some(at) = flip {
+            second[at] = 1;
+        }
+        data.push(2);
+        data.extend_from_slice(&first);
+        data.extend_from_slice(&second);
+        data
+    };
+    create_template_raw(&mut ch, &two_blocks(None)).await.expect("the two-block control is admitted");
+    for at in [38usize, 39, 65, 71, 72, 103] {
+        assert!(shape(create_template_raw(&mut ch, &two_blocks(Some(at))).await) != 0, "nonzero ignored byte {at}");
+    }
+    // The canonical form of the same template is admitted.
+    create_template_raw(&mut ch, &template_body(&g, 800)).await.unwrap();
+}
+
+/// An LX1 template's unused skeleton fields (depth, spec bases, plan id) are
+/// fixed, so an LX1 template too has one id (owner 10-05, R2 review A-L1).
+#[tokio::test(flavor = "multi_thread")]
+async fn lx_templates_have_one_canonical_skeleton() {
+    let mut ch = Chain::new(750).await;
+    let lx = |depth: u8, bases: u8, plan: u8| {
+        let mut d = vec![depth];
+        for x in [1u64, 0, 900, 750, EXECUTOR_BOND, CHALLENGER_BOND] {
+            d.extend_from_slice(&x.to_le_bytes());
+        }
+        d.extend_from_slice(&[bases; 8]);
+        d.extend_from_slice(&[0x33; 32]);
+        d.extend_from_slice(&SLASHER_BPS.to_le_bytes());
+        d.extend_from_slice(&[plan; 32]);
+        d.extend_from_slice(b"DLX1");
+        d.extend_from_slice(b"dcg-lx-toy-v1\0\0\0");
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&[2, 0, 0, 0]);
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&4u32.to_le_bytes());
+        d.extend_from_slice(&64u64.to_le_bytes());
+        d
+    };
+    create_template_raw(&mut ch, &lx(1, 0, 0)).await.expect("the canonical LX1 template is admitted");
+    assert!(create_template_raw(&mut ch, &lx(2, 0, 0)).await.is_err(), "depth other than 1");
+    assert!(create_template_raw(&mut ch, &lx(1, 1, 0)).await.is_err(), "nonzero spec bases");
+    assert!(create_template_raw(&mut ch, &lx(1, 0, 1)).await.is_err(), "a nonzero plan id");
+}
+
+/// R2 re-review H1: who paid for a staging buffer's growth is recorded, not
+/// inferred from roles. For every creator of the executor's buffer, every
+/// funder of its growth and both endings, the close refunds the funder its
+/// growth exactly, the creator its creation rent, and the challenger the
+/// dispute's rent; no party gains another's rent.
+#[tokio::test(flavor = "multi_thread")]
+async fn staging_growth_returns_to_whoever_paid_it_in_every_ending() {
+    for (creator, funder, executor_wins) in [
+        (0xC1u8, 0xE1u8, true), (0xC1, 0xC1, true), (0xE1, 0xC1, true), (0xE1, 0xE1, true),
+        (0xC1, 0xE1, false), (0xC1, 0xC1, false), (0xE1, 0xC1, false), (0xE1, 0xE1, false),
+    ] {
+        let mut ch = Chain::new(750).await;
+        let c = ch.honest();
+        ch.commit(&c).await;
+        let d = ch.open(90, V::KIND_STEP_DESCEND).await;
+        let (cc, e) = (kp(0xC1), kp(0xE1));
+        let buf = ch.buffer(d, V::ROLE_EXECUTOR);
+        let who = kp(creator);
+        let mut data = vec![V::ROLE_EXECUTOR];
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let create = ix(V::SUB_STAGE_CREATE, &data, vec![AccountMeta::new(who.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+        send(&mut ch.ctx, create, &[&who]).await.unwrap();
+        let created = r2_bal(&mut ch, buf).await;
+        let payer = kp(funder);
+        for _ in 0..3 {
+            let grow = ix(V::SUB_STAGE_GROW, &10_240u32.to_le_bytes(), vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(buf, false), AccountMeta::new_readonly(SYSTEM, false)]);
+            send(&mut ch.ctx, grow, &[&payer]).await.unwrap();
+        }
+        let growth = r2_bal(&mut ch, buf).await - created;
+        assert!(growth > CHALLENGER_BOND);
+        let slot = ch.slot().await;
+        if executor_wins {
+            ch.nodes(d, &c).await.unwrap();
+            ch.ctx.warp_to_slot(slot + 2_000).unwrap();
+            ch.timeout(d).await.unwrap(); // C misses PICK
+            assert_eq!(ch.ruling(d).await, V::RULING_EXECUTOR);
+        } else {
+            ch.ctx.warp_to_slot(slot + 2_000).unwrap();
+            ch.timeout(d).await.unwrap(); // E misses NODES
+            assert_eq!(ch.ruling(d).await, V::RULING_CHALLENGER);
+            ch.advance(d).await.unwrap(); // the pot waits for the ruled prefix
+            let caller = kp(0xA1);
+            let pay = ix(V::SUB_PAY_POT, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new_readonly(d, false), AccountMeta::new(cc.pubkey(), false), AccountMeta::new(kp(0xA1).pubkey(), false)]);
+            send(&mut ch.ctx, pay, &[&caller]).await.unwrap();
+        }
+        if executor_wins {
+            ch.advance(d).await.unwrap();
+        }
+        let (c0, e0) = (r2_bal(&mut ch, cc.pubkey()).await, r2_bal(&mut ch, e.pubkey()).await);
+        let dispute_rent = r2_bal(&mut ch, d).await;
+        ch.close_dispute(d).await.unwrap();
+        let (c_gain, e_gain) = (r2_bal(&mut ch, cc.pubkey()).await - c0, r2_bal(&mut ch, e.pubkey()).await - e0);
+        let mut want_c = dispute_rent;
+        let mut want_e = 0;
+        if creator == 0xC1 { want_c += created } else { want_e += created }
+        if funder == 0xC1 { want_c += growth } else { want_e += growth }
+        assert_eq!((c_gain, e_gain), (want_c, want_e), "creator {creator:#x} funder {funder:#x} executor_wins {executor_wins}");
+    }
+}
+
+/// The growth record (u32 lamports) holds a full 128 KiB buffer's rent at
+/// default rent with room to spare; it saturates rather than refusing growth.
+#[test]
+fn the_growth_record_fits_the_largest_buffer() {
+    let rent = solana_program::rent::Rent::default().minimum_balance(V::STAGE_HEADER + V::MAX_STAGE);
+    assert!(rent * 4 < u32::MAX as u64, "{rent}");
 }

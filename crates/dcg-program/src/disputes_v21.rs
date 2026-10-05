@@ -68,15 +68,21 @@ pub const SUB_PAY_POT: u8 = 13;
 pub const SUB_STAGE_CREATE: u8 = 14;
 pub const SUB_STAGE_WRITE: u8 = 15;
 
-/// Staging buffer "D21S" (design §8.2): magic(4) role(1) pad(3) dispute(32)
-/// len:u32 pad(4) then the staged bytes. PDA ["dcg21stg", dispute, role].
-/// Role 1 is E's buffer, role 2 is C's; C funds both at creation. A reveal or
+/// Staging buffer "D21S" (design §8.2): magic(4) role(1) creator(1: 0 C, 1 E)
+/// pad(2) dispute(32) len:u32 other_growth:u32 (lamports of growth paid by the
+/// party that did not create it) then the staged bytes. PDA ["dcg21stg",
+/// dispute, role]. Role 1 is E's buffer, role 2 is C's; C may create either,
+/// E its own. A reveal or
 /// claim whose data is the single byte `FROM_STAGING` reads its bytes from
 /// the party's buffer instead of the instruction. Skeleton: one CPI
 /// creation, so at most `MAX_STAGE` bytes (growth comes later).
 pub const ROLE_EXECUTOR: u8 = 1;
 pub const ROLE_CHALLENGER: u8 = 2;
 pub const STAGE_HEADER: usize = 48;
+/// Staging header bytes 44..48: lamports of growth paid (`STAGE_GROW`) by the
+/// dispute party that did not create the buffer, refunded to it at
+/// `CLOSE_DISPUTE`.
+pub const STAGE_OTHER_GROWTH: usize = 44;
 /// Created by one CPI (10 KiB), then grown by `SUB_STAGE_GROW` in steps of at
 /// most 10 KiB up to `MAX_STAGE` (a 64 KiB witness plus its claim framing).
 pub const CREATE_STAGE: usize = 10_240 - STAGE_HEADER;
@@ -544,8 +550,12 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     let (cw, pw) = (u64_at(data, 17)?, u64_at(data, 25)?);
     let total_steps = u64_at(data, 1)?;
     if !(1..=MAX_REVEAL_DEPTH).contains(&depth)
-        || !(MIN_WINDOW..=MAX_WINDOW).contains(&cw)
+        // A challenge window shorter than a response phase makes the run
+        // effectively undisputable; the slasher share pays the challenger
+        // (owner 10-05, R2 review A-M2: admission floors).
+        || !(MIN_PHASE_WINDOW..=MAX_WINDOW).contains(&cw)
         || !(MIN_PHASE_WINDOW..=MAX_WINDOW).contains(&pw)
+        || u16_at(data, 89)? == 0
         || total_steps == 0
         || total_steps > 1 << 40
         || u16_at(data, 89)? >= 10_000
@@ -563,7 +573,15 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     let lx_tail = (data.len() == FIXED + lx::LX_TAIL_BYTES && data[FIXED..].starts_with(lx::LX_TAIL_MAGIC))
         .then(|| &data[FIXED..]);
     if let Some(tail) = lx_tail {
-        if lx::parse_tail(tail).is_none() || total_steps != 1 || u64_at(data, 9)? != 0 {
+        // Canonical LX1 skeleton: the fields an LX1 template does not use are
+        // fixed, so one template has one id (owner 10-05, R2 review A-L1).
+        if lx::parse_tail(tail).is_none()
+            || total_steps != 1
+            || u64_at(data, 9)? != 0
+            || depth != 1
+            || data[49..57] != [0; 8]
+            || data[91..123] != [0; 32]
+        {
             return Err(err(6));
         }
     }
@@ -580,6 +598,18 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     };
     let blocks: Vec<Block> = if block_data_end > FIXED {
         let count = data[FIXED] as usize;
+        // Canonical blocks (owner 10-05, R2 review A-L1 / B-L2): bytes the
+        // parser ignores are zero, a single block that equals the default is
+        // written as no blocks, so the same template cannot take two ids.
+        for i in 0..count {
+            let raw = &data[FIXED + 1 + Block::BYTES * i..FIXED + 1 + Block::BYTES * (i + 1)];
+            if raw[38..40] != [0; 2] || raw[65..Block::BYTES] != [0; Block::BYTES - 65] || (raw[4] == 1 && raw[32..38] != [0; 6]) {
+                return Err(err(6));
+            }
+        }
+        if count == 1 && data[FIXED + 1..block_data_end] == default_block(total_steps, u32_at(data, 53)? as u64) {
+            return Err(err(6));
+        }
         (0..count)
             .map(|i| Block::parse(&data[FIXED + 1 + Block::BYTES * i..FIXED + 1 + Block::BYTES * (i + 1)]))
             .collect::<Option<Vec<Block>>>()
@@ -1169,7 +1199,12 @@ fn disputable(program_id: &Pubkey, run: &AccountInfo) -> Result<bool, ProgramErr
 }
 
 // 17: [funder(s,w), run, template, dispute, buffer(w), system] add:u32 (at most
-// 10 KiB). Grows a staging buffer; anyone may pay for the growth.
+// 10 KiB). Grows a staging buffer; anyone may pay for the growth. Growth paid
+// by the dispute party that did not create the buffer (the executor for a
+// challenger-created buffer, the challenger for an executor-created one) is
+// recorded in header bytes 44..48 (lamports) and refunded to that party at
+// CLOSE_DISPUTE; every other lamport goes to the creator (R2 re-review 10-05:
+// who paid is recorded, not inferred from roles).
 fn stage_grow(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [funder, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
@@ -1181,8 +1216,23 @@ fn stage_grow(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
         return Err(err(29));
     }
     let need = Rent::get()?.minimum_balance(new_len).saturating_sub(buffer.lamports());
+    let creator = buffer.try_borrow_data()?[5];
+    let other = if creator == 1 {
+        c.dispute.try_borrow_data()?[D_CHALLENGER..D_CHALLENGER + 32].to_vec()
+    } else {
+        c.run.try_borrow_data()?[R_EXECUTOR..R_EXECUTOR + 32].to_vec()
+    };
+    let by_other = other == funder.key.to_bytes();
     if need > 0 {
         invoke(&system_instruction::transfer(funder.key, buffer.key, need), &[funder.clone(), buffer.clone(), system.clone()])?;
+        if by_other {
+            let mut b = buffer.try_borrow_mut_data()?;
+            // Saturating: growth is never refused for the record's sake (a
+            // 128 KiB buffer's rent is far below u32::MAX at current rent).
+            let paid = u32_at(&b, STAGE_OTHER_GROWTH)? as u64;
+            let paid = u32::try_from(paid.saturating_add(need)).unwrap_or(u32::MAX);
+            b[STAGE_OTHER_GROWTH..STAGE_OTHER_GROWTH + 4].copy_from_slice(&paid.to_le_bytes());
+        }
     }
     buffer.resize(new_len)
 }
@@ -1848,6 +1898,14 @@ impl<'a> Referee<'a> {
         } else {
             None
         };
+        // Built-in reductions and kernels exist at version (1, 1) only; a spec
+        // naming one at another version names no kernel (it rules for C, as
+        // any unknown kernel does) instead of silently binding the built-in
+        // (R2 review A-M1).
+        let builtin = D::reductions::lookup(spec.kernel_id()).is_some() || kernel_code(spec.kernel_id()).is_some();
+        if builtin && (spec.semantic_version(), spec.abi_version()) != (1, 1) {
+            return Ok(true);
+        }
         if D::reductions::lookup(spec.kernel_id()).is_some() {
             // A refused replay cannot carry committed outputs: C wins.
             let Some(r) = D::reductions::replay(spec.kernel_id(), &ins, prior) else { return Ok(true) };
@@ -1899,7 +1957,7 @@ impl<'a> Referee<'a> {
 
 /// The registered kernel whose name equals the spec's 16-byte kernel id
 /// without its NUL padding (for example `identity_i32/v1`).
-fn kernel_code(id: &[u8]) -> Option<u16> {
+pub(crate) fn kernel_code(id: &[u8]) -> Option<u16> {
     let end = id.iter().position(|b| *b == 0).unwrap_or(id.len());
     if id[end..].iter().any(|b| *b != 0) {
         return None; // an interior NUL is not a kernel name (review 10-03, F9)
@@ -2139,8 +2197,9 @@ fn settled(r: &[u8]) -> bool {
 // executor buffer(w), challenger buffer(w)]. A ruled or moot dispute whose
 // sequence the ruled prefix has passed (so `advance` no longer needs it), and,
 // if it is the run's lowest challenger win, after the pot is paid. Closes both
-// staging buffers if they exist (their rent to the party that created them)
-// and the dispute (its rent to the challenger).
+// staging buffers if they exist (each one's recorded non-creator growth to
+// that party, the rest to its creator) and the dispute (its rent to the
+// challenger).
 fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let [_caller, run, tmpl, dispute, challenger, executor, buffer_e, buffer_c, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -2174,7 +2233,23 @@ fn close_dispute(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
             }
             b[5]
         };
-        close_into(buffer, if creator == 1 { executor } else { challenger })?;
+        // Growth the non-creating party paid (recorded at STAGE_GROW) returns
+        // to it; every other lamport (creation rent, anyone else's growth,
+        // pre-funding) to the creator. Before the R2 fixes the creator took
+        // everything, so a losing challenger could collect the executor's
+        // growth (reviews A-H1 / B-M1; re-review H1).
+        let other_paid = {
+            let b = buffer.try_borrow_data()?;
+            (u32_at(&b, STAGE_OTHER_GROWTH)? as u64).min(buffer.lamports())
+        };
+        let (to_creator, to_other) = if creator == 1 { (executor, challenger) } else { (challenger, executor) };
+        if other_paid > 0 {
+            if !to_other.is_writable {
+                return Err(err(35));
+            }
+            move_lamports(buffer, to_other, other_paid)?;
+        }
+        close_into(buffer, to_creator)?;
     }
     {
         let mut r = c.run.try_borrow_mut_data()?;

@@ -517,11 +517,12 @@ pub(crate) fn opening(
     }
     let root: [u8; D::RUN_ROOT_BYTES] = c.run.try_borrow_data()?[R_ROOT..R_REFS].try_into().unwrap();
     let b = bind(&lx, manifest, &root, data)?;
-    let staged = buffer.try_borrow_data()?;
+    let full = buffer.try_borrow_data()?;
+    let staged = staged_part(&full)?;
     let mut at = STAGE_HEADER;
-    let (opened, siblings) = decode_opening(&staged, &mut at)?;
+    let (opened, siblings) = decode_opening(staged, &mut at)?;
     let (nr, nw, nout, nc) = b.machine.max_transition();
-    let consts = decode_constants(&staged, &mut at, nc)?;
+    let consts = decode_constants(staged, &mut at, nc)?;
     let (mut reads, mut writes) = (vec![0u32; nr], vec![0u32; nw]);
     let mut nodes = vec![(0u64, [0u8; 32]); opened.len()];
     let mut read_values: Vec<Option<&[u8]>> = vec![None; nr];
@@ -541,8 +542,15 @@ pub(crate) fn opening(
     };
     let ruling = X::replay(&H, &*b.machine, coordinate, &opened, &siblings, &consts, &c.t.spec_root, &root_lo, &root_hi, &mut s)
         .map_err(refusal)?;
-    drop(staged);
+    drop(full);
     rule(&c, executor, challenger, ruling == X::LxRuling::Challenger)
+}
+
+/// A staging buffer up to its recorded staged length (header bytes 40..44),
+/// as the reveal and claim handlers read it (R2 review A-L4).
+fn staged_part(b: &[u8]) -> Result<&[u8], ProgramError> {
+    let len = u32_at(b, 40)? as usize;
+    b.get(..STAGE_HEADER.checked_add(len).ok_or(err(8))?).ok_or(err(29))
 }
 
 /// 26: [challenger(s), run(w), template, dispute(w), executor(w), C's staging
@@ -571,18 +579,19 @@ pub(crate) fn output(
     let root: [u8; D::RUN_ROOT_BYTES] = c.run.try_borrow_data()?[R_ROOT..R_REFS].try_into().unwrap();
     let b = bind(&lx, manifest, &root, data)?;
     let slots = b.machine.output_slots();
-    let staged = buffer.try_borrow_data()?;
+    let full = buffer.try_borrow_data()?;
+    let staged = staged_part(&full)?;
     let mut at = STAGE_HEADER;
     // The final root, opened from the committed checkpoint tree.
     let count = X::checkpoint_count(b.positions, b.k).ok_or(err(42))?;
     let h = checkpoint_height(count) as usize;
-    let root_t = key32(&staged, at)?;
-    let path = read_hashes(&staged, at + 32, h)?;
+    let root_t = key32(staged, at)?;
+    let path = read_hashes(staged, at + 32, h)?;
     at += 32 + 32 * h;
     if D::root_from_path(&H, D::Tree::LxCheckpoint, &root_t, count - 1, &path) != key32(&root, RR_CHECKPOINTS)? {
         return Err(err(49));
     }
-    let (opened, siblings) = decode_opening(&staged, &mut at)?;
+    let (opened, siblings) = decode_opening(staged, &mut at)?;
     // The opening covers exactly the output slots and verifies against R_T.
     let mut nodes = vec![(0u64, [0u8; 32]); opened.len()];
     let values: Vec<Option<&[u8]>> = opened.iter().map(|(_, v)| *v).collect();
@@ -592,7 +601,7 @@ pub(crate) fn output(
         return Err(err(48)); // unreachable: the values compared are the opened ones
     }
     let lie = X::outputs_digest(&H, &values) != key32(&root, RR_OUTPUTS)?;
-    drop(staged);
+    drop(full);
     rule(&c, executor, challenger, lie)
 }
 
@@ -602,7 +611,7 @@ pub(crate) fn output(
 /// the start's first chunk chosen by h, as the Python toy's `by_value`) each
 /// start reads two template constant chunks (design §13), as the Python toy's
 /// `weights=True`.
-#[cfg(feature = "test-kernel")]
+#[cfg(any(feature = "test-kernel", feature = "example-kernels"))]
 pub mod toy {
     use super::*;
     use crate::kernel::{Kernel, KernelError, KernelId, KernelManifest, ModeId, PortLayout, ResourceLimits, VersionedId};

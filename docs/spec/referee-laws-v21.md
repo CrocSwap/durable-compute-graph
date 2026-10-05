@@ -32,7 +32,7 @@ Uses:
 | Run | `["dcg21run", run_id, payer]` | payer (sub 2) | the run payer |
 | Receipt | the run's own address, after sub 19 | the run, shrunk | the run payer |
 | Dispute | `["dcg21dsp", run, challenger, nonce]` | challenger (sub 4) | the challenger |
-| Staging buffer | `["dcg21stg", dispute, role]` | sub 14: C may create either role; E may create its own if C has not. Any signer may fund growth (sub 17). Sub 27 (LX1 staged open): C may create its role-2 buffer before the dispute exists, for the address `["dcg21dsp", run, C, nonce]` | the recorded creator, byte 5 |
+| Staging buffer | `["dcg21stg", dispute, role]` | sub 14: C may create either role; E may create its own if C has not. Any signer may fund growth (sub 17); growth paid by the dispute party that did not create the buffer is recorded in header bytes 44..48. Sub 27 (LX1 staged open): C may create its role-2 buffer before the dispute exists, for the address `["dcg21dsp", run, C, nonce]` | the recorded non-creating party gets back exactly its recorded growth; the rest to the recorded creator, byte 5 |
 | Reveal cache | `["dcg21rc", run, kind, level, position]` | the executor, at REVEAL_NODES (sub 5) | the executor, recorded in the cache |
 
 **Parties.** `A` is a template's admitter, `P` a run's payer, `E` the run's
@@ -128,13 +128,13 @@ touched accounts is unchanged.
 | 4 open | C → dispute: rent and the challenger bond. |
 | 5 reveal nodes | E → reveal cache: rent, when it creates a cache entry. |
 | 14 stage create | the creator (C for either role, or E for its own) → the buffer: creation rent. |
-| 17 stage grow | any signer → the buffer: rent for the growth; refunded through the buffer's recorded creator at close. |
+| 17 stage grow | any signer → the buffer: rent for the growth. Growth paid by the dispute party that did not create the buffer (the run's executor key, or the dispute's challenger key) is recorded in header bytes 44..48 (u32 lamports, saturating) and refunded to that party at close; growth paid from any other key, including another wallet of a party, is a gift to the creator. |
 | 16 cache answer | none; anyone may call it. |
 | ruling (CLAIM resolution or 9 timeout) | the dispute's lamports above its rent floor (C's bond) → E on an executor win, → C on a challenger win or a neutral (moot) outcome. |
 | 12 moot | C's bond → C. E gains nothing. |
 | 10 finalize | E's bond → E, from the run, on a run that ends `FINAL`. |
 | 13 pay pot | from the run: `bond_slasher_bps` of E's bond → the `best_win` challenger, and the remainder → P. Once only (`R_PAID`). |
-| 18 close dispute | bonds have already moved. The dispute's rent → C. Each buffer's whole balance → its recorded creator (byte 5): E's buffer → E only if E created it, otherwise → C. |
+| 18 close dispute | bonds have already moved. The dispute's rent → C. For each buffer: min(recorded growth, balance) → the party that did not create it; every other lamport (creation rent, other funders' growth, pre-funding) → the recorded creator (byte 5). The same in every ending. |
 | 19 close run | the run's lamports above the receipt's rent → P. |
 | 20 close cache | the cache's rent → its recorded executor. |
 | 21 close template | the template's whole balance → A. |
@@ -157,8 +157,10 @@ silently absorbed.
   cell of the every-ending matrix (`2dfb0e0`), in both role orders.
 - Not checked: a sum over all accounts across a long random run. That is the
   run-level fuzzer's job.
-- Known, accepted: growth funders are refunded through the buffer's creator
-  (design §9, `CLOSE_DISPUTE`).
+- Growth is refunded by recorded payer (design §9, `CLOSE_DISPUTE`; R2 reviews
+  2026-10-05): a party's growth paid from its run or dispute key comes back to
+  it; growth paid from any other key goes to the creator. Buffers created
+  before this rule have zero in bytes 44..48 and close wholly to the creator.
 
 ## 3. Authority and provenance
 
