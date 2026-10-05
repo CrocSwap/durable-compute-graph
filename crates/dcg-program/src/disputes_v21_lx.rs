@@ -25,6 +25,27 @@ pub const SUB_LX_MIDPOINTS: u8 = 23;
 pub const SUB_LX_PICK: u8 = 24;
 pub const SUB_LX_OPENING: u8 = 25;
 pub const SUB_LX_OUTPUT: u8 = 26;
+/// Staged dispute open (owner decision 8a, 2026-10-04): before opening a
+/// `KIND_LX_STATE` dispute, the challenger creates, writes or closes its own
+/// staging buffer for the dispute it is about to open (the dispute address is
+/// known from run, challenger and nonce). OPEN then takes the body
+/// `FROM_STAGING`. Two checkpoint paths no longer have to fit one packet
+/// (~512 checkpoints at most before; 2,561 at K=10,240, k=4).
+pub const SUB_LX_PRESTAGE: u8 = 27;
+/// The staged OPEN body is masked by `SHA-256(domain || secret || dispute ||
+/// block:u32le)` keystream blocks; the OPEN carries `secret` (32 bytes).
+pub const LX_PRESTAGE_MASK_DOMAIN: &[u8] = b"dcg.lx.prestage.mask.v1\x00";
+
+/// XOR `bytes` with the staged-open keystream for `secret` and `dispute`
+/// (masking and unmasking are the same operation).
+pub fn prestage_mask(secret: &[u8], dispute: &Pubkey, bytes: &mut [u8]) {
+    for (block, chunk) in bytes.chunks_mut(32).enumerate() {
+        let k = crate::hash::sha256(&[LX_PRESTAGE_MASK_DOMAIN, secret, dispute.as_ref(), &(block as u32).to_le_bytes()]);
+        for (b, m) in chunk.iter_mut().zip(k.iter()) {
+            *b ^= m;
+        }
+    }
+}
 pub const KIND_LX_STATE: u8 = 3;
 pub const KIND_LX_OUTPUT: u8 = 4;
 
@@ -209,8 +230,12 @@ pub(crate) fn check_commit(
 
 /// OPEN for an LX1 run. `KIND_LX_STATE`: `pair:u32 root_lo root_hi
 /// path_lo[h*32] path_hi[h*32] params`, the checkpoint pair the challenger
-/// disputes, opened against the committed checkpoint root. `KIND_LX_OUTPUT`:
-/// no body; the challenger then owes its output claim.
+/// disputes, opened against the committed checkpoint root. The body may
+/// instead be `FROM_STAGING secret[32]`: it is then read from the
+/// challenger's staging buffer (account 5, written masked by
+/// `SUB_LX_PRESTAGE`), unmasked with `secret`, checked exactly as an inline
+/// body, and the buffer's staged length is reset so later staged claims start
+/// clean. `KIND_LX_OUTPUT`: no body; the challenger then owes its output claim.
 pub(crate) fn open(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -227,7 +252,29 @@ pub(crate) fn open(
     let root = run_root_if_open(run)?;
     match kind {
         KIND_LX_STATE => {
-            let body = &data[33..];
+            let staged_body;
+            let body: &[u8] = if data.len() == 33 + 1 + 32 && data[33] == FROM_STAGING {
+                let buffer = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+                // The dispute address before any read of the buffer (review
+                // 10-05, provenance: validate before reads or writes).
+                if Pubkey::find_program_address(&[b"dcg21dsp", run.key.as_ref(), challenger.key.as_ref(), &data[..32]], program_id).0 != *dispute.key {
+                    return Err(err(2));
+                }
+                if buffer.owner != program_id || staging_role(program_id, dispute, buffer)? != ROLE_CHALLENGER {
+                    return Err(err(29));
+                }
+                staged_body = {
+                    let b = buffer.try_borrow_data()?;
+                    let len = u32_at(&b, 40)? as usize;
+                    let mut body = b.get(STAGE_HEADER..STAGE_HEADER.checked_add(len).ok_or(err(8))?).ok_or(err(29))?.to_vec();
+                    prestage_mask(&data[34..66], dispute.key, &mut body);
+                    body
+                };
+                buffer.try_borrow_mut_data()?[40..44].copy_from_slice(&0u32.to_le_bytes());
+                &staged_body
+            } else {
+                &data[33..]
+            };
             let pair = u32_at(body, 0)? as u64;
             let positions = u64_at(&root, RR_POSITIONS)?;
             let k = u32_at(&root, RR_K)? as u64;
