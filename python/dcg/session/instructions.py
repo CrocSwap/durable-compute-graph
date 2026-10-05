@@ -8,7 +8,7 @@ from typing import Iterable
 from solders.instruction import AccountMeta, Instruction
 from solders.pubkey import Pubkey
 
-from .layout import SessionAddresses
+from .layout import FEATURE_RING_STREAM, FEATURES_KNOWN, MIN_RING_CAPACITY, SessionAddresses
 from .manifest import KernelRef
 
 
@@ -88,13 +88,25 @@ def open_session(
     input_capacity: int = 8,
     max_steps: int = 1,
     writer: Pubkey | None = None,
+    features: int = 0,
+    lanes: int = 0,
 ) -> BuiltInstruction:
+    """``features`` and ``lanes`` are v3 only: ``features`` (``FEATURE_*``)
+    selects a ring stream and/or declared rejection (the kernel's capability
+    must match), ``lanes`` the render lanes. Zero for both keeps the 178-byte
+    payload, byte-identical to sessions opened before features existed."""
     if not 0 <= session_id < 1 << 64:
         raise ValueError("session_id must fit in an unsigned 64-bit integer")
     if not 2 <= input_capacity <= (64 if wire_version == 1 else ((10 * 1024 * 1024 - 128) // 16)):
         raise ValueError("input_capacity is outside the selected wire-version bounds")
     if not 1 <= max_steps <= 8:
         raise ValueError("max_steps must be between 1 and 8")
+    if wire_version != 3 and (features or lanes):
+        raise ValueError("features and lanes need stateful wire v3")
+    if features & ~FEATURES_KNOWN or not 0 <= lanes <= 4:
+        raise ValueError("unknown feature bits or more than four lanes")
+    if features & FEATURE_RING_STREAM and input_capacity < MIN_RING_CAPACITY:
+        raise ValueError(f"a ring stream needs input_capacity >= {MIN_RING_CAPACITY}")
     requested_writer = writer or authority
     body = bytearray([wire_version])
     body.extend(session_id.to_bytes(8, "little"))
@@ -111,7 +123,7 @@ def open_session(
         body.extend(kernel.mode_version.to_bytes(2, "little"))
         body.extend(kernel.stream_root)
         body.extend(bytes(requested_writer))
-    elif wire_version == 2:
+    elif wire_version in (2, 3):
         body.extend(input_capacity.to_bytes(4, "little"))
         body.append(max_steps)
         body.extend(kernel.id)
@@ -124,6 +136,12 @@ def open_session(
         body.extend(bytes(32))  # no optional resource account
         body.extend(bytes(6))   # no resource schema
         body.extend(bytes(32))  # no resource commitment
+        if wire_version == 3:
+            body.append(0)  # headered state (no headerless primary)
+            if features:
+                body.extend((lanes, features))
+            elif lanes:
+                body.append(lanes)
     else:
         raise ValueError(f"unsupported stateful wire version {wire_version}")
     return _build(
@@ -140,8 +158,19 @@ def open_session(
     )
 
 
+def _creator_authority(wire_version: int, authority: Pubkey | None) -> tuple:
+    """v3 child creators take the session authority, signing, as account 2
+    (sessions review H1); v1 and v2 have no such slot."""
+    if wire_version != 3:
+        return ()
+    if authority is None:
+        raise ValueError("v3 child creation needs the session authority")
+    return (("authority", authority, True, False),)
+
+
 def create_stream(
-    *, program_id: Pubkey, addresses: SessionAddresses, payer: Pubkey, wire_version: int
+    *, program_id: Pubkey, addresses: SessionAddresses, payer: Pubkey, wire_version: int,
+    authority: Pubkey | None = None,
 ) -> BuiltInstruction:
     body = bytes([wire_version]) if wire_version == 1 else bytes([wire_version, 0])
     return _build(
@@ -152,6 +181,7 @@ def create_stream(
         accounts=(
             ("payer", payer, True, True),
             ("session", addresses.session, False, True),
+            *_creator_authority(wire_version, authority),
             ("input_stream", addresses.stream, False, True),
             ("system_program", SYSTEM_PROGRAM_ID, False, False),
         ),
@@ -159,7 +189,8 @@ def create_stream(
 
 
 def create_state(
-    *, program_id: Pubkey, addresses: SessionAddresses, kernel: KernelRef, payer: Pubkey, wire_version: int
+    *, program_id: Pubkey, addresses: SessionAddresses, kernel: KernelRef, payer: Pubkey, wire_version: int,
+    authority: Pubkey | None = None,
 ) -> BuiltInstruction:
     body = bytearray([wire_version, len(kernel.state_span_lengths)])
     for length in kernel.state_span_lengths:
@@ -172,6 +203,7 @@ def create_state(
         accounts=(
             ("payer", payer, True, True),
             ("session", addresses.session, False, True),
+            *_creator_authority(wire_version, authority),
             *((f"state_span_{index}", address, False, True) for index, address in enumerate(addresses.states)),
             ("system_program", SYSTEM_PROGRAM_ID, False, False),
         ),
@@ -179,15 +211,15 @@ def create_state(
 
 
 def initialize_state(
-    *, program_id: Pubkey, addresses: SessionAddresses, authority: Pubkey
+    *, program_id: Pubkey, addresses: SessionAddresses, authority: Pubkey, wire_version: int = 2
 ) -> BuiltInstruction:
-    """Initialize the v2 state spans after their bounded account allocation."""
+    """Initialize the v2 or v3 state spans after their bounded account allocation."""
 
     return _build(
         program_id=program_id,
         name="initialize_state",
         tag=TAG_CREATE_STATE,
-        body=bytes([2, STATE_OP_INITIALIZE]),
+        body=bytes([wire_version, STATE_OP_INITIALIZE]),
         accounts=(
             ("authority", authority, True, False),
             ("session", addresses.session, False, True),
@@ -197,7 +229,7 @@ def initialize_state(
 
 
 def grow_state(
-    *, program_id: Pubkey, addresses: SessionAddresses, payer: Pubkey, index: int
+    *, program_id: Pubkey, addresses: SessionAddresses, payer: Pubkey, index: int, wire_version: int = 2
 ) -> BuiltInstruction:
     """Grow one v2 span by the handler's fixed maximum of 8,192 bytes."""
 
@@ -207,7 +239,7 @@ def grow_state(
         program_id=program_id,
         name=f"grow_state_{index}",
         tag=TAG_CREATE_STATE,
-        body=bytes([2, STATE_OP_GROW, index]),
+        body=bytes([wire_version, STATE_OP_GROW, index]),
         accounts=(
             ("payer", payer, True, True),
             ("session", addresses.session, False, True),

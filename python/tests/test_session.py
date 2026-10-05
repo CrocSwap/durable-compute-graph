@@ -230,6 +230,16 @@ class SessionGoldenTests(unittest.TestCase):
                 "REFUSAL_PHASE_CURSOR": 2335,
                 "REFUSAL_PHASE_STATE_CHANGED": 2336,
             },
+            "stateful_v3.rs": {
+                **{name: code for name, code in zip(common_names, range(2321, 2335))},
+                "REFUSAL_PHASE_CURSOR": 2335,
+                "REFUSAL_PHASE_STATE_CHANGED": 2336,
+                "REFUSAL_INITIALIZATION": 2337,
+                "REFUSAL_LANE": 2338,
+                "REFUSAL_LANE_CURSOR": 2339,
+                "REFUSAL_CAPTURE_OPEN": 2340,
+                "REFUSAL_STALE_PUBLICATION": 2341,
+            },
         }
         for filename, expected in expected_by_file.items():
             source = ROOT / "crates/dcg-program/src" / filename
@@ -240,7 +250,10 @@ class SessionGoldenTests(unittest.TestCase):
                 )
             }
             self.assertEqual(observed, expected)
-        self.assertEqual(set(ACCOUNT_LAYOUTS), {1, 2})
+        self.assertEqual(set(ACCOUNT_LAYOUTS), {1, 2, 3})
+        from dcg.session.errors import REFUSAL_CLASSES, REFUSAL_TABLE
+        self.assertEqual(set(REFUSAL_CLASSES), set(REFUSAL_TABLE))
+        self.assertTrue(set(range(2321, 2342)) <= set(REFUSAL_TABLE))
 
     def test_custom_2304_with_bad_advance_meta_names_writable_role(self):
         built = advance(

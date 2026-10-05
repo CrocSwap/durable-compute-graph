@@ -94,6 +94,26 @@ class PhaseStateChangedRefused(StatefulRefusal):
     pass
 
 
+class InitializationRefused(StatefulRefusal):
+    """Stateful v3 refusal."""
+
+
+class LaneRefused(StatefulRefusal):
+    """Stateful v3 refusal."""
+
+
+class LaneCursorRefused(StatefulRefusal):
+    """Stateful v3 refusal."""
+
+
+class CaptureOpenRefused(StatefulRefusal):
+    """Stateful v3 refusal."""
+
+
+class StalePublicationRefused(StatefulRefusal):
+    """Stateful v3 refusal."""
+
+
 class WritableAccountRefused(SessionAccountRefused):
     """The refusal table's account check found a read-only required role."""
 
@@ -138,6 +158,11 @@ REFUSAL_CLASSES: dict[int, type[StatefulRefusal]] = {
     2334: KernelRefused,
     2335: PhaseCursorRefused,
     2336: PhaseStateChangedRefused,
+    2337: InitializationRefused,
+    2338: LaneRefused,
+    2339: LaneCursorRefused,
+    2340: CaptureOpenRefused,
+    2341: StalePublicationRefused,
 }
 
 REFUSAL_TABLE: dict[int, tuple[str, str, str]] = {
@@ -160,7 +185,7 @@ REFUSAL_TABLE: dict[int, tuple[str, str, str]] = {
     2323: ("AccountAliasRefused", "two account roles resolve to the same address", "derive each role from its own documented v2 PDA seed"),
     2324: ("SessionAccountRefused", "a session or child account has the wrong owner, link, PDA, or writable flag", "check the derived address, owner and parent link, and mark mutated accounts writable"),
     2325: ("LiveSessionRefused", "the session is still active or has live children", "halt the session and close its journaled child accounts first"),
-    2326: ("ResourceRefused", "the kernel, resource, width, capacity, or resource limit does not match", "compare the session manifest and bounded resource declaration with the linked kernel"),
+    2326: ("ResourceRefused", "the kernel, resource, width, capacity, or resource limit does not match", "compare the session manifest and bounded resource declaration with the linked kernel; on v3, a rejecting kernel must open rejectable (and only it), a ring needs capacity >= 128 and never grows"),
     2327: ("DuplicateInputRefused", "the write-once input slot already contains a command", "write each input cursor once"),
     2328: ("BackpressureRefused", "the input cursor is outside the allowed buffer window", "advance the session or increase capacity before writing farther ahead"),
     2329: ("CursorRefused", "the instruction cursor differs from the session cursor", "read the current cursor and rebuild the instruction with that value"),
@@ -168,9 +193,14 @@ REFUSAL_TABLE: dict[int, tuple[str, str, str]] = {
     2331: ("StateRefused", "the state account set or state cursor does not match the kernel schema", "use the session's derived state spans in manifest order"),
     2332: ("ViewRefused", "the view declaration or publication state is invalid", "match the linked view ABI and declared output range"),
     2333: ("RefundRefused", "the refund account is not the session authority or the refund would overflow", "use the authority recorded by the session as the writable refund account"),
-    2334: ("KernelRefused", "the statically linked kernel rejected its input or state", "check the kernel's declared input and state shape"),
+    2334: ("KernelRefused", "the statically linked kernel rejected its input or state", "check the kernel's declared input and state shape; on v3, only a kernel that declares rejection may reject, with a nonzero code, no output and state unchanged"),
     2335: ("PhaseCursorRefused", "the publication phase cursor is stale", "read the exact next phase cursor and resume there"),
     2336: ("PhaseStateChangedRefused", "state changed while a resumable publication phase was open", "abort that phase and start a fresh publication from the current state cursor"),
+    2337: ("InitializationRefused", "state is not (or is no longer) in the initialization phase this call needs", "finish phased initialization in order, or halt the session if a phase can never complete"),
+    2338: ("LaneRefused", "the render lane, its workspace or its scratch does not match the session's lanes", "use a lane index below the session's lane count and its derived lane accounts"),
+    2339: ("LaneCursorRefused", "the lane's capture or render cursor is stale", "read the lane record and resume at its exact cursor"),
+    2340: ("CaptureOpenRefused", "a lane is still capturing the state at the current cursor", "finish or abort the open capture before advancing"),
+    2341: ("StalePublicationRefused", "a newer state was already published to these views", "capture and render the newest cursor instead"),
 }
 
 

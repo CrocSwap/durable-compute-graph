@@ -20,6 +20,11 @@ from .errors import (
     MalformedInstruction,
     PhaseCursorRefused,
     PhaseStateChangedRefused,
+    InitializationRefused,
+    LaneRefused,
+    LaneCursorRefused,
+    CaptureOpenRefused,
+    StalePublicationRefused,
     REFUSAL_CLASSES,
     REFUSAL_TABLE,
     RefundRefused,
@@ -42,11 +47,26 @@ from .journal import (
     UnexpectedAccount,
     stateful_account_codecs,
 )
-from .layout import ACCOUNT_LAYOUTS, AccountLayout, SessionAddresses, account_layout
+from .layout import (
+    ACCOUNT_LAYOUTS,
+    FEATURE_REJECTABLE,
+    FEATURE_RING_STREAM,
+    MIN_RING_CAPACITY,
+    AccountLayout,
+    SessionAddresses,
+    SessionInfo,
+    account_layout,
+    slot_offset,
+)
 from .manifest import COUNTER_MANIFEST, KernelRef
 from .signers import SessionSigners
 
 __all__ = [
+    "FEATURE_REJECTABLE",
+    "FEATURE_RING_STREAM",
+    "MIN_RING_CAPACITY",
+    "SessionInfo",
+    "slot_offset",
     "ACCOUNT_LAYOUTS",
     "AccountAliasRefused",
     "AccountInventory",
@@ -71,6 +91,11 @@ __all__ = [
     "MalformedInstruction",
     "PhaseCursorRefused",
     "PhaseStateChangedRefused",
+    "InitializationRefused",
+    "LaneRefused",
+    "LaneCursorRefused",
+    "CaptureOpenRefused",
+    "StalePublicationRefused",
     "REFUSAL_CLASSES",
     "REFUSAL_TABLE",
     "ReconciliationReport",

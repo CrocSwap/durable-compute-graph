@@ -784,10 +784,10 @@ class AccountInventory(Inventory):
 
 
 def stateful_account_codecs(wire_version: int) -> tuple[AccountKindCodec, ...]:
-    """Header codecs for stateful v1/v2 sessions and parent-bearing children."""
+    """Header codecs for stateful v1/v2/v3 sessions and parent-bearing children."""
 
-    if wire_version not in {1, 2}:
-        raise ValueError("stateful inventory codecs support wire versions 1 and 2")
+    if wire_version not in {1, 2, 3}:
+        raise ValueError("stateful inventory codecs support wire versions 1, 2 and 3")
     version = str(wire_version).encode("ascii")
     session_kind = f"stateful_session_v{wire_version}"
 
@@ -861,7 +861,7 @@ def stateful_account_codecs(wire_version: int) -> tuple[AccountKindCodec, ...]:
             seeds_from_data=(
                 lambda data: (b"dcg-session-v1", data[20:52], data[12:20])
                 if wire_version == 1
-                else (b"dcg-session-v2", data[22:54], data[14:22])
+                else (b"dcg-session-v" + version, data[22:54], data[14:22])
             ),
             role_from_data=lambda _data: "session",
             state_from_data=session_state,

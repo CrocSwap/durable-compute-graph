@@ -49,7 +49,16 @@ from .instructions import (
     write_input as encode_write_input,
 )
 from .journal import AccountRecord, Inventory, stateful_account_codecs
-from .layout import SessionAddresses, account_layout
+from .layout import (
+    FEATURE_REJECTABLE,
+    FEATURE_RING_STREAM,
+    MAX_STREAM_WINDOW,
+    MIN_RING_CAPACITY,
+    RING_SEQUENCE_CEILING,
+    SessionAddresses,
+    SessionInfo,
+    account_layout,
+)
 from .manifest import KernelRef
 from .signers import SessionSigners
 
@@ -213,6 +222,7 @@ class Session:
         wire_version: int | None = None,
         input_capacity: int = 8,
         max_steps: int = 1,
+        ring: bool = False,
     ):
         self.kernel = kernel
         self.transport = transport
@@ -222,8 +232,15 @@ class Session:
         if not 0 <= self.session_id < 1 << 64:
             raise ValueError("session_id must fit in an unsigned 64-bit integer")
         self.wire_version = kernel.mode_version if wire_version is None else wire_version
-        if self.wire_version not in {1, 2}:
-            raise ValueError("stateful session wire_version must be 1 or 2")
+        if self.wire_version not in {1, 2, 3}:
+            raise ValueError("stateful session wire_version must be 1, 2 or 3")
+        if (ring or kernel.rejects_input) and self.wire_version != 3:
+            raise ValueError("ring streams and rejecting kernels need stateful wire v3")
+        # v3 features (DCG design session-reject-and-ring-v1): the rejectable
+        # flag is the kernel's declared capability, never a caller choice.
+        self.features = (FEATURE_RING_STREAM if ring else 0) | (FEATURE_REJECTABLE if kernel.rejects_input else 0)
+        if ring and input_capacity < MIN_RING_CAPACITY:
+            raise ValueError(f"a ring stream needs input_capacity >= {MIN_RING_CAPACITY}")
         if kernel.mode_version != self.wire_version:
             raise ValueError("kernel mode version must match the selected stateful wire version")
         if not 2 <= input_capacity <= (64 if self.wire_version == 1 else ((10 * 1024 * 1024 - 128) // 16)):
@@ -255,7 +272,7 @@ class Session:
                     kind=f"stateful_session_v{self.wire_version}",
                     role="session",
                     seeds=(self.layout.session_seed, bytes(signers.authority.pubkey()), self.session_id.to_bytes(8, "little")),
-                    expected_size=672 if self.wire_version == 1 else 1280,
+                    expected_size=672 if self.wire_version == 1 else 1280,  # v2 and v3
                     payer=signers.public_key,
                 ),
                 AccountRecord.derive(
@@ -356,6 +373,7 @@ class Session:
                 input_capacity=self.input_capacity,
                 max_steps=self.max_steps,
                 writer=self.signers.writer.pubkey(),
+                features=self.features,
             ),
             expected=((self.addresses.session, True),),
         )
@@ -366,6 +384,7 @@ class Session:
                 addresses=self.addresses,
                 payer=self.signers.payer.pubkey(),
                 wire_version=self.wire_version,
+                authority=self.signers.authority.pubkey(),
             ),
             expected=((self.addresses.stream, True),),
         )
@@ -377,12 +396,13 @@ class Session:
                 kernel=self.kernel,
                 payer=self.signers.payer.pubkey(),
                 wire_version=self.wire_version,
+                authority=self.signers.authority.pubkey(),
             ),
             expected=tuple((address, True) for address in self.addresses.states),
         )
         for address in self.addresses.states:
             await self._mark_inventory_live(str(address))
-        if self.wire_version == 2:
+        if self.wire_version in (2, 3):
             for index, length in enumerate(self.kernel.state_span_lengths):
                 for _offset in range(min(length, 8192), length, 8192):
                     await self._send(
@@ -391,6 +411,7 @@ class Session:
                             addresses=self.addresses,
                             payer=self.signers.payer.pubkey(),
                             index=index,
+                            wire_version=self.wire_version,
                         ),
                         expected=((self.addresses.states[index], True),),
                     )
@@ -399,6 +420,7 @@ class Session:
                     program_id=self.program_id,
                     addresses=self.addresses,
                     authority=self.signers.authority.pubkey(),
+                    wire_version=self.wire_version,
                 ),
                 expected=tuple((address, True) for address in self.addresses.states),
             )
@@ -407,7 +429,12 @@ class Session:
 
     async def write_input(self, value: int | bytes) -> int:
         self._require_open()
-        if self._write_cursor >= self.input_capacity:
+        if self.ring:
+            # A ring never fills; writes are bounded by the 64-input window
+            # ahead of the cursor and the sequence ceiling.
+            if self._write_cursor - self.cursor >= MAX_STREAM_WINDOW or self._write_cursor >= RING_SEQUENCE_CEILING:
+                raise ValueError("advance before writing more: the ring's write window is full")
+        elif self._write_cursor >= self.input_capacity:
             raise ValueError("input stream is full; choose a larger input_capacity before opening")
         if self.kernel.input_codec == "u8":
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 255:
@@ -436,7 +463,7 @@ class Session:
         self._require_open()
         if not 1 <= n <= self.max_steps:
             raise ValueError(f"advance step count must be between 1 and {self.max_steps}")
-        if self.cursor + n > self.input_capacity:
+        if not self.ring and self.cursor + n > self.input_capacity:
             raise ValueError("advance would move beyond the declared input-stream capacity")
         if self._write_cursor < self.cursor + n:
             raise ValueError(f"write {self.cursor + n - self._write_cursor} more input value(s) before advancing")
@@ -455,6 +482,31 @@ class Session:
         )
         self.cursor += n
         return start
+
+    @property
+    def ring(self) -> bool:
+        return bool(self.features & FEATURE_RING_STREAM)
+
+    @property
+    def rejectable(self) -> bool:
+        return bool(self.features & FEATURE_REJECTABLE)
+
+    async def info(self) -> SessionInfo:
+        """The session's on-chain status, cursor, features and rejection
+        counters (v3 only)."""
+        if self.wire_version != 3:
+            raise ValueError("session info reads the v3 record")
+        session, stream = await self.transport.endpoint.get_multiple_accounts(
+            (str(self.addresses.session), str(self.addresses.stream)), Commitment.CONFIRMED
+        )
+        if session is None:
+            raise RuntimeError("session account does not exist")
+        return SessionInfo.decode(session.data, None if stream is None else stream.data)
+
+    async def explain(self) -> str:
+        """Plain-language summary of the live session, including whether its
+        kernel can reject inputs (v3)."""
+        return (await self.info()).explain()
 
     async def read_state(self) -> CounterState | bytes:
         self._require_open()
