@@ -192,7 +192,12 @@ pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     &kernel::test_kernel::MANIFEST_APP
 }
 
-#[cfg(not(feature = "test-kernel"))]
+#[cfg(all(not(feature = "test-kernel"), feature = "example-kernels"))]
+pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
+    &kernel::test_kernel::ALPHA_MANIFEST_APP
+}
+
+#[cfg(all(not(feature = "test-kernel"), not(feature = "example-kernels")))]
 pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     static EMPTY_KERNELS: [&'static dyn kernel::Kernel; 0] = [];
     static EMPTY_REPLAYS: [kernel::OptimisticReplayBinding; 0] = [];

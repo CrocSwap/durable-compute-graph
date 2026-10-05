@@ -1456,7 +1456,7 @@ impl<'a> ClosedRegistryAdapter<'a> {
     }
 }
 
-#[cfg(feature = "test-kernel")]
+#[cfg(any(feature = "test-kernel", feature = "example-kernels"))]
 pub mod test_kernel {
     use super::*;
 
@@ -1647,6 +1647,20 @@ pub mod test_kernel {
     #[cfg(feature = "graph-v21")]
     pub static KERNELS: [&'static dyn Kernel; 3] =
         [&BYTE_SUM, &SHA256_CONCAT, &crate::disputes_v21::lx::toy::TOY_KERNEL];
+    /// The alpha shared program's manifest: the example kernels only, with no
+    /// replay or revision-8 form bindings (owner 10-05, R2 review B-M2).
+    #[cfg(feature = "example-kernels")]
+    pub static ALPHA_MANIFEST_APP: ApplicationManifest = ApplicationManifest {
+        application_id: b"dcg-alpha/1",
+        version: 1,
+        kernels: &KERNELS,
+        optimistic_replays: &[],
+        legacy_forms: &[],
+        require_legacy_form_binding: false,
+        admission_scan: AdmissionScan::Full,
+        hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
+    };
     pub static REPLAY_BINDINGS: [OptimisticReplayBinding; 1] = [OptimisticReplayBinding {
         mode: MODE_OPTIMISTIC_V1,
         replay: &BYTE_SUM,
@@ -2124,6 +2138,12 @@ mod tests {
         }));
         let kernels: &'static [&'static dyn Kernel] = Box::leak(Box::new([&*Box::leak(Box::new(CapKernel(manifest))) as &dyn Kernel]));
         ApplicationManifest { kernels, ..INVALID_LIMIT_APP }.validate()
+    }
+
+    #[cfg(feature = "example-kernels")]
+    #[test]
+    fn the_alpha_manifest_validates() {
+        assert_eq!(test_kernel::ALPHA_MANIFEST_APP.validate(), Ok(()));
     }
 
     #[test]

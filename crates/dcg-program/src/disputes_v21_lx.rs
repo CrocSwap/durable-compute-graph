@@ -602,7 +602,7 @@ pub(crate) fn output(
 /// the start's first chunk chosen by h, as the Python toy's `by_value`) each
 /// start reads two template constant chunks (design §13), as the Python toy's
 /// `weights=True`.
-#[cfg(feature = "test-kernel")]
+#[cfg(any(feature = "test-kernel", feature = "example-kernels"))]
 pub mod toy {
     use super::*;
     use crate::kernel::{Kernel, KernelError, KernelId, KernelManifest, ModeId, PortLayout, ResourceLimits, VersionedId};
