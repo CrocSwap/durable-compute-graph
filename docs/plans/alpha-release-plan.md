@@ -139,7 +139,7 @@ DCG keeps no model code (owner decision, 09-26).
 **C3. Stateful kernel kit.** The E2 conformance harness extended to stateful kernels: the Rust transition and its host reference agree on generated inputs, including state at its size limits and every refusal.
 
 **C4. Lanes (throughput); an alpha gate.** Lanes (`docs/design/stateful-session-lanes-v1.md`, owner decisions recorded) let independent parts of a session advance in parallel. They are consensus mode's main throughput lever.
-- **The alpha's hook (owner, 2026-10-03):** Doom runs on DCG at 3.0 frames per second on the shared testnet program.
+- **The alpha's hook (owner, 2026-10-03; program clarified 2026-10-05):** Doom runs on DCG at 3.0 frames per second on testnet, on **Doom's own program** built on the reviewed DCG runtime (the consensus runtime is a library embedded in each application's program, owner decision 2026-10-03; the shared program does not route sessions).
 - Lanes are on the critical path, together with whatever else that target needs: CoW views, inputs-in-step and TPU sends (DCG roadmap, the 10-01 owner goal).
 - Today's measured floor is about 0.32 s of serial execution plus about 0.25 s of visibility per frame. Reaching 3.0 frames per second means parallel render work per frame, not only faster sends.
 
@@ -169,7 +169,7 @@ The alpha ships when all of these hold:
    - **Consensus:** writes a stateful kernel, runs a session of a few thousand transactions to completion with the sequencer (including a resend after a dropped transaction), reads the result, and closes the session.
 5. **A custom kernel** passes the kernel kit's conformance harness and wins an honest dispute on testnet.
 6. **Release terms** are published.
-7. **Doom on DCG runs at 3.0 frames per second** on the shared testnet program (*measured*, sustained over a session of at least 1,000 frames), with lanes reviewed.
+7. **Doom on DCG runs at 3.0 frames per second** on testnet, on Doom's own program built on the reviewed DCG runtime (*measured*, sustained over a session of at least 1,000 frames), with lanes reviewed (owner 2026-10-05: Doom stays on its own program).
 
 ## Owner decisions (2026-10-03)
 
