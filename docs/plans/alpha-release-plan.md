@@ -124,6 +124,7 @@ DCG keeps no model code (owner decision, 09-26).
 - `dcg dev`: a local validator, the program deployed, a funded payer.
 - `dcg build`: a reproducible program image with its receipt.
 - Today these take a pinned SDK path, wrapper environment variables and the Basanos runbook's deploy tools.
+- *Status (2026-10-05):* built (`docs/dev-commands.md`), plus `dcg verify`. `dcg build --alpha` reproduces the deployed alpha image `8d39d440…`; the examples run unchanged against `dcg dev`.
 
 **E7. Docs.**
 - Getting started for v2.1, replacing today's v2.0-era guide.

@@ -1,5 +1,7 @@
 # Getting started with DCG
 
+> **For the alpha, start with [`dev-commands.md`](dev-commands.md) (`dcg dev`, `dcg build`, `dcg verify`), [`session-quickstart.md`](session-quickstart.md) and [`services.md`](services.md).** This page describes the older v2.0-era kernel path and will be replaced (alpha plan E7).
+
 This first-hour path follows the static kernel contract and app manifest, then
 runs tests against the extracted revision-8 handlers. The optional real-SBF
 path at the end is a test-only mechanics demonstration using retained
