@@ -1060,27 +1060,33 @@ fn stage_create(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     Ok(())
 }
 
-// 27: [challenger(s,w), run, template, dispute, buffer(w), system] nonce[32]
-// op:u8, then for op 0 (create) size:u32, op 1 (write) offset:u32 bytes,
-// op 2 (close). The challenger's staging buffer for a dispute it has not
-// opened yet: `dispute` is the address ["dcg21dsp", run, challenger, nonce]
-// and must still be unopened (empty). An LX1 OPEN then reads its body from
-// this buffer; after the open it is the dispute's ordinary challenger buffer
-// (grown by sub 17, written by sub 15, closed with the dispute by sub 18). A
-// buffer whose dispute was never opened is closed here, its rent to the
-// challenger. No dispute state, bond or deadline changes until OPEN.
+// 27: staged dispute open (owner decision 8a). The challenger's staging
+// buffer for a dispute it has not opened yet: `dispute` is the address
+// ["dcg21dsp", run, challenger, nonce] and must still be unopened (empty).
+// - op 0 create `size:u32`, op 1 write `offset:u32 bytes`:
+//   [challenger(s,w), run, template, dispute, buffer(w), system] nonce[32] op;
+//   the challenger alone, while the run is committed and in its window.
+// - op 2 close: [caller(s), run, template, dispute, buffer(w), challenger(w)]
+//   nonce[32] op; by the challenger at any time, or by anyone once the run
+//   can no longer be disputed (final, refuted, a receipt, or gone). The rent
+//   returns to the challenger (review 10-05: a buffer must never strand once
+//   its run is closed into a receipt).
+// The staged bytes are masked (`LX_PRESTAGE_MASK_DOMAIN`) by a secret that only
+// the OPEN carries, so the buffer does not reveal the divergence before the
+// open lands (review 10-05: a copycat could otherwise open first and take
+// the first-divergence reward). An LX1 OPEN reads its body from this buffer;
+// after the open it is the dispute's ordinary challenger buffer (grown by
+// sub 17, written by sub 15, closed with the dispute by sub 18). No dispute
+// state, bond or deadline changes until OPEN.
 fn prestage(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [challenger, run, tmpl, dispute, buffer, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
-    if !challenger.is_signer {
+    let [signer, run, tmpl, dispute, buffer, last, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    if !signer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
-    }
-    let t = template(program_id, tmpl)?;
-    run_checked(program_id, run, tmpl)?;
-    if t.lx.is_none() {
-        return Err(err(10)); // only an LX1 open reads a staged body
     }
     let nonce = data.get(0..32).ok_or(err(1))?;
     let op = *data.get(32).ok_or(err(1))?;
+    // op 2 names the challenger in account 5; ops 0 and 1 are signed by it.
+    let challenger = if op == 2 { last } else { signer };
     if Pubkey::find_program_address(&[b"dcg21dsp", run.key.as_ref(), challenger.key.as_ref(), nonce], program_id).0 != *dispute.key {
         return Err(err(2));
     }
@@ -1090,20 +1096,30 @@ fn prestage(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     if Pubkey::find_program_address(&[b"dcg21stg", dispute.key.as_ref(), &[ROLE_CHALLENGER]], program_id).0 != *buffer.key {
         return Err(err(29));
     }
+    if op == 2 {
+        if data.len() != 33 || buffer.owner != program_id || staging_role(program_id, dispute, buffer)? != ROLE_CHALLENGER {
+            return Err(err(29));
+        }
+        if signer.key != challenger.key && disputable(program_id, run)? {
+            return Err(err(37));
+        }
+        return close_into(buffer, challenger);
+    }
+    let t = template(program_id, tmpl)?;
+    run_checked(program_id, run, tmpl)?;
+    if t.lx.is_none() {
+        return Err(err(10)); // only an LX1 open reads a staged body
+    }
     match op {
         0 => {
             let size = u32_at(data, 33)? as usize;
             if data.len() != 37 || size == 0 || size > CREATE_STAGE {
                 return Err(err(29));
             }
-            {
-                // Staging for a dispute that can no longer open is refused.
-                let r = run.try_borrow_data()?;
-                if r[R_STATUS] != RUN_COMMITTED || now()? > u64_at(&r, R_DEADLINE)? {
-                    return Err(err(9));
-                }
+            if !disputable(program_id, run)? {
+                return Err(err(9)); // staging for a dispute that can no longer open
             }
-            create_pda(program_id, challenger, buffer, system, &[b"dcg21stg", dispute.key.as_ref(), &[ROLE_CHALLENGER]], STAGE_HEADER + size)?;
+            create_pda(program_id, challenger, buffer, system_of(last)?, &[b"dcg21stg", dispute.key.as_ref(), &[ROLE_CHALLENGER]], STAGE_HEADER + size)?;
             let mut b = buffer.try_borrow_mut_data()?;
             b[0..4].copy_from_slice(b"D21S");
             b[4] = ROLE_CHALLENGER;
@@ -1111,15 +1127,9 @@ fn prestage(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
             b[8..40].copy_from_slice(dispute.key.as_ref());
             Ok(())
         }
-        1 | 2 => {
+        1 => {
             if buffer.owner != program_id || staging_role(program_id, dispute, buffer)? != ROLE_CHALLENGER {
                 return Err(err(29));
-            }
-            if op == 2 {
-                if data.len() != 33 || buffer.try_borrow_data()?[5] != 0 {
-                    return Err(err(29));
-                }
-                return close_into(buffer, challenger);
             }
             let offset = u32_at(data, 33)? as usize;
             let bytes = data.get(37..).ok_or(err(1))?;
@@ -1135,6 +1145,27 @@ fn prestage(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         }
         _ => Err(err(29)),
     }
+}
+
+fn system_of<'a, 'b>(account: &'a AccountInfo<'b>) -> Result<&'a AccountInfo<'b>, ProgramError> {
+    if *account.key != solana_program::system_program::id() {
+        return Err(err(29));
+    }
+    Ok(account)
+}
+
+/// Whether a new dispute could still open on `run`: a live run record,
+/// committed, inside its challenge window. A run that is final, refuted, a
+/// receipt or gone cannot be disputed again.
+fn disputable(program_id: &Pubkey, run: &AccountInfo) -> Result<bool, ProgramError> {
+    if run.owner != program_id || run.data_is_empty() {
+        return Ok(false);
+    }
+    let r = run.try_borrow_data()?;
+    if r.len() < R_REFS || &r[0..4] != b"D21R" {
+        return Ok(false); // a receipt (D21P)
+    }
+    Ok(r[R_STATUS] == RUN_COMMITTED && now()? <= u64_at(&r, R_DEADLINE)?)
 }
 
 // 17: [funder(s,w), run, template, dispute, buffer(w), system] add:u32 (at most

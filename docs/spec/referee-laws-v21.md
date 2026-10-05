@@ -32,7 +32,7 @@ Uses:
 | Run | `["dcg21run", run_id, payer]` | payer (sub 2) | the run payer |
 | Receipt | the run's own address, after sub 19 | the run, shrunk | the run payer |
 | Dispute | `["dcg21dsp", run, challenger, nonce]` | challenger (sub 4) | the challenger |
-| Staging buffer | `["dcg21stg", dispute, role]` | sub 14: C may create either role; E may create its own if C has not. Any signer may fund growth (sub 17) | the recorded creator, byte 5 |
+| Staging buffer | `["dcg21stg", dispute, role]` | sub 14: C may create either role; E may create its own if C has not. Any signer may fund growth (sub 17). Sub 27 (LX1 staged open): C may create its role-2 buffer before the dispute exists, for the address `["dcg21dsp", run, C, nonce]` | the recorded creator, byte 5 |
 | Reveal cache | `["dcg21rc", run, kind, level, position]` | the executor, at REVEAL_NODES (sub 5) | the executor, recorded in the cache |
 
 **Parties.** `A` is a template's admitter, `P` a run's payer, `E` the run's
@@ -233,7 +233,10 @@ and nobody can revive a phase once it has expired.
   most `challenge_window + D(N)` after commit (design §10.2), where `N` counts
   the opens.
 - Every dispute, run, cache and staging account has a permissionless route
-  to close once its run settles (§7). A template closes only with its
+  to close once its run settles (§7). A buffer staged for a dispute that
+  never opened (sub 27) closes by sub 27 op 2: by its challenger at any time,
+  or by anyone once its run is final, refuted, a receipt or gone; its rent
+  returns to the challenger. A template closes only with its
   admitter's signature, once its active-run count is zero; until then its
   rent is the admitter's own choice to leave in place.
 
@@ -293,6 +296,8 @@ an answer here. A new instruction is not complete without one.
 | 18–20 closes | anyone | nothing; rent goes to recorded payers |
 | 1 create template | any admitter | its own address only; no control of another payer's template |
 | 4 open | any challenger | a place in the sequence order; the first win becomes `best_win`. This is the intended reward for finding the first divergence |
+| 27 pre-open staging (create, write) | the challenger only (the dispute address is derived from the signer) | nothing: no dispute, bond, sequence or deadline exists until the open. The staged body is masked by a secret that only the open carries, so a watcher learns nothing it could open with first; front-running the open itself is the same race as an inline open |
+| 27 op 2 close of an unopened buffer | the challenger any time; anyone once the run cannot be disputed | nothing; the rent goes to the challenger |
 | 21, 22 retire, close template | the recorded admitter only | — |
 
 **Catches.** A pot paid to whoever settles first. A ruling that changes with

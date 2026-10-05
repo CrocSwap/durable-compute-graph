@@ -12,6 +12,7 @@ Parties are callables, so an application plugs in its executor service:
 from __future__ import annotations
 
 import hashlib
+import os
 import struct
 import time
 from dataclasses import dataclass
@@ -31,6 +32,19 @@ KIND_LX_STATE, KIND_LX_OUTPUT = 3, 4
 # An inline OPEN body above this size does not fit one packet with the open's
 # accounts and signature; it is staged first (tag 227 sub 27, decision 8a).
 INLINE_OPEN_MAX = 800
+PRESTAGE_MASK_DOMAIN = b"dcg.lx.prestage.mask.v1\x00"
+
+
+def prestage_mask(secret: bytes, dispute: Pubkey, data: bytes) -> bytes:
+    """XOR with the staged-open keystream (DCG `lx::prestage_mask`): blocks
+    SHA-256(domain || secret || dispute || block:u32le). Masking and
+    unmasking are the same."""
+    out = bytearray(data)
+    for block in range(0, len(out), 32):
+        k = hashlib.sha256(PRESTAGE_MASK_DOMAIN + secret + bytes(dispute) + struct.pack("<I", block // 32)).digest()
+        for i in range(min(32, len(out) - block)):
+            out[block + i] ^= k[i]
+    return bytes(out)
 LX_TAIL_MAGIC = b"DLX1"
 PARAMS_DOMAIN = b"dcg.lx.params.v1\x00"
 RUN_ROOT_BYTES = 176
@@ -138,20 +152,33 @@ class LxClient(DisputeClient):
         return buffer
 
     def lx_prestage(self, run: Pubkey, template: Pubkey, dispute: Pubkey, nonce: bytes, body: bytes,
-                    challenger: Keypair) -> Pubkey:
-        """Stage an OPEN body (without its kind byte) in the challenger's
-        buffer for the dispute it is about to open (sub 27: op 0 create, op 1
-        write). OPEN then reads it with the body byte FROM_STAGING."""
-        if not 0 < len(body) <= CREATE_STAGE:
+                    challenger: Keypair, secret: bytes) -> Pubkey:
+        """Stage an OPEN body (without its kind byte), masked with `secret`, in
+        the challenger's buffer for the dispute it is about to open (sub 27:
+        op 0 create, op 1 write). OPEN then reads it with `FROM_STAGING
+        secret`; until then the buffer does not reveal the body."""
+        if not 0 < len(body) <= CREATE_STAGE or len(secret) != 32:
             raise ValueError(f"staged open body of {len(body)} bytes")
         buffer = self.pda(b"dcg21stg", bytes(dispute), bytes([ROLE_CHALLENGER]))
+        masked = prestage_mask(secret, dispute, body)
         metas = [AccountMeta(challenger.pubkey(), True, True), AccountMeta(run, False, False),
                  AccountMeta(template, False, False), AccountMeta(dispute, False, False),
                  AccountMeta(buffer, False, True), AccountMeta(SYSTEM, False, False)]
         self._send("lx_prestage", nonce + bytes([0]) + struct.pack("<I", len(body)), metas, [challenger])
-        self._send_many([("lx_prestage", nonce + bytes([1]) + struct.pack("<I", at) + body[at:at + STAGE_PIECE],
-                          metas, [challenger]) for at in range(0, len(body), STAGE_PIECE)])
+        self._send_many([("lx_prestage", nonce + bytes([1]) + struct.pack("<I", at) + masked[at:at + STAGE_PIECE],
+                          metas, [challenger]) for at in range(0, len(masked), STAGE_PIECE)])
         return buffer
+
+    def lx_prestage_close(self, run: Pubkey, template: Pubkey, dispute: Pubkey, nonce: bytes,
+                          challenger: Pubkey, caller: Keypair) -> None:
+        """Close an unopened dispute's staged buffer (sub 27 op 2), rent to
+        the challenger: by the challenger at any time, by anyone once the run
+        can no longer be disputed."""
+        buffer = self.pda(b"dcg21stg", bytes(dispute), bytes([ROLE_CHALLENGER]))
+        self._send("lx_prestage", nonce + bytes([2]),
+                   [AccountMeta(caller.pubkey(), True, True), AccountMeta(run, False, False),
+                    AccountMeta(template, False, False), AccountMeta(dispute, False, False),
+                    AccountMeta(buffer, False, True), AccountMeta(challenger, False, True)], [caller])
 
     def lx_play(self, run: Pubkey, template: Pubkey, *, coordinates: Sequence[int], roots: Sequence[bytes],
                 levels: list[list[bytes]], pair: int, params: bytes, arity: int,
@@ -174,9 +201,15 @@ class LxClient(DisputeClient):
                       AccountMeta(template, False, False), AccountMeta(dispute, False, True),
                       AccountMeta(SYSTEM, False, False)]
         if staged_open if staged_open is not None else len(body) > INLINE_OPEN_MAX:
-            buffer = self.lx_prestage(run, template, dispute, dispute_nonce, body[1:], challenger)
-            self._send("open", dispute_nonce + bytes([KIND_LX_STATE, FROM_STAGING]),
-                       open_metas + [AccountMeta(buffer, False, True)], [challenger])
+            secret = os.urandom(32)
+            buffer = self.lx_prestage(run, template, dispute, dispute_nonce, body[1:], challenger, secret)
+            try:
+                self._send("open", dispute_nonce + bytes([KIND_LX_STATE, FROM_STAGING]) + secret,
+                           open_metas + [AccountMeta(buffer, False, True)], [challenger])
+            except Exception:
+                # The open failed: recover the buffer's rent, then report.
+                self.lx_prestage_close(run, template, dispute, dispute_nonce, challenger.pubkey(), challenger)
+                raise
             log(f"  open staged ({len(body) - 1} bytes)")
         else:
             self._send("open", dispute_nonce + body, open_metas, [challenger])
