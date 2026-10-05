@@ -2387,12 +2387,19 @@ impl Fuzz {
             Some("authority began phased init on a one-call kernel")
         } else if self.p.reject
             && m.slots.get(m.cursor as usize).and_then(|s| s.as_ref()).is_some_and(|c| {
-                matches!(c[0], app::V3_REJECT_DIRTY_COMMAND | app::V3_REJECT_ZERO_COMMAND)
+                matches!(
+                    c[0],
+                    app::V3_REJECT_DIRTY_COMMAND
+                        | app::V3_REJECT_ZERO_COMMAND
+                        | app::V3_REJECT_HALT_BEFORE_COMMAND
+                        | app::V3_REJECT_HALT_AFTER_COMMAND
+                )
             })
         {
-            // A buggy rejection refuses by design; a plain rejected input at
-            // the cursor (0xEE) must still advance, which this oracle checks.
-            Some("buggy rejection at the cursor (refuses by design)")
+            // A buggy rejection refuses and a halt command halts, by design; a
+            // plain rejected input at the cursor (0xEE) must still advance and
+            // publish, which this oracle checks.
+            Some("buggy rejection or halt command at the cursor (by design)")
         } else {
             None
         };
