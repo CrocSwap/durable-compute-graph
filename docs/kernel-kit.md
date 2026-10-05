@@ -119,7 +119,11 @@ and not a copy of it:
 - For stateful kernels: the initial state for the declared spans, and
   refusal for other splits.
 - For each transition: whether the runtime accepts it, and if it does, the
-  disposition, code, next state and output.
+  disposition, code and next state, plus the output for `continue` and
+  `halt_after`.
+- A STEP kernel whose name is a built-in kernel or reduction is reported as a
+  disagreement: the referee rules on the built-in first and never runs the app
+  kernel. `step_kernel` refuses such names.
 
 Error kinds are reported but not compared, because the program treats every
 kernel error alike.
@@ -148,6 +152,15 @@ mirror bugs:
 6. a missing capability.
 
 ## What the kit does not check
+
+- The server passes zero account keys and owners, binds invocation state per
+  call (the program binds once per multi-step advance), and initialises with
+  no resource accounts. A kernel that reads keys, caches across the steps of
+  one advance, or uses resources is checked only partly.
+- `@step_kernel` registers into one process-wide registry; import only the
+  mirrors of kernels your image has.
+- Set `DCG_REQUIRE_KERNEL_CONFORM=1` in CI so a missing server fails the kit
+  tests instead of skipping them.
 
 - Account plumbing, session admission, the per-advance compute budget and the
   STEP template's arity are not checked. They belong to the program and are

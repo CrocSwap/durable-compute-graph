@@ -122,7 +122,17 @@ impl KernelDecl {
         let m = self.manifest;
         assert!(m.input.id.id != 0 && m.input.id.version != 0, "declare the input layout");
         assert!(m.output.id.id != 0 && m.output.id.version != 0, "declare the output layout");
-        assert!(m.output.max_bytes != 0, "a kernel has a nonzero output limit");
+        assert!(m.input.max_bytes != 0 && m.output.max_bytes != 0, "a kernel has nonzero port limits");
+        assert!(m.resources.max_operations != 0, "a kernel allows at least one operation");
+        let mut i = 0;
+        let mut consensus_v3 = false;
+        while i < m.modes.len() {
+            consensus_v3 |= m.modes[i].id == crate::stateful::v3::MODE_CONSENSUS_V3.id
+                && m.modes[i].version == crate::stateful::v3::MODE_CONSENSUS_V3.version;
+            i += 1;
+        }
+        assert!(!consensus_v3 || m.state.is_some(), "a consensus-v3 kernel declares its state");
+        assert!(!m.capabilities.rejects_input() || m.state.is_some(), "only a stateful kernel rejects inputs");
         assert!(!m.modes.is_empty(), "a kernel declares at least one mode");
         assert!(m.resources.max_compute_units != 0, "declare the compute ceiling");
         assert!(
@@ -244,7 +254,8 @@ pub mod conformance {
     //! empty. Requests:
     //!
     //! - `manifest <id> <semver> <abi>`
-    //! - `step <id> <semver> <abi> <input>...` (zero or more input spans)
+    //! - `step <id> <semver> <abi> <input>...` (zero or more input spans;
+    //!   `builtin` for a built-in kernel or reduction name)
     //! - `init <id> <semver> <abi> <span lengths, comma separated>`
     //! - `advance <id> <semver> <abi> <rejectable 0|1> <span lengths> <state> <input>`
     //!
@@ -300,6 +311,10 @@ pub mod conformance {
         let av: u16 = av.parse().map_err(|_| "bad ABI version")?;
         match *verb {
             "manifest" => manifest(registry, id, sv, av),
+            // A built-in reduction or kernel name shadows any application
+            // kernel: the referee rules on the built-in (or for the
+            // challenger at another version) before the manifest is read.
+            "step" if crate::kernel::is_builtin_kernel_name(&id.0) => Ok("builtin".into()),
             "step" => {
                 let inputs = rest.iter().map(|w| unhex(w)).collect::<Result<Vec<_>, _>>()?;
                 Ok(match step_kernel_call(registry.app, id, sv, av, &inputs) {
@@ -336,7 +351,8 @@ pub mod conformance {
         })
     }
 
-    /// `ok key=value ...` with the declared limits, or `unknown`.
+    /// `ok key=value ...` with the declared limits (port/resource), or
+    /// `unknown`.
     fn manifest(registry: &Registry<'_>, id: KernelId, sv: u16, av: u16) -> Result<String, String> {
         let stateful = stateful(registry, id, sv, av);
         let m = match (registry.app.resolve(id, sv, av), stateful) {
@@ -346,10 +362,13 @@ pub mod conformance {
         };
         let modes: Vec<String> = m.modes.iter().map(|m| format!("{:08x}.{}", m.id, m.version)).collect();
         Ok(format!(
-            "ok input={} output={} state={} operations={} compute={} capabilities={} modes={} stateful={}",
+            "ok input={}/{} output={}/{} state={}/{} operations={} compute={} capabilities={} modes={} stateful={}",
             m.input.max_bytes,
+            m.resources.max_input_bytes,
             m.output.max_bytes,
+            m.resources.max_output_bytes,
             m.state.map_or("-".to_string(), |s| s.max_bytes.to_string()),
+            m.resources.max_state_bytes,
             m.resources.max_operations,
             m.resources.max_compute_units,
             m.capabilities.0,

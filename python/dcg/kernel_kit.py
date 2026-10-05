@@ -94,9 +94,11 @@ class KernelDecl:
     def manifest_line(self, stateful: bool) -> str:
         """The server's ``manifest`` answer this declaration implies."""
         modes = ",".join(f"{i:08x}.{v}" for i, v in self.modes) or "-"
-        state = "-" if self.max_state_bytes is None else str(self.max_state_bytes)
+        # KernelDecl makes each port limit its resource limit too.
+        state = "-/0" if self.max_state_bytes is None else f"{self.max_state_bytes}/{self.max_state_bytes}"
         return (
-            f"ok input={self.max_input_bytes} output={self.max_output_bytes} state={state} "
+            f"ok input={self.max_input_bytes}/{self.max_input_bytes} "
+            f"output={self.max_output_bytes}/{self.max_output_bytes} state={state} "
             f"operations={self.max_operations} compute={self.max_compute_units} "
             f"capabilities={int(self.rejects_input)} modes={modes} stateful={int(stateful)}"
         )
@@ -118,6 +120,14 @@ class StepMirror:
         if not isinstance(out, (bytes, bytearray)):
             raise TypeError("a STEP mirror returns bytes")
         return [bytes(out)]
+
+
+def _is_builtin(kid: bytes) -> bool:
+    """Whether an id names a built-in v2.1 reduction or kernel, which shadows
+    any application kernel of that id (``is_builtin_kernel_name``)."""
+    from dcg.disputes_v21 import reductions, run
+
+    return reductions.lookup(kid) is not None or run.replay_known(kid)
 
 
 #: STEP mirrors by (16-byte id, semantic version, ABI version), as the program
@@ -150,6 +160,9 @@ def step_kernel(
         semantic_version=semantic_version,
         abi_version=abi_version,
     )
+
+    if _is_builtin(decl.id):
+        raise ValueError(f"{name} is a built-in kernel or reduction name; the referee never runs an app kernel by it")
 
     def wrap(fn: Callable[[list[bytes]], bytes]) -> StepMirror:
         mirror = StepMirror(decl, fn)
@@ -361,8 +374,13 @@ def check_step(rust: RustKernels, mirror: StepMirror, cases: Iterable[list[bytes
             want = "output " + _hex(mirror(inputs)[0])
         except ValueError as e:
             want = "refused " + getattr(e, "kind", "ValueError")
+        except Exception as e:  # the referee catches ValueError only
+            want = f"mirror raised {type(e).__name__}"
         kind = got.split()[0]
         report.saw(kind)
+        if kind == "builtin":
+            report.disagreements.append("the id is a built-in kernel name: the referee never runs this kernel")
+            break
         same = got == want if kind == "output" else want.startswith("refused") and kind == "refused"
         if not same:
             sizes = [len(v) for v in inputs]
@@ -386,6 +404,8 @@ def _states(mirror: StatefulMirror, initial: bytes, rng: random.Random) -> list[
 
 
 def _rust_advance(answer: str) -> tuple[bool, Outcome | None, str]:
+    if answer == "panic":
+        return False, None, "panic"
     words = answer.split()
     accepted = words[-1] == "accepted"
     if words[0] in ("failed", "not-stateful"):
@@ -399,6 +419,9 @@ def _compare(report: Report, label: str, prior: bytes, got: tuple[bool, Outcome 
              want: Outcome | None, want_ok: bool) -> None:
     ok, raw, kind = got
     report.saw(kind)
+    if kind == "panic":
+        report.disagreements.append(f"{label}: the Rust kernel panicked")
+        return
     if ok != want_ok:
         report.disagreements.append(f"{label}: rust {'accepts' if ok else 'refuses'} {raw}, mirror {want}")
         return
@@ -435,6 +458,8 @@ def check_stateful(rust: RustKernels, mirror: StatefulMirror, seed: int = 0, wal
             want = "refused kernel " + getattr(e, "kind", "ValueError")
         if split == spans and got.startswith("state "):
             initial = _unhex(got.split()[1])
+        elif split == spans:
+            report.disagreements.append(f"the kernel refuses its declared spans {list(spans)}: {got!r}")
         report.saw("init " + got.split()[0])
         if got != want and not (got.startswith("refused") and want.startswith("refused")):
             report.disagreements.append(f"init {list(split)}: rust {got!r}, mirror {want!r}")
@@ -447,10 +472,15 @@ def check_stateful(rust: RustKernels, mirror: StatefulMirror, seed: int = 0, wal
             want_ok = judge(decl, want, state, rejectable)
         except ValueError:
             want, want_ok = None, False
+        except Exception as e:
+            report.disagreements.append(f"mirror raised {type(e).__name__}: {e}")
+            want, want_ok = None, False
         label = f"state {state.hex()[:32]} command {command.hex()[:32] or '-'} rejectable {int(rejectable)}"
         _compare(report, label, state, got, want, want_ok)
         return got
 
+    if not initial:
+        return report
     commands = _commands(mirror, rng)
     for state in _states(mirror, initial, rng):
         for command in commands:
@@ -459,8 +489,10 @@ def check_stateful(rust: RustKernels, mirror: StatefulMirror, seed: int = 0, wal
     state = initial
     for _ in range(walk):
         ok, raw, _ = one(state, rng.choice(commands), rng.random() < 0.5)
-        if ok and raw is not None and raw.disposition != "halt_before":
+        if ok and raw is not None and raw.disposition in ("continue", "reject"):
             state = raw.state
+        elif ok and raw is not None and raw.disposition == "halt_after":
+            state = initial  # a halted session never advances; restart the walk
     return report
 
 

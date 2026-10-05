@@ -2780,11 +2780,8 @@ fn advance(
     for seq in expected_cursor..end_cursor {
         commands.push(read_slot(stream, &session, seq)?);
     }
-    let output_len = (kernel.manifest().output.max_bytes as usize)
-        .min(kernel.manifest().resources.max_output_bytes as usize);
-    if output_len == 0 || output_len > 65_536 {
-        return Err(refusal(REFUSAL_RESOURCE));
-    }
+    let output_len =
+        crate::kernel_kit::v3_output_len(kernel.manifest()).ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
     let mut guards = state_accounts
         .iter()
         .map(AccountInfo::try_borrow_mut_data)

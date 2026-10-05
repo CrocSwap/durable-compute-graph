@@ -46,6 +46,10 @@ def _server() -> Path | None:
 
 
 SERVER = _server()
+# DCG_REQUIRE_KERNEL_CONFORM=1 turns a missing server into a failure rather
+# than a skip (review M1).
+if SERVER is None and os.environ.get("DCG_REQUIRE_KERNEL_CONFORM") == "1":
+    raise RuntimeError("DCG_REQUIRE_KERNEL_CONFORM=1 but no dcg-kernel-conform binary was found")
 needs_server = pytest.mark.skipif(SERVER is None, reason="cargo build -p dcg-kernel-conform first")
 
 
@@ -188,3 +192,14 @@ class UndeclaredCapability(CM.RejectCounter):
 @pytest.mark.parametrize("mutant", [WrappingCounter(), CleanDirtyReject(), UndeclaredCapability()])
 def test_catches_stateful_mutants(rust, mutant):
     assert not kit.check_stateful(rust, mutant).ok
+
+
+def test_builtin_names_are_refused():
+    with pytest.raises(ValueError, match="built-in"):
+        kit.step_kernel("add_i32/v1", max_input_bytes=8, max_output_bytes=4, max_compute_units=1, register=False)
+
+
+@needs_server
+def test_server_reports_builtin_shadowing(rust):
+    decl = dataclasses.replace(appkernels.sha256_concat.decl, name="add_i32/v1", semantic_version=2)
+    assert rust.step(decl, [b"abcd"]) == "builtin"
