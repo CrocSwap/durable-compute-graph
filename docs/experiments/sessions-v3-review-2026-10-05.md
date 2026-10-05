@@ -1,6 +1,6 @@
 # Stateful sessions v3 and lanes: independent review (alpha R2) — 2026-10-05
 
-**Status: reviewed; not ready for sign-off (4 high).** Rule-10 adversarial
+**Status: reviewed; H1–H3 fixed and re-reviewed (merged 10-05, see "Fixes"); H4 and M2 wait on the owner; the session fuzzer is still to build.** Rule-10 adversarial
 review of `stateful_v3.rs` (tags 230–240) and `stateful_v3_lanes.rs` (lane
 ops 4–11) at DCG c0afbc9, for the alpha's R2 item
 (`docs/plans/alpha-release-plan.md`). Five findings were confirmed by native
@@ -89,3 +89,19 @@ would have caught H1–H3).
 Fix H1–H3 (creation and close semantics change: version them; rule-10
 re-review), owner decision on H4 (and M2 for the public demo), then the
 fuzzer, then R2 sign-off.
+
+## Fixes (10-05)
+
+Branch `fast/sessions-v3-r2-fixes`, re-reviewed (fix-then-keep; its one high,
+a pre-funded anchor address still blocking multi-chunk anchors, fixed):
+
+- H1: the five child creators require the session authority at account 2
+  (it may be the payer); old account lists fail closed (no wire-version bump:
+  acceptable for testnet-only v3; mainnet needs an explicit version, and the
+  Doom drivers in Basanos `stunts/doom-dcg` change when Doom repins).
+- H2: every v3 creation, the session and the anchor adopt pre-funded empty
+  system addresses.
+- H3: a halted session closes a partly grown headerless primary.
+- Docs: creator account lists, growth rules, provenance note (L6).
+- Tests: `tests/stateful_v3_creators.rs` (5) — native and SBF 5/5; SBF
+  workload 13/13; lanes 9/9 native and SBF; Python session/sequencer 124.

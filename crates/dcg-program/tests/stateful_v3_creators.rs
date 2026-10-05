@@ -395,3 +395,44 @@ async fn h3_partly_grown_primary_closes_after_halt() {
         assert_eq!(balance(&mut ctx, key).await, 0);
     }
 }
+
+fn anchor_pda(s: &Pubkey) -> Pubkey {
+    pda(&[b"dcg-anchor-v3", s.as_ref()])
+}
+
+/// H2 (re-review 10-05): a pre-funded anchor address still takes a
+/// multi-chunk anchor. Before the fix `begin_anchor` treated any address with
+/// lamports as an existing anchor and refused it (2324) for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_prefunded_anchor_address_still_anchors() {
+    let mut ctx = start(None).await;
+    let auth = keypair(37);
+    let payer = ctx.payer.pubkey();
+    let s = session_pda(&auth.pubkey(), 3);
+    send(&mut ctx, open(payer, auth.pubkey(), 3), &[&auth]).await.unwrap();
+    send(&mut ctx, create_stream(payer, s, Slot(auth.pubkey(), true)), &[&auth]).await.unwrap();
+    send(&mut ctx, create_state(payer, s, Slot(auth.pubkey(), true)), &[&auth]).await.unwrap();
+    send(&mut ctx, initialize(auth.pubkey(), s), &[&auth]).await.unwrap();
+    let anchor = anchor_pda(&s);
+    let small = ctx.banks_client.get_rent().await.unwrap().minimum_balance(0);
+    send(&mut ctx, system_instruction::transfer(&payer, &anchor, small), &[]).await.unwrap();
+    let mut payload = vec![v3::WIRE_VERSION, v3::ANCHOR_OP_BEGIN];
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    let begin = ix(
+        sw::TAG_ANCHOR,
+        payload,
+        vec![
+            AccountMeta::new(payer, true),
+            signer(auth.pubkey()),
+            w(s),
+            r(stream_pda(&s)),
+            w(anchor),
+            r(state_pda(&s, 0)),
+            r(state_pda(&s, 1)),
+            r(SYSTEM),
+        ],
+    );
+    send(&mut ctx, begin, &[&auth]).await.expect("anchor begins on a pre-funded address");
+    let account = ctx.banks_client.get_account(anchor).await.unwrap().unwrap();
+    assert_eq!(account.owner, PROGRAM, "the anchor was created");
+}

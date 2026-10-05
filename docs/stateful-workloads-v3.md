@@ -188,11 +188,15 @@ The authority must sign and equal the session's stored authority, or the
 creation refuses with `REFUSAL_AUTHORITY` (2322). The authority may be the same
 key as the payer; the program then skips that repeated slot in its alias
 check. (`OPEN_SESSION` itself still refuses a payer equal to the authority with
-2323.) Growth (`GROW_STREAM`, `GROW_STATE`, `GROW_VIEW`, `RESOURCE_GROW`)
-stays open to any payer, since it only extends lengths the authority declared.
+2323.) `GROW_STATE` and `GROW_VIEW` stay open to any payer: they only extend
+toward the lengths fixed at creation. `GROW_STREAM` is open too and lets the
+payer choose the new capacity (at most `MAX_STREAM_GROWTH_SLOTS` more, only at
+`cursor == capacity`); the payer's rent returns to the authority at close.
+`RESOURCE_GROW` requires the authority's signature.
 
-Session and child creation accept an address that someone pre-funded with a
-plain lamport transfer, provided it is still an empty system-owned account.
+Session and child creation (stream, state, views, scratch, workspace, lanes,
+the resource copy and the anchor) accept an address that someone pre-funded with
+a plain lamport transfer, provided it is still an empty system-owned account.
 Creation tops the account up to rent if needed and keeps any excess, which is
 returned to the authority when the account closes. `OPEN_SESSION` no longer
 requires zero lamports at the session address.

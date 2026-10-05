@@ -4000,10 +4000,10 @@ fn begin_anchor(
     if anchor_account.key != &expected || *system.key != system_program::id() {
         return Err(refusal(REFUSAL_SESSION));
     }
-    if anchor_account.owner == &system_program::id()
-        && anchor_account.lamports() == 0
-        && anchor_account.data_is_empty()
-    {
+    // An empty system-owned address is a new anchor whatever lamports it
+    // holds (sessions re-review 10-05: a pre-funded anchor address otherwise
+    // fell through to `checked_anchor` and refused every multi-chunk anchor).
+    if anchor_account.owner == &system_program::id() && anchor_account.data_is_empty() {
         create_pda(
             program,
             payer,
