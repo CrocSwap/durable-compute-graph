@@ -282,6 +282,10 @@ def driver(image: Path | None, seconds: int, towers: int, restart: bool, adversa
         slot_ms = 50.0
     procs = []
     templates = {}
+    # Testnet: windows sized for a service ~350 ms per RPC call away from the
+    # node (measured 10-05): 3,000-slot challenge (~2 min), 1,500-slot phase
+    # (~1 min). Local: the program's minimums.
+    windows = {"challenge_window": 3_000, "phase_window": 1_500} if network else {}
     try:
         admin = key(Path(network["payer_key"])) if network else Keypair()
         gc = GraphClient(rpc, program, admin, timeout=30)
@@ -307,7 +311,7 @@ def driver(image: Path | None, seconds: int, towers: int, restart: bool, adversa
                 gc.rpc("requestAirdrop", [str(k.pubkey()), 50_000_000_000])
             time.sleep(2)
         for p, (sp, _values) in plans().items():
-            tdata = W.template_data(sp, DEPTHS[p], PLAN_IDS[p], slot_ms=slot_ms)
+            tdata = W.template_data(sp, DEPTHS[p], PLAN_IDS[p], slot_ms=slot_ms, **windows)
             templates[p] = {"template": str(cl.create_template(tdata, admin)),
                             "template_id": hashlib.sha256(W.TEMPLATE_DOMAIN + tdata).digest().hex()}
         cfg = {"rpc": rpc, "program": str(program), "dir": str(run_dir), "templates": templates,

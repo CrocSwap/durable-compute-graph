@@ -32,7 +32,7 @@ from ..disputes_v21 import lx_client as LX
 from ..disputes_v21 import run as R
 from ..disputes_v21 import spec as S
 from ..disputes_v21 import wire as W
-from .chain import PH_CLAIM, PH_LEAF, PH_NODES, PH_PICK, Discovery, DisputeState, RunState
+from .chain import PH_CLAIM, PH_LEAF, PH_NODES, PH_PICK, Discovery, DisputeState, RunState, TickCache
 from .journal import Journal
 
 
@@ -65,6 +65,8 @@ class ExecutorService:
                  execute: Callable[..., R.Commitment] = R.execute, tick_budget_s: float = 10.0):
         self.cl, self.executor, self.plans, self.execute = cl, executor, plans, execute
         self.tick_budget_s = tick_budget_s
+        if not isinstance(cl.gc, TickCache):
+            cl.gc = TickCache(cl.gc)
         self.journal = Journal(journal)
         self.journal.data.setdefault("runs", {})
         self.journal.data.setdefault("discovery", {})
@@ -98,6 +100,15 @@ class ExecutorService:
         settlement where a step is possible. Returns the actions taken."""
         t0 = time.monotonic()
         actions: list[str] = []
+        # One batched read of everything tracked (runs, disputes, buffers).
+        tracked = []
+        for run_s, entry in self.journal.data["runs"].items():
+            if not entry["done"]:
+                tracked.append(run_s)
+                for d_s in entry["disputes"]:
+                    tracked += [d_s] + [str(self.cl.pda(b"dcg21stg", bytes(Pubkey.from_string(d_s)), bytes([r])))
+                                        for r in (CL.ROLE_EXECUTOR, CL.ROLE_CHALLENGER)]
+        self.cl.gc.begin_tick(tracked)
         live: list[tuple[Pubkey, dict, RunState]] = []
         for run_s, entry in self.journal.data["runs"].items():
             if entry["done"]:
@@ -165,7 +176,8 @@ class ExecutorService:
             if not settleable:
                 continue
             try:
-                out = self.cl.settle_and_reclaim(run, wait=0.0, candidates=self.discovery.known(run))
+                out = self.cl.settle_and_reclaim(run, wait=0.0, candidates=self.discovery.known(run),
+                                                 max_steps=3)
                 if out["steps"]:
                     log(event="settle", run=str(run), **out)
                     actions += out["steps"]

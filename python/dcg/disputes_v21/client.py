@@ -486,7 +486,8 @@ class DisputeClient:
         With ``wait`` > 0, sleeps and retries while the next step is behind
         a deadline, for at most ``wait`` seconds. Returns the steps taken and
         the run's state: ``closed`` (a receipt with nothing left),
-        ``waiting`` (with the reason) or ``stuck``.
+        ``waiting`` (with the reason), ``partial`` (``max_steps`` reached;
+        call again) or ``stuck``.
         """
         steps: list[str] = []
         give_up = time.monotonic() + wait
@@ -517,4 +518,4 @@ class DisputeClient:
                 time.sleep(2.0)
                 continue
             steps.append(step)
-        return {"state": "stuck", "reason": f"more than {max_steps} steps", "steps": steps}
+        return {"state": "partial", "reason": f"stopped after {max_steps} steps; call again", "steps": steps}

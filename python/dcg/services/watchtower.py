@@ -31,12 +31,15 @@ from ..disputes_v21 import client as CL
 from ..disputes_v21 import game as G
 from ..disputes_v21 import run as R
 from ..disputes_v21 import spec as S
-from .chain import PH_CLAIM, PH_PICK, Discovery, DisputeState, RunState, dispute_moves, staged_lists
+from .chain import PH_CLAIM, PH_PICK, Discovery, DisputeState, RunState, TickCache, dispute_moves, staged_lists
 from .challenger import Challenger, dispute_kind
 from .journal import Journal
 
 #: (run, external id, its 52-byte ref) -> the input bytes, or None if unknown.
 InputSource = Callable[[Pubkey, int, bytes], "bytes | None"]
+
+#: Settlement steps per dispute per tick (each is one transaction).
+SETTLE_STEPS_PER_TICK = 3
 
 # Template account layout (disputes_v21.rs `template`).
 T_DEPTH, T_STEPS, T_OUTPUTS, T_SPEC_ROOT, T_PLAN_ID = 4, 8, 16, 64, 136
@@ -70,6 +73,8 @@ class Watchtower:
     def __init__(self, cl: CL.DisputeClient, challenger: Keypair, journal: str, watched: list[Watched],
                  budget: Budget = Budget(), tick_budget_s: float = 10.0):
         self.cl, self.key, self.budget, self.tick_budget_s = cl, challenger, budget, tick_budget_s
+        if not isinstance(cl.gc, TickCache):
+            cl.gc = TickCache(cl.gc)
         self.watched = {str(w.template): w for w in watched}
         self.journal = Journal(journal)
         for k in ("runs", "disputes", "discovery"):
@@ -82,6 +87,9 @@ class Watchtower:
         self._claims: dict[str, tuple] = {}
         for w in watched:
             self._check_config(w)
+            # Live runs that already exist are found through the template's
+            # run count; new ones from here on (no full-history read).
+            self.discovery.start_at_newest(w.template)
 
     def _check_config(self, w: Watched) -> None:
         """The plan must be the one the template commits to: a wrong plan
@@ -103,6 +111,16 @@ class Watchtower:
         checks of committed runs, then bounded discovery of new runs."""
         t0 = time.monotonic()
         actions: list[str] = []
+        # One batched read of everything tracked: templates, runs, disputes
+        # and their staging buffers.
+        tracked = list(self.watched)
+        for run_s, entry in self.journal.data["runs"].items():
+            tracked.append(run_s)
+        for d_s, entry in self.journal.data["disputes"].items():
+            if not entry.get("done"):
+                tracked += [d_s] + [str(self.cl.pda(b"dcg21stg", bytes(Pubkey.from_string(d_s)), bytes([r])))
+                                    for r in (CL.ROLE_EXECUTOR, CL.ROLE_CHALLENGER)]
+        self.cl.gc.begin_tick(tracked)
         disputes = []
         for d_s, entry in self.journal.data["disputes"].items():
             if entry.get("done"):
@@ -319,7 +337,9 @@ class Watchtower:
             return None
         d = DisputeState.parse(dispute, raw)
         if d.ruling != CL.RULING_OPEN:
-            out = self.cl.settle_and_reclaim(run, wait=0.0, candidates=self._run_accounts(run, dispute))
+            # A few settlement steps per tick: settling must not delay play.
+            out = self.cl.settle_and_reclaim(run, wait=0.0, candidates=self._run_accounts(run, dispute),
+                                             max_steps=SETTLE_STEPS_PER_TICK)
             log(event="settle", dispute=str(dispute), ruling=CL.RULINGS[d.ruling], **out)
             if out["state"] == "closed" or self.cl.gc.account(dispute) is None:
                 entry["done"] = True
@@ -327,7 +347,8 @@ class Watchtower:
             return f"settle {run}" if out["steps"] else None
         if self.cl.gc.slot() > d.deadline and d.phase not in (PH_PICK, PH_CLAIM):
             # The executor missed its deadline: the timeout rules for us.
-            out = self.cl.settle_and_reclaim(run, wait=0.0, candidates=self._run_accounts(run, dispute))
+            out = self.cl.settle_and_reclaim(run, wait=0.0, candidates=self._run_accounts(run, dispute),
+                                             max_steps=SETTLE_STEPS_PER_TICK)
             log(event="executor_timeout", dispute=str(dispute), **out)
             return f"timeout {dispute}" if out["steps"] else None
         if d.phase not in (PH_PICK, PH_CLAIM):

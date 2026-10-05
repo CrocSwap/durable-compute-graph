@@ -150,6 +150,17 @@ class Discovery:
         self.state.setdefault("keys", {})
         self.max_transactions = max_transactions
 
+    def start_at_newest(self, address: Pubkey) -> None:
+        """Begin forward discovery at the address's newest transaction
+        instead of its whole history (a new watchtower on an old template).
+        Accounts that already exist are found by `search_newest` when the
+        chain's own count shows them."""
+        if str(address) in self.state["cursors"]:
+            return
+        newest = self.cl.gc.rpc("getSignaturesForAddress", [str(address), {"limit": 1, "commitment": "confirmed"}])
+        if newest:
+            self.state["cursors"][str(address)] = newest[0]["signature"]
+
     def known(self, address: Pubkey) -> list[Pubkey]:
         return [Pubkey.from_string(k) for k in self.state["keys"].get(str(address), [])]
 
@@ -283,3 +294,62 @@ def dispute_moves(cl: CL.DisputeClient, dispute: Pubkey) -> list[tuple[int, byte
             else:
                 moves.append((data[1], data[2:]))
     return moves
+
+
+class TickCache:
+    """A per-tick read cache over a GraphClient (alpha E3; testnet run
+    10-05: ticks of 20-40 s at ~350 ms per RPC call missed 30 s phase windows).
+
+    - `begin_tick(keys)` reads every tracked account in batched
+      `getMultipleAccounts` calls and the slot once.
+    - `account(key)` serves from the cache (a miss is read and cached).
+    - Any send (`send`, or a `sendTransaction` through `rpc`) clears the
+      cache, so the service never acts on its own stale reads.
+    Everything else is passed through to the wrapped client."""
+
+    def __init__(self, gc):
+        self._gc = gc
+        self._accounts: dict[str, bytes | None] = {}
+        self._slot: int | None = None
+
+    def __getattr__(self, name):
+        return getattr(self._gc, name)
+
+    def begin_tick(self, keys) -> None:
+        import base64
+
+        self._accounts.clear()
+        self._slot = None
+        keys = list(dict.fromkeys(str(k) for k in keys))
+        for at in range(0, len(keys), 100):
+            batch = keys[at:at + 100]
+            values = self._gc.rpc("getMultipleAccounts", [batch, {"encoding": "base64", "commitment": "confirmed"}])["value"]
+            for k, v in zip(batch, values):
+                self._accounts[k] = None if v is None else base64.b64decode(v["data"][0])
+
+    def invalidate(self) -> None:
+        self._accounts.clear()
+        self._slot = None
+
+    def account(self, key):
+        k = str(key)
+        if k not in self._accounts:
+            self._accounts[k] = self._gc.account(key)
+        return self._accounts[k]
+
+    def slot(self) -> int:
+        if self._slot is None:
+            self._slot = self._gc.slot()
+        return self._slot
+
+    def send(self, *a, **kw):
+        self.invalidate()
+        try:
+            return self._gc.send(*a, **kw)
+        finally:
+            self.invalidate()
+
+    def rpc(self, method, params):
+        if method == "sendTransaction":
+            self.invalidate()
+        return self._gc.rpc(method, params)

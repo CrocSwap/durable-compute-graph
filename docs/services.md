@@ -153,6 +153,23 @@ win are ruled moot, and their bonds return.
     chunked disputes and 5 list lies);
   - discovery and history reading are unit-tested against a fake RPC.
 
+**Sizing windows (measured on testnet, 2026-10-05).**
+- **Test conditions:** both services ran on a Mac about 350 ms per RPC call
+  from the testnet node.
+- **Tick times:** the longest tick was about 33 s for the watchtower and
+  26 s for the executor. Most of that is transaction confirmations, about
+  2 s each. The services use one batched account read per tick and a few
+  settlement steps per tick.
+- **The minimum windows are too short at that distance.** With the program's
+  minimums (1,000-slot challenge, 750-slot phase, about 40 s and 30 s), a lie
+  finalized before the watchtower's first check reached it.
+- **What passed:** with a 3,000-slot challenge window and a 1,500-slot phase
+  window (about 2 min and 1 min), every scenario passed.
+- **Guidance:** size a template's challenge window to at least twice the
+  watchtower's slowest tick plus its time to check a run. Size its phase
+  window to at least twice the slowest tick plus the staging time
+  (`phase_window_for`). Services run next to their RPC node tick faster.
+
 **Known limits (alpha):**
 - **Discovery cost scales with spam.** Anyone can send cheap transactions
   that name a run or template. The services find an account the chain
