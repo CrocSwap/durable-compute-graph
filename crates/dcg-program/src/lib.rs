@@ -29,6 +29,7 @@ pub mod graph_v2;
 pub mod disputes_v21;
 pub mod hash;
 pub mod kernel;
+pub mod kernel_kit;
 pub mod kernel_svm;
 pub mod kernels;
 pub mod position_template;

@@ -1921,29 +1921,13 @@ impl<'a> Referee<'a> {
         let id = crate::kernel::KernelId(spec.kernel_id().try_into().unwrap());
         // Only a kernel that advertises the v2.1 STEP mode replays a step
         // (review 10-03, F2): other manifest kernels are unknown here.
-        let step_kernel = self
-            .manifest
-            .resolve(id, spec.semantic_version(), spec.abi_version())
-            .filter(|k| k.manifest().modes.contains(&crate::kernel::MODE_STEP_V21));
-        if let Some(kernel) = step_kernel {
-            let m = kernel.manifest();
-            let spans: Vec<crate::kernel::AccountSpan> = ins
-                .iter()
-                .map(|v| crate::kernel::AccountSpan {
-                    key: [0; 32],
-                    owner: [0; 32],
-                    is_signer: false,
-                    is_writable: false,
-                    schema: m.input.id,
-                    offset: 0,
-                    data: v,
-                })
-                .collect();
-            let mut out = vec![0u8; m.output.max_bytes as usize];
-            return Ok(match kernel.execute_spans(&spans, &mut out) {
-                Err(_) => true,
-                Ok(len) => leaf.output_count() != 1 || D::value_digest(&H, &out[..len]) != leaf.output(0)[23..55],
-            });
+        match crate::kernel_kit::step_kernel_call(self.manifest, id, spec.semantic_version(), spec.abi_version(), &ins) {
+            crate::kernel_kit::StepCall::NotStepKernel => {}
+            crate::kernel_kit::StepCall::Refused(_) => return Ok(true),
+            call => {
+                let out = call.output().unwrap();
+                return Ok(leaf.output_count() != 1 || D::value_digest(&H, out) != leaf.output(0)[23..55]);
+            }
         }
         let mut out = [0u8; 4];
         // An unknown kernel cannot replay any output (as in the Python

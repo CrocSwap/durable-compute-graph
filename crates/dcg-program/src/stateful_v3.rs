@@ -9,9 +9,10 @@ use crate::account_provenance::{
     allocate_derived_account, expect_derived, expect_derived_with_bump, expect_keyed, AccountKind,
     CanonicalBump, RoleFlags,
 };
+use crate::kernel_kit::{judge_outcome, Judged};
 use crate::kernel::{
     AccountSpan, InitializationPhase, KernelId, ModeId, StateSchema, StateSpanMut, StatefulKernel,
-    TransitionDisposition, VersionedId, ViewAbi, ViewPhase, MAX_DECLARED_KERNEL_COMPUTE_UNITS,
+    VersionedId, ViewAbi, ViewPhase, MAX_DECLARED_KERNEL_COMPUTE_UNITS,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -2836,9 +2837,6 @@ fn advance(
                 let outcome = kernel
                     .transition_spans_with_outcome(command, &mut spans, &mut output)
                     .map_err(|_| refusal(REFUSAL_KERNEL))?;
-                if outcome.output_bytes > output_len {
-                    return Err(refusal(REFUSAL_KERNEL));
-                }
                 // State unchanged since the snapshot (checked at or below the
                 // snapshot cap; above it, a kernel obligation).
                 let state_changed = |spans: &[StateSpanMut<'_>]| {
@@ -2852,34 +2850,29 @@ fn advance(
                         })
                     })
                 };
-                match outcome.disposition {
-                    TransitionDisposition::Continue => {
+                // Halts need a nonzero reason and HaltBefore unchanged state;
+                // only a rejectable session may reject, consuming the input
+                // with state and output untouched (design
+                // session-reject-and-ring-v1 §2.2). The conformance harness
+                // runs the same judgement (`kernel_kit`).
+                match judge_outcome(outcome, rejectable, output_len, || state_changed(&spans))
+                    .ok_or_else(|| refusal(REFUSAL_KERNEL))?
+                {
+                    Judged::Continue => {
                         committed_steps += 1;
                         rejections.push(None);
                     }
-                    TransitionDisposition::HaltBefore { reason } => {
-                        if reason == 0 || state_changed(&spans) {
-                            return Err(refusal(REFUSAL_KERNEL));
-                        }
+                    Judged::HaltBefore(reason) => {
                         halt_reason = Some(reason);
                         break;
                     }
-                    TransitionDisposition::HaltAfter { reason } => {
-                        if reason == 0 {
-                            return Err(refusal(REFUSAL_KERNEL));
-                        }
+                    Judged::HaltAfter(reason) => {
                         committed_steps += 1;
                         rejections.push(None);
                         halt_reason = Some(reason);
                         break;
                     }
-                    // Only a session opened rejectable (its kernel declares the
-                    // capability) may reject; the input is consumed with state
-                    // and output untouched (design session-reject-and-ring-v1 §2.2).
-                    TransitionDisposition::Reject { code } => {
-                        if !rejectable || code == 0 || outcome.output_bytes != 0 || state_changed(&spans) {
-                            return Err(refusal(REFUSAL_KERNEL));
-                        }
+                    Judged::Reject(code) => {
                         committed_steps += 1;
                         rejections.push(Some(code));
                     }
