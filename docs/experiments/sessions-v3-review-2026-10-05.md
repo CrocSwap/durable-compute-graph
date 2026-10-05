@@ -1,6 +1,6 @@
 # Stateful sessions v3 and lanes: independent review (alpha R2) — 2026-10-05
 
-**Status: reviewed; H1–H3 fixed and re-reviewed (merged 10-05, see "Fixes"); H4 and M2 wait on the owner; the session fuzzer is built (13,000 sequences, one low finding F1; see [`sessions-v3-fuzz-2026-10-05.md`](sessions-v3-fuzz-2026-10-05.md)).** Rule-10 adversarial
+**Status: reviewed; H1–H3 fixed and re-reviewed (merged 10-05, see "Fixes"); H4 and M2 fixed by session features (owner 10-05; merged 5624a82, `docs/design/session-reject-and-ring-v1.md`); the session fuzzer is built (13,000 sequences, one low finding F1; see [`sessions-v3-fuzz-2026-10-05.md`](sessions-v3-fuzz-2026-10-05.md)).** Rule-10 adversarial
 review of `stateful_v3.rs` (tags 230–240) and `stateful_v3_lanes.rs` (lane
 ops 4–11) at DCG c0afbc9, for the alpha's R2 item
 (`docs/plans/alpha-release-plan.md`). Five findings were confirmed by native
