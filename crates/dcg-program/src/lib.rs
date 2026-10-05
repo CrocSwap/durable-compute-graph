@@ -92,7 +92,16 @@ fn application_program_manifest() -> &'static app_api::ApplicationProgramManifes
     &TEST_APPLICATION
 }
 
-#[cfg(not(feature = "test-kernel"))]
+/// The alpha shared program (owner 10-05): the example kernels under
+/// `dcg-alpha/1`, the default dispute hooks, no application instructions.
+#[cfg(all(not(feature = "test-kernel"), feature = "example-kernels"))]
+fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
+    static ALPHA_PROGRAM: app_api::ApplicationProgramManifest =
+        app_api::ApplicationProgramManifest::new(&kernel::test_kernel::ALPHA_MANIFEST_APP, &[]);
+    &ALPHA_PROGRAM
+}
+
+#[cfg(all(not(feature = "test-kernel"), not(feature = "example-kernels")))]
 fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
     static EMPTY_KERNELS: [&'static dyn kernel::Kernel; 0] = [];
     static EMPTY_REPLAYS: [kernel::OptimisticReplayBinding; 0] = [];
