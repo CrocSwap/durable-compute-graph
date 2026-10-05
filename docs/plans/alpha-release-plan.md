@@ -111,6 +111,7 @@ DCG keeps no model code (owner decision, 09-26).
 - An executor service that answers its runs' disputes on time: reveals, leaves, openings and staged witnesses.
 - A watchtower that checks runs it cares about, and challenges a wrong commitment from the first divergence.
 - Without both, users can only replay scripted disputes.
+- *Status (2026-10-05):* built (`docs/services.md`, design `executor-watchtower-v1.md`; owner: inputs from an application source until on-chain posting before mainnet, watchtower v1 checks descents only). Local validator, separate processes: honest/state lie/input lie/silent executor, a watchtower restart mid-dispute and two watchtowers all rule as expected; the executor service answers LX1 (lying executor C, lying challenger E). Not yet run on testnet.
 
 **E4. The lifecycle in the client.**
 - `settle_and_reclaim(run)`: advance, pay the pot, close disputes with their buffers, finalize after the window, shrink the run to its receipt, close caches.
