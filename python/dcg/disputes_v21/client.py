@@ -211,6 +211,31 @@ class DisputeClient:
         return {"ruling": ruling, "transactions": self.sent - sent0, "wall_s": round(time.monotonic() - t0, 1),
                 "dispute": str(dispute)}
 
+    def stage_body(self, run: Pubkey, template: Pubkey, dispute: Pubkey, role: int, body: bytes, writer: Keypair,
+               funder: Keypair) -> Pubkey:
+        """Create (and grow) a dispute's staging buffer for `role` and write
+        `body` into it; `funder` pays the buffer's rent. Returns the buffer."""
+        buffer = self.pda(b"dcg21stg", bytes(dispute), bytes([role]))
+        created = CREATE_STAGE if role == ROLE_EXECUTOR else min(len(body), CREATE_STAGE)
+        grow = [AccountMeta(funder.pubkey(), True, True), AccountMeta(run, False, False),
+                AccountMeta(template, False, False), AccountMeta(dispute, False, False),
+                AccountMeta(buffer, False, True), AccountMeta(SYSTEM, False, False)]
+        self._send("stage_create", bytes([role]) + struct.pack("<I", created), grow, [funder])
+        size = created
+        while size < len(body):
+            add = min(len(body) - size, 10_240)
+            self._send("stage_grow", struct.pack("<I", add), grow, [funder])
+            size += add
+        write = [AccountMeta(writer.pubkey(), True, False), AccountMeta(run, False, False),
+                 AccountMeta(template, False, False), AccountMeta(dispute, False, False),
+                 AccountMeta(buffer, False, True)]
+        self._send_many([("stage_write", struct.pack("<I", at) + body[at:at + STAGE_PIECE], write, [writer])
+                         for at in range(0, len(body), STAGE_PIECE)])
+        return buffer
+
+    # The LX client's name for it.
+    _stage = stage_body
+
     def run_status(self, run: Pubkey) -> int:
         """A live run's or a receipt's status byte (both keep it at byte 4)."""
         data = self.gc.account(run)

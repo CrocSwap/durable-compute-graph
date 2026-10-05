@@ -133,26 +133,6 @@ class LxClient(DisputeClient):
         self.commit(run, template, bytes(root) + tree_path(levels, 0) + params, executor)
         return levels
 
-    def _stage(self, run: Pubkey, template: Pubkey, dispute: Pubkey, role: int, body: bytes, writer: Keypair,
-               funder: Keypair) -> Pubkey:
-        buffer = self.pda(b"dcg21stg", bytes(dispute), bytes([role]))
-        created = CREATE_STAGE if role == ROLE_EXECUTOR else min(len(body), CREATE_STAGE)
-        grow = [AccountMeta(funder.pubkey(), True, True), AccountMeta(run, False, False),
-                AccountMeta(template, False, False), AccountMeta(dispute, False, False),
-                AccountMeta(buffer, False, True), AccountMeta(SYSTEM, False, False)]
-        self._send("stage_create", bytes([role]) + struct.pack("<I", created), grow, [funder])
-        size = created
-        while size < len(body):
-            add = min(len(body) - size, 10_240)
-            self._send("stage_grow", struct.pack("<I", add), grow, [funder])
-            size += add
-        write = [AccountMeta(writer.pubkey(), True, False), AccountMeta(run, False, False),
-                 AccountMeta(template, False, False), AccountMeta(dispute, False, False),
-                 AccountMeta(buffer, False, True)]
-        self._send_many([("stage_write", struct.pack("<I", at) + body[at:at + STAGE_PIECE], write, [writer])
-                         for at in range(0, len(body), STAGE_PIECE)])
-        return buffer
-
     def lx_prestage(self, run: Pubkey, template: Pubkey, dispute: Pubkey, nonce: bytes, body: bytes,
                     challenger: Keypair, secret: bytes) -> Pubkey:
         """Stage an OPEN body (without its kind byte), masked with `secret`, in
