@@ -54,6 +54,15 @@ parallel; it is useful evidence, but it does not gate the alpha.
 - Alpha bar: LX1 handlers are covered by R2's review and the fuzzer, by `explain()` (E8), and by a newcomer walkthrough (E7) using the toy machine.
 
 **R2. Review the whole surface.** Only tag 227 has had an independent review.
+*Status 10-05:* stateful sessions v3 + lanes reviewed (4 high fixed and
+re-reviewed: authority on creators, pre-funded addresses, partial-primary
+close; `docs/experiments/sessions-v3-review-2026-10-05.md`) and fuzzed
+(13,500 sequences, ~1.07M transactions, native and SBF, no failure; F1 fixed;
+`docs/experiments/sessions-v3-fuzz-2026-10-05.md`). Signable as a mechanics
+claim for accepting kernels, excluding H4 (refused-input wedge; owner
+decision), M2 (session lifetime; owner decision) and L3 (anyone may close a
+halted session's children). Admission, the template lifecycle and the other
+handlers are still to review.
 - Stateful sessions (v3) get the same treatment tag 227 had, including a run-level fuzzer of their own: random interleavings of steps, resends, failed and duplicated transactions, view publications and closes, with invariants (each step applied once and in order, state digests match a host replay, lamports conserved) checked after every step.
 - Admission, the template lifecycle, and every other handler the shared program exposes each get an independent adversarial review (Basanos project rule 10).
 - That includes the staging-buffer question from finding F10: does any handler accept an account by owner and magic alone?
