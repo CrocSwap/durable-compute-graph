@@ -132,7 +132,7 @@ DCG keeps no model code (owner decision, 09-26).
 - "Your first custom kernel", using E2.
 - A guarantees page built on `explain()`.
 
-**E8. `explain()` for both modes:** for v2.1 templates, the kernels and their STEP mode, the dispute path, windows, bonds and open limits; for sessions, the consensus guarantee, the kernel, and the per-step compute and transaction bounds.
+**E8. `explain()` for both modes:** for v2.1 templates, the kernels and their STEP mode, the dispute path, windows, bonds and open limits; for sessions, the consensus guarantee, the kernel, and the per-step compute and transaction bounds. *Status (2026-10-05):* built: `dcg.explain.template` / `dcg explain template` (plan check, kernels, dispute path, staging need, windows, bonds, limits; warns on tight windows for remote watchers, per the owner's choice to keep the 750-slot minimums) and `Session.explain(decl=…)` (guarantee, kernel, per-step and per-transaction bounds, live state).
 
 ### Consensus mode
 

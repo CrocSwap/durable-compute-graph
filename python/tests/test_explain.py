@@ -1,110 +1,68 @@
-"""explain(): composed guarantee and refusals (offline)."""
+"""`explain()` (alpha E8): a template described from its account bytes, its
+plan checked against it, windows flagged; a session's guarantee and bounds."""
 
 from __future__ import annotations
 
-import unittest
+import struct
+import sys
+from pathlib import Path
 
-from dcg import tracing
-from dcg.kernels import add_i32, identity_i32
-from dcg.tracing import KernelSpec, TraceError, call
+from solders.pubkey import Pubkey
 
+from dcg import explain
+from dcg.kernel_kit import MODE_CONSENSUS_V3, KernelDecl
+from dcg.session import KernelRef
+from dcg.session.layout import SessionInfo
 
-def hello(a, b):
-    with tracing.region("child"):
-        total = add_i32(a, b)
-    return identity_i32(total)
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "examples" / "hello-graph"))
+import traced_dispute as T  # noqa: E402
 
-
-def parent_child(a, b):
-    s = add_i32(a, b)
-    with tracing.region("child"):
-        t = identity_i32(s)
-    return identity_i32(t)
+SPEC = T.checksum.plan()
 
 
-def siblings(a, b):
-    with tracing.region("left"):
-        s = add_i32(a, b)
-    with tracing.region("right"):
-        t = identity_i32(s)
-    return t
+def account(spec, *, depth=3, challenge=1_000, phase=750, plan_id=T.PLAN_ID, tracked_runs=2) -> bytes:
+    d = bytearray(explain.T_LX + 44 + 40)
+    d[:4] = b"D21T"
+    d[explain.T_DEPTH] = depth
+    struct.pack_into("<QQQQQQ", d, explain.T_STEPS, spec.total_steps, spec.total_outputs, challenge, phase,
+                     2_000_000, 1_000_000)
+    d[explain.T_SPEC_ROOT:explain.T_SPEC_ROOT + 32] = spec.root
+    struct.pack_into("<H", d, explain.T_SLASHER, 5_000)
+    d[explain.T_PLAN_ID:explain.T_PLAN_ID + 32] = plan_id
+    d[explain.T_FIXED] = len(spec.blocks)
+    d[len(d) - 40:len(d) - 36] = b"D21O"
+    struct.pack_into("<I", d, len(d) - 4, tracked_runs)
+    return bytes(d)
 
 
-def grandchild(a, b):
-    with tracing.region("child"):
-        with tracing.region("grand"):
-            s = add_i32(a, b)
-        t = identity_i32(s)
-    return identity_i32(t)
+def test_template_with_its_plan():
+    e = explain.template(None, Pubkey.new_unique(), spec=SPEC, data=account(SPEC), watcher_tick_s=5)
+    text = str(e)
+    assert "the given plan matches" in text and "sumchunk_i32" in text and "2 live run(s)" in text
+    assert "largest STEP witness" in text and not e.warnings
 
 
-def skip_level(a, b):
-    with tracing.region("child"):
-        with tracing.region("grand"):
-            s = add_i32(a, b)
-    return identity_i32(s)
+def test_tight_windows_and_wrong_plans_are_flagged():
+    e = explain.template(None, Pubkey.new_unique(), spec=SPEC, data=account(SPEC))  # remote watcher (33 s)
+    assert any("challenge window" in w for w in e.warnings) and any("phase window" in w for w in e.warnings)
+    e = explain.template(None, Pubkey.new_unique(), spec=SPEC, data=account(SPEC, plan_id=bytes(32)),
+                         plan_id=T.PLAN_ID)
+    assert any("does NOT match" in w for w in e.warnings)
+    e = explain.template(None, Pubkey.new_unique(), data=account(SPEC))
+    assert any("no plan given" in w for w in e.warnings)
+    long = account(SPEC, challenge=3_000, phase=2_000)  # 120 s and 80 s: over twice a 33 s tick
+    assert not explain.template(None, Pubkey.new_unique(), spec=SPEC, data=long).warnings
 
 
-def _bind(kernel):
-    def uses(a, b):
-        return call(kernel, a, b)
-
-    return uses
-
-
-class ExplainTests(unittest.TestCase):
-    def test_hello_names_modes_imports_and_kernels(self):
-        text = tracing.trace(hello).explain("optimistic")
-        self.assertIn("region child [optimistic, parent root]: steps [0]", text)
-        self.assertIn("imports: child step0 -> root step1 (child)", text)
-        self.assertIn("add_i32/v1 abi 1 code 1", text)
-        self.assertIn("direct replay of one step", text)
-        self.assertIn("composition: every region resolves in optimistic mode", text)
-        self.assertIn("not a production guarantee", text)
-
-    def test_root_commitment_and_sampling_are_refused_pending_the_redesign(self):
-        g = tracing.trace(hello)
-        for args, kw in ((("optimistic",), {"commitment": "root"}), (("sampling",), {"samples": 2})):
-            with self.assertRaises(TraceError) as ctx:
-                g.explain(*args, **kw)
-            self.assertEqual(ctx.exception.code, "UNSOUND")
-
-    def test_relations(self):
-        self.assertEqual([f[-1] for f in tracing.trace(parent_child).imports()], ["parent", "child"])
-        self.assertEqual([f[-1] for f in tracing.trace(grandchild).imports()], ["child", "child"])
-        self.assertEqual([f[-1] for f in tracing.trace(siblings).imports()], ["other"])
-        self.assertEqual([f[-1] for f in tracing.trace(skip_level).imports()], ["other"])
-
-    def test_non_adjacent_imports_still_explain_under_a_trace_commitment(self):
-        for fn in (siblings, skip_level):
-            self.assertIn("direct replay", tracing.trace(fn).explain("optimistic"))
-
-    def test_unsupported_modes_and_commitments_are_refused(self):
-        g = tracing.trace(hello)
-        cases = [(("zk",), {}, "MODE"), (("sampling",), {}, "MODE"), (("optimistic",), {"commitment": "x"}, "COMMITMENT"),
-                 (("consensus",), {"commitment": "root"}, "COMMITMENT"),
-                 (("sampling",), {"samples": 2, "commitment": "root"}, "COMMITMENT")]
-        # Order of checks: mode and commitment shape first, soundness after.
-        for args, kw, code in cases:
-            with self.assertRaises(TraceError) as ctx:
-                g.explain(*args, **kw)
-            self.assertEqual(ctx.exception.code, code, (args, kw))
-
-    def test_fast_path_bytes_are_reported_as_trusted(self):
-        def reuse(a, b):
-            return add_i32(a, a)
-
-        self.assertIn("admission trusts the step table", tracing.trace(reuse).explain("optimistic"))
-
-    def test_an_unregistered_kernel_is_refused(self):
-        mul = KernelSpec(9, "mul_i32", 2)
-        newer_add = KernelSpec(1, "add_i32", 2, semantic_version=2)
-        for k in (mul, newer_add):
-            g = tracing.trace(_bind(k))
-            with self.assertRaises(TraceError) as ctx:
-                g.explain("consensus")
-            self.assertEqual(ctx.exception.code, "CAPABILITY")
-
-
-if __name__ == "__main__":
-    unittest.main()
+def test_session_text_states_the_guarantee_and_bounds():
+    kernel = KernelRef.from_manifest({"id": "dcg-tally-v1", "semantic_version": 1, "abi_version": 1,
+                                      "mode": {"id": 0x434F4E53, "version": 3}, "schema": {"id": 1, "version": 1},
+                                      "input_width": 1, "state_spans": [16], "rejects_input": True})
+    decl = KernelDecl(name="dcg-tally-v1", max_input_bytes=1, max_output_bytes=16, max_state_bytes=16,
+                      max_compute_units=50_000, max_operations=8, modes=(MODE_CONSENSUS_V3,), rejects_input=True)
+    info = SessionInfo(status="active", capacity=8, cursor=4, frontier=4, features=2, rejected_count=1,
+                       halt_reason=0, halt_cursor=0, last_reject_sequence=1, last_reject_code=1)
+    text = explain.session_text(info, kernel, decl, "dcg-runtime 0.1.0 (stateful-v3, v21)", max_steps=4)
+    assert "consensus" in text and "may reject inputs" in text and "50,000 CU" in text and "200,000 CU" in text
+    assert "rejected inputs: 1" in text

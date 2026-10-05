@@ -503,10 +503,14 @@ class Session:
             raise RuntimeError("session account does not exist")
         return SessionInfo.decode(session.data, None if stream is None else stream.data)
 
-    async def explain(self) -> str:
-        """Plain-language summary of the live session, including whether its
-        kernel can reject inputs (v3)."""
-        return (await self.info()).explain()
+    async def explain(self, decl=None, runtime: str | None = None) -> str:
+        """Plain-language summary: the consensus guarantee, the kernel and its
+        bounds (with `decl`, the kernel's `KernelDecl` mirror, the per-step
+        compute ceiling), then the live session, including whether its kernel
+        can reject inputs (v3). Alpha plan E8."""
+        from dcg.explain import session_text
+
+        return session_text(await self.info(), self.kernel, decl, runtime, self.max_steps)
 
     async def read_state(self) -> CounterState | bytes:
         self._require_open()
