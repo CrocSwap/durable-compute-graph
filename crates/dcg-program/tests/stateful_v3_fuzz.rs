@@ -1269,19 +1269,9 @@ impl Fuzz {
                 live && *auth == A && m.phase == PH_ANCHOR && *cursor == m.ph_state && a.open && a.progress == m.ph_at
             }
             Op::Close { child, kind, refund } => {
-                // Finding F1 (observed, 10-05): `close_account` checks the kind
-                // byte against the target's byte 6, which for the anchor is its
-                // open flag and for the headerless primary is application state;
-                // `close_child` then closes either by address. A wrong kind equal
-                // to that byte (and not 0, the session path) is accepted.
-                let byte6 = match child {
-                    Child::Anchor => m.anchor.as_ref().map_or(0, |a| u8::from(a.open)),
-                    Child::State(0) if p.ws => {
-                        if m.initialized { self.state_at(m, m.cursor)[6] } else { 0 }
-                    }
-                    _ => child.kind(),
-                };
-                let kind_ok = *kind == child.kind() || (*kind != v3::KIND_SESSION && *kind == byte6);
+                // Finding F1 (fixed 10-05): the requested kind must be the
+                // child's own, including the anchor and the headerless primary.
+                let kind_ok = *kind == child.kind();
                 m.open && !m.active && *refund == A && m.has(*child) && kind_ok && match child {
                     Child::State(i) => *i + 1 == m.states,
                     _ => true,
@@ -2501,9 +2491,9 @@ async fn fuzz_catches_a_planted_kernel_error() {
 /// the anchor by its address. The effect equals a correct close (rent to the
 /// authority, child count decremented); the kind byte is just not enforced.
 /// The same holds for a headerless primary whose application byte 6 equals the
-/// kind. Ignored: it asserts the strict behavior the program does not have.
+/// kind. Fixed 10-05 (the close dispatcher requires the anchor's and the
+/// primary's own kind); this now passes.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "finding F1: close kind byte not enforced for the anchor and the headerless primary"]
 async fn finding_f1_open_anchor_closes_under_a_wrong_kind() {
     let ctx = start(false, &[]).await;
     let mut rng = Rng::new(0xF1, 0);

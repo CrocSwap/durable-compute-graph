@@ -3857,15 +3857,22 @@ fn close_account(
             return Err(ProgramError::NotEnoughAccountKeys);
         };
         check_unique(accounts)?;
-        let primary_state = kind == KIND_STATE
-            && checked_session_from(program, session, false, kernel, Some(refund.key))
-                .is_ok_and(|decoded| decoded.primary_state && target.key == &decoded.state_keys[0]);
-        let anchor_account =
-            kind == KIND_ANCHOR && checked_anchor(program, target, session, false).is_ok();
-        if !primary_state
-            && !anchor_account
-            && target.try_borrow_data()?.get(6).copied() != Some(kind)
-        {
+        // The anchor and a headerless primary are recognised by address (their
+        // byte 6 is an open flag or application state, not a kind), so for
+        // them the requested kind must be exactly theirs (fuzz finding F1,
+        // 10-05: before this either one closed under a kind its byte 6 happened
+        // to match). Every other child carries its kind at byte 6.
+        let is_primary = checked_session_from(program, session, false, kernel, Some(refund.key))
+            .is_ok_and(|decoded| decoded.primary_state && target.key == &decoded.state_keys[0]);
+        let is_anchor = target.key == &anchor_pda(program, session.key).0;
+        let kind_ok = if is_primary {
+            kind == KIND_STATE
+        } else if is_anchor {
+            kind == KIND_ANCHOR && checked_anchor(program, target, session, false).is_ok()
+        } else {
+            target.try_borrow_data()?.get(6).copied() == Some(kind)
+        };
+        if !kind_ok {
             return Err(refusal(REFUSAL_SESSION));
         }
         close_child(program, session, target, refund, kernel)

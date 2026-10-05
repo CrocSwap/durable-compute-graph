@@ -207,3 +207,14 @@ continue). A fix would check the kind against the address-derived kind before
 - H4 and M2 owner decisions (unchanged by this campaign; the fuzzer shows the
   fixed engine's 0xED wedge and recovers only by halt and close).
 - An independent rule-10 review of this harness and note.
+
+## F1 fixed (10-05, host)
+
+The close dispatcher (tag 238) now requires the anchor's and the headerless
+primary's own kind (`KIND_ANCHOR`, `KIND_STATE`), recognising both by address;
+every other child keeps the byte-6 check. The reproducer
+`finding_f1_open_anchor_closes_under_a_wrong_kind` now passes and is no longer
+ignored, and the model's F1 allowance is removed (strict kind). Re-run after
+the fix: native seed 1001, sequences 0..1000 (includes index 316), 79,164
+transactions, 111 s, no failure; smoke, planted checks, creators 5/5 and lanes
+9/9 pass. A stricter refusal on testnet-only v3, like H1 (no wire version).
