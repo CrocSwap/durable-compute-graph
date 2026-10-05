@@ -229,8 +229,50 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--commitment", default="finalized")
     verify.set_defaults(fn=cmd_verify)
 
+    ex = sub.add_parser("explain", help="what a template guarantees and costs (alpha E8)")
+    ex.add_argument("what", choices=["template"])
+    ex.add_argument("--rpc", required=True)
+    ex.add_argument("--template", required=True)
+    ex.add_argument("--plan", help="FILE.py:NAME, a Spec or a traced function, to check against the template")
+    ex.add_argument("--slot-ms", type=float, default=40.0)
+    ex.add_argument("--watcher-tick", type=float, default=None,
+                    help="a watcher's slowest tick in seconds (default: the remote testnet measurement)")
+    ex.add_argument("--json", action="store_true")
+    ex.set_defaults(fn=cmd_explain)
+
     a = ap.parse_args(argv)
     return a.fn(a)
+
+
+def _load_plan(ref: str):
+    """FILE.py:NAME -> a Spec (calling `.plan()` on a traced function)."""
+    import importlib.util
+    import io
+    from contextlib import redirect_stderr
+
+    path, _, name = ref.rpartition(":")
+    sys.path.insert(0, str(Path(path).resolve().parent))
+    spec = importlib.util.spec_from_file_location(Path(path).stem, path)
+    module = importlib.util.module_from_spec(spec)
+    with redirect_stderr(io.StringIO()):
+        spec.loader.exec_module(module)
+        obj = getattr(module, name)
+        return obj.plan() if hasattr(obj, "plan") else obj() if callable(obj) else obj
+
+
+def cmd_explain(a) -> int:
+    from . import explain
+
+    spec = _load_plan(a.plan) if a.plan else None
+    kw = {"spec": spec, "slot_ms": a.slot_ms}
+    if a.watcher_tick is not None:
+        kw["watcher_tick_s"] = a.watcher_tick
+    e = explain.template(a.rpc, a.template, **kw)
+    if a.json:
+        print(json.dumps({"title": e.title, "sections": e.sections, "warnings": e.warnings}, indent=1))
+    else:
+        print(e)
+    return 0
 
 
 if __name__ == "__main__":

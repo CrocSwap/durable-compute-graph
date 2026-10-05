@@ -153,7 +153,7 @@ win are ruled moot, and their bonds return.
     chunked disputes and 5 list lies);
   - discovery and history reading are unit-tested against a fake RPC.
 
-**Sizing windows (measured on testnet, 2026-10-05).**
+**Sizing windows (measured on testnet, 2026-10-05).** `dcg explain template` checks a template against these numbers.
 - **Test conditions:** both services ran on a Mac about 350 ms per RPC call
   from the testnet node.
 - **Tick times:** the longest tick was about 33 s for the watchtower and

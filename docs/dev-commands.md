@@ -83,6 +83,37 @@ it.
 receipt. The image matches, 16,080 bytes of zero headroom follow it, and the
 runtime is `dcg-runtime 0.1.0`.
 
+## `dcg explain`: what a template guarantees and costs
+
+```sh
+dcg explain template --rpc URL --template T --plan examples/hello-graph/traced_dispute.py:checksum
+```
+
+It reads the template from chain and reports:
+- whether it is open or retired, and how many live runs it has;
+- the guarantee (optimistic);
+- with `--plan`: a check of the plan against the template's spec root and
+  counts, then every kernel (built-in, or an application kernel with its
+  mirror's declared limits) and the dispute path (rounds, claims, phases);
+- the largest STEP witness, and the phase window it needs;
+- the windows, the bonds and the slasher share;
+- the alpha limits.
+
+It warns when:
+- the plan does not match the template;
+- a window is too short to stage the largest witness;
+- the windows are under twice a remote watcher's slowest tick. That tick is
+  33 s, measured on testnet; pass `--watcher-tick` for your own. The owner
+  kept the program's 750-slot minimums (2026-10-05), so `explain` flags the
+  risk instead.
+
+LX1 templates show their machine, checkpoint bounds and bisection arity. In
+Python, use `dcg.explain.template(rpc_url, template, spec=plan)`.
+
+For a session, `await session.explain(decl=MANIFEST)` states the consensus
+guarantee, the kernel and its per-step and per-transaction compute bounds,
+then the live state: cursor, rejections and halt.
+
 ## Not covered yet
 
 - Deploying to a network. Use the Solana CLI or your own deploy tooling,
