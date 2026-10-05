@@ -214,10 +214,9 @@ impl Params {
         if self.ring {
             self.capacity = rng.range(v3::MIN_RING_CAPACITY, v3::MIN_RING_CAPACITY + 8);
         }
+        // The rejecting kernel is the lane counter plus REJECTS_INPUT, so
+        // rejectable sessions keep their lanes (the Doom shape, review M1).
         self.reject = !self.ws && self.width == 1 && rng.pct(30);
-        if self.reject {
-            self.lanes = 0;
-        }
         self
     }
     fn features(&self) -> u8 {
@@ -1149,7 +1148,8 @@ impl Fuzz {
                 if self.p.rejected(cmd) {
                     continue;
                 }
-                value += cmd[0] as u64 + u64::from(self.cfg.plant == 3);
+                let add = if self.p.reject && cmd[0] == app::V3_REJECT_HALT_AFTER_COMMAND { 1 } else { cmd[0] as u64 };
+                value += add + u64::from(self.cfg.plant == 3);
                 total += value;
             }
             let mut st = value.to_le_bytes().to_vec();
@@ -1168,9 +1168,15 @@ impl Fuzz {
                 if cmd.len() != 1 {
                     return None;
                 }
-                // The rejecting counter: a dirty or codeless rejection refuses.
-                if self.p.reject && matches!(cmd[0], app::V3_REJECT_DIRTY_COMMAND | app::V3_REJECT_ZERO_COMMAND) {
-                    return None;
+                // The rejecting counter: a dirty or codeless rejection refuses;
+                // halt commands halt before (unconsumed) or after (+1).
+                if self.p.reject {
+                    match cmd[0] {
+                        app::V3_REJECT_DIRTY_COMMAND | app::V3_REJECT_ZERO_COMMAND => return None,
+                        app::V3_REJECT_HALT_BEFORE_COMMAND => return Some((c, Some(app::V3_REJECT_HALT_REASON))),
+                        app::V3_REJECT_HALT_AFTER_COMMAND => return Some((c + 1, Some(app::V3_REJECT_HALT_REASON))),
+                        _ => {}
+                    }
                 }
                 c += 1;
                 continue;
@@ -1200,7 +1206,9 @@ impl Fuzz {
             Op::Open { payer, auth, lanes } => {
                 let lanes_ok = match lanes {
                     None => true,
-                    Some(n) => !p.ws && !p.reject && (1..=4).contains(n),
+                    // The 180-byte form (features) allows an explicit 0.
+                    Some(0) => p.features() != 0,
+                    Some(n) => !p.ws && (1..=4).contains(n),
                 };
                 !m.open && *auth == A && *payer != A && lanes_ok
             }
@@ -1228,8 +1236,7 @@ impl Fuzz {
             Op::CreateView { auth, signed, role, bad_abi, .. } => {
                 live && *auth == A && *signed && m.initialized && m.states > 0 && m.stream && !m.views.contains_key(role) && !bad_abi && p.view_roles().contains(role)
             }
-            // The rejecting counter declares no renderer workspace.
-            Op::CreateWorkspace { auth, len, .. } => !p.reject && live && *auth == A && m.initialized && m.workspace.is_none() && (1..=64).contains(len),
+            Op::CreateWorkspace { auth, len, .. } => live && *auth == A && m.initialized && m.workspace.is_none() && (1..=64).contains(len),
             Op::CreateScratch { auth, len, .. } => live && *auth == A && m.initialized && m.states > 0 && !m.views.is_empty() && m.scratch.is_none() && *len > 0,
             Op::GrowView { .. } => false,
             Op::Write { actor, seq, bytes } => {
@@ -1997,6 +2004,8 @@ impl Fuzz {
                         0..=24 => app::V3_REJECT_COMMAND,
                         25..=27 => app::V3_REJECT_DIRTY_COMMAND,
                         28..=30 => app::V3_REJECT_ZERO_COMMAND,
+                        31..=32 => app::V3_REJECT_HALT_BEFORE_COMMAND,
+                        33..=34 => app::V3_REJECT_HALT_AFTER_COMMAND,
                         _ => self.rng.range(0, 0x40) as u8,
                     }]
                 } else {
@@ -2604,9 +2613,12 @@ async fn fuzz_campaign() {
 /// A small native campaign in the default suite.
 #[tokio::test(flavor = "multi_thread")]
 async fn fuzz_smoke() {
-    let stats = campaign(7, 0, 6, 6, false, None).await;
-    assert_eq!(stats.sequences, 6);
+    // Enough sequences to draw ring laps and rejections (review L5).
+    let stats = campaign(7, 0, 48, 8, false, None).await;
+    assert_eq!(stats.sequences, 48);
     assert!(stats.accepted > 0 && stats.refused > 0);
+    assert!(stats.ring_laps > 0 && stats.reject_sequences > 0 && stats.rejected_inputs > 0,
+            "ring laps {} reject sequences {} rejected inputs {}", stats.ring_laps, stats.reject_sequences, stats.rejected_inputs);
 }
 
 /// Planted checks: a wrong host input chain, a wrong acceptance prediction

@@ -85,6 +85,10 @@ fn u32_at(raw: &[u8], at: usize) -> u32 {
 /// Open payload for `kernel` (headered state, indexed policy, width 1);
 /// `features` None is the 178-byte form, Some(f) the 180-byte form.
 fn open_payload(kernel: &dyn Kernel, id: u64, capacity: u32, features: Option<u8>) -> Vec<u8> {
+    open_payload_lanes(kernel, id, capacity, features, 0)
+}
+
+fn open_payload_lanes(kernel: &dyn Kernel, id: u64, capacity: u32, features: Option<u8>, lanes: u8) -> Vec<u8> {
     let m = kernel.manifest();
     let mut p = vec![v3::WIRE_VERSION];
     p.extend_from_slice(&id.to_le_bytes());
@@ -104,7 +108,7 @@ fn open_payload(kernel: &dyn Kernel, id: u64, capacity: u32, features: Option<u8
     p.extend_from_slice(&[0; 32]);
     p.push(0);
     if let Some(f) = features {
-        p.extend_from_slice(&[0, f]); // no lanes, features
+        p.extend_from_slice(&[lanes, f]);
     }
     p
 }
@@ -117,10 +121,15 @@ struct Session {
 /// Open, create the stream and two state spans, initialize.
 async fn session(ctx: &mut ProgramTestContext, kernel: &dyn Kernel, capacity: u32, features: Option<u8>)
     -> Result<Session, u32> {
+    session_lanes(ctx, kernel, capacity, features, 0).await
+}
+
+async fn session_lanes(ctx: &mut ProgramTestContext, kernel: &dyn Kernel, capacity: u32, features: Option<u8>, lanes: u8)
+    -> Result<Session, u32> {
     let auth = keypair(7);
     let payer = ctx.payer.pubkey();
     let s = session_pda(&auth.pubkey(), 1);
-    send(ctx, ix(sw::TAG_OPEN_SESSION, open_payload(kernel, 1, capacity, features),
+    send(ctx, ix(sw::TAG_OPEN_SESSION, open_payload_lanes(kernel, 1, capacity, features, lanes),
                  vec![AccountMeta::new(payer, true), signer(auth.pubkey()), w(s), r(SYSTEM)]), &[&auth]).await?;
     send(ctx, ix(sw::TAG_CREATE_STREAM, vec![v3::WIRE_VERSION, 0],
                  vec![AccountMeta::new(payer, true), w(s), signer(auth.pubkey()), w(stream_pda(&s)), r(SYSTEM)]), &[&auth])
@@ -308,4 +317,109 @@ async fn a_rejectable_ring_session_combines_both() {
     }
     assert_eq!(value(&mut ctx, &s).await, sum);
     assert_eq!(u32_at(&data(&mut ctx, s.key).await, SESSION_REJECTED), rejected);
+}
+
+const SESSION_STATUS: usize = 6;
+const SESSION_HALT_REASON: usize = 1254;
+
+/// Review M2: a rejection mixed with HaltBefore and HaltAfter in one ADVANCE
+/// commits a consistent prefix, chain, count and last-rejection record.
+#[tokio::test]
+async fn rejection_mixes_with_halts_in_one_advance() {
+    let code = Some(app::V3_REJECT_CODE);
+    // [2, reject, halt-before]: two consumed, the halt-before input stays.
+    let mut ctx = start().await;
+    let s = session(&mut ctx, &app::V3_REJECT_COUNTER, 16, Some(v3::FEATURE_REJECTABLE)).await.unwrap();
+    for (i, c) in [2u8, app::V3_REJECT_COMMAND, app::V3_REJECT_HALT_BEFORE_COMMAND].iter().enumerate() {
+        write(&mut ctx, &s, i as u32, *c).await.unwrap();
+    }
+    advance(&mut ctx, &s, 0, 3).await.unwrap();
+    let raw = data(&mut ctx, s.key).await;
+    assert_eq!((u32_at(&raw, SESSION_CURSOR), raw[SESSION_STATUS], u32_at(&raw, SESSION_HALT_REASON)), (2, 2, app::V3_REJECT_HALT_REASON));
+    assert_eq!(u32_at(&raw, SESSION_REJECTED), 1);
+    assert_eq!(raw[SESSION_INPUT_ROOT..SESSION_INPUT_ROOT + 32], chain(true, &[(0, 2, None), (1, 0xEE, code)]));
+    assert_eq!(value(&mut ctx, &s).await, 2);
+    // [reject, halt-after]: both consumed; halt-after applies +1.
+    let mut ctx = start().await;
+    let s = session(&mut ctx, &app::V3_REJECT_COUNTER, 16, Some(v3::FEATURE_REJECTABLE)).await.unwrap();
+    for (i, c) in [app::V3_REJECT_COMMAND, app::V3_REJECT_HALT_AFTER_COMMAND, 9].iter().enumerate() {
+        write(&mut ctx, &s, i as u32, *c).await.unwrap();
+    }
+    advance(&mut ctx, &s, 0, 3).await.unwrap();
+    let raw = data(&mut ctx, s.key).await;
+    assert_eq!((u32_at(&raw, SESSION_CURSOR), raw[SESSION_STATUS]), (2, 2));
+    assert_eq!(u32_at(&raw, SESSION_REJECTED), 1);
+    assert_eq!(raw[SESSION_INPUT_ROOT..SESSION_INPUT_ROOT + 32], chain(true, &[(0, 0xEE, code), (1, 0xEA, None)]));
+    let stream = data(&mut ctx, stream_pda(&s.key)).await;
+    assert_eq!((u32_at(&stream, 120), u32_at(&stream, 124)), (0, app::V3_REJECT_CODE), "a rejection at sequence 0");
+    assert_eq!(value(&mut ctx, &s).await, 1);
+}
+
+/// Review M2: after a lap, a gap in an indexed ring is not served from the
+/// previous lap's slot.
+#[tokio::test]
+async fn a_ring_gap_after_a_lap_refuses_rather_than_reading_the_old_lap() {
+    let mut ctx = start().await;
+    let cap = v3::MIN_RING_CAPACITY;
+    let s = session(&mut ctx, &app::V3_COUNTER, cap, Some(v3::FEATURE_RING_STREAM)).await.unwrap();
+    let mut cursor = 0;
+    while cursor < cap {
+        for seq in cursor..cursor + 8 {
+            write(&mut ctx, &s, seq, 1).await.unwrap();
+        }
+        advance(&mut ctx, &s, cursor, 8).await.unwrap();
+        cursor += 8;
+    }
+    // Skip sequence `cap` (its slot still holds sequence 0); write `cap + 1`.
+    write(&mut ctx, &s, cap + 1, 1).await.unwrap();
+    assert_eq!(advance(&mut ctx, &s, cap, 1).await, Err(v3::REFUSAL_INPUT_GAP));
+    write(&mut ctx, &s, cap, 2).await.unwrap();
+    advance(&mut ctx, &s, cap, 2).await.unwrap();
+    assert_eq!(value(&mut ctx, &s).await, cap as u64 + 3);
+}
+
+/// Review M2: a ring refuses writes at the sequence ceiling. The session and
+/// stream counters are moved near the top directly (no 4-billion-input run).
+#[tokio::test]
+async fn a_ring_refuses_writes_at_the_sequence_ceiling() {
+    let mut ctx = start().await;
+    let s = session(&mut ctx, &app::V3_COUNTER, v3::MIN_RING_CAPACITY, Some(v3::FEATURE_RING_STREAM)).await.unwrap();
+    let c = v3::RING_SEQUENCE_CEILING - 2;
+    // Session cursor/frontier/last start, stream cursor/frontier, and each
+    // state span's before/after cursors.
+    let targets = [
+        (s.key, vec![SESSION_CURSOR, 116, 1263]),
+        (stream_pda(&s.key), vec![76, 80]),
+        (state_pda(&s.key, 0), vec![88, 92]),
+        (state_pda(&s.key, 1), vec![88, 92]),
+    ];
+    for (key, offsets) in targets {
+        let mut account = ctx.banks_client.get_account(key).await.unwrap().unwrap();
+        for at in offsets {
+            account.data[at..at + 4].copy_from_slice(&c.to_le_bytes());
+        }
+        ctx.set_account(&key, &account.into());
+    }
+    write(&mut ctx, &s, c, 1).await.unwrap();
+    write(&mut ctx, &s, c + 1, 1).await.unwrap();
+    assert_eq!(write(&mut ctx, &s, c + 2, 1).await, Err(v3::REFUSAL_BACKPRESSURE), "the ceiling");
+    advance(&mut ctx, &s, c, 2).await.unwrap();
+    assert_eq!(u32_at(&data(&mut ctx, s.key).await, SESSION_CURSOR), v3::RING_SEQUENCE_CEILING);
+    assert_eq!(write(&mut ctx, &s, v3::RING_SEQUENCE_CEILING, 1).await, Err(v3::REFUSAL_BACKPRESSURE), "no write past the ceiling");
+}
+
+/// Review M1: a rejectable session with render lanes (the Doom shape) opens
+/// and rejects inputs.
+#[tokio::test]
+async fn a_rejectable_session_with_lanes_rejects() {
+    let mut ctx = start().await;
+    let f = v3::FEATURE_REJECTABLE | v3::FEATURE_RING_STREAM;
+    let s = session_lanes(&mut ctx, &app::V3_REJECT_COUNTER, v3::MIN_RING_CAPACITY, Some(f), 2).await.unwrap();
+    assert_eq!(data(&mut ctx, s.key).await[1267], 2, "two lanes");
+    for (i, c) in [5u8, app::V3_REJECT_COMMAND, 6].iter().enumerate() {
+        write(&mut ctx, &s, i as u32, *c).await.unwrap();
+    }
+    advance(&mut ctx, &s, 0, 3).await.unwrap();
+    assert_eq!(value(&mut ctx, &s).await, 11);
+    assert_eq!(u32_at(&data(&mut ctx, s.key).await, SESSION_REJECTED), 1);
 }

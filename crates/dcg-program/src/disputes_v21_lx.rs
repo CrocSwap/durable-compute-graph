@@ -811,3 +811,61 @@ pub mod toy {
 
     pub static TOY_KERNEL: ToyKernel = ToyKernel;
 }
+
+/// v2.1 has no rejection outcome yet (owner 10-05, design
+/// session-reject-and-ring-v1 Q2): `bind` refuses a kernel declaring
+/// `REJECTS_INPUT` before it builds the machine (review M2).
+#[cfg(all(test, feature = "test-kernel"))]
+mod reject_capability_tests {
+    use super::toy::{TOY_FACTORY, TOY_MANIFEST};
+    use super::*;
+    use crate::kernel::{AdmissionScan, ApplicationManifest, Kernel, KernelCapabilities, KernelError, KernelManifest};
+
+    static REJECTING_TOY_MANIFEST: KernelManifest = KernelManifest {
+        id: crate::kernel::KernelId(*b"dcg-lx-rejtoy-v1"),
+        capabilities: KernelCapabilities::REJECTS_INPUT,
+        ..TOY_MANIFEST
+    };
+    struct RejectingToy;
+    impl Kernel for RejectingToy {
+        fn manifest(&self) -> &'static KernelManifest {
+            &REJECTING_TOY_MANIFEST
+        }
+        fn execute(&self, _input: &[u8], _output: &mut [u8]) -> Result<usize, KernelError> {
+            Err(KernelError::Refused)
+        }
+        fn lx_machine(&self) -> Option<&dyn LxFactory> {
+            Some(&TOY_FACTORY)
+        }
+    }
+    static KERNELS: [&dyn Kernel; 2] = [&super::toy::TOY_KERNEL, &RejectingToy];
+    static APP: ApplicationManifest = ApplicationManifest {
+        application_id: b"dcg-lx-reject-capability-test/1",
+        version: 1,
+        kernels: &KERNELS,
+        optimistic_replays: &[],
+        legacy_forms: &[],
+        require_legacy_form_binding: false,
+        admission_scan: AdmissionScan::Full,
+        hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
+        decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
+    };
+
+    fn bind_with(kernel: &KernelManifest) -> Result<(), ProgramError> {
+        let lx = LxBinding { kernel: kernel.id.0, semantic: kernel.semantic_version, abi: kernel.abi_version, arity: 2, k_min: 1, k_max: 4, max_positions: 16 };
+        let mut params = 4u64.to_le_bytes().to_vec();
+        params.extend_from_slice(&1u64.to_le_bytes());
+        params.extend_from_slice(&0i64.to_le_bytes());
+        // Positions 0: a resolvable kernel gets past resolution and fails the
+        // bounds (42); a rejecting one is refused at resolution (43).
+        let mut root = vec![0u8; D::RUN_ROOT_BYTES];
+        root[RR_PARAMS..RR_PARAMS + 32].copy_from_slice(&sha256(&[PARAMS_DOMAIN, &params]));
+        bind(&lx, &APP, &root, &params).map(|_| ())
+    }
+
+    #[test]
+    fn lx_bind_refuses_a_kernel_declaring_rejects_input() {
+        assert_eq!(bind_with(&TOY_MANIFEST).unwrap_err(), err(42));
+        assert_eq!(bind_with(&REJECTING_TOY_MANIFEST).unwrap_err(), err(43));
+    }
+}

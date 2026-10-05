@@ -1262,8 +1262,13 @@ fn stream_pda_check(
         || u32_at(&raw, 80) != session.frontier
         || u32_at(&raw, 84) as usize != SLOT_BYTES
         || raw[88..120] != session.writer.to_bytes()
-        // 120..128: the last rejected sequence and code (rejectable sessions).
+        // 120..128: the last rejected sequence and code (rejectable sessions):
+        // a code exactly when something was rejected, at a consumed sequence.
         || (!session.rejectable() && raw[120..CHILD_HEADER_BYTES].iter().any(|byte| *byte != 0))
+        || (session.rejectable()
+            && ((u32_at(&raw, 124) == 0) != (session.rejected_count == 0)
+                || (u32_at(&raw, 124) == 0 && u32_at(&raw, 120) != 0)
+                || (u32_at(&raw, 124) != 0 && u32_at(&raw, 120) >= session.cursor)))
     {
         return Err(refusal(REFUSAL_SESSION));
     }
@@ -2802,7 +2807,10 @@ fn advance(
     let mut halt_reason = None;
     // Per consumed command: None applied, Some(code) rejected (§2.2).
     let mut rejections: Vec<Option<u32>> = Vec::with_capacity(commands.len());
-    let rejectable = session.rejectable();
+    // Both the session's flag (fixed at open) and the kernel's current
+    // declaration: an upgrade that drops the capability without a semantic
+    // version bump cannot keep rejecting (review L1).
+    let rejectable = session.rejectable() && kernel.manifest().capabilities.rejects_input();
     let state_bytes = spans
         .iter()
         .try_fold(0usize, |total, span| total.checked_add(span.data.len()))
@@ -2939,6 +2947,8 @@ fn advance(
     }
     session.input_root = input_root;
     let newly_rejected = rejections.iter().take(committed_steps as usize).filter(|r| r.is_some()).count() as u32;
+    // Cannot overflow: rejected_count <= cursor < RING_SEQUENCE_CEILING (rings)
+    // or <= capacity (linear) (review L4).
     if newly_rejected != 0 {
         session.rejected_count = session
             .rejected_count

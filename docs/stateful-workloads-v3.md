@@ -225,6 +225,14 @@ rejectable). A rejectable session's input chain is
 with disposition 0 applied, 1 rejected (followed by the code); other sessions
 keep `dcg/input-chain/2`.
 
+A `Reject` needs both the session flag and the kernel's current declaration.
+A declaring kernel must answer every input-dependent refusal with `Reject`
+(`Err` is for faults), and above the 8 KiB snapshot cap must itself keep state
+unchanged on `Reject`. The stream's last-rejection words carry a code exactly
+when `rejected_count > 0`, at a sequence below the cursor. No DCG Python client
+speaks wire v3 yet; clients that address slots must use `s mod capacity` on a
+ring.
+
 v2.1 has no rejection outcome yet: an LX1 run cannot bind a kernel declaring
 `REJECTS_INPUT` (manifests also refuse the bit on stateless kernels), and the
 `DLX1` tail's flags byte stays zero.

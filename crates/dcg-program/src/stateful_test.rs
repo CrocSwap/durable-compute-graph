@@ -259,6 +259,12 @@ pub const V3_REJECT_COMMAND: u8 = 0xEE;
 pub const V3_REJECT_DIRTY_COMMAND: u8 = 0xED;
 pub const V3_REJECT_ZERO_COMMAND: u8 = 0xEC;
 pub const V3_REJECT_CODE: u32 = 7;
+/// Halt commands of the reject kernels, to mix rejection with halts in one
+/// `ADVANCE`: `HALT_BEFORE` leaves the command unconsumed, `HALT_AFTER`
+/// applies it (+1) and halts.
+pub const V3_REJECT_HALT_BEFORE_COMMAND: u8 = 0xEB;
+pub const V3_REJECT_HALT_AFTER_COMMAND: u8 = 0xEA;
+pub const V3_REJECT_HALT_REASON: u32 = 0xBEEF;
 
 fn reject_counter_transition(
     input: &[u8],
@@ -273,6 +279,14 @@ fn reject_counter_transition(
             COUNTER.transition_spans(&[1], state, output)?;
             reject(V3_REJECT_CODE)
         }
+        Some(&V3_REJECT_HALT_BEFORE_COMMAND) => Ok(TransitionOutcome {
+            output_bytes: 0,
+            disposition: TransitionDisposition::HaltBefore { reason: V3_REJECT_HALT_REASON },
+        }),
+        Some(&V3_REJECT_HALT_AFTER_COMMAND) => COUNTER.transition_spans(&[1], state, output).map(|output_bytes| TransitionOutcome {
+            output_bytes,
+            disposition: TransitionDisposition::HaltAfter { reason: V3_REJECT_HALT_REASON },
+        }),
         _ => COUNTER.transition_spans(input, state, output).map(|output_bytes| TransitionOutcome {
             output_bytes,
             disposition: TransitionDisposition::Continue,
@@ -280,14 +294,15 @@ fn reject_counter_transition(
     }
 }
 
-/// The v3 counter declaring `REJECTS_INPUT`: sessions binding it must open
-/// with the rejectable feature.
+/// The v3 lane counter declaring `REJECTS_INPUT` (lanes, views and capture as
+/// `V3_LANE_COUNTER`): sessions binding it must open with the rejectable
+/// feature.
 pub struct V3RejectCounterKernel;
 
 static V3_REJECT_COUNTER_MANIFEST: KernelManifest = KernelManifest {
     id: KernelId(*b"dcg-rejctr-v1\0\0\0"),
     capabilities: crate::kernel::KernelCapabilities::REJECTS_INPUT,
-    ..V3_COUNTER_MANIFEST
+    ..V3_LANE_COUNTER_MANIFEST
 };
 
 /// A counter that rejects without declaring the capability: every `Reject`
@@ -296,7 +311,7 @@ pub struct V3UndeclaredRejectKernel;
 
 static V3_UNDECLARED_REJECT_MANIFEST: KernelManifest = KernelManifest {
     id: KernelId(*b"dcg-undrej-v1\0\0\0"),
-    ..V3_COUNTER_MANIFEST
+    ..V3_LANE_COUNTER_MANIFEST
 };
 
 macro_rules! reject_counter_kernel {
@@ -306,12 +321,12 @@ macro_rules! reject_counter_kernel {
                 &$manifest
             }
             fn execute(&self, input: &[u8], output: &mut [u8]) -> Result<usize, KernelError> {
-                COUNTER.execute(input, output)
+                V3_LANE_COUNTER.execute(input, output)
             }
         }
         impl StatefulKernel for $kernel {
             fn initial_state(&self, output: &mut [u8]) -> Result<usize, KernelError> {
-                COUNTER.initial_state(output)
+                V3_LANE_COUNTER.initial_state(output)
             }
             fn transition(
                 &self,
@@ -320,10 +335,10 @@ macro_rules! reject_counter_kernel {
                 output: &mut [u8],
                 next_state: &mut [u8],
             ) -> Result<(usize, usize), KernelError> {
-                COUNTER.transition(input, prior_state, output, next_state)
+                V3_LANE_COUNTER.transition(input, prior_state, output, next_state)
             }
             fn initial_state_spans(&self, spans: &mut [StateSpanMut<'_>]) -> Result<usize, KernelError> {
-                COUNTER.initial_state_spans(spans)
+                V3_LANE_COUNTER.initial_state_spans(spans)
             }
             fn transition_spans_with_outcome(
                 &self,
@@ -334,7 +349,43 @@ macro_rules! reject_counter_kernel {
                 reject_counter_transition(input, state, output)
             }
             fn view_abis(&self) -> &'static [ViewAbi] {
-                COUNTER.view_abis()
+                V3_LANE_COUNTER.view_abis()
+            }
+            fn max_view_phase_bytes(&self) -> u32 {
+                V3_LANE_COUNTER.max_view_phase_bytes()
+            }
+            fn view_phase_compute_units(&self) -> u32 {
+                V3_LANE_COUNTER.view_phase_compute_units()
+            }
+            fn max_view_workspace_bytes(&self) -> u32 {
+                V3_LANE_COUNTER.max_view_workspace_bytes()
+            }
+            fn lane_capture_bytes(&self) -> u32 {
+                V3_LANE_COUNTER.lane_capture_bytes()
+            }
+            fn lane_capture_phase_bytes(&self) -> u32 {
+                V3_LANE_COUNTER.lane_capture_phase_bytes()
+            }
+            fn capture_lane_phase(
+                &self,
+                phase: crate::kernel::LanePhase,
+                state: &[AccountSpan<'_>],
+                resources: &[AccountSpan<'_>],
+                commitment: &[u8; 32],
+                workspace: &mut [u8],
+            ) -> Result<(), KernelError> {
+                V3_LANE_COUNTER.capture_lane_phase(phase, state, resources, commitment, workspace)
+            }
+            fn render_lane_phase(
+                &self,
+                phase: ViewPhase,
+                resources: &[AccountSpan<'_>],
+                commitment: &[u8; 32],
+                workspace_header: &mut [u8],
+                workspace: &mut [u8],
+                output: &mut [u8],
+            ) -> Result<usize, KernelError> {
+                V3_LANE_COUNTER.render_lane_phase(phase, resources, commitment, workspace_header, workspace, output)
             }
         }
     };
