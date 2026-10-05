@@ -39,6 +39,9 @@ class KernelRef:
     stream_root: bytes
     input_codec: str = "u8"
     state_codec: str = "counter-u64-pair"
+    #: The kernel declares KernelCapabilities::REJECTS_INPUT (v3 only): its
+    #: sessions must open rejectable and may consume an input without applying it.
+    rejects_input: bool = False
 
     @classmethod
     def from_manifest(cls, manifest: Mapping[str, Any]) -> KernelRef:
@@ -83,6 +86,11 @@ class KernelRef:
             raise ValueError("supported input_codec values are 'u8' and 'bytes'")
         if state_codec not in {"counter-u64-pair", "bytes"}:
             raise ValueError("supported state_codec values are 'counter-u64-pair' and 'bytes'")
+        rejects_input = manifest.get("rejects_input", False)
+        if not isinstance(rejects_input, bool):
+            raise ValueError("rejects_input must be true or false")
+        if rejects_input and mode_version != 3:
+            raise ValueError("rejects_input needs a stateful v3 kernel")
         input_width = _uint(manifest.get("input_width"), 8, "input_width", nonzero=True)
         if input_width > 8:
             raise ValueError("input_width must not exceed the stateful 8-byte command limit")
@@ -98,6 +106,7 @@ class KernelRef:
             state_span_lengths=lengths,
             stream_root=stream_root,
             input_codec=input_codec,
+            rejects_input=rejects_input,
             state_codec=state_codec,
         )
 

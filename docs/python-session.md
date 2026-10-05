@@ -44,6 +44,30 @@ existing Rust example. PDA vectors were independently produced with Solana's
 Rust `find-program-derived-address` CLI for v1 and v2. The refusal table is
 checked against the Rust constants in `stateful.rs` and `stateful_v2.rs`.
 
+### Stateful v3 and session features
+
+`wire_version=3` (a kernel whose mode version is 3) uses the `-v3` seeds and
+the v3 forms: child creators carry the session authority, signing, as account
+2; the open payload adds the headered-state byte and, when needed, `lanes` and
+`features` (DCG design `docs/design/session-reject-and-ring-v1.md`).
+
+- `Session(..., ring=True)` opens a ring-buffer stream (capacity at least 128,
+  never grown; only the last lap of inputs stays on chain, so keep your own
+  input log). Writes are bounded by the 64-input window, not by capacity.
+- A kernel manifest with `"rejects_input": true` (v3 only) opens rejectable.
+  The flag follows the kernel's declared capability; the program refuses a
+  mismatch either way. A rejected input is consumed without changing state.
+- `await session.info()` returns `SessionInfo` (status, cursor, frontier,
+  features, rejected count, last rejection); `await session.explain()` prints
+  it, including `rejectable: yes/no`. `slot_offset(seq, capacity, ring)`
+  addresses a slot for readers of the raw stream.
+
+The v3 builders are checked byte for byte against the program's payload format
+(`tests/test_session_v3.py`); the refusal table covers `stateful_v3.rs` codes
+2321-2341. Not covered: views, lanes, phased initialization and resources
+through the high-level `Session` (use the instruction builders or the Rust
+tests' account lists), and an end-to-end v3 run on a validator.
+
 ## Readable refusals
 
 Known custom codes become named exceptions with a short explanation and a
