@@ -156,6 +156,10 @@ fn bind(
     let factory = manifest
         .resolve(crate::kernel::KernelId(lx.kernel), lx.semantic, lx.abi)
         .filter(|k| k.manifest().modes.contains(&MODE_LX1_V1))
+        // v2.1 has no rejection outcome yet (owner 10-05, design
+        // session-reject-and-ring-v1 Q2): a kernel declaring REJECTS_INPUT
+        // cannot back an LX1 run, and the DLX1 tail's flags byte stays zero.
+        .filter(|k| !k.manifest().capabilities.rejects_input())
         .and_then(|k| k.lx_machine())
         .ok_or(err(43))?;
     let machine = factory.bind(params).ok_or(err(42))?;
@@ -790,6 +794,7 @@ pub mod toy {
             max_compute_units: 100_000,
         },
         modes: &TOY_MODES,
+        capabilities: crate::kernel::KernelCapabilities::NONE,
     };
 
     impl Kernel for ToyKernel {

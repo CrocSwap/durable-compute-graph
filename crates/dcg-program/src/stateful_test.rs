@@ -72,6 +72,7 @@ static MANIFEST: KernelManifest = KernelManifest {
         max_compute_units: 80_000,
     },
     modes: &MODES,
+    capabilities: crate::kernel::KernelCapabilities::NONE,
 };
 
 pub struct CounterKernel;
@@ -200,6 +201,7 @@ static V3_COUNTER_MANIFEST: KernelManifest = KernelManifest {
         max_compute_units: 80_000,
     },
     modes: &V3_COUNTER_MODES,
+    capabilities: crate::kernel::KernelCapabilities::NONE,
 };
 
 pub struct V3CounterKernel;
@@ -248,6 +250,101 @@ impl StatefulKernel for V3CounterKernel {
 }
 
 pub static V3_COUNTER: V3CounterKernel = V3CounterKernel;
+
+/// Commands the reject test kernels treat specially (design
+/// `session-reject-and-ring-v1.md` §5): `REJECT` is rejected with code 7;
+/// `REJECT_DIRTY` changes state and then rejects; `REJECT_ZERO` rejects with
+/// code 0. Anything else is the counter's ordinary transition.
+pub const V3_REJECT_COMMAND: u8 = 0xEE;
+pub const V3_REJECT_DIRTY_COMMAND: u8 = 0xED;
+pub const V3_REJECT_ZERO_COMMAND: u8 = 0xEC;
+pub const V3_REJECT_CODE: u32 = 7;
+
+fn reject_counter_transition(
+    input: &[u8],
+    state: &mut [StateSpanMut<'_>],
+    output: &mut [u8],
+) -> Result<TransitionOutcome, KernelError> {
+    let reject = |code| Ok(TransitionOutcome { output_bytes: 0, disposition: TransitionDisposition::Reject { code } });
+    match input.first() {
+        Some(&V3_REJECT_COMMAND) => reject(V3_REJECT_CODE),
+        Some(&V3_REJECT_ZERO_COMMAND) => reject(0),
+        Some(&V3_REJECT_DIRTY_COMMAND) => {
+            COUNTER.transition_spans(&[1], state, output)?;
+            reject(V3_REJECT_CODE)
+        }
+        _ => COUNTER.transition_spans(input, state, output).map(|output_bytes| TransitionOutcome {
+            output_bytes,
+            disposition: TransitionDisposition::Continue,
+        }),
+    }
+}
+
+/// The v3 counter declaring `REJECTS_INPUT`: sessions binding it must open
+/// with the rejectable feature.
+pub struct V3RejectCounterKernel;
+
+static V3_REJECT_COUNTER_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-rejctr-v1\0\0\0"),
+    capabilities: crate::kernel::KernelCapabilities::REJECTS_INPUT,
+    ..V3_COUNTER_MANIFEST
+};
+
+/// A counter that rejects without declaring the capability: every `Reject`
+/// it returns must be refused.
+pub struct V3UndeclaredRejectKernel;
+
+static V3_UNDECLARED_REJECT_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-undrej-v1\0\0\0"),
+    ..V3_COUNTER_MANIFEST
+};
+
+macro_rules! reject_counter_kernel {
+    ($kernel:ty, $manifest:expr) => {
+        impl Kernel for $kernel {
+            fn manifest(&self) -> &'static KernelManifest {
+                &$manifest
+            }
+            fn execute(&self, input: &[u8], output: &mut [u8]) -> Result<usize, KernelError> {
+                COUNTER.execute(input, output)
+            }
+        }
+        impl StatefulKernel for $kernel {
+            fn initial_state(&self, output: &mut [u8]) -> Result<usize, KernelError> {
+                COUNTER.initial_state(output)
+            }
+            fn transition(
+                &self,
+                input: &[u8],
+                prior_state: &[u8],
+                output: &mut [u8],
+                next_state: &mut [u8],
+            ) -> Result<(usize, usize), KernelError> {
+                COUNTER.transition(input, prior_state, output, next_state)
+            }
+            fn initial_state_spans(&self, spans: &mut [StateSpanMut<'_>]) -> Result<usize, KernelError> {
+                COUNTER.initial_state_spans(spans)
+            }
+            fn transition_spans_with_outcome(
+                &self,
+                input: &[u8],
+                state: &mut [StateSpanMut<'_>],
+                output: &mut [u8],
+            ) -> Result<TransitionOutcome, KernelError> {
+                reject_counter_transition(input, state, output)
+            }
+            fn view_abis(&self) -> &'static [ViewAbi] {
+                COUNTER.view_abis()
+            }
+        }
+    };
+}
+
+reject_counter_kernel!(V3RejectCounterKernel, V3_REJECT_COUNTER_MANIFEST);
+reject_counter_kernel!(V3UndeclaredRejectKernel, V3_UNDECLARED_REJECT_MANIFEST);
+
+pub static V3_REJECT_COUNTER: V3RejectCounterKernel = V3RejectCounterKernel;
+pub static V3_UNDECLARED_REJECT: V3UndeclaredRejectKernel = V3UndeclaredRejectKernel;
 
 /// The v3 counter with render lanes (design `stateful-session-lanes-v1.md`
 /// §10): a capture copies the 16 state bytes into the lane workspace in
@@ -464,6 +561,7 @@ static WORKLOAD_MANIFEST: KernelManifest = KernelManifest {
         max_compute_units: 100_000,
     },
     modes: &WORKLOAD_MODES,
+    capabilities: crate::kernel::KernelCapabilities::NONE,
 };
 
 // Keep the engine address on this invocation's kernel value. `process` creates
@@ -667,6 +765,7 @@ static V3_MANIFEST: KernelManifest = KernelManifest {
         max_compute_units: 100_000,
     },
     modes: &V3_MODES,
+    capabilities: crate::kernel::KernelCapabilities::NONE,
 };
 
 static V3_WORKSPACE_MANIFEST: KernelManifest = KernelManifest {
@@ -701,6 +800,7 @@ static V3_WORKSPACE_MANIFEST: KernelManifest = KernelManifest {
         max_compute_units: 100_000,
     },
     modes: &V3_MODES,
+    capabilities: crate::kernel::KernelCapabilities::NONE,
 };
 
 /// Small Rust engine used by the SBF test. It rejects any state pointer except
@@ -1084,6 +1184,10 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_WORKSPACE_ENGINE)
         } else if kernel_id == Some(V3_LANE_COUNTER.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_LANE_COUNTER)
+        } else if kernel_id == Some(V3_REJECT_COUNTER.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_REJECT_COUNTER)
+        } else if kernel_id == Some(V3_UNDECLARED_REJECT.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_UNDECLARED_REJECT)
         } else {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_COUNTER)
         }

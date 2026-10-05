@@ -86,6 +86,20 @@ pub const REFUSAL_LANE_CURSOR: u32 = 2_339;
 pub const REFUSAL_CAPTURE_OPEN: u32 = 2_340;
 pub const REFUSAL_STALE_PUBLICATION: u32 = 2_341;
 
+/// `OPEN_SESSION` features (design `session-reject-and-ring-v1.md` §4), the
+/// optional byte after `lanes`. Zero is today's linear stream, no rejection.
+pub const FEATURE_RING_STREAM: u8 = 1;
+pub const FEATURE_REJECTABLE: u8 = 2;
+pub const FEATURES_KNOWN: u8 = FEATURE_RING_STREAM | FEATURE_REJECTABLE;
+/// A ring stream holds at least two write windows, so a live input is never
+/// overwritten (§3.2).
+pub const MIN_RING_CAPACITY: u32 = 2 * MAX_STREAM_WINDOW;
+/// Sequences never wrap: a ring stream refuses writes from here on (§3.2).
+pub const RING_SEQUENCE_CEILING: u32 = u32::MAX - MAX_STREAM_WINDOW;
+/// Input-chain domain of a rejectable session: every entry carries its
+/// disposition (0 applied; 1 rejected, then the code) (§2.3).
+pub const INPUT_CHAIN_V3: &[u8] = b"dcg/input-chain/3";
+
 const SESSION_BYTES: usize = 1_280;
 const SESSION_MAGIC: &[u8; 4] = b"DSS3";
 const SESSION_SEED: &[u8] = b"dcg-session-v3";
@@ -172,6 +186,24 @@ struct Session {
     capture_mask: u8,
     /// The newest captured cursor plus one (0: none).
     last_captured: u32,
+    /// `FEATURE_*` bits fixed at open.
+    features: u8,
+    /// Inputs consumed by a `Reject` outcome (rejectable sessions only).
+    rejected_count: u32,
+}
+
+impl Session {
+    fn ring(&self) -> bool {
+        self.features & FEATURE_RING_STREAM != 0
+    }
+    fn rejectable(&self) -> bool {
+        self.features & FEATURE_REJECTABLE != 0
+    }
+    /// Byte offset of `sequence`'s slot in the stream account.
+    fn slot_at(&self, sequence: u32) -> usize {
+        let index = if self.ring() { sequence % self.capacity } else { sequence };
+        CHILD_HEADER_BYTES + index as usize * SLOT_BYTES
+    }
 }
 
 #[path = "stateful_v3_lanes.rs"]
@@ -722,6 +754,8 @@ fn encode_session(account: &AccountInfo, session: &Session) -> ProgramResult {
     raw[1267] = session.lanes;
     raw[1268] = session.capture_mask;
     put_u32(&mut raw, 1269, session.last_captured);
+    raw[1273] = session.features;
+    put_u32(&mut raw, 1274, session.rejected_count);
     Ok(())
 }
 
@@ -747,7 +781,10 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || raw[1164] > PHASE_STATE_ANCHOR
         || raw[1182] > 1
         || raw[1189] > 1
-        || raw[1273..].iter().any(|byte| *byte != 0)
+        || raw[1273] & !FEATURES_KNOWN != 0
+        || raw[1278..].iter().any(|byte| *byte != 0)
+        || (raw[1273] & FEATURE_REJECTABLE == 0 && u32_at(raw, 1274) != 0)
+        || (raw[1273] & FEATURE_RING_STREAM != 0 && u32_at(raw, 10) < MIN_RING_CAPACITY)
         || raw[1267] as usize > lanes::MAX_LANES
         || (raw[1268] as u32) >> raw[1267] != 0
         || u32_at(raw, 1269) > u32_at(raw, 112).saturating_add(1)
@@ -765,7 +802,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || raw[123] as usize > MAX_VIEW_OUTPUTS
         || u32_at(raw, 112) > u32_at(raw, 116)
         || u32_at(raw, 1263) > u32_at(raw, 112)
-        || u32_at(raw, 116) > u32_at(raw, 10)
+        || (raw[1273] & FEATURE_RING_STREAM == 0 && u32_at(raw, 116) > u32_at(raw, 10))
         || u32_at(raw, 188) > u32_at(raw, 112)
         || u32_at(raw, 224) > MAX_ENGINE_STATE_BYTES
         || raw[1164] == PHASE_NONE
@@ -875,6 +912,8 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         lanes: raw[1267],
         capture_mask: raw[1268],
         last_captured: u32_at(raw, 1269),
+        features: raw[1273],
+        rejected_count: u32_at(raw, 1274),
     })
 }
 
@@ -965,11 +1004,24 @@ fn open_session(
 ) -> ProgramResult {
     check_unique(accounts)?;
     // Optional trailing `lanes: u8` (1..=MAX_LANES); 178 bytes is no lanes.
-    let lanes = match data.len() {
-        178 => 0u8,
-        179 if (1..=lanes::MAX_LANES as u8).contains(&data[178]) => data[178],
+    // A 180-byte payload adds `features: u8` (nonzero; design
+    // session-reject-and-ring-v1 §4) after a `lanes` byte that may then be 0.
+    let (lanes, features) = match data.len() {
+        178 => (0u8, 0u8),
+        179 if (1..=lanes::MAX_LANES as u8).contains(&data[178]) => (data[178], 0),
+        180 if data[178] as usize <= lanes::MAX_LANES
+            && data[179] != 0
+            && data[179] & !FEATURES_KNOWN == 0 =>
+        {
+            (data[178], data[179])
+        }
         _ => return Err(ProgramError::InvalidInstructionData),
     };
+    // The rejectable flag is the kernel's declared capability, visible before
+    // anyone writes an input: a mismatch either way refuses (§2.4).
+    if (features & FEATURE_REJECTABLE != 0) != kernel.manifest().capabilities.rejects_input() {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
     if lanes != 0 && kernel.lane_capture_bytes() == 0 {
         return Err(refusal(REFUSAL_LANE));
     }
@@ -1071,6 +1123,7 @@ fn open_session(
         || width as usize > input_limit
         || capacity < 2
         || capacity > MAX_STREAM_CAPACITY
+        || (features & FEATURE_RING_STREAM != 0 && capacity < MIN_RING_CAPACITY)
         || max_steps == 0
         || max_steps > MAX_STEPS_PER_ADVANCE
         || max_steps as u32 > manifest.resources.max_operations
@@ -1163,6 +1216,8 @@ fn open_session(
             lanes,
             capture_mask: 0,
             last_captured: 0,
+            features,
+            rejected_count: 0,
         },
     )
 }
@@ -1207,7 +1262,8 @@ fn stream_pda_check(
         || u32_at(&raw, 80) != session.frontier
         || u32_at(&raw, 84) as usize != SLOT_BYTES
         || raw[88..120] != session.writer.to_bytes()
-        || raw[120..CHILD_HEADER_BYTES].iter().any(|byte| *byte != 0)
+        // 120..128: the last rejected sequence and code (rejectable sessions).
+        || (!session.rejectable() && raw[120..CHILD_HEADER_BYTES].iter().any(|byte| *byte != 0))
     {
         return Err(refusal(REFUSAL_SESSION));
     }
@@ -1283,6 +1339,9 @@ fn grow_stream(
         return Err(refusal(REFUSAL_AUTHORITY));
     }
     let mut session = checked_session(program, session_account, true, kernel)?;
+    if session.ring() {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
     if session.status != STATUS_ACTIVE || session.cursor != session.capacity {
         return Err(refusal(REFUSAL_BACKPRESSURE));
     }
@@ -2555,8 +2614,9 @@ fn write_input(
     if width != session.command_width as usize || data.len() != 7 + width {
         return Err(refusal(REFUSAL_MALFORMED));
     }
+    let ceiling = if session.ring() { RING_SEQUENCE_CEILING } else { session.capacity };
     if sequence < session.cursor
-        || sequence >= session.capacity
+        || sequence >= ceiling
         || sequence - session.cursor >= MAX_STREAM_WINDOW
     {
         return Err(refusal(REFUSAL_BACKPRESSURE));
@@ -2572,12 +2632,23 @@ fn write_input(
     if next_frontier.saturating_sub(session.cursor) > MAX_STREAM_WINDOW {
         return Err(refusal(REFUSAL_BACKPRESSURE));
     }
-    let slot_at = CHILD_HEADER_BYTES + sequence as usize * SLOT_BYTES;
-    if stream.try_borrow_data()?[slot_at + 4] != 0 {
-        return Err(refusal(REFUSAL_DUPLICATE_SLOT));
+    let slot_at = session.slot_at(sequence);
+    {
+        // A slot is free when empty or, on a ring, when it holds an input of an
+        // earlier lap that was already consumed (`t < cursor`). The window
+        // (`sequence - cursor < 64 <= capacity / 2`) keeps every unconsumed
+        // input in a slot of its own.
+        let raw = stream.try_borrow_data()?;
+        if raw[slot_at + 4] != 0 {
+            let held = u32_at(&raw, slot_at);
+            if !(session.ring() && held < session.cursor && held % session.capacity == sequence % session.capacity) {
+                return Err(refusal(REFUSAL_DUPLICATE_SLOT));
+            }
+        }
     }
     {
         let mut raw = stream.try_borrow_mut_data()?;
+        raw[slot_at..slot_at + SLOT_BYTES].fill(0);
         put_u32(&mut raw, slot_at, sequence);
         raw[slot_at + 4] = 1;
         raw[slot_at + 8..slot_at + 8 + width].copy_from_slice(&data[7..]);
@@ -2592,7 +2663,7 @@ fn read_slot(
     session: &Session,
     sequence: u32,
 ) -> Result<Vec<u8>, ProgramError> {
-    let slot_at = CHILD_HEADER_BYTES + sequence as usize * SLOT_BYTES;
+    let slot_at = session.slot_at(sequence);
     let raw = stream.try_borrow_data()?;
     if raw.len() < slot_at + SLOT_BYTES
         || u32_at(&raw, slot_at) != sequence
@@ -2686,7 +2757,7 @@ fn advance(
     let end_cursor = expected_cursor
         .checked_add(steps as u32)
         .ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
-    if end_cursor > session.capacity || end_cursor > session.frontier {
+    if (!session.ring() && end_cursor > session.capacity) || end_cursor > session.frontier {
         return Err(refusal(REFUSAL_INPUT_GAP));
     }
     let schema = validate_kernel(kernel)?;
@@ -2729,6 +2800,9 @@ fn advance(
     let bind = kernel.bind_invocation_state(&mut spans);
     let mut committed_steps = 0u8;
     let mut halt_reason = None;
+    // Per consumed command: None applied, Some(code) rejected (§2.2).
+    let mut rejections: Vec<Option<u32>> = Vec::with_capacity(commands.len());
+    let rejectable = session.rejectable();
     let state_bytes = spans
         .iter()
         .try_fold(0usize, |total, span| total.checked_add(span.data.len()))
@@ -2757,21 +2831,26 @@ fn advance(
                 if outcome.output_bytes > output_len {
                     return Err(refusal(REFUSAL_KERNEL));
                 }
+                // State unchanged since the snapshot (checked at or below the
+                // snapshot cap; above it, a kernel obligation).
+                let state_changed = |spans: &[StateSpanMut<'_>]| {
+                    let mut offset = 0;
+                    before_halt_guard.as_ref().is_some_and(|before| {
+                        spans.iter().any(|span| {
+                            let end = offset + span.data.len();
+                            let changed = before[offset..end] != span.data[..];
+                            offset = end;
+                            changed
+                        })
+                    })
+                };
                 match outcome.disposition {
-                    TransitionDisposition::Continue => committed_steps += 1,
+                    TransitionDisposition::Continue => {
+                        committed_steps += 1;
+                        rejections.push(None);
+                    }
                     TransitionDisposition::HaltBefore { reason } => {
-                        if reason == 0 {
-                            return Err(refusal(REFUSAL_KERNEL));
-                        }
-                        let mut offset = 0;
-                        if before_halt_guard.as_ref().is_some_and(|before| {
-                            spans.iter().any(|span| {
-                                let end = offset + span.data.len();
-                                let changed = before[offset..end] != span.data[..];
-                                offset = end;
-                                changed
-                            })
-                        }) {
+                        if reason == 0 || state_changed(&spans) {
                             return Err(refusal(REFUSAL_KERNEL));
                         }
                         halt_reason = Some(reason);
@@ -2782,8 +2861,19 @@ fn advance(
                             return Err(refusal(REFUSAL_KERNEL));
                         }
                         committed_steps += 1;
+                        rejections.push(None);
                         halt_reason = Some(reason);
                         break;
+                    }
+                    // Only a session opened rejectable (its kernel declares the
+                    // capability) may reject; the input is consumed with state
+                    // and output untouched (design session-reject-and-ring-v1 §2.2).
+                    TransitionDisposition::Reject { code } => {
+                        if !rejectable || code == 0 || outcome.output_bytes != 0 || state_changed(&spans) {
+                            return Err(refusal(REFUSAL_KERNEL));
+                        }
+                        committed_steps += 1;
+                        rejections.push(Some(code));
                     }
                 }
             }
@@ -2820,16 +2910,46 @@ fn advance(
     } else {
         session.input_root
     };
+    let mut last_reject = None;
     for (index, command) in commands.iter().take(committed_steps as usize).enumerate() {
         let sequence = expected_cursor + index as u32;
-        input_root = crate::hash::sha256(&[
-            b"dcg/input-chain/2",
-            &input_root,
-            &sequence.to_le_bytes(),
-            command,
-        ]);
+        input_root = if rejectable {
+            match rejections[index] {
+                None => crate::hash::sha256(&[INPUT_CHAIN_V3, &input_root, &sequence.to_le_bytes(), &[0], command]),
+                Some(code) => {
+                    last_reject = Some((sequence, code));
+                    crate::hash::sha256(&[
+                        INPUT_CHAIN_V3,
+                        &input_root,
+                        &sequence.to_le_bytes(),
+                        &[1],
+                        &code.to_le_bytes(),
+                        command,
+                    ])
+                }
+            }
+        } else {
+            crate::hash::sha256(&[
+                b"dcg/input-chain/2",
+                &input_root,
+                &sequence.to_le_bytes(),
+                command,
+            ])
+        };
     }
     session.input_root = input_root;
+    let newly_rejected = rejections.iter().take(committed_steps as usize).filter(|r| r.is_some()).count() as u32;
+    if newly_rejected != 0 {
+        session.rejected_count = session
+            .rejected_count
+            .checked_add(newly_rejected)
+            .ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
+    }
+    if let Some((sequence, code)) = last_reject {
+        let mut raw = stream.try_borrow_mut_data()?;
+        put_u32(&mut raw, 120, sequence);
+        put_u32(&mut raw, 124, code);
+    }
     if let Some(reason) = halt_reason {
         session.status = STATUS_HALTED;
         session.halt_reason = reason;
@@ -3142,6 +3262,8 @@ mod workspace_first_account_tests {
             lanes: 0,
             capture_mask: 0,
             last_captured: 0,
+            features: 0,
+            rejected_count: 0,
         }
     }
 

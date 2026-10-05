@@ -59,6 +59,27 @@ pub const MAX_TRANSACTION_COMPUTE_UNITS: u64 = 1_400_000;
 pub const MAX_DECLARED_KERNEL_COMPUTE_UNITS: u64 =
     MAX_TRANSACTION_COMPUTE_UNITS - APP_REPLAY_MEASURED_OVERHEAD_CU - APP_REPLAY_CU_MARGIN;
 
+/// Behaviours a kernel promises beyond its ports and modes (design
+/// `session-reject-and-ring-v1.md` §2.1). A bit set; unknown bits are refused
+/// by `ApplicationManifest::validate`. Turning a bit on changes the kernel's
+/// promised computation, so it is a semantic-version change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelCapabilities(pub u32);
+
+impl KernelCapabilities {
+    pub const NONE: Self = Self(0);
+    /// The kernel may answer a well-formed stateful input with
+    /// `TransitionDisposition::Reject`: the input is consumed and state is
+    /// unchanged. Sessions and templates binding such a kernel are marked
+    /// rejectable ahead of time.
+    pub const REJECTS_INPUT: Self = Self(1);
+    pub const KNOWN: u32 = Self::REJECTS_INPUT.0;
+
+    pub const fn rejects_input(self) -> bool {
+        self.0 & Self::REJECTS_INPUT.0 != 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelManifest {
     pub id: KernelId,
@@ -71,6 +92,8 @@ pub struct KernelManifest {
     pub state: Option<StateSchema>,
     pub resources: ResourceLimits,
     pub modes: &'static [ModeId],
+    /// Declared capabilities (`KernelCapabilities::NONE` for most kernels).
+    pub capabilities: KernelCapabilities,
 }
 
 /// A region of account data selected by the application's compiled SVM
@@ -160,11 +183,15 @@ pub struct ViewPhase {
 /// Result of one stateful v3 transition callback. `HaltBefore` leaves the
 /// current command unconsumed and requires the kernel to leave state unchanged.
 /// `HaltAfter` commits the current command's state and consumes that command.
+/// `Reject` consumes the command without changing state or writing output; it
+/// is allowed only for a kernel declaring `KernelCapabilities::REJECTS_INPUT`
+/// in a session opened as rejectable, and refused otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransitionDisposition {
     Continue,
     HaltBefore { reason: u32 },
     HaltAfter { reason: u32 },
+    Reject { code: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1103,6 +1130,13 @@ impl ApplicationManifest {
             {
                 return Err(ManifestError::ResourceExceedsLayout(a.id));
             }
+            // Only stateful transitions can reject; a stateless (replay) kernel
+            // with the bit would make the rev-8 admission digest silent about it.
+            if a.capabilities.0 & !KernelCapabilities::KNOWN != 0
+                || (a.capabilities.rejects_input() && a.state.is_none())
+            {
+                return Err(ManifestError::InvalidCapabilities(a.id));
+            }
             if a.resources.max_operations == 0
                 || a.resources.max_compute_units == 0
                 || a.resources.max_compute_units > MAX_DECLARED_KERNEL_COMPUTE_UNITS
@@ -1244,6 +1278,8 @@ pub enum ManifestError {
     InvalidAlignment(KernelId),
     ResourceExceedsLayout(KernelId),
     InvalidComputeLimit(KernelId),
+    /// An unknown capability bit, or `REJECTS_INPUT` on a stateless kernel.
+    InvalidCapabilities(KernelId),
     DuplicateMode(KernelId, ModeId),
     ReplayNotRegistered(KernelId),
     ReplayModeUnsupported(KernelId, ModeId),
@@ -1443,6 +1479,7 @@ pub mod test_kernel {
             max_compute_units: 10_000,
         },
         modes: &MODES,
+        capabilities: crate::kernel::KernelCapabilities::NONE,
     };
 
     impl Kernel for ByteSum {
@@ -1549,6 +1586,7 @@ pub mod test_kernel {
             max_compute_units: 100_000,
         },
         modes: &SHA_MODES,
+        capabilities: crate::kernel::KernelCapabilities::NONE,
     };
     static SHA_MODES: [ModeId; 1] = [MODE_STEP_V21];
 
@@ -1854,6 +1892,7 @@ mod tests {
             max_compute_units: 10_000,
         },
         modes: &[ALIGNMENT_PROBE_MODE],
+        capabilities: crate::kernel::KernelCapabilities::NONE,
     };
     #[cfg(feature = "test-kernel")]
     struct AlignmentProbe {
@@ -2021,6 +2060,7 @@ mod tests {
             max_compute_units: MAX_DECLARED_KERNEL_COMPUTE_UNITS + 1,
         },
         modes: &INVALID_LIMIT_MODES,
+        capabilities: crate::kernel::KernelCapabilities::NONE,
     };
     struct InvalidLimitKernel;
     impl Kernel for InvalidLimitKernel {
@@ -2044,6 +2084,38 @@ mod tests {
         hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
+
+    /// Capability bits (design session-reject-and-ring-v1 §2.1): an unknown
+    /// bit, or REJECTS_INPUT on a stateless kernel, is refused.
+    fn capability_app(caps: KernelCapabilities, stateful: bool) -> Result<(), ManifestError> {
+        struct CapKernel(&'static KernelManifest);
+        impl Kernel for CapKernel {
+            fn manifest(&self) -> &'static KernelManifest {
+                self.0
+            }
+            fn execute(&self, _input: &[u8], _output: &mut [u8]) -> Result<usize, KernelError> {
+                Err(KernelError::Refused)
+            }
+        }
+        let manifest: &'static KernelManifest = Box::leak(Box::new(KernelManifest {
+            id: KernelId([0xC4; 16]),
+            resources: ResourceLimits { max_compute_units: 1_000, max_state_bytes: 0, ..INVALID_LIMIT_KERNEL_MANIFEST.resources },
+            state: stateful.then_some(StateSchema { id: VersionedId { id: 3, version: 1 }, max_bytes: 16 }),
+            capabilities: caps,
+            ..INVALID_LIMIT_KERNEL_MANIFEST
+        }));
+        let kernels: &'static [&'static dyn Kernel] = Box::leak(Box::new([&*Box::leak(Box::new(CapKernel(manifest))) as &dyn Kernel]));
+        ApplicationManifest { kernels, ..INVALID_LIMIT_APP }.validate()
+    }
+
+    #[test]
+    fn manifest_checks_capability_bits() {
+        let id = KernelId([0xC4; 16]);
+        assert_eq!(capability_app(KernelCapabilities::NONE, false), Ok(()));
+        assert_eq!(capability_app(KernelCapabilities::REJECTS_INPUT, true), Ok(()));
+        assert_eq!(capability_app(KernelCapabilities::REJECTS_INPUT, false), Err(ManifestError::InvalidCapabilities(id)));
+        assert_eq!(capability_app(KernelCapabilities(2), true), Err(ManifestError::InvalidCapabilities(id)));
+    }
 
     #[test]
     fn manifest_rejects_over_budget_kernel_compute_declarations() {
