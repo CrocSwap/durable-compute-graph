@@ -1,0 +1,33 @@
+[package]
+name = "dcg-kernel-app"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+description = "Template application program for DCG optimistic mode: tag 227 with an application STEP kernel (alpha plan criterion 5)."
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+conform = []
+
+[dependencies]
+# An application pins DCG by git revision; this example uses the path.
+dcg-program = { path = "../../crates/dcg-program", features = ["no-entrypoint", "graph-v21"] }
+solana-program = "=2.3.0"
+
+[[bin]]
+name = "polyhash-conform"
+required-features = ["conform"]
+
+[patch.crates-io]
+curve25519-dalek = { path = "../../crates/dcg-program/vendor" }
+
+[profile.release]
+overflow-checks = false
+lto = true
+codegen-units = 1
