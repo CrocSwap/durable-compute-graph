@@ -55,8 +55,8 @@
   },
   "schema": "basanos/dcg-closure-v2-rev7-mechanics-golden/1",
   "source": {
-    "compiler": "/Users/colkitt/sith/toys/crypto/basanos/out/runs/dcg-pt1-compiler-first-document-20260922/rev7",
-    "reference_slices": "/Users/colkitt/sith/toys/crypto/basanos/out/director/first-document-traces"
+    "compiler": "<basanos>/out/runs/dcg-pt1-compiler-first-document-20260922/rev7",
+    "reference_slices": "<basanos>/out/director/first-document-traces"
   },
   "tree_roots": {
     "1": "d09f319f351a306f8317ac1fa52f9cff0f201944a8ecf3d4646eae585f251215",

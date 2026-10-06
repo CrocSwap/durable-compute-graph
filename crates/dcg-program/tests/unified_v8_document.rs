@@ -303,9 +303,17 @@ fn artifacts_at(root: PathBuf) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Ve
     Some((routes, geometry, payloads, pwr1, clause12))
 }
 
+/// The Basanos checkout that holds the retained emissions: `BASANOS_ROOT`, or
+/// a `basanos` directory beside this repository.
+fn basanos_root() -> PathBuf {
+    std::env::var_os("BASANOS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../basanos")))
+}
+
 fn artifacts() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let root = std::env::var_os("BASANOS_PT2P_ROOT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(
-        "/Users/colkitt/sith/toys/crypto/basanos/out/runs/dcg-pt2-parametric-window-routes-20260923/pt2p"));
+    let root = std::env::var_os("BASANOS_PT2P_ROOT").map(PathBuf::from).unwrap_or_else(|| basanos_root().join(
+        "out/runs/dcg-pt2-parametric-window-routes-20260923/pt2p"));
     artifacts_at(root)
 }
 
@@ -329,8 +337,8 @@ fn k10240_artifacts() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
             panic!("BASANOS_PT2P_K10240_ROOT points at an invalid PT2P fixture")
         }));
     }
-    artifacts_at(PathBuf::from(
-        "/Users/colkitt/sith/toys/crypto/basanos/out/runs/rev8-k10240-template-2026-09-30/fixture/pt2p",
+    artifacts_at(basanos_root().join(
+        "out/runs/rev8-k10240-template-2026-09-30/fixture/pt2p",
     ))
 }
 

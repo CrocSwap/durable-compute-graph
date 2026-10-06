@@ -40,8 +40,8 @@ nonzero.
 
 ## `BASANOS_*` environment variables
 
-Paths below are relative to the Basanos checkout at
-`/Users/colkitt/sith/toys/crypto/basanos`. Variables absent from the environment
+Paths below are relative to the Basanos checkout: `BASANOS_ROOT`, or a
+`basanos` directory beside this repository. Variables absent from the environment
 are optional unless marked required by the SBF runner. For fixture roots, the
 directory must contain `base-routes.bin`, `base-geometry.bin`,
 `base-payloads.bin`, and `program.bin`; `clause12-v4.bin` is read when present

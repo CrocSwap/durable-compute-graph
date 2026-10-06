@@ -32,21 +32,26 @@ pub struct Fixture {
     pub payload_index: Vec<u8>,
 }
 
-const DEFAULT_K80: &str =
-    "/Users/colkitt/sith/toys/crypto/basanos/out/runs/dcg-pt2-parametric-window-routes-20260923/pt2p";
-const DEFAULT_F47: &str =
-    "/Users/colkitt/sith/toys/crypto/basanos/out/runs/rev8-f-integrate-2026-09-28/compiler-v1-position29";
-const DEFAULT_K10240: &str =
-    "/Users/colkitt/sith/toys/crypto/basanos/out/runs/rev8-k10240-template-2026-09-30/fixture/pt2p";
+const DEFAULT_K80: &str = "out/runs/dcg-pt2-parametric-window-routes-20260923/pt2p";
+const DEFAULT_F47: &str = "out/runs/rev8-f-integrate-2026-09-28/compiler-v1-position29";
+const DEFAULT_K10240: &str = "out/runs/rev8-k10240-template-2026-09-30/fixture/pt2p";
+
+/// The Basanos checkout that holds the retained emissions: `BASANOS_ROOT`, or
+/// a `basanos` directory beside this repository.
+pub fn basanos_root() -> PathBuf {
+    std::env::var_os("BASANOS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../basanos")))
+}
 
 impl Fixture {
     /// Load an emission, or `None` (with a printed reason) when it is absent:
     /// suites skip rather than fail on a machine without the retained files.
     pub fn load(kind: FixtureKind) -> Option<Fixture> {
         let root = match kind {
-            FixtureKind::K80 => std::env::var_os("BASANOS_PT2P_ROOT").map(PathBuf::from).unwrap_or_else(|| DEFAULT_K80.into()),
-            FixtureKind::F47 => std::env::var_os("BASANOS_PT2P_F47_ROOT").map(PathBuf::from).unwrap_or_else(|| DEFAULT_F47.into()),
-            FixtureKind::K10240 => std::env::var_os("BASANOS_PT2P_K10240_ROOT").map(PathBuf::from).unwrap_or_else(|| DEFAULT_K10240.into()),
+            FixtureKind::K80 => std::env::var_os("BASANOS_PT2P_ROOT").map(PathBuf::from).unwrap_or_else(|| basanos_root().join(DEFAULT_K80)),
+            FixtureKind::F47 => std::env::var_os("BASANOS_PT2P_F47_ROOT").map(PathBuf::from).unwrap_or_else(|| basanos_root().join(DEFAULT_F47)),
+            FixtureKind::K10240 => std::env::var_os("BASANOS_PT2P_K10240_ROOT").map(PathBuf::from).unwrap_or_else(|| basanos_root().join(DEFAULT_K10240)),
         };
         let read = |name: &str| std::fs::read(root.join(name)).ok();
         let (Some(routes), Some(geometry), Some(payloads), Some(pwr1)) =

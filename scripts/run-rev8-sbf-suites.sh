@@ -11,7 +11,7 @@ CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/private/tmp/basanos-dcg-r8-test-hardening-
 DCG_SBF_SDK=${DCG_SBF_SDK:-/private/tmp/basanos-sbf-sdk-v151-20260920}
 DCG_SBF_TOOLS_VERSION=${DCG_SBF_TOOLS_VERSION:-v1.51}
 BUILD_SCRIPT="$REPO_DIR/crates/dcg-program/scripts/build-sbf-reproducible.sh"
-BASANOS_ROOT=/Users/colkitt/sith/toys/crypto/basanos
+BASANOS_ROOT=${BASANOS_ROOT:-"$WORKTREE_DIR/basanos"}
 
 K80_ROOT=${BASANOS_PT2P_ROOT:-"$BASANOS_ROOT/out/runs/dcg-pt2-parametric-window-routes-20260923/pt2p"}
 F47_ROOT=${BASANOS_PT2P_F47_ROOT:-"$BASANOS_ROOT/out/runs/rev8-typed-decision-2026-09-30/fixture-decision/pt2p"}

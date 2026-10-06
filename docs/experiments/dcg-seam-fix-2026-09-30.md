@@ -185,7 +185,7 @@ feature sets; one admission test passed in each feature set. All three
 reproducible SBF builds passed the exact-feature manifest preflight.
 
 Raw build, preflight, and ProgramTest logs are retained at
-`/Users/colkitt/sith/toys/crypto/basanos/.fadeno/local/worktrees/dcg-seam-fix-2/out/runs/dcg-seam-fix-2-20260930/`;
+`<basanos>/.fadeno/local/worktrees/dcg-seam-fix-2/out/runs/dcg-seam-fix-2-20260930/`;
 its README lists each log's image and feature configuration.
 
 Across the Round 2 SBF runs, the exact tags sent were 131, 132, 145, 156,
@@ -288,7 +288,7 @@ single PT2S bind/view performed by the adapter, not general kernel runtime.
 It does not show that every application kernel fits its declared budget.
 
 Receipts are retained at
-`/Users/colkitt/sith/toys/crypto/basanos/out/runs/dcg-seam-fix-4-2026-09-30/`.
+`<basanos>/out/runs/dcg-seam-fix-4-2026-09-30/`.
 That directory includes the successful logs and earlier failed measurement
 attempts (app-image admission reached the CU limit; pre-measurement harness
 iterations exposed and corrected witness sizing, plan-position, and selected
@@ -442,4 +442,4 @@ peak). These are workload-path measurements, not worst-case bounds.
 The default offline `dcg-program` suite passed, including the portable and
 revision-8 record goldens. The full lifecycle target's seven failures and the
 focused empty-application pass are retained with the SBF build and test logs in
-`/Users/colkitt/sith/toys/crypto/basanos/out/runs/dcg-prereq-2a-fix-2026-10-01/`.
+`<basanos>/out/runs/dcg-prereq-2a-fix-2026-10-01/`.

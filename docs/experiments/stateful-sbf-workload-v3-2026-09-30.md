@@ -85,7 +85,7 @@ The standalone checkout used the pinned local SBF SDK at
 `/private/tmp/basanos-sbf-sdk-v151-20260920` and this build command:
 
 ```sh
-DCG_CARGO_BUILD_SBF=/Users/colkitt/.local/share/solana/install/active_release/bin/cargo-build-sbf \
+DCG_CARGO_BUILD_SBF=~/.local/share/solana/install/active_release/bin/cargo-build-sbf \
 DCG_SBF_SDK=/private/tmp/basanos-sbf-sdk-v151-20260920 \
 DCG_SBF_TOOLS_VERSION=v1.51 \
 DCG_SBF_STAGING_NAME=dcg-stateful-3-staging \
@@ -178,7 +178,7 @@ the requested prefix is not reproducible from the stated base and toolchain.
 The focused commands were:
 
 ```sh
-DCG_CARGO_BUILD_SBF=/Users/colkitt/.local/share/solana/install/active_release/bin/cargo-build-sbf \
+DCG_CARGO_BUILD_SBF=~/.local/share/solana/install/active_release/bin/cargo-build-sbf \
 DCG_SBF_SDK=/private/tmp/basanos-sbf-sdk-v151-20260920 \
 DCG_SBF_TOOLS_VERSION=v1.51 \
 DCG_SBF_STAGING_NAME=dcg-stateful-3-fix-staging \
@@ -248,7 +248,7 @@ they do not establish validator or deployed-chain behavior.
 ### Follow-up commands
 
 ```sh
-DCG_CARGO_BUILD_SBF=/Users/colkitt/.local/share/solana/install/active_release/bin/cargo-build-sbf \
+DCG_CARGO_BUILD_SBF=~/.local/share/solana/install/active_release/bin/cargo-build-sbf \
 DCG_SBF_SDK=/private/tmp/basanos-sbf-sdk-v151-20260920 \
 DCG_SBF_TOOLS_VERSION=v1.51 \
 DCG_SBF_STAGING_NAME=dcg-stateful-3-fix2-staging \

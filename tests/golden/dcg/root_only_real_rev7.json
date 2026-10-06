@@ -203,7 +203,7 @@
   ],
   "segment_start": 24795,
   "segment_table_root": "dffb3238136b4579786ecb4e75a1a701c4e71fb333df1e97d3ed733b7ee1a331",
-  "source_leaf_file": "/Users/colkitt/sith/toys/crypto/basanos/.fadeno/local/worktrees/host-executor-leaves-pages-plan-zg/out/runs/dcg-closure-v2-executor-20260923-20260923/leaves/position-00.digests",
+  "source_leaf_file": "<basanos>/.fadeno/local/worktrees/host-executor-leaves-pages-plan-zg/out/runs/dcg-closure-v2-executor-20260923-20260923/leaves/position-00.digests",
   "source_leaf_sha256": "20775f0452d90e5481b0a590190b8f67831562f18bc7184e203f51310a256f30",
   "source_page_sha256": "9650aa9494fa0696494c620478c51de7a4d2f0f3cfdccd9f73f5fb037d55d1f4",
   "target_entry": 3243,
