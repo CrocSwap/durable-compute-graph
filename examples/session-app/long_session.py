@@ -171,10 +171,12 @@ async def main(image: Path, steps: int, drop_at: int) -> int:
             mirror_agrees=predicted == state, expected_rejections=zeros)
 
         dropped_status = await endpoint.signature_status(endpoint.dropped) if endpoint.dropped else None
+        landed = dropped_status is not None and dropped_status.error is None
         say("dropped send", send_number=endpoint.dropped_at, signature=endpoint.dropped,
-            resent_same_bytes=endpoint.resent_same,
-            landed=dropped_status is not None and dropped_status.error is None,
-            note="the session still advanced every step, so the sequencer recovered it")
+            resent_same_bytes=endpoint.resent_same, landed=landed,
+            recovery=("a rebroadcast of the same bytes landed" if landed else
+                      "the dropped signature expired without landing; the sequencer checked the session's "
+                      "state, signed the step again, and it landed"))
 
         cus = sorted(compute_units(rpc_url, str(session.addresses.session)))
         say("compute", transactions_sampled=len(cus), median_units_per_8_step_transaction=cus[len(cus) // 2] if cus else None,

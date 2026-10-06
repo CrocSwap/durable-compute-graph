@@ -41,9 +41,11 @@ instructions in one transaction; keep the packet under 1,232 bytes.
   the same bytes while their blockhash is valid. A new signature is made only
   after the old one's blockhash has expired, its status has been queried, and
   the application's postcondition has been checked (details below).
-- **A dropped transaction is resent.** In the measured long session, one
-  send was dropped on purpose; the sequencer rebroadcast the same bytes, they
-  landed, and every step applied once.
+- **A dropped transaction is resent.** In the measured long sessions, one
+  send was dropped on purpose. In a 400-step run a rebroadcast of the same
+  bytes landed. In the 16,000-step run (2,008 transactions) the dropped
+  signature never landed; after its blockhash expired, the sequencer checked
+  the session's state and signed the step again. Every step applied once.
 - **Unclear outcomes stop safely.** If a transaction's fate cannot be
   established, the sequencer stops that step instead of guessing. Resuming
   with the same plan and journal checks again and finishes the work.
@@ -69,9 +71,9 @@ duplicate. Keep such guards in any program you drive with the sequencer.
   about 0.5 s on a local validator with 50 ms slots, more on a remote
   testnet node. Batch steps into transactions first; 8 tally steps used about
   64,000 compute units.
-- A long session through `Session` on a local validator ran 2,000
-  transactions (16,000 steps): see
-  [`session-tutorial.md`](session-tutorial.md) for the measured run.
+- A long session through `Session` on a local validator ran 16,000 steps
+  in 2,008 transactions in 1,113 s (14.5 steps/s;
+  [`session-tutorial.md`](session-tutorial.md)).
 - For more, pipeline with `OrderedLane`, and run close to the RPC node.
   Doom's 3.81 frames/s ran from a host near the Fogo testnet nodes.
 

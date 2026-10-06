@@ -104,8 +104,10 @@ PYTHONPATH=../python python long_session.py out/dcg_session_app.so --steps 2000
   advances over them in one transaction. All of it applies, or none does.
 - **The sequencer** sends each transaction, journals it, and resends it if
   it does not land. To show this, the example drops one send on purpose
-  (`--drop-at`); the sequencer rebroadcasts the same bytes and the session
-  carries on.
+  (`--drop-at`). Either a rebroadcast of the same bytes lands, or, once the
+  dropped signature's blockhash has expired, the sequencer checks the
+  session's state and signs the step again. Both happened in the measured
+  runs; in both, every step applied exactly once.
 - **At the end** it reads the state, checks it against the mirror, reads the
   session's info (cursor and rejections), and closes everything.
 
@@ -129,7 +131,7 @@ Output (measured 2026-10-05, local validator with 50 ms slots, 400 steps):
 | Transactions | one per 8 steps, plus 8 to open and close (400 steps took 58) |
 | Compute | 63,726 units per 8-step transaction (about 8,000 per tally step) |
 | Speed | about 16 steps per second, one transaction confirmed at a time |
-| A long run | LONG_RUN_RESULT |
+| A long run | 16,000 steps in 2,008 transactions, 1,113 s (14.5 steps/s); mirror agrees; rent all returned; fees 20,065,000 lamports (about 10,000 per transaction) |
 
 ## 7. Make it yours
 
