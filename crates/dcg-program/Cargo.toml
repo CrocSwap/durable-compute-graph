@@ -30,17 +30,12 @@ test-rev8-before-payer-alias-fix = []
 no-entrypoint = []
 custom-heap = []
 heap-census = []
-weight-witness-probe = []
 test-weakened-class-rule = []
 # Test-only legacy mode: UnifiedInit without the option-range check (an older
 # program's documents), for the fix-point conviction test. Never in a release.
 test-legacy-unchecked-option-range = []
-v7-cu-probe = []
-a16-kernel-probe = []
-decision-kernel-probe = []
 legacy-basanos-fixtures = ["legacy-hclosure-handlers"]
 legacy-hclosure-handlers = []
-pt2p-seal-profile = []
 test-kernel = []
 # Example application kernels (the byte-sum and SHA-256 concat kernels and the
 # toy LX1 machine) under a non-test manifest, `dcg-alpha/1`. No test bindings.

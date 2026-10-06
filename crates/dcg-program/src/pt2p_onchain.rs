@@ -34,16 +34,6 @@ pub const TAG_SEAL_PXR_CHUNK: u8 = 193;
 
 pub const MAGIC: &[u8; 4] = b"PT2S";
 
-#[inline(always)]
-fn profile_seal(label: &'static str) {
-    #[cfg(feature = "pt2p-seal-profile")]
-    {
-        solana_program::msg!(label);
-        solana_program::log::sol_log_compute_units();
-    }
-    #[cfg(not(feature = "pt2p-seal-profile"))]
-    let _ = label;
-}
 pub const STATE_HASHING: u8 = 1;
 pub const STATE_SEALED: u8 = 2;
 pub const STATE_SEALING_PXR: u8 = 3;
@@ -353,7 +343,6 @@ fn validate_pxr1_routes<'a>(
     geometry: &[u8],
     x: &Pt2p<'_>,
 ) -> Result<Option<pt::Pxr1<'a>>, ProgramError> {
-    profile_seal("PT2S-profile:pxr1-start");
     if !cfg!(feature = "revision-8") {
         return Ok(None);
     }
@@ -365,7 +354,6 @@ fn validate_pxr1_routes<'a>(
     // `Pt2p::new` decodes the same committed entry count from that sealed route
     // header; use it to walk the optional extension without repeating the root.
     let entry_count = x.base_entries;
-    profile_seal("PT2S-profile:pxr-header");
     let Some(pxr) = pxr else {
         for entry_index in 0..entry_count {
             let entry = pt::entry_at(routes, entry_index).map_err(err)?;
@@ -376,7 +364,6 @@ fn validate_pxr1_routes<'a>(
                 return Err(err(pt::PT2_ROUTE_SET));
             }
         }
-        profile_seal("PT2S-profile:pxr-absent-scan-done");
         return Ok(None);
     };
     let base = pt2p::ptg4_base(geometry).map_err(err)?;
@@ -389,7 +376,6 @@ fn validate_pxr1_routes<'a>(
     {
         return Err(err(pt::PT2_ROUTE_SET));
     }
-    profile_seal("PT2S-profile:pxr-header-geometry-done");
 
     let position = x
         .position_count
@@ -408,7 +394,6 @@ fn validate_pxr1_routes<'a>(
     {
         return Err(err(pt::PT2_ROUTE_SET));
     }
-    profile_seal("PT2S-profile:gather-and-form-counts-done");
     let mut gather_payload = [0u8; 16];
     let mut reducer_payload = [0u8; 16];
     x.payload(&gather, false, &mut gather_payload)
@@ -418,8 +403,6 @@ fn validate_pxr1_routes<'a>(
     if gather_payload != [1, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
         return Err(err(pt::PT2_ROUTE_SET));
     }
-    profile_seal("PT2S-profile:gather-payloads-done");
-    profile_seal("PT2S-profile:gather-and-form-layout-done");
     let shape =
         crate::kernels::decision::decode_form_geometry(&reducer_payload).map_err(|e| err(e.0))?;
     if shape.option_region_id != u16::MAX
@@ -428,7 +411,6 @@ fn validate_pxr1_routes<'a>(
     {
         return Err(err(pt::PT2_ROUTE_SET));
     }
-    profile_seal("PT2S-profile:form-geometry-done");
     for ordinal in 0..128u16 {
         let route = x.route(&gather, ordinal).map_err(err)?;
         let (raw, _) = x.raw_route(&gather, ordinal).map_err(err)?;
@@ -459,7 +441,6 @@ fn validate_pxr1_routes<'a>(
     {
         return Err(err(pt::PT2_ROUTE_SET));
     }
-    profile_seal("PT2S-profile:gather-routes-done");
     let option_route = (0..reducer.read_count)
         .map(|ordinal| x.route(&reducer, ordinal).map_err(err))
         .collect::<Result<Vec<_>, _>>()?
@@ -490,7 +471,6 @@ fn validate_pxr1_routes<'a>(
     {
         return Err(err(pt::PT2_ROUTE_SET));
     }
-    profile_seal("PT2S-profile:option-route-done");
     let mut saw_gather = false;
     for ordinal in 0..reducer.read_count {
         let route = x.route(&reducer, ordinal).map_err(err)?;
@@ -507,7 +487,6 @@ fn validate_pxr1_routes<'a>(
     if !saw_gather {
         return Err(err(pt::PT2_ROUTE_SET));
     }
-    profile_seal("PT2S-profile:gather-reducer-routes-done");
     let mut output_region = None;
     for lane in 0..256u16 {
         let write = x.route(&reducer, reducer.read_count + lane).map_err(err)?;
@@ -522,7 +501,6 @@ fn validate_pxr1_routes<'a>(
         }
         output_region = Some(write.region_id);
     }
-    profile_seal("PT2S-profile:output-routes-done");
     Ok(Some(pxr))
 }
 
@@ -824,7 +802,6 @@ fn view<'a>(
 /// and the write exists is `Binding2::check`'s question at init, against the
 /// plan, and it is 794 there.
 pub fn seal(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    profile_seal("PT2S-profile:seal-start");
     if (data.len() != 33 && data.len() != 39) || !(5..=6).contains(&accounts.len()) {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -851,16 +828,13 @@ pub fn seal(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         if s[OFF_CURSOR_KIND] != 3 {
             return Err(err(pt::PT2_ROUTE_SET));
         }
-        profile_seal("PT2S-profile:account-bind-done");
         let pwr1 = &s[OFF_PWR1..];
         let g = pt2p::Program::decode(pwr1).map_err(err)?;
-        profile_seal("PT2S-profile:pwr1-decode-done");
         for kind in 0..3 {
             if &s[OFF_DIGESTS + 32 * kind..OFF_DIGESTS + 32 * (kind + 1)] != g.base_digest(kind) {
                 return Err(err(pt::PT2_ROUTE_SET));
             }
         }
-        profile_seal("PT2S-profile:base-digests-done");
         let routes = accounts[1].try_borrow_data()?;
         let geometry = accounts[2].try_borrow_data()?;
         let payloads = accounts[3].try_borrow_data()?;
@@ -894,11 +868,8 @@ pub fn seal(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         };
         let payload_index = pt1x_data.as_ref().map(|data| &data[PT1S_OFF_INDEX..]);
         let x = view(pwr1, &routes, &geometry, &payloads, payload_index)?;
-        profile_seal("PT2S-profile:view-done");
         x.check_program().map_err(err)?;
-        profile_seal("PT2S-profile:program-check-done");
         let pxr = validate_pxr1_routes(&routes, &geometry, &x)?;
-        profile_seal("PT2S-profile:all-validation-done");
         let c12 = pt2p::encode_clause12_v4(x.position_count, x.segment_count, &g.digest());
         (
             c12,
@@ -922,10 +893,8 @@ pub fn seal(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramR
         put_u32(&mut s, OFF_CURSOR_BYTES, 0);
         s[OFF_CURSOR_KIND] = 4;
         s[OFF_STATE] = STATE_SEALING_PXR;
-        profile_seal("PT2S-profile:pxr-cursor-begin");
     } else {
         s[OFF_STATE] = STATE_SEALED;
-        profile_seal("PT2S-profile:seal-finish");
     }
     Ok(())
 }
