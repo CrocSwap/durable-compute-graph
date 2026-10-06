@@ -68,13 +68,14 @@ def my_hash(inputs: list[bytes]) -> bytes:
 A stateful kernel's mirror subclasses `StatefulMirror`. It sets:
 - `decl`, the same limits as the Rust declaration;
 - `state_spans`, the span lengths sessions open with;
-- optionally `special_inputs`, commands the generator should always try.
+- optionally `special_inputs`, a tuple of `bytes` commands the generator
+  should always try (for example the inputs your kernel rejects).
 
 It implements:
 - `initial_state(spans) -> bytes`;
 - `transition(command, state) -> Outcome`.
 
-An `Outcome` carries the output, the state after the call, and the disposition (`continue`, `halt_before`, `halt_after` or `reject`) with its reason or code. A mirror models the kernel only. The kit applies the runtime's own rules on top, which the next section lists.
+An `Outcome` carries the output, the state after the call, and the disposition with its code: `Outcome(output, state, disposition="continue", code=0)`, where `disposition` is `"continue"`, `"halt_before"`, `"halt_after"` or `"reject"`. Raise `KernelRefused` to refuse the input. A mirror models the kernel only. The kit applies the runtime's own rules on top, which the next section lists.
 `examples/kernel-kit/counter_mirrors.py` mirrors DCG's v3 test counters,
 including the rejecting ones.
 

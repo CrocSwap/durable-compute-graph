@@ -1,7 +1,11 @@
 """A long session through the sequencer (alpha plan C5; docs/session-tutorial.md).
 
     ./build.sh out
-    PYTHONPATH=../../python python long_session.py out/dcg_session_app.so [--steps 2000] [--drop-at 100]
+    python long_session.py out/dcg_session_app.so [--steps 2000] [--drop-at 100] [--keep]
+
+`--steps` counts steps; a transaction carries 8, so 16,000 steps is about
+2,000 transactions. The ledger directory is removed at the end unless
+`--keep` (a 16,000-step run leaves about 2 GB).
 
 It starts `solana-test-validator` with the tally program, opens a rejectable
 session with a ring input stream (so it never fills), and runs `--steps`
@@ -109,7 +113,7 @@ async def start_validator(image: Path, run_dir: Path):
     return validator, program_id, f"http://127.0.0.1:{rpc_port}"
 
 
-async def main(image: Path, steps: int, drop_at: int) -> int:
+async def main(image: Path, steps: int, drop_at: int, keep: bool = False) -> int:
     run_dir = Path(tempfile.mkdtemp(prefix="dcg-long-", dir="/private/tmp" if sys.platform == "darwin" else None))
     validator, program_id, rpc_url = await start_validator(image, run_dir)
     endpoint = DroppingEndpoint("local", rpc_url, drop_at=drop_at, config=RpcConfig(
@@ -145,9 +149,10 @@ async def main(image: Path, steps: int, drop_at: int) -> int:
                           program_id=program_id, session_id=1, journal_path=run_dir / "accounts.json",
                           max_steps=8, ring=True, input_capacity=128)
         await session.open()
-        opened = await funds()
-        ops_open = transport._operation
-        say("open", session=str(session.addresses.session), rent_lamports=balance0 - opened)
+        ops_open = transport.transactions
+        accounts = [session.addresses.session, session.addresses.stream, *session.addresses.states]
+        rent = sum([await balance(endpoint, a) for a in accounts])
+        say("open", session=str(session.addresses.session), accounts=len(accounts), rent_lamports=rent)
 
         rng = random.Random(7)
         inputs = [rng.randrange(256) for _ in range(steps)]
@@ -157,7 +162,7 @@ async def main(image: Path, steps: int, drop_at: int) -> int:
             await session.write_and_advance(batch)
             done = start + len(batch)
             if done % 400 == 0 or done == steps:
-                say("progress", steps=done, transactions=transport._operation, seconds=round(time.monotonic() - t1, 1))
+                say("progress", steps=done, transactions=transport.transactions, seconds=round(time.monotonic() - t1, 1))
         run_seconds = time.monotonic() - t1
 
         state = await session.read_state()
@@ -188,7 +193,7 @@ async def main(image: Path, steps: int, drop_at: int) -> int:
             net_cost_lamports=fees)
         ok = (predicted == state and info.cursor == steps and count == steps - zeros
               and info.rejected_count == zeros and endpoint.dropped is not None)
-        txs = transport._operation
+        txs = transport.transactions
         say("done", ok=ok, steps=steps, transactions=txs, session_transactions=txs - ops_open,
             sends_including_rebroadcasts=endpoint.sends,
             steps_per_second=round(steps / run_seconds, 1),
@@ -199,6 +204,8 @@ async def main(image: Path, steps: int, drop_at: int) -> int:
         validator.terminate()
         validator.wait(timeout=20)
         await endpoint.aclose()
+        if not keep:
+            shutil.rmtree(run_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -206,5 +213,6 @@ if __name__ == "__main__":
     ap.add_argument("image", type=Path)
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--drop-at", type=int, default=100)
+    ap.add_argument("--keep", action="store_true", help="keep the ledger directory")
     a = ap.parse_args()
-    raise SystemExit(asyncio.run(main(a.image, a.steps, a.drop_at)))
+    raise SystemExit(asyncio.run(main(a.image, a.steps, a.drop_at, a.keep)))

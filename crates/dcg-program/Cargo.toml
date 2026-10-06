@@ -34,8 +34,6 @@ test-weakened-class-rule = []
 # Test-only legacy mode: UnifiedInit without the option-range check (an older
 # program's documents), for the fix-point conviction test. Never in a release.
 test-legacy-unchecked-option-range = []
-legacy-basanos-fixtures = ["legacy-hclosure-handlers"]
-legacy-hclosure-handlers = []
 test-kernel = []
 # Example application kernels (the byte-sum and SHA-256 concat kernels and the
 # toy LX1 machine) under a non-test manifest, `dcg-alpha/1`. No test bindings.

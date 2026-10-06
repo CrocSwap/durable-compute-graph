@@ -967,50 +967,6 @@ pub fn template_release(
         .copy_from_slice(&documents.to_le_bytes());
     Ok(documents)
 }
-
-#[cfg(all(test, feature = "legacy-basanos-fixtures"))]
-mod tests {
-    use super::*;
-    use crate::unified::classes::tests::{golden, unhex};
-
-    #[test]
-    fn config_and_seal_vectors_decode() {
-        let g = golden();
-        let account = unhex(g["config"]["account"].as_str().unwrap());
-        assert_eq!(account.len(), CONFIG_BYTES);
-        assert_eq!(&account[..4], b"DCF1");
-        let init = unhex(g["config"]["init_data"].as_str().unwrap());
-        assert_eq!((init[0], init.len()), (TAG_CONFIG_INIT, 97));
-        assert_eq!(account[8..104], init[1..97]);
-        let rotate = unhex(g["config"]["rotate_data"].as_str().unwrap());
-        assert_eq!(
-            (rotate[0], rotate[1], rotate.len()),
-            (TAG_CONFIG_SET, ROLE_TEMPLATE_SEAL, 34)
-        );
-        let rotated = unhex(g["config"]["rotated"].as_str().unwrap());
-        assert_eq!(rotated[72..104], rotate[2..34]);
-        assert_eq!(u32::from_le_bytes(rotated[112..116].try_into().unwrap()), 1);
-        let seal = unhex(g["template_seal"]["account"].as_str().unwrap());
-        assert_eq!(
-            (seal.len(), &seal[..4], seal[6]),
-            (SEAL_BYTES, &b"DTA1"[..], SEAL_APPROVED)
-        );
-        assert_eq!(
-            unhex(g["template_seal"]["approve_data"].as_str().unwrap()),
-            vec![TAG_TEMPLATE_SEAL, 1]
-        );
-        let mut pd = vec![0u8; 45];
-        pd[..4].copy_from_slice(&3u32.to_le_bytes());
-        pd[12] = 1;
-        pd[13..45].copy_from_slice(&[9; 32]);
-        assert_eq!(programdata_upgrade_authority(&pd), Ok(Some([9; 32])));
-        pd[12] = 0;
-        assert_eq!(programdata_upgrade_authority(&pd), Ok(None));
-        pd[0] = 2;
-        assert_eq!(programdata_upgrade_authority(&pd), Err(CONFIG_AUTHORITY));
-    }
-}
-
 /// **tag 186 `CloseTemplateV5`** drains one published PT1X/PT2S template and
 /// its base in a single instruction. Only the DTU1 authority may invoke it,
 /// while the PT1X owner, PT2S owner and seal payer receive their recorded rent.

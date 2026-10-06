@@ -173,37 +173,3 @@ fn emit_versioned(version: u16, kind: u8, descriptor: &[u8; 32], body: Body, len
     out.extend_from_slice(body.bytes());
     solana_program::log::sol_log_data(&[&out]);
 }
-
-#[cfg(all(test, feature = "legacy-basanos-fixtures"))]
-mod tests {
-    use super::*;
-    use crate::unified::classes::tests::{golden, unhex};
-
-    /// Kind numbers and body lengths are the golden's (the handlers' event
-    /// bytes are compared field by field in the lifecycle replay).
-    #[test]
-    fn event_kinds_and_lengths_match_the_golden() {
-        let g = golden();
-        let events = g["events"].as_object().expect("golden events");
-        let want = [
-            ("init", INIT),
-            ("land", LAND),
-            ("finalize", FINALIZE),
-            ("challenge_open", CHALLENGE_OPEN),
-            ("respond", RESPOND),
-            ("ruling", RULING),
-            ("settle", SETTLE),
-            ("close", CLOSE),
-            ("output", OUTPUT),
-            ("resolve", RESOLVE),
-            ("close_result", CLOSE_RESULT),
-        ];
-        for (name, kind) in want {
-            let raw = unhex(events[name].as_str().unwrap());
-            assert_eq!((&raw[..4], raw[6], raw[7]), (&MAGIC[..], kind, 0), "{name}");
-            assert_eq!(u16::from_le_bytes([raw[4], raw[5]]), VERSION);
-            assert_eq!(raw.len(), HEADER + BODY[kind as usize], "{name}");
-        }
-        assert_eq!(events.len(), want.len());
-    }
-}

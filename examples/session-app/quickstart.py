@@ -1,8 +1,8 @@
 """Session quickstart (alpha plan C1): run the tally app on a local validator
 and drive one session from Python.
 
-    cargo build-sbf --sbf-out-dir out             # builds out/dcg_session_app.so
-    PYTHONPATH=../../python python quickstart.py out/dcg_session_app.so
+    ./build.sh out                                # builds out/dcg_session_app.so
+    python quickstart.py out/dcg_session_app.so   # [--keep] keeps the ledger directory
 
 Steps: start `solana-test-validator` with the program loaded at a fresh
 address, read its DCG runtime version from chain, open a rejectable stateful
@@ -140,10 +140,13 @@ async def main(image: Path) -> int:
         validator.terminate()
         validator.wait(timeout=20)
         await endpoint.aclose()
+        if "--keep" not in sys.argv:
+            shutil.rmtree(run_dir, ignore_errors=True)  # the ledger: hundreds of MB
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    args = [a for a in sys.argv[1:] if a != "--keep"]
+    if len(args) != 1:
         print(__doc__, file=sys.stderr)
         raise SystemExit(2)
-    raise SystemExit(asyncio.run(main(Path(sys.argv[1]))))
+    raise SystemExit(asyncio.run(main(Path(args[0]))))

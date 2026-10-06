@@ -117,6 +117,11 @@ class SequencedInstructionTransport:
             backoff=Backoff(initial_seconds=0.1, maximum_seconds=1),
         )
 
+    @property
+    def transactions(self) -> int:
+        """Transactions this transport has sent (rebroadcasts not counted)."""
+        return self._operation
+
     async def send(
         self,
         built: BuiltInstruction,

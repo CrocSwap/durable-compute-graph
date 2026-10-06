@@ -149,7 +149,7 @@ async fn forge_and_execute(version: u16) {
         r(routes.pubkey()), r(geom.pubkey()), r(pt2s.pubkey()),
     ])], &[]).await;
     eprintln!("EXECUTE-RESULT {exec:?}");
-    let expected = if version == 5 { 734 } else if cfg!(feature = "legacy-hclosure-handlers") { 731 } else { 742 };
+    let expected = if version == 5 { 734 } else { 742 };
     assert!(format!("{exec:?}").contains(&format!("Custom({expected})")),
         "v{version} must fail in live with {expected}, got {exec:?}");
 
