@@ -64,8 +64,9 @@ session's children). H4 and M2 are fixed by session features (merged 10-05,
 5624a82): declared input rejection and ring-buffer streams
 (`docs/design/session-reject-and-ring-v1.md`; rule-10 reviewed, fix-then-merge;
 fuzzed 1,500 native + 300 SBF sequences with ring laps and rejections, clean).
-Still to do there: client support for v3 features (no DCG Python client speaks
-v3; Doom adopts them with its repin). **Admission, the template lifecycle, the
+The Python `Session` now speaks v3 features (ring streams, declared rejection,
+session info; `python/tests/test_session_v3.py`), and Doom adopted them with
+its repin. **Admission, the template lifecycle, the
 closes and routing reviewed 10-05** (two independent reviews, fixes, two
 re-reviews; merged 69fe0a1): staging growth refunded by recorded payer,
 admission floors and canonical template ids, built-ins bound at version (1, 1),
@@ -173,7 +174,7 @@ DCG keeps no model code (owner decision, 09-26).
 
 The alpha ships when all of these hold:
 
-1. **Independent reviews:** every handler in the alpha surface has one, and every finding is fixed or written up as a known limit.
+1. **Independent reviews:** every handler in the alpha surface has one, and every finding is fixed or written up as a known limit. **Met 2026-10-05:** tag 227 with LX1, sessions v3 with lanes, rejection and ring streams, admission, the template lifecycle, the closes and routing (R2 complete, above), and the executor and watchtower services (E3: three review rounds, every high finding fixed). Known limits are in `docs/release-terms.md`.
 2. **Fuzzer:** it runs clean, natively and on SBF, over the agreed number of interleavings. **Met 2026-10-05:** the run-level v2.1 fuzzer (shadow ledger, settlement precondition model, deadline probes, ruling oracles; reviewed) ran clean over 5,000 native sequences (10,172 disputes, 145,512 transactions) and 500 SBF sequences on the alpha image `8d39d440…` (`docs/experiments/v21-run-fuzz-2026-10-05.md`). The counts were the director's choice; the owner has not set a number.
 3. **Public program:** the shared testnet program runs the reviewed image, and the hash is published. **Met:** `J9Eje…` runs `8d39d440…` (R4), published in `hello-graph.md`; `dcg verify` checks it.
 4. **A newcomer test in each mode,** with no help from the authors. Starting from the docs, someone who did not build DCG:
@@ -181,7 +182,7 @@ The alpha ships when all of these hold:
    - **Consensus:** writes a stateful kernel, runs a session of a few thousand transactions to completion with the sequencer (including a resend after a dropped transaction), reads the result, and closes the session.
    - **Agent-proxy runs, 2026-10-05 (owner: an agent proxy now, humans later; local chain is enough for the optimistic run):** two fresh agents followed only the docs from a clean checkout and completed each mode. Optimistic: their own 10-step traced graph, honest and lying runs, the watchtower convicted the lie, and only the two receipts remained (about 9 minutes). Consensus: their own stateful kernel (kit: 277 cases, 0 disagreements), a session of 2,009 transactions through the sequencer at 16.1 steps/s with a dropped send recovered, the mirror agreed, and all rent returned (about 26 minutes). Of the 18 friction points they reported, 16 are fixed; the two left are cosmetic (the order `explain` lists a block's kernels in, and the host build's warnings, now documented as harmless). Human newcomer runs, and the optimistic run on the shared program, remain.
 5. **A custom kernel** passes the kernel kit's conformance harness and wins an honest dispute on testnet. **Met 2026-10-05:** `examples/kernel-app` (`ex-polyhash-v1`) passes the kit (112 cases, 0 disagreements) and, deployed at the fresh testnet address `FWVem35S…`, won both disputes as the oracle ruled (lie: C; honest: E), then settled and closed everything (27 transactions, 69 s). `docs/kernel-app.md`; Basanos evidence M1385.
-6. **Release terms** are published.
+6. **Release terms** are published. **Met 2026-10-05:** `docs/release-terms.md`, `CHANGELOG.md` and `SECURITY.md` (owner: merged as drafted, review later).
 7. **Doom on DCG runs at 3.0 frames per second** on testnet, on Doom's own program built on the reviewed DCG runtime (*measured*, sustained over a session of at least 1,000 frames), with lanes reviewed (owner 2026-10-05: Doom stays on its own program). **Met 2026-10-05:** 1,000/1,000 frames at 3.81 frames/s (3.71–4.01 per 250-frame window, no repairs) on Doom's own testnet program `2uHBWbYE…`, built on DCG `4a7faf4` (runtime 0.1.0), 3 lanes, from the Tokyo host; the kernel rejects USE-while-dead instead of wedging (83 rejections in the session). Basanos evidence M1384, `docs/experiments/doom-current-dcg-testnet-2026-10-05.md` (Basanos).
 
 ## Owner decisions (2026-10-03)
