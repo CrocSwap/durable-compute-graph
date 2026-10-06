@@ -3,7 +3,13 @@
 Breaking changes are marked **breaking**, with who is affected and how to
 migrate. Formats may change before beta (see `docs/release-terms.md`).
 
-## Alpha (unreleased)
+## v0.1.0-alpha (2026-10-06)
+
+The first tagged release: the alpha exit criteria are met (`docs/plans/alpha-release-plan.md`),
+and consumers (Basanos, Doom on DCG) pin this tag instead of a sibling checkout.
+The shared testnet alpha program `J9Eje…` runs image `8d39d440…` (built from
+466e55d); version-1 runs (sub 28) are in this source but not yet in that image.
+Basanos's own mainnet program (owner decision 2026-10-06) is built from 7d1aac5.
 
 ### Python client
 
