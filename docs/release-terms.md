@@ -1,6 +1,6 @@
 # DCG alpha: release terms
 
-**Status:** draft for owner review (alpha plan R5, exit criterion 6).
+**Status:** published 2026-10-05 (alpha plan R5, exit criterion 6); owner review pending, edits follow as changelog entries.
 
 ## What this release is
 
