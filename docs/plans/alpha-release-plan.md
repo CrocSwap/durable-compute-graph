@@ -175,13 +175,13 @@ The alpha ships when all of these hold:
 
 1. **Independent reviews:** every handler in the alpha surface has one, and every finding is fixed or written up as a known limit.
 2. **Fuzzer:** it runs clean, natively and on SBF, over the agreed number of interleavings.
-3. **Public program:** the shared testnet program runs the reviewed image, and the hash is published.
+3. **Public program:** the shared testnet program runs the reviewed image, and the hash is published. **Met:** `J9Eje…` runs `8d39d440…` (R4), published in `hello-graph.md`; `dcg verify` checks it.
 4. **A newcomer test in each mode,** with no help from the authors. Starting from the docs, someone who did not build DCG:
    - **Optimistic:** traces a v2.1 graph, runs it on the shared program, watches the watchtower convict a planted lie, and gets their rent back.
    - **Consensus:** writes a stateful kernel, runs a session of a few thousand transactions to completion with the sequencer (including a resend after a dropped transaction), reads the result, and closes the session.
 5. **A custom kernel** passes the kernel kit's conformance harness and wins an honest dispute on testnet.
 6. **Release terms** are published.
-7. **Doom on DCG runs at 3.0 frames per second** on testnet, on Doom's own program built on the reviewed DCG runtime (*measured*, sustained over a session of at least 1,000 frames), with lanes reviewed (owner 2026-10-05: Doom stays on its own program).
+7. **Doom on DCG runs at 3.0 frames per second** on testnet, on Doom's own program built on the reviewed DCG runtime (*measured*, sustained over a session of at least 1,000 frames), with lanes reviewed (owner 2026-10-05: Doom stays on its own program). **Met 2026-10-05:** 1,000/1,000 frames at 3.81 frames/s (3.71–4.01 per 250-frame window, no repairs) on Doom's own testnet program `2uHBWbYE…`, built on DCG `4a7faf4` (runtime 0.1.0), 3 lanes, from the Tokyo host; the kernel rejects USE-while-dead instead of wedging (83 rejections in the session). Basanos evidence M1384, `docs/experiments/doom-current-dcg-testnet-2026-10-05.md` (Basanos).
 
 ## Owner decisions (2026-10-03)
 

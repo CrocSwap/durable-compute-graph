@@ -77,6 +77,8 @@ The DRS1 record and tags 14–15 remain outside this small commitment module.
 See [`docs/application-api.md`](docs/application-api.md) for the exact public
 surface and callback contract.
 
+**Alpha terms:** testnet only; formats may change before beta. See [`docs/release-terms.md`](docs/release-terms.md), [`CHANGELOG.md`](CHANGELOG.md) and [`SECURITY.md`](SECURITY.md).
+
 ## Kernel contract: what a developer implements
 
 Each application defines a static `ApplicationManifest` whose kernel entries

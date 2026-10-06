@@ -1,0 +1,31 @@
+# Changelog
+
+Breaking changes are marked **breaking**, with who is affected and how to
+migrate. Formats may change before beta (see `docs/release-terms.md`).
+
+## Alpha (unreleased)
+
+### Program (shared alpha image `8d39d440…`, runtime `dcg-runtime/1 0.1.0`)
+
+- **The runtime version marker** (`dcg-runtime/1 <version> stateful-v3
+  v21`) is in every image. Read it with `python -m dcg.runtime`.
+- **Kernel kit:** the STEP replay and the v3 transition judgement are shared
+  with the conformance harness. Behavior is unchanged (reviewed).
+- **Rejectable sessions and ring streams** (session features; sessions v3).
+  **Breaking for v3 clients:** child creators now take the session authority,
+  signing, as account 2; the open payload may carry `lanes` and `features`.
+  Migrate with the current Python client (`dcg.session`), or follow
+  `docs/stateful-workloads-v3.md`.
+- **Tag 227 admission:** the window floors, canonical template ids,
+  built-in kernels bound at version (1, 1), and staging-growth refunds.
+  **Breaking:** templates that broke these rules are refused; re-encode them
+  with the current client.
+
+### Client and tools
+
+- `dcg dev`, `dcg build`, `dcg verify`, `dcg explain`.
+- `dcg.services`: the executor service and the watchtower.
+- `settle_and_reclaim`, named tag-227 errors, `dcg.v21` tracing, and the
+  kernel kit (`dcg.kernel_kit`).
+- The template session app (`examples/session-app`) and the session
+  quickstart.
