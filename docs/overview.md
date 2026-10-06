@@ -36,9 +36,10 @@ transaction:
 
 - **Consensus mode suits work that must be fully on chain:** games and
   simulations, long state machines, and multi-step settlement. Doom's
-  simulation and renderer run on DCG sessions on testnet (*measured*: about
-  1.65 frames per second, about 140 transactions per frame; DCG
-  `docs/plans/v2-roadmap.md`).
+  simulation and renderer run on DCG sessions on testnet, and the game is
+  playable in a browser (*measured*: 3.81 frames per second over 1,000
+  frames with 3 lanes, Basanos M1384, 2026-10-05; 3.3 to 3.9 frames per
+  second in live play, Basanos M1388, 2026-10-06).
 - **Optimistic mode suits work far too large to run on chain:** model
   inference, simulations, and data pipelines whose results contracts act
   on. Basanos uses DCG to make language-model outputs disputable.
@@ -94,9 +95,10 @@ names them.
 **Consensus mode:**
 - **Throughput and fees are the limits:** every step is a real
   transaction, with the chain's per-transaction compute ceiling. Lanes let
-  independent parts of a session advance in parallel: Doom on DCG ran
-  1,000 frames at 3.81 frames per second on testnet with 3 lanes
-  (*measured* 2026-10-05).
+  independent parts of a session advance in parallel; that is how Doom
+  reaches 3.81 frames per second. Fees grow with play time: Doom costs
+  about 0.7 testnet FOGO a minute, mostly priority fees (*measured*,
+  Basanos M1388, 2026-10-06).
 - **No watcher, no challenge window and no trusted template:** the chain
   executed everything.
 
