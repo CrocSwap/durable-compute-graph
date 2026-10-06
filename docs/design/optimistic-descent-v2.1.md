@@ -1140,8 +1140,11 @@ staging buffers.
   - refunded on a moot dispute.
 - The executor bond:
   - `best_win` receives `bond_slasher_bps` of it;
-  - the remainder goes to the committed destination, the payer or the
-    incinerator.
+  - the remainder goes to the committed destination: the payer on a
+    version-0 run, or the `remainder_to` recorded at `init_run_v1` (sub 28)
+    on a version-1 run. Version 1 (2026-10-06) separates who pays rent from
+    who receives the remainder, so an application can bind the remainder to
+    a party the executor does not control.
 
 **Admission requires:**
 - `bond_slasher_bps < 10,000`;

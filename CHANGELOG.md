@@ -16,6 +16,15 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
 
 ### Program (shared alpha image `8d39d440…`, runtime `dcg-runtime/1 0.1.0`)
 
+- **Version-1 v2.1 runs** (tag 227 sub 28, `init_run_v1`): the run records
+  `remainder_to`, which receives a convicted executor's bond remainder in
+  place of the payer; it may not be the executor, and the payer may then be
+  the executor. The layout version is byte 5 of the run, and `remainder_to`
+  follows `waiting_E`. Version-0 runs (sub 2) are unchanged. Python:
+  `DisputeClient.init_run(..., remainder_to=...)`, `LxClient.init_lx_run(...,
+  remainder_to=...)`, and `client.remainder_recipient(run)`. Not yet in the
+  deployed alpha image.
+
 - **The runtime version marker** (`dcg-runtime/1 <version> stateful-v3
   v21`) is in every image. Read it with `python -m dcg.runtime`.
 - **Kernel kit:** the STEP replay and the v3 transition judgement are shared

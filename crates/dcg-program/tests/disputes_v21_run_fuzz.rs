@@ -79,8 +79,11 @@ const FUND: u64 = 10_000_000_000;
 const A: u8 = 0xA1; // admitter and run payer
 const E: u8 = 0xE1; // executor
 const B: u8 = 0xB1; // bystander
+/// remainder_to on a version-1 run (mainnet hardening H4): a convicted
+/// executor's bond remainder goes here instead of to the payer A.
+const R: u8 = 0xD1;
 const CHALLENGERS: [u8; 5] = [0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
-const ACTORS: [u8; 8] = [A, E, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, B];
+const ACTORS: [u8; 9] = [A, E, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, B, R];
 /// Funds forged accounts, so the bank's capitalization stays exact. Outside
 /// the ledger.
 const FORGER: u8 = 0xF1;
@@ -386,6 +389,8 @@ struct World {
     executor_bond: u64,
     challenger_bond: u64,
     slasher_bps: u64,
+    /// Who receives a convicted executor's remainder: A (version 0) or R (version 1).
+    remainder: u8,
     template: Pubkey,
     template_id: [u8; 32],
     run: Pubkey,
@@ -504,6 +509,7 @@ impl World {
         }
         let c = commitment(&g, &run_id, leaves, outs);
         let e_diligent = rng.pct(if lies.is_empty() { 75 } else { 55 });
+        let remainder = if rng.pct(50) { R } else { A };
 
         // The disputes that will be opened.
         let mut plans = vec![];
@@ -553,12 +559,12 @@ impl World {
         }
         ledger.sort();
         ledger.dedup();
-        let label = format!("lies {lies:?} executor {} windows {challenge_window}/{phase_window} bonds {executor_bond}/{challenger_bond} slasher {slasher_bps} second run {} plans {:?}",
-            if e_diligent { "diligent" } else { "lazy" }, run2.is_some(), ds.iter().map(|d| (d.plan, format!("{:x}", d.who), d.kind)).collect::<Vec<_>>());
+        let label = format!("run v{} lies {lies:?} executor {} windows {challenge_window}/{phase_window} bonds {executor_bond}/{challenger_bond} slasher {slasher_bps} second run {} plans {:?}",
+            u8::from(remainder == R), if e_diligent { "diligent" } else { "lazy" }, run2.is_some(), ds.iter().map(|d| (d.plan, format!("{:x}", d.who), d.kind)).collect::<Vec<_>>());
         let _ = &mut ctx;
         let mut w = World {
             ctx, rng, rent, case: format!("seed {seed} sequence {index}"), label, trace: vec![], g, spec_levels, c, lies, e_diligent,
-            executor_bond, challenger_bond, slasher_bps, template, template_id, run, run2, cache, ds, opened: 0, closed: 0,
+            executor_bond, challenger_bond, slasher_bps, remainder, template, template_id, run, run2, cache, ds, opened: 0, closed: 0,
             status: V::RUN_OPEN, best: u64::MAX, paid: false, run_closed: false, run2_closed: false, retired: false,
             template_closed: false, ledger, init: BTreeMap::new(), txs: 0, accepted: 0, refused_perturbations: 0,
             rulings_by_proof: 0, oracle_checked: 0, boundary_probes: 0, coverage: BTreeMap::new(), plant: None,
@@ -589,7 +595,13 @@ impl World {
         for r in &self.g.refs {
             init.extend_from_slice(r);
         }
-        ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(pk(A), true), AccountMeta::new(key, false), AccountMeta::new(self.template, false), AccountMeta::new_readonly(SYSTEM, false)])
+        let sub = if self.remainder == R {
+            init.extend_from_slice(pk(R).as_ref());
+            V::SUB_INIT_RUN_V1
+        } else {
+            V::SUB_INIT_RUN
+        };
+        ix(sub, &init, vec![AccountMeta::new(pk(A), true), AccountMeta::new(key, false), AccountMeta::new(self.template, false), AccountMeta::new_readonly(SYSTEM, false)])
     }
 
     fn fail(&self, what: &str) -> ! {
@@ -707,7 +719,7 @@ impl World {
             Op::PayPot(k) => {
                 let share = self.executor_bond * self.slasher_bps / 10_000;
                 mv(self.run, pk(self.ds[k].who), share);
-                mv(self.run, pk(A), self.executor_bond - share);
+                mv(self.run, pk(self.remainder), self.executor_bond - share);
             }
             Op::Finalize => mv(self.run, pk(E), self.executor_bond),
             Op::CloseDispute(k) => {
@@ -864,7 +876,7 @@ impl World {
                 self.fail(&format!("an honest, diligent executor ruled against (seq {})", d.seq));
             }
         }
-        let wait = u32_at(&r, r.len() - 4);
+        let wait = u32_at(&r, r.len() - 4 - if r[5] == 1 { 32 } else { 0 }); // waiting_E precedes a v1 run's remainder_to
         let checks = [
             ("open count", u32_at(&r, R_OPEN) as u64, unruled as u64),
             ("executor-wait count", wait as u64, waiting as u64),
@@ -1141,7 +1153,7 @@ impl World {
         }
         let expect = force.unwrap_or(if allowed { Expect::Accepted } else { Expect::Refused });
         let who = self.ds[k].who;
-        let i = self.perm_ix(p, k, caller, who, A, E);
+        let i = self.perm_ix(p, k, caller, who, if p == Perm::PayPot { self.remainder } else { A }, E);
         let op = self.perm_op(p, k);
         // The timeout's verdict: moot after the lowest challenger win, else the
         // party that owed the move loses.
@@ -1547,10 +1559,11 @@ impl World {
                 let wrong_c = self.rng.pick(&others(who));
                 let wrong_e = self.rng.pick(&others(E));
                 let wrong_a = self.rng.pick(&others(A));
+                let wrong_r = self.rng.pick(&others(self.remainder));
                 let (challenger, payer, executor) = match p {
                     Perm::Moot => (wrong_c, A, E),
                     Perm::Timeout | Perm::CloseDispute => if self.rng.pct(50) { (wrong_c, A, E) } else { (who, A, wrong_e) },
-                    Perm::PayPot => if self.rng.pct(50) { (wrong_c, A, E) } else { (who, wrong_a, E) },
+                    Perm::PayPot => if self.rng.pct(50) { (wrong_c, self.remainder, E) } else { (who, wrong_r, E) },
                     Perm::CloseRun => (who, wrong_a, E),
                     _ => (who, A, wrong_e),
                 };

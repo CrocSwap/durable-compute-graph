@@ -653,6 +653,29 @@ async fn admission_refuses_bad_templates_and_runs() {
         let i = ix(V::SUB_INIT_RUN, &data, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
         assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err());
     }
+    // Version 1 (mainnet hardening H4): the remainder's recipient may not be
+    // the executor, but the payer may, since it now only pays rent.
+    let e1 = kp(0xE1);
+    let refs = [&ch.g.refs[0], &ch.g.refs[1]];
+    let mut to_executor = init(&e1.pubkey(), &refs);
+    to_executor.extend_from_slice(e1.pubkey().as_ref());
+    let i = ix(V::SUB_INIT_RUN_V1, &to_executor, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(Pubkey::new_unique(), false), AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err(), "a v1 remainder to the executor is refused");
+    let mut truncated = init(&e1.pubkey(), &refs);
+    truncated.extend_from_slice(&[7u8; 31]);
+    let i = ix(V::SUB_INIT_RUN_V1, &truncated, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(Pubkey::new_unique(), false), AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert!(send(&mut ch.ctx, i, &[&admitter]).await.is_err(), "a short remainder_to is refused");
+    let recipient = kp(0xD1).pubkey();
+    let mut v1 = init(&e1.pubkey(), &refs);
+    v1.extend_from_slice(recipient.as_ref());
+    let template_id: [u8; 32] = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap().data[96..128].try_into().unwrap();
+    let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &v1[0..32], &2u32.to_le_bytes(), &ch.g.refs[0], &ch.g.refs[1], e1.pubkey().as_ref()]);
+    let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, e1.pubkey().as_ref()], &PROGRAM).0;
+    let i = ix(V::SUB_INIT_RUN_V1, &v1, vec![AccountMeta::new(e1.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    send(&mut ch.ctx, i, &[&e1]).await.expect("a v1 run whose payer is the executor");
+    let d = ch.ctx.banks_client.get_account(run).await.unwrap().unwrap().data;
+    assert_eq!(d[5], 1, "version 1");
+    assert_eq!(&d[d.len() - 32..], recipient.as_ref(), "remainder_to after waiting_E");
     // A commit under another plan id is refused.
     let mut c = ch.honest();
     c.root_bytes[0] ^= 1;

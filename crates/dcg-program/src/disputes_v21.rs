@@ -102,6 +102,10 @@ pub const SUB_CLOSE_CACHE: u8 = 20;
 pub const SUB_CLOSE_TEMPLATE: u8 = 21;
 /// Retire a tracked template so no new runs can be initialized from it.
 pub const SUB_RETIRE_TEMPLATE: u8 = 22;
+/// Initialize a version-1 run: as SUB_INIT_RUN plus `remainder_to`, the key
+/// that receives a convicted executor's bond remainder (mainnet hardening H4,
+/// 2026-10-06). Subs 23-27 are the LX1 subs.
+pub const SUB_INIT_RUN_V1: u8 = 28;
 /// Builds the pre-provenance template encoding for backwards-compatibility
 /// tests. This subtype is absent from non-test program builds.
 #[cfg(feature = "test-legacy-template-create")]
@@ -416,11 +420,15 @@ fn change_template_run_count(template: &AccountInfo, delta: i8) -> ProgramResult
     Ok(())
 }
 
-// Run "D21R": magic(4) status(1) pad(3) template(32) payer(32) executor(32)
-// run_id(32) commit_slot(8) deadline(8) open_disputes(4) n_ext(4)
-// run_root_bytes(176) then external refs (52 each). PDA ["dcg21run", run_id,
-// payer]. Before commit, `deadline` is the commit deadline.
+// Run "D21R": magic(4) status(1) version(1) pad(2) template(32) payer(32)
+// executor(32) run_id(32) commit_slot(8) deadline(8) open_disputes(4)
+// n_ext(4) run_root_bytes(176) then external refs (52 each), waiting_E:u32,
+// and on a version-1 run remainder_to(32). PDA ["dcg21run", run_id, payer].
+// Before commit, `deadline` is the commit deadline. Version 0 pays a
+// convicted executor's remainder to the payer, version 1 to remainder_to.
 const R_STATUS: usize = 4;
+const R_VERSION: usize = 5;
+const R_REMAINDER_BYTES: usize = 32;
 const R_TEMPLATE: usize = 8;
 const R_PAYER: usize = 40;
 const R_EXECUTOR: usize = 72;
@@ -458,8 +466,27 @@ fn run_checked(program_id: &Pubkey, run: &AccountInfo, template: &AccountInfo) -
         solana_program::msg!("v2.1 run size {} predates the wait trailer; drain all runs before an in-place upgrade", d.len());
         return Err(err(40));
     }
-    if d.len() != refs_end.checked_add(R_LOAD_BYTES).ok_or(err(8))? { return Err(err(8)); }
+    if d.len() != refs_end.checked_add(R_LOAD_BYTES + trailer_extra(&d)?).ok_or(err(8))? { return Err(err(8)); }
     derived(program_id, run, &[b"dcg21run", &d[R_RUN_ID..R_RUN_ID + 32], &d[R_PAYER..R_PAYER + 32]])
+}
+
+/// Bytes after waiting_E: none on a version-0 run, remainder_to on version 1.
+fn trailer_extra(r: &[u8]) -> Result<usize, ProgramError> {
+    match r.get(R_VERSION).copied() {
+        Some(0) => Ok(0),
+        Some(1) => Ok(R_REMAINDER_BYTES),
+        _ => Err(err(8)),
+    }
+}
+
+/// Who receives a convicted executor's bond remainder: the payer on a
+/// version-0 run, remainder_to on version 1.
+fn remainder_to(r: &[u8]) -> Result<[u8; 32], ProgramError> {
+    match r.get(R_VERSION).copied() {
+        Some(0) => key32(r, R_PAYER),
+        Some(1) => key32(r, load_offset(r)? + R_LOAD_BYTES),
+        _ => Err(err(8)),
+    }
 }
 
 // Dispute "D21D": magic(4) phase(1) kind(1) ruling(1) depth(1) level(4)
@@ -502,7 +529,8 @@ pub fn process(
         SUB_CREATE_TEMPLATE => create_template(program_id, accounts, &data[2..]),
         #[cfg(feature = "test-legacy-template-create")]
         SUB_TEST_CREATE_LEGACY_TEMPLATE => create_template_inner(program_id, accounts, &data[2..], false),
-        SUB_INIT_RUN => init_run(program_id, accounts, &data[2..]),
+        SUB_INIT_RUN => init_run(program_id, accounts, &data[2..], false),
+        SUB_INIT_RUN_V1 => init_run(program_id, accounts, &data[2..], true),
         SUB_COMMIT => commit(program_id, accounts, &data[2..], manifest),
         SUB_OPEN => open(program_id, accounts, &data[2..], manifest),
         lx::SUB_LX_MIDPOINTS => lx::midpoints(program_id, accounts, &data[2..]),
@@ -666,7 +694,8 @@ fn default_block(total_steps: u64, first_record: u64) -> [u8; Block::BYTES] {
 }
 
 // 2: [payer(s,w), run(w), template, system] nonce[32] executor[32] n:u32 refs[52 n]
-fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+// 28 (version 1): the same, then remainder_to[32].
+fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool) -> ProgramResult {
     let [payer, run, tmpl, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -681,8 +710,10 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     }
     let next_active_runs = active_runs.map(|n| n.checked_add(1).ok_or(err(8))).transpose()?;
     let n = u32_at(data, 64)? as usize;
-    let refs = data.get(68..68 + n * 52).ok_or(err(1))?;
-    if data.len() != 68 + n * 52 {
+    let refs_end = n.checked_mul(52).and_then(|b| b.checked_add(68)).ok_or(err(1))?;
+    let refs = data.get(68..refs_end).ok_or(err(1))?;
+    let extra = if v1 { R_REMAINDER_BYTES } else { 0 };
+    if data.len() != refs_end + extra {
         return Err(err(1));
     }
     // External refs are sorted by strictly increasing external id (design
@@ -692,18 +723,26 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
             return Err(err(31));
         }
     }
-    if payer.key.as_ref() == &data[32..64] {
-        // The payer receives the remainder; an executor paying itself
-        // removes the deterrent (design §10.3).
+    // The remainder's recipient may not be the executor: an executor
+    // receiving its own remainder removes the deterrent (design §10.3). On
+    // version 0 the payer is that recipient; on version 1 the payer only
+    // pays rent and may be the executor.
+    let recipient = if v1 { &data[refs_end..refs_end + 32] } else { payer.key.as_ref() };
+    if recipient == &data[32..64] {
         return Err(err(31));
     }
     let template_id = key32(&tmpl.try_borrow_data()?, 96)?;
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &data[0..32], &(n as u32).to_le_bytes(), refs, &data[32..64]]);
     // The payer is part of the run's address (review 10-03, F5): a cancelled
     // run cannot be re-initialized at the same address by someone else.
-    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], R_REFS + refs.len() + R_LOAD_BYTES)?;
+    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], R_REFS + refs.len() + R_LOAD_BYTES + extra)?;
     let mut d = run.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"D21R");
+    if v1 {
+        d[R_VERSION] = 1;
+        let at = R_REFS + refs.len() + R_LOAD_BYTES;
+        d[at..at + 32].copy_from_slice(&data[refs_end..refs_end + 32]);
+    }
     d[R_TEMPLATE..R_TEMPLATE + 32].copy_from_slice(tmpl.key.as_ref());
     d[R_PAYER..R_PAYER + 32].copy_from_slice(payer.key.as_ref());
     d[R_EXECUTOR..R_EXECUTOR + 32].copy_from_slice(&data[32..64]);
@@ -894,7 +933,7 @@ fn expect_phase(d: &[u8], phase: u8, _run: &AccountInfo) -> ProgramResult {
 
 fn load_offset(r: &[u8]) -> Result<usize, ProgramError> {
     let at = R_REFS.checked_add((u32_at(r, R_NEXT)? as usize).checked_mul(52).ok_or(err(8))?).ok_or(err(8))?;
-    if r.len() != at + R_LOAD_BYTES { return Err(err(8)); }
+    if r.len() != at + R_LOAD_BYTES + trailer_extra(r)? { return Err(err(8)); }
     Ok(at)
 }
 
@@ -2109,6 +2148,8 @@ fn moot(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 // the ruled prefix has passed `best_win`: the slasher share of the executor
 // bond to that challenger, the remainder to the run's payer.
 fn pay_pot(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    // `payer` is the remainder's recipient: the run's payer (version 0) or
+    // its remainder_to (version 1).
     let [_caller, run, tmpl, dispute, challenger, payer, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     let c = dispute_ctx(program_id, run, tmpl, dispute)?;
     {
@@ -2121,7 +2162,7 @@ fn pay_pot(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             || u64_at(&d, D_SEQ)? != best
             || d[D_RULING] != RULING_CHALLENGER
             || challenger.key.to_bytes() != d[D_CHALLENGER..D_CHALLENGER + 32]
-            || payer.key.to_bytes() != r[R_PAYER..R_PAYER + 32]
+            || payer.key.to_bytes() != remainder_to(&r)?
         {
             return Err(err(28));
         }

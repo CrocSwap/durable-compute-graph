@@ -27,17 +27,29 @@ TAG = 227
 SUB = {"create_template": 1, "init_run": 2, "commit": 3, "open": 4, "reveal_nodes": 5, "pick": 6,
        "reveal_leaf": 7, "claim": 8, "finalize": 10, "advance": 11, "pay_pot": 13, "stage_create": 14,
        "stage_write": 15, "stage_grow": 17, "close_dispute": 18, "close_run": 19, "close_cache": 20,
-       "close_template": 21, "retire_template": 22, "timeout": 9, "moot": 12}
+       "close_template": 21, "retire_template": 22, "timeout": 9, "moot": 12, "init_run_v1": 28}
 RUN_OPEN, RUN_COMMITTED, RUN_FINAL, RUN_REFUTED = 0, 1, 2, 3
 SUB_CACHE_ANSWER = 16
 # Run, dispute and cache layouts (disputes_v21.rs).
 R_STATUS, R_TEMPLATE, R_PAYER, R_EXECUTOR, R_DEADLINE, R_OPEN = 4, 8, 40, 72, 144, 152
 R_SEQ, R_PREFIX, R_BEST, R_PAID, R_CLOSED = 160, 168, 176, 184, 188
+R_VERSION, R_NEXT, R_REFS = 5, 156, 192 + 176
 D_PHASE, D_RULING, D_DEADLINE, D_CHALLENGER, D_RUN, D_SEQ = 4, 6, 24, 32, 64, 136
 PH_RULED, RULING_OPEN, RULING_CHALLENGER = 5, 0, 2
 CACHE_BYTES = 56 + 32 * 32
 CACHE_BYTES_V2 = CACHE_BYTES + 32
 RECEIPT_BYTES = 136 + 176  # a closed run: its first 136 bytes, then its root
+
+
+def remainder_recipient(run: bytes) -> bytes:
+    """Who receives a convicted executor's bond remainder: the payer on a
+    version-0 run, remainder_to (after waiting_E) on version 1."""
+    if run[R_VERSION] == 0:
+        return run[R_PAYER:R_PAYER + 32]
+    if run[R_VERSION] == 1:
+        at = R_REFS + 52 * struct.unpack_from("<I", run, R_NEXT)[0] + 4
+        return run[at:at + 32]
+    raise ValueError(f"unknown v2.1 run version {run[R_VERSION]}")
 KIND = {"STEP_DESCEND": 1, "OUT_DESCEND": 2}
 ROLE_EXECUTOR, ROLE_CHALLENGER, FROM_STAGING = 1, 2, 0xFF
 DIRECT_LIMIT = 700
@@ -149,14 +161,19 @@ class DisputeClient:
         return template
 
     def init_run(self, template: Pubkey, template_id: bytes, nonce: bytes, executor: Pubkey, refs: list[bytes],
-                 payer: Keypair) -> Pubkey:
+                 payer: Keypair, remainder_to: Pubkey | None = None) -> Pubkey:
+        """A version-0 run, or with ``remainder_to`` a version-1 run whose
+        convicted-executor remainder goes to that key (the payer then only
+        pays rent and may be the executor)."""
         refs = sorted(refs, key=lambda r: struct.unpack_from("<I", r)[0])
         flat = b"".join(refs)
         run_id = hashlib.sha256(b"dcg.run.id.v2.1\x00" + template_id + nonce + struct.pack("<I", len(refs)) + flat
                                 + bytes(executor)).digest()
         run = self.pda(b"dcg21run", run_id, bytes(payer.pubkey()))
         body = nonce + bytes(executor) + struct.pack("<I", len(refs)) + flat
-        self._send("init_run", body, [AccountMeta(payer.pubkey(), True, True), AccountMeta(run, False, True),
+        if remainder_to is not None:
+            body += bytes(remainder_to)
+        self._send("init_run" if remainder_to is None else "init_run_v1", body, [AccountMeta(payer.pubkey(), True, True), AccountMeta(run, False, True),
                                       AccountMeta(template, False, True), AccountMeta(SYSTEM, False, False)], [payer])
         return run
 
@@ -324,10 +341,14 @@ class DisputeClient:
     def settle_dispute(self, run: Pubkey, template: Pubkey, dispute: Pubkey, challenger: Pubkey,
                        executor: Pubkey, payer: Pubkey) -> None:
         """After a ruling on a run's only open dispute: advance the ruled
-        prefix, pay the pot if the challenger won, and close the dispute."""
+        prefix, pay the pot if the challenger won, and close the dispute.
+        The pot's remainder goes to the run's recipient (``payer`` is kept
+        for the call shape; the run says who receives it)."""
         self.advance(run, template, dispute)
         if self.run_status(run) == RUN_REFUTED:
-            self.pay_pot(run, template, dispute, challenger, payer)
+            raw = self.gc.account(run)
+            recipient = Pubkey.from_bytes(remainder_recipient(raw)) if raw is not None else payer
+            self.pay_pot(run, template, dispute, challenger, recipient)
         self.close_dispute(run, template, dispute, challenger, executor)
 
     # --- the whole lifecycle -------------------------------------------------------------
@@ -439,7 +460,8 @@ class DisputeClient:
                 return f"advance past {dispute}"
         if status == RUN_REFUTED and not paid and prefix > best:
             dispute, d = next((dd for dd in disputes if u64(dd[1], D_SEQ) == best))
-            self.pay_pot(run, template, dispute, Pubkey.from_bytes(d[D_CHALLENGER:D_CHALLENGER + 32]), payer)
+            self.pay_pot(run, template, dispute, Pubkey.from_bytes(d[D_CHALLENGER:D_CHALLENGER + 32]),
+                         Pubkey.from_bytes(remainder_recipient(r)))
             return f"pay_pot {dispute}"
         for dispute, d in disputes:
             seq = u64(d, D_SEQ)

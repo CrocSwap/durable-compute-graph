@@ -133,7 +133,7 @@ touched accounts is unchanged.
 | ruling (CLAIM resolution or 9 timeout) | the dispute's lamports above its rent floor (C's bond) → E on an executor win, → C on a challenger win or a neutral (moot) outcome. |
 | 12 moot | C's bond → C. E gains nothing. |
 | 10 finalize | E's bond → E, from the run, on a run that ends `FINAL`. |
-| 13 pay pot | from the run: `bond_slasher_bps` of E's bond → the `best_win` challenger, and the remainder → P. Once only (`R_PAID`). |
+| 13 pay pot | from the run: `bond_slasher_bps` of E's bond → the `best_win` challenger, and the remainder → P on a version-0 run, or → the run's `remainder_to` on a version-1 run (sub 28). Once only (`R_PAID`). |
 | 18 close dispute | bonds have already moved. The dispute's rent → C. For each buffer: min(recorded growth, balance) → the party that did not create it; every other lamport (creation rent, other funders' growth, pre-funding) → the recorded creator (byte 5). The same in every ending. |
 | 19 close run | the run's lamports above the receipt's rent → P. |
 | 20 close cache | the cache's rent → its recorded executor. |
@@ -142,8 +142,11 @@ touched accounts is unchanged.
 
 **Design and code differ (surfaced, not resolved).** Design §10.3 says the
 pot's remainder goes to "the committed destination, the payer or the
-incinerator". The program pays the run's payer only, and `init_run` refuses a
-payer equal to the named executor. Design §10.2 also describes a zero-key
+incinerator". The program pays the run's payer on a version-0 run, and
+`init_run` (sub 2) refuses a payer equal to the named executor. A version-1
+run (sub 28, 2026-10-06) records a separate `remainder_to`, which may not be
+the executor; its payer only pays rent and may be the executor. There is no
+incinerator destination. Design §10.2 also describes a zero-key
 executor ("anyone may commit"). The program's commit requires the signer to
 equal the recorded executor key, so that mode is not built. The program is
 what this table states.
@@ -384,10 +387,14 @@ under which the other laws can hold.
 *The program, at template admission (sub 1) and `init_run` (sub 2):*
 - the executor and challenger bonds are nonzero (F4);
 - `bond_slasher_bps < 10,000`, so the remainder is nonzero (design §10.3);
-- `init_run` refuses a payer equal to the named executor, since the payer
-  receives the remainder. An executor can still pay through a key it
+- `init_run` (sub 2) refuses a payer equal to the named executor, since the
+  payer receives the remainder. An executor can still pay through a key it
   controls under another name; the deterrent then rests on the payer being a
   real watcher (F11, accepted);
+- `init_run_v1` (sub 28) refuses a `remainder_to` equal to the named
+  executor. An application that must keep the remainder away from the
+  executor checks `remainder_to` itself: Basanos's TCR1 requires it to be the
+  requester (mainnet hardening H4, 2026-10-06);
 - the challenge window is within `[MIN_WINDOW, MAX_WINDOW]`, and the phase
   window within `[MIN_PHASE_WINDOW, MAX_WINDOW]`.
 

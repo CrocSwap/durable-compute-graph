@@ -113,11 +113,11 @@ class LxClient(DisputeClient):
         return hashlib.sha256(b"dcg.run.id.v2.1\x00" + template_id + nonce + struct.pack("<I", 0) + bytes(executor)).digest()
 
     def init_lx_run(self, template: Pubkey, template_id: bytes, params: bytes, executor: Pubkey,
-                    payer: Keypair) -> tuple[Pubkey, bytes]:
+                    payer: Keypair, remainder_to: Pubkey | None = None) -> tuple[Pubkey, bytes]:
         """An LX1 run: its input id is the digest of the machine parameters
         (the payer admits them, LX1 review H1)."""
         nonce = hashlib.sha256(PARAMS_DOMAIN + params).digest()
-        run = self.init_run(template, template_id, nonce, executor, [], payer)
+        run = self.init_run(template, template_id, nonce, executor, [], payer, remainder_to)
         return run, self.run_id(template_id, params, executor, nonce)
 
     def lx_commit(self, run: Pubkey, template: Pubkey, run_id: bytes, roots: Sequence[bytes], outputs_digest: bytes,
