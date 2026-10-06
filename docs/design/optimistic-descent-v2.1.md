@@ -75,7 +75,9 @@ build their own dispute game.
     enumerated.
 - **State.** Explicit state chains, with a STATE claim. There are three
   schemes: SMALL, LOG and CHUNKED. LOG and CHUNKED are fixed-capacity trees,
-  so no MMR is needed. A step may export its state as a value for other
+  so no MMR is needed. **LOG is reserved and not supported in the alpha**
+  (see F3): the encoding is fixed, but the program rules LOG claims moot and
+  the plan builder refuses LOG steps. Large state uses LX1 checkpoints. A step may export its state as a value for other
   steps to read.
 - **Constants.** Large immutable inputs are bound in the template ID. They
   may be resident on chain, or committed and held off chain (R2-B6).
@@ -977,6 +979,12 @@ of tag 227 at bc4e391:
   implemented on chain. `tests/golden/dcg/disputes_v21/log_neutral_scenarios.json`
   (from `scripts/disputes_v21_log_neutral_scenarios.py`) checks this.
   Superseded for new runs by follow-up A below.
+  **Alpha decision (2026-10-05):** LOG is reserved, not supported. It has no
+  user (LX1 covers large state), so it is not implemented on chain for the
+  alpha. `PlanBuilder` refuses LOG steps unless the caller passes
+  `allow_log=True`, which only the LOG-neutrality tests do; `dcg explain`
+  warns on any LOG step; the program keeps ruling LOG claims moot, so nothing
+  already deployed changes.
 - **F4, flooding.** Templates need nonzero executor and challenger bonds. The
   load extension (§8.3) is built: a phase the executor owes gets the phase
   window times the run's open disputes, capped at the maximum window.

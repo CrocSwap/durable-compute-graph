@@ -16,6 +16,10 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
   signing, as account 2; the open payload may carry `lanes` and `features`.
   Migrate with the current Python client (`dcg.session`), or follow
   `docs/stateful-workloads-v3.md`.
+- **LOG state is reserved, not supported** (alpha decision 2026-10-05).
+  **Breaking for plan builders:** `PlanBuilder.build` refuses LOG steps
+  unless `allow_log=True`. The program is unchanged and still rules LOG
+  claims moot. Use LX1 checkpoints for large state.
 - **Tag 227 admission:** the window floors, canonical template ids,
   built-in kernels bound at version (1, 1), and staging-growth refunds.
   **Breaking:** templates that broke these rules are refused; re-encode them
