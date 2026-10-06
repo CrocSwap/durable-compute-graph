@@ -1,6 +1,12 @@
 # durable-compute-graph
 
-DCG puts long computations on chain. It has two modes:
+DCG (Durable Compute Graph) is a framework for orchestrating massively multi-transactional workloads in a blockchain context. Well suited applications include AI/ML models, complex derivative pricing and risk engines, clearing large batch auctions, and rich onchain gaming. DCG currently targets SVM based blockchains like Fogo and Solana. 
+
+Modern blockchains have abundant compute in aggregate, but expose only thin transactions with limited compute and data budgets. In that context, scaling compute beyond non-trivial workloads has required manual and low-level coordination of intermediate data between atomic transactions. Traditionally scaling workloads beyond single transactions introduce a steep escalation of developer frictions and error and security risks. DCG solves this by abstracting the multi-transactional coordination into a single highly optimized, highly verified orchestration layer.
+
+To write a DCG application, you break down your workload into *kernels* and assemble those kernels into *templates*. Kernels are small, deterministic integer-exact functions that must always execute within a single transaction. The DCG library provides a library of pre-written and validated kernels, but developing new kernels is easily supported by the framework. Templates are written as directed-acyclic-graphs where each node is a kernel. Each workload executes as a run through a pre-defined template. DCG handles both the onchain coalescing of intermediate data, as well as the off chain transport layer to orchestrate interdependent execution transactions at low latency and high throughput.  
+
+DCG has two modes:
 
 - **Consensus mode:** every step of a stateful kernel runs on
   chain, one transaction at a time, in your own program with DCG's runtime
