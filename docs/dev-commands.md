@@ -4,8 +4,10 @@ These commands replace the runbook steps that used to need project
 knowledge: the pinned toolchain path, environment variables, and the deploy
 scripts. Alpha plan item E6.
 
-Run them from the repository with `PYTHONPATH=python python -m dcg ...`, or
-install the Python package and use `dcg ...`. They need `cargo build-sbf`
+Install the Python package (`cd python && uv sync`, then
+`source python/.venv/bin/activate`) and use `dcg ...`, or run
+`PYTHONPATH=python python -m dcg ...` with a Python that has DCG's
+dependencies. They need `cargo build-sbf`
 (platform tools v1.51) and `solana-test-validator` on PATH.
 
 ## `dcg dev`: a local chain with DCG on it
@@ -35,8 +37,9 @@ python examples/hello-graph/traced_dispute.py --settle
 ```
 
 **Measured (2026-10-05):**
-- the first `dcg dev` built the alpha image and started in 36 s; later
-  starts take about 1 s;
+- the first `dcg dev` builds the alpha image: 270 s on a fresh checkout
+  (36 s with a warm cargo cache), with no output meanwhile; later starts
+  take about 1 s;
 - `traced_dispute.py --settle` and `app_kernel_dispute.py` ran unchanged
   against it. The rulings matched the oracle, and all runs and the template
   closed (67 s).

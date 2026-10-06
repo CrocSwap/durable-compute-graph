@@ -93,13 +93,16 @@ names them.
 
 **Consensus mode:**
 - **Throughput and fees are the limits:** every step is a real
-  transaction, with the chain's per-transaction compute ceiling. Lanes
-  (designed, not built yet) let independent parts of a session advance in
-  parallel.
+  transaction, with the chain's per-transaction compute ceiling. Lanes let
+  independent parts of a session advance in parallel: Doom on DCG ran
+  1,000 frames at 3.81 frames per second on testnet with 3 lanes
+  (*measured* 2026-10-05).
 - **No watcher, no challenge window and no trusted template:** the chain
   executed everything.
 
 **Optimistic mode:**
+- What each mode guarantees, and how to check a template or session with
+  `explain`: [`guarantees.md`](guarantees.md).
 - **At least one honest, watching challenger:** a lie nobody challenges
   within the window stands. The alpha ships a watchtower service.
 - **Responsiveness:** each party must act before its phase deadlines, and
@@ -122,8 +125,9 @@ names them.
 
 **Alpha status:**
 - Testnet only, and formats may change before beta.
-- One independent review of the optimistic dispute program is done, with
-  its fixes re-reviewed. The rest of the surface, including sessions, is
-  reviewed before release.
+- The optimistic dispute program, the template lifecycle and the closes,
+  and sessions with lanes have each had independent reviews, with fixes
+  re-reviewed. Sessions and the dispute program are also covered by
+  run-level fuzzers.
 - Python first; TypeScript later.
 - Known limits are listed with each release.

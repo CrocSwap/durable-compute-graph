@@ -7,7 +7,7 @@ import os
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from solders.hash import Hash
 from solders.message import Message
@@ -124,6 +124,19 @@ class SequencedInstructionTransport:
         program_id: Pubkey,
         expected_accounts: Iterable[tuple[Pubkey, bool]],
     ) -> None:
+        await self.send_many((built,), program_id=program_id, expected_accounts=expected_accounts)
+
+    async def send_many(
+        self,
+        builts: Sequence[BuiltInstruction],
+        *,
+        program_id: Pubkey,
+        expected_accounts: Iterable[tuple[Pubkey, bool]],
+    ) -> None:
+        """Send several instructions in one transaction: all apply, or none
+        do. The caller keeps the packet under 1,232 bytes."""
+        if not builts:
+            raise ValueError("send_many needs at least one instruction")
         if self._genesis_hash is None:
             self._genesis_hash = await self.endpoint.get_genesis_hash()
         expected = tuple(expected_accounts)
@@ -131,23 +144,29 @@ class SequencedInstructionTransport:
         for address, _should_exist in expected:
             info = await self.endpoint.get_account_info(str(address), Commitment.CONFIRMED)
             before[str(address)] = _account_fingerprint(info)
-        ix = built.instruction
+        ixs = [built.instruction for built in builts]
         payer = self.signers.payer.pubkey()
-        operation_signers = self.signers.for_roles({"payer", *built.signer_roles})
+        operation_signers = self.signers.for_roles({"payer", *(role for built in builts for role in built.signer_roles)})
+        # One instruction digests exactly as before; several digest in order.
         intent_digest = hashlib.sha256(
             bytes(program_id)
-            + built.data
             + b"".join(
-                bytes(meta.pubkey) + bytes([meta.is_signer, meta.is_writable])
-                for _role, meta in built.account_roles
+                built.data
+                + b"".join(
+                    bytes(meta.pubkey) + bytes([meta.is_signer, meta.is_writable])
+                    for _role, meta in built.account_roles
+                )
+                for built in builts
             )
         ).hexdigest()
-        step_id = f"{self._operation:04d}-{built.name}-{secrets.token_hex(4)}"
+        built = builts[-1]
+        name = built.name if len(builts) == 1 else f"{builts[0].name}x{len(builts)}"
+        step_id = f"{self._operation:04d}-{name}-{secrets.token_hex(4)}"
         self._operation += 1
         journal_path = self.journal_dir / f"{step_id}.jsonl"
 
         def build_message(lease):
-            return bytes(Message.new_with_blockhash([ix], payer, Hash.from_string(lease.blockhash)))
+            return bytes(Message.new_with_blockhash(ixs, payer, Hash.from_string(lease.blockhash)))
 
         async def postcondition(endpoint):
             digest = hashlib.sha256()
@@ -176,19 +195,19 @@ class SequencedInstructionTransport:
             compute_class=f"dcg-stateful-tag-{built.tag}",
             compute_unit_limit=1_400_000,
             intent_digest=intent_digest,
-            recovery_policy_digest=f"stateful-session:{built.name}:account-delta-postcondition-v1",
+            recovery_policy_digest=f"stateful-session:{name}:account-delta-postcondition-v1",
             build_message=build_message,
             postcondition=postcondition,
             max_packet_bytes=1232,
             write_locks=tuple(
-                sorted(str(meta.pubkey) for _role, meta in built.account_roles if meta.is_writable)
+                sorted({str(meta.pubkey) for b in builts for _role, meta in b.account_roles if meta.is_writable})
             ),
             retry_policy=RetryPolicy.SAME_BYTES,
         )
         plan = TransactionPlan(
             genesis_hash=self._genesis_hash,
             program_id=str(program_id),
-            destination_accounts=tuple(sorted({str(meta.pubkey) for _role, meta in built.account_roles})),
+            destination_accounts=tuple(sorted({str(meta.pubkey) for b in builts for _role, meta in b.account_roles})),
             signer_public_key=operation_signers.public_key,
             signer_public_keys=operation_signers.public_keys,
             steps=(step,),
@@ -482,6 +501,53 @@ class Session:
         )
         self.cursor += n
         return start
+
+    async def write_and_advance(self, values: Sequence[int | bytes]) -> int:
+        """Write up to `max_steps` inputs and advance over them, in one
+        transaction: all of it applies, or none of it. A long session sends
+        one transaction per batch instead of one per input. Returns the
+        cursor before the advance."""
+        self._require_open()
+        n = len(values)
+        if not 1 <= n <= self.max_steps:
+            raise ValueError(f"write between 1 and {self.max_steps} inputs per batch")
+        if self._write_cursor != self.cursor:
+            raise ValueError("advance over the inputs already written before batching")
+        if self.ring:
+            if self._write_cursor + n > RING_SEQUENCE_CEILING:
+                raise ValueError("the ring's sequence ceiling is reached")
+        elif self._write_cursor + n > self.input_capacity:
+            raise ValueError("input stream is full; choose a larger input_capacity before opening")
+        builts = [encode_write_input(
+            program_id=self.program_id, addresses=self.addresses, writer=self.signers.writer.pubkey(),
+            sequence=self._write_cursor + i, value=self._command(value), wire_version=self.wire_version,
+        ) for i, value in enumerate(values)]
+        builts.append(encode_advance(
+            program_id=self.program_id, addresses=self.addresses, authority=self.signers.authority.pubkey(),
+            cursor=self.cursor, steps=n, wire_version=self.wire_version,
+        ))
+        expected = ((self.addresses.session, True), (self.addresses.stream, True)) + tuple(
+            (address, True) for address in self.addresses.states)
+        try:
+            await self.transport.send_many(builts, program_id=self.program_id, expected_accounts=expected)
+        except ProgramRefused as error:
+            translated = explain_refusal(error, builts[-1])
+            if translated is error:
+                raise
+            raise translated from error
+        start = self.cursor
+        self._write_cursor += n
+        self.cursor += n
+        return start
+
+    def _command(self, value: int | bytes) -> bytes:
+        if self.kernel.input_codec == "u8":
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 255:
+                raise ValueError("this kernel accepts an integer input from 0 through 255")
+            return bytes([value])
+        if not isinstance(value, bytes) or len(value) != self.kernel.input_width:
+            raise ValueError(f"input must be exactly {self.kernel.input_width} bytes")
+        return value
 
     @property
     def ring(self) -> bool:

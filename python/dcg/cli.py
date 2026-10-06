@@ -164,13 +164,19 @@ def cmd_dev(a) -> int:
 
     image = _dev_image(a)
     dev = LocalValidator(image, run_dir=a.dir, ticks_per_slot=a.ticks_per_slot)
+    ok = False
     try:
-        return _serve(a, dev, image)
+        code = _serve(a, dev, image)
+        ok = code == 0
+        return code
     finally:
         # An automatically created run directory (ledger, keys) is removed on
-        # exit unless --keep; one named with --dir is always kept.
-        if not a.dir and not a.keep:
+        # a clean exit unless --keep; one named with --dir is always kept. A
+        # failed start keeps it, so its validator.log can be read.
+        if not a.dir and not a.keep and ok:
             shutil.rmtree(dev.run_dir, ignore_errors=True)
+        elif not a.dir and not ok:
+            print(f"kept {dev.run_dir} (validator.log explains the failure)", file=sys.stderr)
 
 
 def _serve(a, dev, image: Path) -> int:

@@ -105,4 +105,7 @@ To use testnet instead, deploy the image with the usual Solana tools, then point
 
 - Views, lanes, resource accounts and phased initialization through the high-level `Session`. These are built and tested in Rust (`stateful-workloads-v3.md`, `stateful-session-lanes-v1.md`), but the Python `Session` does not drive them yet.
 - A deployment to testnet or mainnet. The quickstart is a local run; it shows that the mechanics work, not network performance.
-- Sequencer throughput guidance (C2). Doom's measurements are the first data point.
+- A long session. [`session-tutorial.md`](session-tutorial.md) runs one
+  through the sequencer, with batching, a dropped and resent transaction,
+  and measured costs; [`sequencer.md`](sequencer.md) gives throughput
+  guidance.

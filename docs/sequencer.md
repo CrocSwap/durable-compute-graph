@@ -16,6 +16,67 @@ signer, alongside the injectable `RpcEndpoint` and `Signer` protocols. Offline
 tests use an in-memory fake or an HTTPX mock transport and make no network
 calls.
 
+## Which API to use (alpha)
+
+The sequencer is consensus mode's transport. Four layers, from simplest to
+fastest:
+
+| Layer | Use it for | Exactly once from | Measured |
+|---|---|---|---|
+| `dcg.session.Session` | a session from Python: open, write, advance, read, close | the program's cursor guards, plus a journal per transaction | 16 steps/s on a local validator: 8 steps per transaction, one transaction confirmed at a time (`examples/session-app/long_session.py`, 2026-10-05) |
+| `Sequencer` with a `TransactionPlan` | a fixed list of dependent transactions you build yourself | the journal (`JournalStore`) and your postconditions | as `Session`: one confirmation round trip per transaction |
+| `SequencerStream` | an open-ended stream, with backpressure, batched confirmation and restart from the journal | the stream journal | see "Streaming plans" |
+| `OrderedLane` | a chain of dependent transactions sent without waiting for each one; out-of-order landings are repaired | the application's on-chain guards (each step must refuse when it is not next) | Doom on DCG, Fogo testnet from Tokyo: 3.81 frames/s, 8 game steps per frame, 3 lanes, 1,000 frames with no repairs (Basanos M1384, 2026-10-05) |
+
+Start with `Session` ([`session-tutorial.md`](session-tutorial.md)). Move to
+`OrderedLane` when the round trip per transaction is the bottleneck.
+
+**Batching.** `Session.write_and_advance(values)` writes up to `max_steps`
+(at most 8) inputs and advances over them in one transaction: all of it
+applies, or none does. The transport's `send_many` puts any list of session
+instructions in one transaction; keep the packet under 1,232 bytes.
+
+**What the sequencer guarantees:**
+- **Signed bytes are journaled before they are sent.** A rebroadcast reuses
+  the same bytes while their blockhash is valid. A new signature is made only
+  after the old one's blockhash has expired, its status has been queried, and
+  the application's postcondition has been checked (details below).
+- **A dropped transaction is resent.** In the measured long sessions, one
+  send was dropped on purpose. In a 400-step run a rebroadcast of the same
+  bytes landed. In the 16,000-step run (2,008 transactions) the dropped
+  signature never landed; after its blockhash expired, the sequencer checked
+  the session's state and signed the step again. Every step applied once.
+- **Unclear outcomes stop safely.** If a transaction's fate cannot be
+  established, the sequencer stops that step instead of guessing. Resuming
+  with the same plan and journal checks again and finishes the work.
+- **Refusals are final and named.** A program refusal is not retried; the
+  session layer raises it as a named error (`dcg.session.errors`).
+
+**Exactly once needs the program too.** The sequencer never knowingly sends
+a step twice under two signatures. But the guarantee that a step applies at
+most once comes from the program: a session's cursor guards refuse a
+duplicate. Keep such guards in any program you drive with the sequencer.
+
+**What it does not guarantee:**
+- **Landing order across lanes or parallel sends.** That comes from the
+  program's guards. `OrderedLane` repairs out-of-order landings only because
+  the steps refuse when they are not next.
+- **Fees or priority.** The application chooses compute limits and prices
+  (`OrderedLane` documents the levers that worked for Doom).
+- **Liveness of the network.** A step that cannot land before its time cap
+  is reported, not forced.
+
+**Throughput guidance.**
+- One confirmed transaction at a time costs one confirmation round trip:
+  about 0.5 s on a local validator with 50 ms slots, more on a remote
+  testnet node. Batch steps into transactions first; 8 tally steps used about
+  64,000 compute units.
+- A long session through `Session` on a local validator ran 16,000 steps
+  in 2,008 transactions in 1,113 s (14.5 steps/s;
+  [`session-tutorial.md`](session-tutorial.md)).
+- For more, pipeline with `OrderedLane`, and run close to the RPC node.
+  Doom's 3.81 frames/s ran from a host near the Fogo testnet nodes.
+
 ## Production adapters
 
 The runtime dependencies are pinned in `pyproject.toml` and `uv.lock`:

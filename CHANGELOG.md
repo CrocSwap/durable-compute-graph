@@ -5,6 +5,15 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
 
 ## Alpha (unreleased)
 
+### Python client
+
+- **`Session.write_and_advance(values)`** writes up to `max_steps` inputs and
+  advances over them in one transaction; the transport's `send_many` sends
+  several instructions in one transaction. One transaction per batch instead
+  of one per input.
+- **`dcg dev`** keeps its run directory when the validator fails to start, so
+  its `validator.log` can be read.
+
 ### Program (shared alpha image `8d39d440…`, runtime `dcg-runtime/1 0.1.0`)
 
 - **The runtime version marker** (`dcg-runtime/1 <version> stateful-v3
@@ -16,6 +25,10 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
   signing, as account 2; the open payload may carry `lanes` and `features`.
   Migrate with the current Python client (`dcg.session`), or follow
   `docs/stateful-workloads-v3.md`.
+- **Removed features (R4):** `weight-witness-probe`, `v7-cu-probe`,
+  `a16-kernel-probe`, `decision-kernel-probe` and `pt2p-seal-profile`. They
+  gated no runtime behavior; the alpha image is unchanged. **Breaking** only
+  for a build that names them: drop them from its feature list.
 - **LOG state is reserved, not supported** (alpha decision 2026-10-05).
   **Breaking for plan builders:** `PlanBuilder.build` refuses LOG steps
   unless `allow_log=True`. The program is unchanged and still rules LOG
