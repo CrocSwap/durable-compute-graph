@@ -1,5 +1,11 @@
 # durable-compute-graph
 
+**New here? Start at [`docs/getting-started.md`](docs/getting-started.md).**
+It compares DCG's two modes and links a quickstart for each: sessions,
+where every step runs on chain, and optimistic v2.1 runs, which are
+disputed on chain only when wrong. What each mode guarantees is in
+[`docs/guarantees.md`](docs/guarantees.md).
+
 `durable-compute-graph` is a standalone Rust/SVM home for reusable byte
 commitments, records, and optimistic-resolution mechanics. This repository
 contains no neural model implementation, typed-decision producer, or graph or
@@ -46,7 +52,7 @@ Basanos's revision-8 image.
 
 For a first-hour path through the kernel contract, app manifest, replay witness,
 and the extracted revision-8 handler tests, see
-[`docs/getting-started.md`](docs/getting-started.md). The separate
+[`docs/revision-8-handlers.md`](docs/revision-8-handlers.md). The separate
 `bytesum_sbf_lifecycle` target is an isolated canary, not the revision-8
 lifecycle.
 

@@ -78,9 +78,8 @@ Each tick does three things, in this order:
      revealed on chain (the committed view). It checks the claim with the
      local referee in the program's mode before sending, and withholds a
      claim the program would rule for the executor. A claim the program
-     would rule moot is still sent, so the bond returns. On a LOG-state step the program
-     rules a STEP or STATE claim moot; such a run is not convicted, which is
-     a known gap.
+     would rule moot is still sent, so the bond returns. LOG state is not
+     supported in the alpha (the plan builder refuses it).
    - It reads list element refs from the executor's buffer only for a leaf
      with list inputs, and only if the buffer holds that same leaf.
    - It claims a timeout when the executor misses a deadline.
