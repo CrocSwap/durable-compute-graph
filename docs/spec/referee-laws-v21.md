@@ -394,7 +394,13 @@ under which the other laws can hold.
 - `init_run_v1` (sub 28) refuses a `remainder_to` equal to the named
   executor. An application that must keep the remainder away from the
   executor checks `remainder_to` itself: Basanos's TCR1 requires it to be the
-  requester (mainnet hardening H4, 2026-10-06);
+  requester (mainnet hardening H4, 2026-10-06). The program cannot tell a
+  sockpuppet key from a real party, so the deterrent holds only where the
+  application pins `remainder_to`. A `remainder_to` that cannot receive
+  lamports (an executable account, or one left below rent by the transfer)
+  makes `pay_pot` fail, which keeps the best dispute, the run and the
+  template open; the run's payer chooses it, so only the payer's own run is
+  affected;
 - the challenge window is within `[MIN_WINDOW, MAX_WINDOW]`, and the phase
   window within `[MIN_PHASE_WINDOW, MAX_WINDOW]`.
 
