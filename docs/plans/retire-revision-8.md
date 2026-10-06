@@ -42,7 +42,9 @@ carry it.
 
 ## Steps
 
-1. **Owner decision:** does testnet switchover `9CHa…` stay alive?
+1. **Owner decision (10-06): retire `9CHa…`.** Revision 8 is deleted (it
+   stays in git history and in v0.1.0-alpha); Basanos closes `9CHa…`'s
+   accounts for rent. The alternatives considered were:
    - If yes: revision 8 moves to a Basanos-owned crate (built against the last
      DCG tag that has it).
    - If no: it is deleted; it stays in git history and in that tag.

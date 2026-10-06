@@ -1,6 +1,6 @@
 # DCG alpha: release terms
 
-**Status:** published 2026-10-05 (alpha plan R5, exit criterion 6); owner review pending, edits follow as changelog entries.
+**Status:** published 2026-10-05 (alpha plan R5, exit criterion 6); 2026-10-06: mainnet at your own risk (owner). Edits follow as changelog entries.
 
 ## What this release is
 
@@ -12,9 +12,15 @@ It has two modes:
 
 ## Use
 
-- **Testnet only.** Do not deploy DCG to mainnet, and do not use it to hold or
-  move anything of value. Bonds, pots and rent in the alpha are testnet
-  tokens.
+- **Mainnet at your own risk.** DCG is alpha and unaudited. You may build
+  and deploy your own DCG-based program on mainnet, but you do so at your own
+  risk: formats may change before beta (below), there is no warranty, and you
+  should run your own independent review and requalify your exact image on
+  testnet first. Basanos runs its own DCG-based program on Fogo mainnet
+  (2026-10-06) under its project's review process; that is not an endorsement
+  of any other deployment.
+- **The shared alpha program is testnet only.** Bonds, pots and rent on it are
+  testnet tokens.
 - **The shared alpha program** is
   `J9Eje75v3AgEUZZPJJTJNqKmVxiAjhRhQ7iKYBRo1Hi9` on Fogo testnet. Its image
   hash and build are published in `docs/hello-graph.md`; check them with
@@ -44,7 +50,9 @@ template):
 - **It depends on:**
   - **Input availability.** Inputs are committed as digests only. A watcher
     can check a run only if the application makes its inputs available.
-    On-chain input posting is planned before any mainnet use.
+    On-chain input posting (design §4.4) is planned; until it lands, a
+    mainnet application must keep its inputs on chain itself (Basanos keeps
+    the prompt and frame in its request accounts).
   - **The plan behind a template.** The spec root is trusted; check the plan
     off chain.
   - **The live image.** Application kernels resolve against the image that

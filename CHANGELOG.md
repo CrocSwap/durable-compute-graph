@@ -3,6 +3,15 @@
 Breaking changes are marked **breaking**, with who is affected and how to
 migrate. Formats may change before beta (see `docs/release-terms.md`).
 
+## Unreleased
+
+- **Release terms (owner 2026-10-06):** DCG-based programs may be deployed to
+  mainnet at the deployer's own risk (alpha, unaudited, formats may change); the
+  shared alpha program stays testnet only.
+- **Planned (owner 2026-10-06):** the revision-8 lifecycle is retired from DCG
+  (`docs/plans/retire-revision-8.md`); it stays in git history and in
+  v0.1.0-alpha.
+
 ## v0.1.0-alpha (2026-10-06)
 
 The first tagged release: the alpha exit criteria are met (`docs/plans/alpha-release-plan.md`),

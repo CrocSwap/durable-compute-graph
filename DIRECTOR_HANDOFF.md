@@ -21,9 +21,8 @@ Ephemeral state for whoever directs DCG next. Standing rules are in
   3. Doom to its own repo.
 
   See `docs/plans/post-alpha-roadmap.md`.
-- **Open owner questions:**
-  - the release terms' "testnet only" wording, now that Basanos runs a
-    DCG-based program on mainnet;
-  - whether `9CHa…` stays.
+- **Owner answers (10-06):**
+  - the release terms now say mainnet at your own risk;
+  - `9CHa…` is retired, so revision 8 is deleted from DCG rather than moved.
 - **Shared checkout:** another session works in the main DCG checkout
   (settlement and bend identity, uncommitted). Work in a worktree.
