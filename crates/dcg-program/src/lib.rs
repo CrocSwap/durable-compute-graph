@@ -12,8 +12,6 @@ pub mod closure_v2;
 #[cfg(not(feature = "sbf-real-lifecycle-test"))]
 pub mod closure_v2;
 pub(crate) mod closure_v2_accounts;
-#[cfg(feature = "legacy-hclosure-handlers")]
-pub(crate) mod closure_v2_bootstrap;
 /// Shared revision-8 dispute verifier used by the statically selected app
 /// manifest. Application form execution remains behind the app API hooks.
 pub mod closure_v2_generic;
@@ -90,8 +88,7 @@ pub fn process_instruction(
         feature = "graph-v2",
         feature = "test-legacy-template-create",
         feature = "sbf-lifecycle-test",
-        feature = "sbf-real-lifecycle-test",
-        feature = "legacy-hclosure-handlers"
+        feature = "sbf-real-lifecycle-test"
     )
 ))]
 compile_error!("the alpha-image feature excludes test, legacy and v2.0 features");

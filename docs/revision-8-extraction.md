@@ -25,9 +25,9 @@ model execution. HClosure tree commitments now live in
 [`closure_v2_tree.rs`](../crates/dcg-program/src/closure_v2_tree.rs), while account
 and PDA helpers live in
 [`closure_v2_accounts.rs`](../crates/dcg-program/src/closure_v2_accounts.rs).
-Legacy HClosure handlers compile only with the non-default
-`legacy-hclosure-handlers` feature; the default entrypoint does not dispatch
-them.
+Legacy HClosure handlers compiled only with the non-default
+`legacy-hclosure-handlers` feature. *(2026-10-05, R4: they were removed from
+DCG; Basanos keeps its own copy.)*
 
 Measured current source inventory, using `wc -l` on Rust files: 13,071 lines
 under `unified/`; 23,689 under the other program source modules; and 6,539 in
@@ -177,9 +177,10 @@ cargo test --locked --profile fasttest --all-targets
 ```
 
 The suite includes the lifecycle property harness and ported v8 record,
-resolve-check, and bond tests. Tests gated by the optional
-`legacy-basanos-fixtures` feature require historical Basanos v7/rung-D fixtures
-that are not included here.
+resolve-check, and bond tests. *(2026-10-05, R4: the tests that needed
+historical Basanos v7/rung-D fixtures, formerly behind
+`legacy-basanos-fixtures`, were removed from DCG. Their Basanos counterparts
+pass in Basanos, and DCG's own hook test among them now runs ungated.)*
 
 Measured before the app-dispatch change on 2026-09-30: 87 tests passed with the
 default command above. The SBF-only lifecycle canary is a separate ProgramTest

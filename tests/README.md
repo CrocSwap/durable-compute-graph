@@ -4,11 +4,10 @@ Run repository tests offline with:
 
 ```sh
 cargo test --locked --offline --profile fasttest --all-targets
-cargo test --locked --offline --profile fasttest --all-targets --features legacy-basanos-fixtures
 ```
 
-The second command enables historical v7/rung-D tests. Those fixtures are not
-checked in; see the environment table below. Revision-8 SBF suites use
+The historical v7/rung-D tests (the former `legacy-basanos-fixtures`
+feature) moved to Basanos with their fixtures (alpha plan R4, 2026-10-05). Revision-8 SBF suites use
 [`scripts/run-rev8-sbf-suites.sh`](../scripts/run-rev8-sbf-suites.sh), which
 builds the default, app-lifecycle, and unbound-form images in sequence and
 fails before testing if a required base fixture is missing or malformed. If

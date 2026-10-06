@@ -26,9 +26,12 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
   Migrate with the current Python client (`dcg.session`), or follow
   `docs/stateful-workloads-v3.md`.
 - **Removed features (R4):** `weight-witness-probe`, `v7-cu-probe`,
-  `a16-kernel-probe`, `decision-kernel-probe` and `pt2p-seal-profile`. They
-  gated no runtime behavior; the alpha image is unchanged. **Breaking** only
-  for a build that names them: drop them from its feature list.
+  `a16-kernel-probe`, `decision-kernel-probe`, `pt2p-seal-profile`,
+  `legacy-basanos-fixtures` and `legacy-hclosure-handlers` (the legacy
+  HClosure dispatch, about 1,150 lines, and 41 fixture-dependent tests that
+  could not run in DCG; their Basanos counterparts pass in Basanos). None
+  gated default or alpha-image behavior. **Breaking** only for a build that
+  names them: drop them from its feature list.
 - **LOG state is reserved, not supported** (alpha decision 2026-10-05).
   **Breaking for plan builders:** `PlanBuilder.build` refuses LOG steps
   unless `allow_log=True`. The program is unchanged and still rules LOG

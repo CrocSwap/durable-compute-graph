@@ -411,14 +411,14 @@ fn production_images_exclude_raw_write_required_for_legacy_forgery() {
     }
     reject_raw_feature(dcg_manifest, &core_features, "Basanos switchover");
 
-    let hello = include_str!("../../../docs/hello-graph.md");
-    let line = hello.lines().find(|line| line.starts_with("The next shared testnet image feature set is "))
-        .expect("declared shared testnet feature set");
-    let selected = line.split("--features \"").nth(1).expect("shared image features");
-    let selected = selected.split('"').next().unwrap();
-    let features: Vec<String> = selected.split_whitespace().map(str::to_owned).collect();
+    // The shared testnet image is built by scripts/build-alpha-image.sh; its
+    // FEATURES line is the feature set that image ships.
+    let script = include_str!("../../../scripts/build-alpha-image.sh");
+    let line = script.lines().find(|line| line.starts_with("FEATURES="))
+        .expect("the alpha image build script declares FEATURES");
+    let features: Vec<String> = line["FEATURES=".len()..].trim_matches('"').split_whitespace().map(str::to_owned).collect();
     assert!(!features.is_empty());
-    reject_raw_feature(dcg_manifest, &features, "next shared testnet image");
+    reject_raw_feature(dcg_manifest, &features, "shared testnet alpha image");
 }
 
 #[test]
@@ -452,19 +452,6 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "closure_v2_accounts.rs::pub land_leaves",
     "closure_v2_accounts.rs::pub publish_checkpoint",
     "closure_v2_accounts.rs::restricted create",
-    "closure_v2_bootstrap.rs::private init_variable",
-    "closure_v2_bootstrap.rs::pub collect_root",
-    "closure_v2_bootstrap.rs::pub finalize_from_roots",
-    "closure_v2_bootstrap.rs::pub grow_page",
-    "closure_v2_bootstrap.rs::pub grow_root_group",
-    "closure_v2_bootstrap.rs::pub grow_v2",
-    "closure_v2_bootstrap.rs::pub init",
-    "closure_v2_bootstrap.rs::pub init_page",
-    "closure_v2_bootstrap.rs::pub init_root_group",
-    "closure_v2_bootstrap.rs::pub init_small",
-    "closure_v2_bootstrap.rs::pub init_v4",
-    "closure_v2_bootstrap.rs::pub seal_v2",
-    "closure_v2_bootstrap.rs::pub upload_v2",
     "closure_v2_generic.rs::private rule_v6", // execute authenticates the v5 DCR1 and v6 DCM2 PDAs, size and kind before this helper.
     "desc_upload.rs::private store_dcd1",
     "desc_upload.rs::pub process_alloc",
@@ -514,7 +501,6 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "pt1_onchain.rs::private init_with_magic",
     "pt1_onchain.rs::pub init_variant",
     "pt2p_onchain.rs::pub init",
-    "root_only.rs::private producer_record_binds_coordinate_in_pda",
     "root_only.rs::pub increment_slots",
     "root_only_sealed.rs::pub bind_manifest",
     "root_only_sealed.rs::pub init_sealed",

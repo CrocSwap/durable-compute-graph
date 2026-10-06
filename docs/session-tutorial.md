@@ -14,21 +14,34 @@ and the input 0 is rejected (consumed, with the state unchanged).
 
 ## 1. Start from the template
 
+Copy the template application to the top of your DCG checkout:
+
 ```sh
 cp -r examples/session-app my-app
 cd my-app
 ```
 
-In `Cargo.toml`, rename the package and point `dcg-program` at a pinned
-revision of this repository instead of the relative path:
+Then edit these files:
+- **`Cargo.toml`:**
+  - The `dcg-program` path and the `[patch.crates-io] curve25519-dalek`
+    path are relative to `examples/session-app`. For `my-app` at the
+    checkout's top, change `../../crates/` to `../crates/` in both.
+  - Rename the package if you like (`name = "my-app"`). `build.sh` names the
+    image after it (`out/my_app.so`).
+  - In your own repository, depend on DCG by git revision instead, and point
+    the patch at that revision's `crates/dcg-program/vendor`:
 
-```toml
-dcg-program = { git = "https://…/durable-compute-graph", rev = "<commit>", default-features = false,
-                features = ["no-entrypoint", "revision-8"] }
-```
+    ```toml
+    dcg-program = { git = "<DCG repository URL>", rev = "<commit>", default-features = false,
+                    features = ["no-entrypoint", "revision-8"] }
+    ```
+- **`src/bin/tally-conform.rs`:** if you renamed the package, change
+  `use dcg_session_app::TALLY;` to your crate name with underscores
+  (`use my_app::TALLY;`). Rename the `[[bin]]` in `Cargo.toml` too if you
+  like.
 
-Keep the `[patch.crates-io] curve25519-dalek` entry, pointed at the same
-revision's `crates/dcg-program/vendor`. DCG's pinned dependency set needs it.
+`build.sh` finds DCG's Python package through the checkout's git top level,
+so it needs no edit.
 
 **Cost:** none (local files).
 
@@ -62,18 +75,21 @@ PYTHONPATH=../python python -m dcg.kernel_kit check --bin target/debug/tally-con
 Fix any disagreement before going on. A disagreement means a client would
 predict a state the chain does not reach.
 
-**Cost:** one host build (about 80 s from cold on an M-series Mac).
+**Cost:** one host build (80 to 185 s from cold on an M-series Mac, measured).
 
 ## 4. Build the program
 
 ```sh
-PYTHON=$(which python) ./build.sh out
+./build.sh out                  # with DCG's Python environment active
 ```
 
-This runs `cargo build-sbf` and writes `out/dcg_session_app.so` and a
-receipt with its sha256 and the DCG runtime version it embeds. `PYTHON` must
-be a Python with this repository's `python/` package installed; the receipt
-step uses it.
+This runs `cargo build-sbf` and writes `out/<package>.so` (for the
+template, `out/dcg_session_app.so`) and a receipt with its sha256 and the DCG runtime version it embeds. The receipt
+step runs `python3`; set `PYTHON=` to another interpreter if `python3` does
+not have DCG's packages.
+
+The host build prints many warnings from `dcg-program` (unused imports in
+code your program does not link); they are harmless.
 
 **Cost:** one SBF build (128 s from cold, measured 2026-10-05). The image is
 about 376 KB.
@@ -81,20 +97,22 @@ about 376 KB.
 ## 5. Run a first session
 
 ```sh
-PYTHONPATH=../python python quickstart.py out/dcg_session_app.so
+python quickstart.py out/dcg_session_app.so
 ```
 
 It starts a local validator with your program at a fresh address, opens a
 session, writes four inputs (one of them a rejected 0), advances, reads the
 state, checks it against the mirror, and closes the session.
 
-**Cost (measured, local):** 11 s in all. The open creates three accounts:
-the session, its input stream and its state. Their rent comes back at close.
+**Cost (measured, local):** 11 to 13 s in all. The open creates the session,
+its input stream, and one account per state span (three accounts for the
+tally). Their rent comes back at close. The ledger directory is removed at
+the end; pass `--keep` to keep it.
 
 ## 6. Run a long session
 
 ```sh
-PYTHONPATH=../python python long_session.py out/dcg_session_app.so --steps 2000
+python long_session.py out/dcg_session_app.so --steps 2000     # about 250 transactions
 ```
 
 `long_session.py` is the real shape of a consensus application:
@@ -114,7 +132,7 @@ PYTHONPATH=../python python long_session.py out/dcg_session_app.so --steps 2000
 Output (measured 2026-10-05, local validator with 50 ms slots, 400 steps):
 
 ```text
-{"step": "open", "session": "…", "rent_lamports": 27768640}
+{"step": "open", "session": "…", "accounts": 3, "rent_lamports": 27728640}
 {"step": "result", "count": 399, "sum": …, "cursor": 400, "rejected": 1, "mirror_agrees": true, "expected_rejections": 1}
 {"step": "dropped send", "send_number": 10, "resent_same_bytes": 2, "landed": true, …}
 {"step": "compute", "median_units_per_8_step_transaction": 63726, …}
@@ -137,8 +155,21 @@ Output (measured 2026-10-05, local validator with 50 ms slots, 400 steps):
 
 - **Change the transition** (step 2), re-run the kernel kit (step 3), and
   rebuild (step 4).
-- **Change the session's layout** in `quickstart.py`'s `TALLY_SESSION`: the
-  input width and the state spans must match your manifest.
+- **Describe your kernel to the session** in `quickstart.py`'s
+  `TALLY_SESSION`. Its keys:
+
+  | Key | Value |
+  |---|---|
+  | `id` | the kernel id: UTF-8 text of 1 to 16 bytes, as in `KernelDecl::new` |
+  | `semantic_version`, `abi_version` | as in `KernelDecl::new` |
+  | `mode` | `{"id": 0x434F4E53, "version": 3}` (consensus v3) |
+  | `schema` | `{"id": <your STATE_SCHEMA id>, "version": 1}` |
+  | `input_width` | bytes per input, 1 to 8 |
+  | `state_spans` | the state's span lengths, 1 to 8 spans, summing to your declared state size |
+  | `input_codec` | `"u8"` (inputs are integers 0 to 255) or `"bytes"` (inputs are `input_width` bytes) |
+  | `state_codec` | `"bytes"`, or `"counter-u64-pair"` for two u64s |
+  | `rejects_input` | `true` if the manifest declares `.rejects_input()` |
+  | `stream_root` | optional: 32 bytes as hex; the default is fine |
 - **Check the guarantee** for a live session:
   `print(await session.explain(decl=MANIFEST))` ([`guarantees.md`](guarantees.md)).
 - **Go faster:** the sequencer guide ([`sequencer.md`](sequencer.md))
