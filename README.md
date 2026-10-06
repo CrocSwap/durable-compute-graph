@@ -1,10 +1,11 @@
 # durable-compute-graph
 
 DCG puts long computations on chain. It has two modes:
-- **Consensus mode (sessions):** every step of a stateful kernel runs on
+
+- **Consensus mode:** every step of a stateful kernel runs on
   chain, one transaction at a time, in your own program with DCG's runtime
   embedded. Nothing needs to be watched, and each step is final when it lands.
-- **Optimistic mode (v2.1 runs and disputes):** an executor runs a plan off
+- **Optimistic mode:** an executor runs a plan off
   chain and commits to the result. Anyone can check it, and a wrong
   commitment is refuted on chain by replaying a single step.
 
@@ -27,7 +28,7 @@ does not show that the computation is the right one.
 
 ## Status
 
-**Alpha, testnet only.** Formats may change before beta. See
+**Alpha.** Formats may change before beta. See
 [`docs/release-terms.md`](docs/release-terms.md),
 [`CHANGELOG.md`](CHANGELOG.md) and [`SECURITY.md`](SECURITY.md).
 
@@ -58,14 +59,6 @@ cd python && uv run --with pytest pytest                   # Python, offline
 ```
 
 Tests that need a local validator or a network are opt-in and say so.
-
-## Revision-8 material
-
-DCG began as an extraction of the revision-8 lifecycle mechanics from
-Basanos, which still uses them through the application seam. That history,
-the seam, and the older checks are in
-[`docs/revision-8-extraction.md`](docs/revision-8-extraction.md) and
-[`docs/revision-8-handlers.md`](docs/revision-8-handlers.md).
 
 ## License
 
