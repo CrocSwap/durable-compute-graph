@@ -19,8 +19,9 @@ a Python mirror that the kernel kit checks against them
 ## Setup
 
 You need:
-- Python 3.12. Install the `python/` package with `cd python && uv sync`, or
-  use `pip install -e python`. This installs the `dcg` command.
+- Python 3.12. Install the `python/` package with `cd python && uv sync`,
+  then `source python/.venv/bin/activate` (from the repository root). That
+  puts the `dcg` command, and a `python` with DCG installed, on PATH.
 - The Solana CLI tools (`solana-test-validator`, `cargo build-sbf`), for
   local chains and program builds.
 
@@ -30,8 +31,9 @@ Start a local chain with DCG on it:
 dcg dev
 ```
 
-It prints an env file to source in another terminal
-([`dev-commands.md`](dev-commands.md)).
+The first start builds the alpha program image, which takes about 4 to 5
+minutes on a fresh checkout with no output. It then prints an env file to
+source in another terminal ([`dev-commands.md`](dev-commands.md)).
 
 ## Next steps
 
@@ -41,6 +43,7 @@ It prints an env file to source in another terminal
   [`session-tutorial.md`](session-tutorial.md), from an empty directory to
   a long session with costs; [`session-quickstart.md`](session-quickstart.md)
   explains each piece, and [`sequencer.md`](sequencer.md) how to go faster.
+- **Tracing a graph, and the built-in kernels:** [`tracing.md`](tracing.md).
 - **What each mode guarantees, and how to check it:**
   [`guarantees.md`](guarantees.md).
 - **Running the executor service and a watchtower:**

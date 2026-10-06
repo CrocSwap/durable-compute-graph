@@ -27,6 +27,7 @@ import io
 import json
 import os
 import random
+import shutil
 import struct
 import sys
 import tempfile
@@ -55,6 +56,21 @@ def checksum(data: v21.Chunked(bytes=256, chunk=64)):
     acc = v21.reduce("sumchunk_i32", data)
     v21.call("head_i32", acc)
     return acc
+
+
+def sample_inputs(traced, rng: random.Random) -> dict[int, bytes]:
+    """Random inputs for every input the traced function declares, so the
+    graph can change without editing this: an i32 for `v21.Scalar`, and i32
+    words in -1000..1000 for byte inputs (random bytes if not whole words)."""
+    values = {}
+    for eid, decl in enumerate(traced._declarations()):
+        if decl is v21.Scalar:
+            values[eid] = struct.pack("<i", rng.randint(-1000, 1000))
+        elif decl.bytes % 4 == 0:
+            values[eid] = struct.pack(f"<{decl.bytes // 4}i", *[rng.randint(-1000, 1000) for _ in range(decl.bytes // 4)])
+        else:
+            values[eid] = bytes(rng.randrange(256) for _ in range(decl.bytes))
+    return values
 
 
 def lying_execute(sp, plan_id, run_id, values):
@@ -96,7 +112,7 @@ class Events(io.TextIOBase):
             "pick": "watchtower: descending toward the first wrong step",
             "claim": f"watchtower: claim sent ({e.get('claim')})",
             "executor_timeout": "watchtower: the executor missed a deadline",
-            "settled_elsewhere": "watchtower: its dispute was settled by another party",
+            "settled_elsewhere": "watchtower: its dispute was already settled (the executor's service settles too; either may go first)",
             "error": f"error: {e.get('error')}",
         }.get(ev)
         if ev == "settle" and e.get("ruling"):
@@ -114,7 +130,7 @@ def balance(gc: GraphClient, key) -> int:
 def main() -> int:
     gc = GraphClient.from_environment()
     local = any(h in gc.rpc_url for h in ("127.0.0.1", "localhost"))
-    run_dir = tempfile.mkdtemp(prefix="dcg-quickstart-")
+    run_dir = tempfile.mkdtemp(prefix="dcg-quickstart-", dir="/private/tmp" if sys.platform == "darwin" else None)
     os.chmod(run_dir, 0o700)
     print(f"chain {gc.rpc_url}, program {gc.program_id}; run directory {run_dir}")
 
@@ -158,7 +174,7 @@ def main() -> int:
     # 4. Two runs: inputs, run id, commitment, then the commit on chain.
     rng = random.Random()
     for case in ("honest", "lying"):
-        values = {0: struct.pack("<64i", *[rng.randint(-1000, 1000) for _ in range(64)])}
+        values = sample_inputs(checksum, rng)
         refs = [R.external_ref(e, sp.in_specs[e][8:31], R.input_digest(sp.in_specs[e], v)) for e, v in values.items()]
         nonce = os.urandom(32)
         run_id = R.run_id(template_id, nonce, refs, bytes(executor.pubkey()))
@@ -195,6 +211,10 @@ def main() -> int:
     for run, case in names.items():
         print(f"the {case} run: {status.get(cl.run_status(Pubkey.from_string(run)), '?')}")
 
+    # What each party gained or lost (the payer funded both with 100,000,000).
+    for name, k in (("executor", executor), ("challenger", challenger)):
+        print(f"{name}: {balance(gc, k.pubkey()) - 100_000_000:+,} lamports (bonds and rent, less its fees)")
+
     # 7. Close the template and count the cost.
     cl.retire_template(template, gc.payer)
     cl.close_template(template, gc.payer)
@@ -210,6 +230,11 @@ def main() -> int:
     print(f"done in {time.monotonic() - t0:.0f} s, {txs} transactions. The payer spent {spent:,} lamports: {receipts:,} stay in the two "
           f"run receipts (each run's permanent record), the rest is fees. Every other account was closed and its "
           f"rent returned; the slashed bond went to the challenger and the payer.")
+    print(f"template {template} closed: {gc.account(template) is None}")
+    if "--keep" not in sys.argv:
+        shutil.rmtree(run_dir, ignore_errors=True)
+    else:
+        print(f"kept the journals and services.log in {run_dir}")
     return 0
 
 
