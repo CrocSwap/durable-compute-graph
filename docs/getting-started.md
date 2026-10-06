@@ -9,7 +9,7 @@ then follow its quickstart. Each takes a few minutes on a local chain.
 | **Trust** | none beyond the chain | at least one honest watcher per run, inside its window |
 | **Finality** | each step, at once | after the challenge window |
 | **Good for** | long interactive state machines (a game, an agent loop) | big computations that are rarely wrong |
-| **Start here** | [`session-quickstart.md`](session-quickstart.md) | [`optimistic-quickstart.md`](optimistic-quickstart.md) |
+| **Start here** | [`session-tutorial.md`](session-tutorial.md) | [`optimistic-quickstart.md`](optimistic-quickstart.md) |
 
 Both modes run kernels: small, deterministic, integer-exact functions.
 Built-in kernels cover simple reductions. You can add your own in Rust, with
@@ -38,8 +38,9 @@ It prints an env file to source in another terminal
 - **Your own kernel in optimistic mode:** [`kernel-app.md`](kernel-app.md),
   a template application with one custom STEP kernel.
 - **Your own stateful program in consensus mode:**
-  [`session-quickstart.md`](session-quickstart.md), then the sequencer
-  ([`sequencer.md`](sequencer.md)) for long sessions.
+  [`session-tutorial.md`](session-tutorial.md), from an empty directory to
+  a long session with costs; [`session-quickstart.md`](session-quickstart.md)
+  explains each piece, and [`sequencer.md`](sequencer.md) how to go faster.
 - **What each mode guarantees, and how to check it:**
   [`guarantees.md`](guarantees.md).
 - **Running the executor service and a watchtower:**

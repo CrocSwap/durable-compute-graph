@@ -26,7 +26,7 @@ from dcg.session import (
     slot_offset,
 )
 from dcg.session.client import Session
-from dcg.session.instructions import create_state, create_stream, initialize_state, open_session
+from dcg.session.instructions import create_state, create_stream, initialize_state, open_session, write_input
 
 V3_MODE = {"id": 0x434F_4E53, "version": 3}
 
@@ -141,6 +141,36 @@ class SessionV3Tests(unittest.TestCase):
                     journal_path=journal.with_name("c.json"))
         with self.assertRaises(ValueError):
             KernelRef.from_manifest({**COUNTER_MANIFEST, "rejects_input": True})  # a v2 kernel
+
+    def test_write_and_advance_sends_one_transaction(self):
+        import asyncio
+
+        sent = []
+
+        class Recorder:
+            async def send_many(self, builts, *, program_id, expected_accounts):
+                sent.append(([b.name for b in builts], [b.data for b in builts]))
+
+        payer, authority = keys()
+        signers = SessionSigners(payer=payer, authority=authority)
+        journal = Path(tempfile.mkdtemp()) / "accounts.json"
+        s = Session(kernel=kernel(), transport=Recorder(), signers=signers, session_id=9, wire_version=3,
+                    journal_path=journal, ring=True, input_capacity=128, max_steps=8)
+        s._opened = True
+        self.assertEqual(asyncio.run(s.write_and_advance([1, 2, 3])), 0)
+        self.assertEqual(asyncio.run(s.write_and_advance([4] * 8)), 3)
+        self.assertEqual((s.cursor, s._write_cursor), (11, 11))
+        (names, data), (names2, _) = sent
+        self.assertEqual(names[:3], ["write_input"] * 3)
+        self.assertTrue(names[3].startswith("advance") and len(names2) == 9)
+        # The batch's writes carry consecutive sequences starting at the cursor.
+        expected = [write_input(program_id=s.program_id, addresses=s.addresses, writer=authority.pubkey(), sequence=i,
+                                value=bytes([i + 1]), wire_version=3).data for i in range(3)]
+        self.assertEqual(data[:3], expected)
+        with self.assertRaises(ValueError):
+            asyncio.run(s.write_and_advance([1] * 9))  # more than max_steps
+        with self.assertRaises(ValueError):
+            asyncio.run(s.write_and_advance([256]))  # not a u8
 
     def test_session_info_reads_features_and_rejections(self):
         session = bytearray(1280)
