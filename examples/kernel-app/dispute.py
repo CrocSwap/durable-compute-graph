@@ -11,7 +11,7 @@ Every run is then settled and the template closed. The Python mirror
 (mirror.py, checked by the kernel kit) is what the off-chain referee and
 executor use.
 
-    source <(dcg dev --crate examples/kernel-app ...)    # or a testnet program
+    dcg dev --crate examples/kernel-app        # then source the env file it prints
     PYTHONPATH=python python examples/kernel-app/dispute.py --settle
 """
 

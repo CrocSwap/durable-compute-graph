@@ -51,8 +51,9 @@ template):
     is live when a dispute is ruled. Do not change a kernel while runs that
     use it are live.
 - **Known gaps:**
-  - a lie at a LOG-state step is ruled moot, not convicted, so admitters
-    should refuse LOG-state templates;
+  - LOG state is reserved and not supported: the plan builder refuses it,
+    and a lie at a LOG-state step is ruled moot, not convicted, so admitters
+    must refuse LOG-state templates (use LX1 checkpoints for large state);
   - the v1 watchtower does not check LX1 runs.
 - **Windows:** the program's minimum windows (750 slots) are short for a
   watcher far from its RPC node. `dcg explain` warns, and `docs/services.md`

@@ -4,6 +4,10 @@ The kernel kit is how an application declares a kernel and checks that the
 kernel's Python mirror agrees with it. It covers alpha plan items E2
 (optimistic mode, STEP kernels) and C3 (consensus mode, stateful kernels).
 
+To start a whole application, copy a template: `examples/kernel-app` for a
+custom STEP kernel (`docs/kernel-app.md`) or `examples/session-app` for a
+stateful kernel (`docs/session-quickstart.md`).
+
 **Why it exists.** The Python client stands in for the program wherever the
 program would run a kernel:
 - the v2.1 referee replays STEP claims with the mirror;

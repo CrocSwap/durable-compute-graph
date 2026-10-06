@@ -65,6 +65,10 @@ class PlanBuilder:
     outputs: list[tuple[bytes, int, bool]] = field(default_factory=list)  # (producer, length, scalar)
     lists: dict[int, tuple[Input, ...]] = field(default_factory=dict)  # list id -> elements
     node_base: int = 1
+    # LOG state (state_scheme 2) is reserved and not supported in the alpha: the
+    # program rules every LOG STATE/STEP claim moot, so a LOG step cannot be
+    # convicted. Only the LOG-neutrality tests opt in.
+    allow_log: bool = False
 
     # --- declarations --------------------------------------------------------------
     def scalar_input(self, eid: int) -> bytes:
@@ -143,6 +147,8 @@ class PlanBuilder:
 
     # --- derivation ------------------------------------------------------------------
     def build(self) -> S.Spec:
+        if not self.allow_log and any(st.log for blk in self.blocks for st in blk[1]):
+            raise S.SpecError("LOG state is not supported in the alpha (reserved; claims on it are moot)")
         shapes, bases, base = [], [], 0
         for blk in self.blocks:
             if blk[0] == "enum":

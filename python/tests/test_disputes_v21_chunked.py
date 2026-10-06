@@ -128,7 +128,7 @@ def const_plan(seed: int = 1):
 def kv_plan(n_chunks: int, capacity: int = 8):
     """A KV-cache-shaped chunked kernel: iteration i appends the first word of
     chunk i to LOG state and outputs the sum over every entry so far."""
-    b = P.PlanBuilder()
+    b = P.PlanBuilder(allow_log=True)
     b.chunked_input(0, n_chunks << 6, 6)
     step = P.Step("logsum_i32l", (P.Input(S.producer(5, 0, 2, 1, 0), 64),), ((0, 8, False), (1, 4, True)),
                   state_predecessor=S.producer(4, 0, 0, 1), log=(4, capacity))
@@ -137,10 +137,22 @@ def kv_plan(n_chunks: int, capacity: int = 8):
     return b.build()
 
 
+def test_log_state_is_refused_by_default():
+    # LOG is reserved in the alpha: the program rules LOG claims moot, so the
+    # builder refuses a LOG step unless the caller opts in (neutrality tests only).
+    b = P.PlanBuilder()
+    b.chunked_input(0, 128, 6)
+    b.enumerated([P.Step("logsum_i32l", (P.Input(S.producer(5, 0, 2, 0, 0), 64),),
+                         ((0, 8, False), (1, 4, True)), log=(4, 8))])
+    b.output(S.producer(1, 0, 0), 8)
+    with pytest.raises(S.SpecError, match="not supported in the alpha"):
+        b.build()
+
+
 def test_log_kind1_predecessor_must_keep_scheme_and_capacity():
     # Review A1: changing capacity makes an honest predecessor digest differ.
     for predecessor_log, capacity, accepted in ((True, 8, True), (True, 4, False), (False, 8, False)):
-        b = P.PlanBuilder()
+        b = P.PlanBuilder(allow_log=True)
         b.chunked_input(0, 128, 6)
         s0 = P.Step("logsum_i32l", (P.Input(S.producer(5, 0, 2, 0, 0), 64),),
                     ((0, 8, False), (1, 4, True)), log=(4, 8)) if predecessor_log else P.Step(
@@ -165,7 +177,7 @@ def test_log_to_small_chain_is_refused():
     # Re-review of the fix round: a SMALL step whose kind-1 predecessor is LOG has
     # no honest execution (the reference kernel refuses it), so the plan refuses it.
     for small_bytes in (8, 16, 32):
-        b = P.PlanBuilder()
+        b = P.PlanBuilder(allow_log=True)
         b.chunked_input(0, 128, 6)
         s0 = P.Step("logsum_i32l", (P.Input(S.producer(5, 0, 2, 0, 0), 64),),
                     ((0, 8, False), (1, 4, True)), log=(4, 4))

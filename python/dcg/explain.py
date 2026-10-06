@@ -182,7 +182,7 @@ def _explain_plan(e: Explanation, t: dict, spec, plan_id: bytes | None, slot_ms:
             f"the phase window (~{phase_s:.0f} s) is under twice a remote watcher's slowest tick "
             f"(~{watcher_tick_s:.0f} s): watchers and executors should run close to their RPC node")
     if any(spec.step_spec(k)[120] == 2 for k in range(min(spec.total_steps, 4096))):
-        e.warnings.append("the plan has LOG-state steps: a lie there is ruled moot, not convicted (known gap)")
+        e.warnings.append("the plan has LOG-state steps: LOG is not supported in the alpha, and a lie there is ruled moot, not convicted; refuse this template")
 
 
 def _explain_kernels(e: Explanation, spec) -> None:
