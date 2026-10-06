@@ -174,7 +174,7 @@ DCG keeps no model code (owner decision, 09-26).
 The alpha ships when all of these hold:
 
 1. **Independent reviews:** every handler in the alpha surface has one, and every finding is fixed or written up as a known limit.
-2. **Fuzzer:** it runs clean, natively and on SBF, over the agreed number of interleavings.
+2. **Fuzzer:** it runs clean, natively and on SBF, over the agreed number of interleavings. **Met 2026-10-05:** the run-level v2.1 fuzzer (shadow ledger, settlement precondition model, deadline probes, ruling oracles; reviewed) ran clean over 5,000 native sequences (10,172 disputes, 145,512 transactions) and 500 SBF sequences on the alpha image `8d39d440…` (`docs/experiments/v21-run-fuzz-2026-10-05.md`). The counts were the director's choice; the owner has not set a number.
 3. **Public program:** the shared testnet program runs the reviewed image, and the hash is published. **Met:** `J9Eje…` runs `8d39d440…` (R4), published in `hello-graph.md`; `dcg verify` checks it.
 4. **A newcomer test in each mode,** with no help from the authors. Starting from the docs, someone who did not build DCG:
    - **Optimistic:** traces a v2.1 graph, runs it on the shared program, watches the watchtower convict a planted lie, and gets their rent back.
