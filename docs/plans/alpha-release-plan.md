@@ -83,7 +83,7 @@ and magic alone where it matters. **R2 is complete.**
 - Publish an upgrade policy: runs created before an upgrade that changes addresses must drain first.
 - Set fee, rent and abuse limits.
 
-**R4. Make the repo stand alone.** Move out or delete the Basanos-specific leftovers:
+**R4. Make the repo stand alone.** *Status (2026-10-05):* the four probe features and `pt2p-seal-profile` are removed (no Basanos build enables them; the alpha image is unchanged); the README is rewritten for the alpha, and its revision-8 body moved to `docs/revision-8-extraction.md`. Open: `legacy-basanos-fixtures` and `legacy-hclosure-handlers` gate about 3,060 lines of tests over live revision-8 code, so removing them needs a replacement or an owner decision. Move out or delete the Basanos-specific leftovers:
 - features: `legacy-basanos-fixtures`, `a16-kernel-probe`, `decision-kernel-probe`, `legacy-hclosure-handlers`, `pt2p-seal-profile`, `weight-witness-probe`, `v7-cu-probe`;
 - old fixtures and docs that name Basanos internals.
 
@@ -126,7 +126,7 @@ DCG keeps no model code (owner decision, 09-26).
 - Today these take a pinned SDK path, wrapper environment variables and the Basanos runbook's deploy tools.
 - *Status (2026-10-05):* built (`docs/dev-commands.md`), plus `dcg verify`. `dcg build --alpha` reproduces the deployed alpha image `8d39d440…`; the examples run unchanged against `dcg dev`.
 
-**E7. Docs.**
+**E7. Docs.** *Status (2026-10-05):* written and run: `getting-started.md` (the two modes), `optimistic-quickstart.md` with `examples/optimistic-quickstart` (measured locally: the watchtower convicts the lie, 21 transactions), `guarantees.md`, and `kernel-app.md` for a first custom kernel.
 - Getting started for v2.1, replacing today's v2.0-era guide.
 - A dispute walkthrough (a lie, the descent, the ruling, settlement, rent back).
 - "Your first custom kernel", using E2.
@@ -143,7 +143,7 @@ DCG keeps no model code (owner decision, 09-26).
 
 **C1. A session quickstart.** Write a stateful kernel (`StatefulKernel`: initial state, transition, optional views), register it in an application image, open a session from Python, drive it to completion with the sequencer, and read the result. The existing `python-session.md` and `sequencer.md` become its basis. *Status (2026-10-05):* built (`docs/session-quickstart.md`): the tally app runs end to end on a local validator through `dcg.session.Session` (rejectable v3 session, 4 inputs with one rejected, mirror agrees, accounts closed with rent back; 11 s, *measured*).
 
-**C2. The sequencer as a product.**
+**C2. The sequencer as a product.** *Status (2026-10-05):* `sequencer.md` now opens with which API to use, what the sequencer guarantees and does not, and measured throughput (16,000 steps in 2,008 transactions locally at 14.5 steps/s; Doom's 3.81 frames/s with `OrderedLane`). `Session.write_and_advance` sends one transaction per batch.
 - A documented, stable Python API: lanes, batching, resend and recovery from the journal, multi-node sends, and pacing.
 - What it guarantees, and what it does not.
 - Measured throughput guidance per workload shape (Doom's numbers are the first data point).
@@ -155,7 +155,7 @@ DCG keeps no model code (owner decision, 09-26).
 - Lanes are on the critical path, together with whatever else that target needs: CoW views, inputs-in-step and TPU sends (DCG roadmap, the 10-01 owner goal).
 - Today's measured floor is about 0.32 s of serial execution plus about 0.25 s of visibility per frame. Reaching 3.0 frames per second means parallel render work per frame, not only faster sends.
 
-**C5. A tutorial:** "a multi-transaction state machine", from an empty repo to a session running on the shared program, with costs (transactions, compute, rent) shown at each step.
+**C5. A tutorial:** "a multi-transaction state machine", from an empty repo to a session running on the shared program, with costs (transactions, compute, rent) shown at each step. *Status (2026-10-05):* `session-tutorial.md` with `examples/session-app/long_session.py` (a dropped send recovered; costs measured). Sessions run in the application's own program, not the shared one (owner decision 2026-10-03).
 
 ## Order of work (estimated)
 
