@@ -130,6 +130,37 @@ in the switchover feature set. That cross-repo check is gone from DCG; port it
 into Basanos's own `chain/dcg-program` tests when Basanos next touches its DCG
 pin.
 
+## Verification (2026-10-07, branch at 57b6b4e against 272ccf7)
+
+All results below are **measured** locally on the Mac. Nothing ran on any
+network.
+- **Default offline suite:** passes on the branch. The baseline's only failure
+  is the revision-8 `legacy_dcr1_forgery` test, which the branch deletes.
+- **`graph-v21,example-kernels` (alpha features):** every v2.1 test passes,
+  with the same counts as the baseline.
+- **`graph-v21,test-kernel,test-legacy-template-create`:** v2.1 and LX1 pass.
+  The one failure is
+  `an_existing_template_keeps_its_read_only_account_lists_and_cannot_be_closed`.
+  It fails identically at 272ccf7: its legacy template uses a 30-slot window,
+  below the 10-05 floor.
+- **`sbf-real-lifecycle-test`, with the branch's SBF image:** sessions v1–v3,
+  lanes, reject/ring, creators and the fuzzer pass, and so do all SBF
+  workload tests. The baseline's SBF-image run was not repeated.
+- **`graph-v2-*`:** passes. The `dcg-program` doc tests pass.
+- **Alpha image:** reproducible at `7acbce49…`, 344,304 bytes, against
+  `9fee3c53…`, 346,736 bytes, at 272ccf7. `alpha_image_routes_only_tag_227`
+  passes on the branch image.
+- **Doom on DCG**, built against the branch with `["no-entrypoint"]` (no
+  `revision-8`): its image is 941,184 bytes, against 944,200 for the
+  deployed `b65854a3` on `4a7faf4`. Both Doom ProgramTests pass with the 10-05
+  resource `d9cb7108…` (605 s): the full lifecycle (sim2 roots, renders,
+  adversarial refusals) and the lanes golden frame.
+- **Independent rule-10 review (10-07):** no critical or high findings. Two
+  medium and three low findings were fixed or recorded (57b6b4e).
+- **Not tested:** deploying the new image to `J9Eje…` (that needs the owner's
+  OK), a baseline SBF-image run of the session suites, and Basanos against the
+  branch.
+
 ## Blocker found 2026-10-06: the Bend settlement pilot builds on revision 8
 
 Another session's uncommitted work in the main DCG checkout (features

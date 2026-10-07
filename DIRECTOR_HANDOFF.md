@@ -36,3 +36,11 @@ Progress lines, newest last:
   doc tests pass. **Merge into main held:** the Bend settlement pilot's
   uncommitted work in the main checkout builds on revision 8 (options a/b/c in
   the plan). G3 feature-suite comparison against 272ccf7 running.
+- 10-07 ~02:00: G3 done (plan "Verification"): v2.1/LX1/sessions/lanes/graph v2
+  match 272ccf7; alpha image `7acbce49…` (routing test passes); Doom on DCG
+  builds without `revision-8` and both its ProgramTests pass. G4 review: no
+  critical/high; fixes in 57b6b4e. **Merge into DCG main not done:** waiting on
+  the owner's Bend-pilot choice (a/b/c in the plan); the main checkout also has
+  that session's uncommitted edits to `lib.rs` and `Cargo.toml`. S2 plan on
+  Basanos branch `plan/dcg-doom-split` (14651e575). S1 (`9CHa…` closes) not
+  started: needs the owner to say whether the program account itself closes.
