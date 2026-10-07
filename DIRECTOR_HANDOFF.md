@@ -24,8 +24,10 @@ Ephemeral state for whoever directs DCG next. Standing rules are in
 - **Owner answers (10-06):**
   - the release terms now say mainnet at your own risk;
   - `9CHa…` is retired, so revision 8 is deleted from DCG rather than moved.
-- **Shared checkout:** another session works in the main DCG checkout
-  (settlement and bend identity, uncommitted). Work in a worktree.
+- **Bend settlement pilot: deferred (owner 2026-10-07).** Its uncommitted work
+  from the main checkout is preserved unchanged on `wip/bend-settlement-pilot`
+  (c6816ab, off 272ccf7, which still has revision 8); it is not wired into the
+  program. Work in a worktree.
 
 ## Overnight loop 2026-10-06/07 (revision-8 retirement, branch `retire-rev8`)
 
@@ -44,3 +46,6 @@ Progress lines, newest last:
   that session's uncommitted edits to `lib.rs` and `Cargo.toml`. S2 plan on
   Basanos branch `plan/dcg-doom-split` (14651e575). S1 (`9CHa…` closes) not
   started: needs the owner to say whether the program account itself closes.
+- 10-07 morning (owner): Bend pilot deferred; its work committed as-is to
+  `wip/bend-settlement-pilot` (c6816ab); main fast-forwarded to `retire-rev8`
+  (revision 8 retired on main); Bend docs marked deferred. Not pushed.

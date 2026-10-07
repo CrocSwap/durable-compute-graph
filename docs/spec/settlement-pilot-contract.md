@@ -1,5 +1,11 @@
 # DCG settlement pilot contract
 
+**Deferred (owner 2026-10-07):** the bendSVM settlement pilot is not part of
+the DCG program. Its work is kept unchanged on branch
+`wip/bend-settlement-pilot` (c6816ab, based on 272ccf7, which still has
+revision 8). The revision-8 tags it targets (131, 132, 172) were retired from
+main after v0.1.0-alpha, so resuming it needs a decision on what it settles.
+
 **Status:** integration proposal for a local-only bendSVM pilot. This document
 is documentation only; the settlement executor remains designed, not
 implemented. Existing account bytes below were

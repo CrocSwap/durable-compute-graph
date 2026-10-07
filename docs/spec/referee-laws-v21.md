@@ -20,8 +20,8 @@ Uses:
 - **Review.** An independent review of an ending or payout change checks the
   change against each law and fills in the "who profits by calling first"
   table (§6.3).
-- **bendSVM.** The settlement subset in §11 is the proposed target for the
-  bendSVM pilot, replacing the revision-8 tags 132, 131 and 172.
+- **bendSVM (deferred, 2026-10-07; see §11).** The settlement subset in §11
+  is the proposed target for the bendSVM pilot, replacing the revision-8 tags 132, 131 and 172.
 
 ## Model
 
@@ -475,6 +475,12 @@ shared settlement; the independent program review's findings are fixed
 (design §12). Not yet measured: an application machine's compute and heap.
 
 ## 11. The bendSVM settlement subset
+
+**Deferred (owner 2026-10-07):** the bendSVM settlement pilot is not part of
+the DCG program. Its work is kept unchanged on branch
+`wip/bend-settlement-pilot` (c6816ab, based on 272ccf7, which still has
+revision 8). The revision-8 tags it targets (131, 132, 172) were retired from
+main after v0.1.0-alpha, so resuming it needs a decision on what it settles.
 
 These transitions decide winners, amounts, recipients and deadlines, and are
 small in compute:

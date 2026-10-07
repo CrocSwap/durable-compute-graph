@@ -1,6 +1,6 @@
 # Retiring the revision-8 lifecycle from DCG: plan (2026-10-06)
 
-**Status: in progress on branch `retire-rev8` (2026-10-06 overnight); merge held, see "Blocker".** Agreed order with the owner (2026-10-06):
+**Status: merged to local DCG main 2026-10-07 (not pushed). The Bend pilot was deferred (owner): its work is on `wip/bend-settlement-pilot`.** Agreed order with the owner (2026-10-06):
 tag the first release, switch consumers to tags, then this.
 
 ## Why
@@ -161,7 +161,7 @@ network.
   OK), a baseline SBF-image run of the session suites, and Basanos against the
   branch.
 
-## Blocker found 2026-10-06: the Bend settlement pilot builds on revision 8
+## Blocker found 2026-10-06 (resolved 2026-10-07: pilot deferred, option a)
 
 Another session's uncommitted work in the main DCG checkout (features
 `bend-settlement-pilot`, `bend-*-executor`, modules `settlement_identity*`,
