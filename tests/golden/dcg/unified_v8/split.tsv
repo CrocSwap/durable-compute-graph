@@ -1,8 +1,0 @@
-pot	bps	winner_recorded	slasher	remainder	note
-5000000	5000	yes	2500000	2500000	the even case, and it matches executor_reward_bps = 5,000 on the same pot
-5000001	1	yes	500	4999501	the dust: 5,000,001 // 10,000 = 500 and the remainder keeps the dropped lamport
-18446744073709551615	10000	yes	18446744073709551615	0	the overflow vector, and the reason the helper is u128
-5000001	1	no	0	5000001	D11: no recorded winner, so the whole pot is the remainder's
-1	0	no	0	1	the smallest pot and the opt-out share; the sum is still the pot
-1	10000	yes	1	0	the smallest pot and the whole share
-0	10000	yes	0	0	a zero bond disposes of nothing

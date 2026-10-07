@@ -4,6 +4,10 @@
 
 pub mod fold;
 
+/// A commit-mode refusal code (values below, append-only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DcgError(pub u32);
+
 pub mod err {
     pub const CLOSURE_FRONTIER: u32 = 459;
     pub const CLOSURE_ROOT_MISMATCH: u32 = 452;

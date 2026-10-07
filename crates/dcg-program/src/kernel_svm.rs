@@ -26,7 +26,9 @@ pub(crate) fn with_account_spans<R>(
     bindings: &[AccountSpanBinding],
     f: impl FnOnce(&[AccountSpan<'_>]) -> Result<R, ProgramError>,
 ) -> Result<R, ProgramError> {
-    use crate::unified::{DCR1_AUTH, DCR1_BAD};
+    // DCR1 refusal codes, kept at their historical values.
+    const DCR1_BAD: u32 = 730;
+    const DCR1_AUTH: u32 = 731;
 
     if bindings.is_empty() || bindings.len() > 16 {
         return Err(refusal(DCR1_BAD));
@@ -158,7 +160,7 @@ mod tests {
         let wrong_owner = account_info(&KEY, &OTHER, &mut lamports, &mut data, false, false);
         assert_eq!(
             with_account_spans(&PROGRAM, &[wrong_owner], &[binding(0, 2)], |_| Ok(())),
-            Err(ProgramError::Custom(crate::unified::DCR1_AUTH))
+            Err(ProgramError::Custom(731))
         );
 
         let mut lamports = 1;
@@ -166,7 +168,7 @@ mod tests {
         let wrong_role = account_info(&KEY, &PROGRAM, &mut lamports, &mut data, false, true);
         assert_eq!(
             with_account_spans(&PROGRAM, &[wrong_role], &[binding(0, 2)], |_| Ok(())),
-            Err(ProgramError::Custom(crate::unified::DCR1_AUTH))
+            Err(ProgramError::Custom(731))
         );
     }
 
@@ -177,7 +179,7 @@ mod tests {
         let info = account_info(&KEY, &PROGRAM, &mut lamports, &mut data, false, false);
         assert_eq!(
             with_account_spans(&PROGRAM, &[info.clone()], &[binding(5, 2)], |_| Ok(())),
-            Err(ProgramError::Custom(crate::unified::DCR1_BAD))
+            Err(ProgramError::Custom(730))
         );
         assert_eq!(
             with_account_spans(
@@ -186,7 +188,7 @@ mod tests {
                 &[binding(0, 3), binding(2, 2)],
                 |_| Ok(())
             ),
-            Err(ProgramError::Custom(crate::unified::DCR1_BAD))
+            Err(ProgramError::Custom(730))
         );
         with_account_spans(
             &PROGRAM,

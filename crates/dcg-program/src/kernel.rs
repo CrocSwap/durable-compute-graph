@@ -744,8 +744,9 @@ pub struct OptimisticReplayBinding {
     pub replay: &'static dyn OptimisticReplay,
 }
 
-/// How tag 160 admits a class whose form this manifest binds to an app kernel
-/// (`docs/spec/app-bound-replay-v1.md` §1.1).
+/// How revision 8's tag 160 admitted a class bound to an app kernel. Retired
+/// with revision 8: no route reads it, but `Attested` still changes
+/// `admission_identity_digest`. Removed in the next release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionScan {
     /// Every instance of the class is checked on chain for an opening the
@@ -763,19 +764,24 @@ pub struct ApplicationManifest {
     pub version: u16,
     pub kernels: &'static [&'static dyn Kernel],
     pub optimistic_replays: &'static [OptimisticReplayBinding],
-    /// Optional app-selected mappings from revision-8 form rows to kernels.
-    /// An empty list leaves the historical adapter's behavior unchanged.
+    /// Retired with revision 8: must be empty (`validate` refuses a binding).
+    /// Still committed by `admission_identity_digest`, so existing identities
+    /// do not move. Removed in the next release.
+    #[deprecated(note = "revision 8 is retired; leave empty")]
     pub legacy_forms: &'static [LegacyFormBinding],
-    /// When true, a form without an explicit app mapping is refused rather
-    /// than handled by the historical profile adapter. Admission checks this
-    /// before a document can rely on the mapping.
+    /// Retired with revision 8: must be false. Removed in the next release.
+    #[deprecated(note = "revision 8 is retired; leave false")]
     pub require_legacy_form_binding: bool,
-    /// Whether tag 160 scans app-bound classes position by position.
+    /// Retired with revision 8 (tag 160's admission scan); no route reads it.
+    /// An attested value still changes `admission_identity_digest`. Removed in
+    /// the next release.
+    #[deprecated(note = "revision 8 is retired; no route reads it")]
     pub admission_scan: AdmissionScan,
-    /// App-selected revision-8 policy hooks.
+    /// Retired with revision 8; no route reads it. Removed in the next release.
+    #[deprecated(note = "revision 8 is retired; no route reads it")]
     pub hooks: &'static dyn crate::compatibility::ApplicationHooks,
-    /// App-selected typed-decision route producer. Kept as a separate trait
-    /// object so the pinned SBF Rust toolchain does not need trait upcasting.
+    /// Retired with revision 8; no route reads it. Removed in the next release.
+    #[deprecated(note = "revision 8 is retired; no route reads it")]
     pub decision_routes: &'static dyn crate::compatibility::DecisionRouteSelector,
 }
 
@@ -841,110 +847,6 @@ impl ApplicationManifest {
             index += 1;
         }
         None
-    }
-
-    /// Resolve an app binding, preferring an exact machine selector over a
-    /// machine-neutral binding. Duplicate bindings are rejected by
-    /// `validate`, so this order is deterministic.
-    pub fn resolve_legacy_form(
-        &self,
-        machine_selector: u8,
-        form_id: u16,
-    ) -> Option<&'static LegacyFormBinding> {
-        self.legacy_forms
-            .iter()
-            .find(|binding| {
-                binding.machine_selector == Some(machine_selector) && binding.form_id == form_id
-            })
-            .or_else(|| {
-                self.legacy_forms.iter().find(|binding| {
-                    binding.machine_selector.is_none() && binding.form_id == form_id
-                })
-            })
-    }
-
-    /// Whether admission may rely on the app binding for this machine/form
-    /// pair. Required mappings fail closed when the registry has no machine
-    /// selector or the app did not bind the selected form.
-    pub fn admits_legacy_form(&self, machine_selector: Option<u8>, form_id: u16) -> bool {
-        !self.require_legacy_form_binding
-            || machine_selector
-                .is_some_and(|machine| self.resolve_legacy_form(machine, form_id).is_some())
-    }
-
-    /// Re-execute a historical form only through the exact identity and mode
-    /// selected by this app's static manifest. Inputs and output are opened
-    /// from the coordinate-specific ROOT_ONLY leaf preimage.
-    pub fn replay_legacy_form(
-        &self,
-        binding: &LegacyFormBinding,
-        inputs: &[ReplayInputSpan<'_>],
-        claimed_output: &[u8],
-    ) -> Result<bool, ManifestRunError> {
-        if inputs.len() != binding.input_spans.len() {
-            return Err(ManifestRunError::InvalidSpanCount);
-        }
-        let replay = self
-            .resolve_optimistic_replay(
-                binding.kernel_id,
-                binding.semantic_version,
-                binding.abi_version,
-                binding.mode,
-            )
-            .ok_or(ManifestRunError::KernelUnavailable)?;
-        let kernel = self
-            .resolve(
-                binding.kernel_id,
-                binding.semantic_version,
-                binding.abi_version,
-            )
-            .ok_or(ManifestRunError::KernelUnavailable)?;
-        let manifest = kernel.manifest();
-        let replay_manifest = replay.replay.replay_manifest();
-        if replay_manifest.id != manifest.id
-            || replay_manifest.semantic_version != manifest.semantic_version
-            || replay_manifest.abi_version != manifest.abi_version
-        {
-            return Err(ManifestRunError::KernelUnavailable);
-        }
-        if !manifest.modes.contains(&binding.mode) {
-            return Err(ManifestRunError::ModeUnsupported);
-        }
-        if manifest.input.alignment == 0 || manifest.output.alignment == 0 {
-            return Err(ManifestRunError::InputAlignment);
-        }
-        let input_limit =
-            (manifest.input.max_bytes as usize).min(manifest.resources.max_input_bytes as usize);
-        let mut total_input = 0usize;
-        for (layout, span) in binding.input_spans.iter().zip(inputs) {
-            if span.schema != layout.schema
-                || span.schema != manifest.input.id
-                || span.data.is_empty()
-                || span.data.len() > layout.max_bytes as usize
-            {
-                return Err(ManifestRunError::InvalidCommittedInput);
-            }
-            if span.data.len() % manifest.input.alignment as usize != 0 {
-                return Err(ManifestRunError::InvalidCommittedInput);
-            }
-            total_input = total_input
-                .checked_add(span.data.len())
-                .ok_or(ManifestRunError::InputLimit)?;
-        }
-        if total_input > input_limit {
-            return Err(ManifestRunError::InvalidCommittedInput);
-        }
-        let output_limit =
-            (manifest.output.max_bytes as usize).min(manifest.resources.max_output_bytes as usize);
-        if claimed_output.len() != binding.claimed_output_bytes as usize
-            || claimed_output.len() > output_limit
-        {
-            return Err(ManifestRunError::ClaimedOutputLength);
-        }
-        replay
-            .replay
-            .replay_input_spans(inputs, claimed_output)
-            .map_err(ManifestRunError::Kernel)
     }
 
     /// Stable app-image identity used by app-specific replay leaves and the
@@ -1018,64 +920,6 @@ impl ApplicationManifest {
             digest = hash::sha256(&[b"dcg/application-admission-attested/1", &digest]);
         }
         digest
-    }
-
-    /// Maximum ARW1 byte length admitted for one form, before an optional RWP1
-    /// extension. `validate()` limits this adapter to zero or one input span.
-    pub fn max_arw1_bytes(binding: &LegacyFormBinding) -> Option<usize> {
-        binding
-            .input_spans
-            .iter()
-            .try_fold(CommittedReplayWitness::HEADER_BYTES, |n, span| {
-                n.checked_add(CommittedReplayWitness::SPAN_HEADER_BYTES)?
-                    .checked_add(span.max_bytes as usize)
-            })?
-            .checked_add(binding.claimed_output_bytes as usize)
-    }
-
-    /// 64-byte ARI1 identity written only to the new app-replay DCR1 record
-    /// version. Revision-8 DCR1 v5 bytes remain untouched on the compatibility
-    /// path.
-    pub fn ruling_identity(&self, binding: &LegacyFormBinding) -> [u8; 64] {
-        let mut out = [0; 64];
-        out[..4].copy_from_slice(b"ARI1");
-        out[4..36].copy_from_slice(&self.identity_digest());
-        out[36..52].copy_from_slice(&binding.kernel_id.0);
-        out[52..54].copy_from_slice(&binding.semantic_version.to_le_bytes());
-        out[54..56].copy_from_slice(&binding.abi_version.to_le_bytes());
-        out[56..60].copy_from_slice(&binding.mode.id.to_le_bytes());
-        out[60..62].copy_from_slice(&binding.mode.version.to_le_bytes());
-        out[62..64].copy_from_slice(&binding.form_id.to_le_bytes());
-        out
-    }
-
-    /// App-specific leaf commitment for the exact coordinate and canonical
-    /// witness. The enclosing revision-8 ROOT_ONLY segment/position proofs
-    /// commit this digest into the document's landed position root.
-    pub fn replay_leaf_digest(
-        &self,
-        binding: &LegacyFormBinding,
-        descriptor: &[u8; 32],
-        position: u32,
-        segment: u16,
-        local: u32,
-        witness: &[u8],
-    ) -> [u8; 32] {
-        let mut coordinate = [0; 10];
-        coordinate[..4].copy_from_slice(&position.to_le_bytes());
-        coordinate[4..6].copy_from_slice(&segment.to_le_bytes());
-        coordinate[6..].copy_from_slice(&local.to_le_bytes());
-        let identity = self.ruling_identity(binding);
-        // RWP1 is a transport proof for predecessor bytes, not part of the
-        // app's coordinate preimage. Excluding it avoids a Merkle cycle when
-        // a predecessor and consumer share the same segment tree.
-        let committed = CommittedReplayWitness::decode(witness)
-            .map(|opened| &witness[..witness.len() - opened.extension.len()])
-            .unwrap_or(witness);
-        crate::closure_v2::hash(
-            b"app-replay-leaf/2",
-            &[descriptor, &coordinate, &identity[4..], committed],
-        )
     }
 
     /// Run one already-authenticated byte transition through a kernel that
@@ -1205,82 +1049,16 @@ impl ApplicationManifest {
                 ));
             }
         }
-        if self.application_id.is_empty()
-            || (self.require_legacy_form_binding && self.legacy_forms.is_empty())
-        {
+        if self.application_id.is_empty() {
             return Err(ManifestError::MissingRequiredFormBindings);
         }
-        for (i, binding) in self.legacy_forms.iter().enumerate() {
-            if binding.form_id == 0
-                || binding.claimed_output_bytes == 0
-                || binding.input_routes.len() != binding.input_spans.len()
-                || binding.input_routes.len() > 1
-            {
-                return Err(ManifestError::InvalidLegacyForm(binding.form_id));
-            }
-            if self.legacy_forms.iter().skip(i + 1).any(|other| {
-                other.machine_selector == binding.machine_selector
-                    && other.form_id == binding.form_id
-            }) {
-                return Err(ManifestError::DuplicateLegacyForm(binding.form_id));
-            }
-            let Some(kernel) = self.resolve(
-                binding.kernel_id,
-                binding.semantic_version,
-                binding.abi_version,
-            ) else {
-                return Err(ManifestError::LegacyKernelUnavailable(binding.form_id));
-            };
-            let kernel_manifest = kernel.manifest();
-            if !kernel_manifest.modes.contains(&binding.mode)
-                || self
-                    .resolve_optimistic_replay(
-                        binding.kernel_id,
-                        binding.semantic_version,
-                        binding.abi_version,
-                        binding.mode,
-                    )
-                    .is_none()
-            {
-                return Err(ManifestError::LegacyModeUnsupported(binding.form_id));
-            }
-            let input_limit = (kernel_manifest.input.max_bytes as usize)
-                .min(kernel_manifest.resources.max_input_bytes as usize);
-            let output_limit = (kernel_manifest.output.max_bytes as usize)
-                .min(kernel_manifest.resources.max_output_bytes as usize);
-            let accepts_empty_input_spans = self
-                .resolve_optimistic_replay(
-                    binding.kernel_id,
-                    binding.semantic_version,
-                    binding.abi_version,
-                    binding.mode,
-                )
-                .is_some_and(|replay| replay.replay.accepts_empty_input_spans());
-            if binding.claimed_output_bytes as usize > output_limit
-                || (binding.input_spans.is_empty() && !accepts_empty_input_spans)
-                || binding.input_spans.iter().any(|span| {
-                    span.schema != kernel_manifest.input.id
-                        || span.max_bytes == 0
-                        || span.max_bytes as usize > input_limit
-                })
-                || binding
-                    .input_routes
-                    .iter()
-                    .enumerate()
-                    .any(|(route_index, route)| {
-                        route.length == 0
-                            || route.offset.checked_add(route.length).is_none()
-                            || route.length > binding.input_spans[route_index].max_bytes
-                            || route.length % kernel_manifest.input.alignment as u32 != 0
-                            || binding
-                                .input_routes
-                                .iter()
-                                .skip(route_index + 1)
-                                .any(|other| other.ordinal == route.ordinal)
-                    })
-            {
-                return Err(ManifestError::InvalidLegacyForm(binding.form_id));
-            }
+        // Revision-8 form bindings are retired: a manifest may not declare
+        // or require them.
+        if let Some(binding) = self.legacy_forms.first() {
+            return Err(ManifestError::InvalidLegacyForm(binding.form_id));
+        }
+        if self.require_legacy_form_binding {
+            return Err(ManifestError::MissingRequiredFormBindings);
         }
         Ok(())
     }
@@ -1365,95 +1143,6 @@ pub trait ResolutionBackend {
         state: &mut Self::State,
         transition: Self::Transition,
     ) -> Result<ResolutionStatus, Self::Error>;
-}
-
-/// A closed-registry compatibility row contains the old image's application
-/// registration metadata, but no model implementation. The Basanos adapter
-/// supplies the matching compiled kernel functions at its image boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ClosedRegistryRow {
-    pub machine_name: Option<&'static [u8]>,
-    pub form_id: u16,
-    pub geometry_bytes: u16,
-    pub profile_bytes: u16,
-    pub closure_execute: bool,
-    pub private_supply_freeze: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RegistryInheritance {
-    pub machine_name: &'static [u8],
-    pub base_machine_name: &'static [u8],
-    pub excluded_forms: &'static [u16],
-}
-
-pub struct ClosedRegistryAdapter<'a> {
-    rows: &'a [ClosedRegistryRow],
-    inheritance: &'a [RegistryInheritance],
-}
-
-impl<'a> ClosedRegistryAdapter<'a> {
-    pub const fn new(
-        rows: &'a [ClosedRegistryRow],
-        inheritance: &'a [RegistryInheritance],
-    ) -> Self {
-        Self { rows, inheritance }
-    }
-
-    /// Reproduces the old lookup order: machine-specific rows win, while
-    /// machine-neutral rows serve only as fallbacks.
-    pub fn resolve(&self, machine: &[u8], form_id: u16) -> Option<&'a ClosedRegistryRow> {
-        self.resolve_at_depth(machine, form_id, 0)
-    }
-
-    fn resolve_at_depth(
-        &self,
-        machine: &[u8],
-        form_id: u16,
-        depth: usize,
-    ) -> Option<&'a ClosedRegistryRow> {
-        let exact = self
-            .rows
-            .iter()
-            .find(|row| row.form_id == form_id && row.machine_name == Some(machine));
-        if exact.is_some() {
-            return exact;
-        }
-        if depth < self.inheritance.len() {
-            if let Some(rule) = self
-                .inheritance
-                .iter()
-                .find(|rule| rule.machine_name == machine)
-            {
-                let has_override = self.rows.iter().any(|row| {
-                    row.form_id == form_id && row.machine_name == Some(rule.machine_name)
-                });
-                if !has_override && !rule.excluded_forms.contains(&form_id) {
-                    if let Some(inherited) =
-                        self.resolve_at_depth(rule.base_machine_name, form_id, depth + 1)
-                    {
-                        return Some(inherited);
-                    }
-                }
-            }
-        }
-        self.rows
-            .iter()
-            .find(|row| row.form_id == form_id && row.machine_name.is_none())
-    }
-
-    pub fn admits_private_supply_freeze(&self, machine: &[u8]) -> bool {
-        self.rows.iter().any(|row| {
-            row.private_supply_freeze
-                && self
-                    .resolve(machine, row.form_id)
-                    .is_some_and(|resolved| core::ptr::eq(resolved, row))
-        })
-    }
-
-    pub fn rows(&self) -> &'a [ClosedRegistryRow] {
-        self.rows
-    }
 }
 
 #[cfg(any(feature = "test-kernel", feature = "example-kernels"))]
@@ -1665,233 +1354,17 @@ pub mod test_kernel {
         mode: MODE_OPTIMISTIC_V1,
         replay: &BYTE_SUM,
     }];
-    pub static BYTE_SUM_INPUTS: [ReplayInputLayout; 1] = [ReplayInputLayout {
-        schema: VersionedId { id: 1, version: 1 },
-        max_bytes: 64,
-    }];
-    pub static BYTE_SUM_INPUT_ROUTES: [ReplayRouteBinding; 1] = [ReplayRouteBinding {
-        ordinal: 7,
-        offset: 0,
-        length: 3,
-    }];
-    pub static BYTE_SUM_LEGACY_FORMS: [LegacyFormBinding; 1] = [LegacyFormBinding {
-        machine_selector: Some(1),
-        form_id: 22,
-        kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
-        semantic_version: 1,
-        abi_version: 1,
-        mode: MODE_OPTIMISTIC_V1,
-        input_spans: &BYTE_SUM_INPUTS,
-        input_routes: &BYTE_SUM_INPUT_ROUTES,
-        claimed_output_bytes: 8,
-    }];
-    #[cfg(feature = "sbf-real-lifecycle-test")]
-    pub static BYTE_SUM_PRODUCER_FORM_BINDING: [LegacyFormBinding; 1] = [LegacyFormBinding {
-        machine_selector: Some(1),
-        form_id: 30,
-        kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
-        semantic_version: 1,
-        abi_version: 1,
-        mode: MODE_OPTIMISTIC_V1,
-        input_spans: &[],
-        input_routes: &[],
-        claimed_output_bytes: 256,
-    }];
-    #[cfg(feature = "sbf-real-lifecycle-test")]
-    pub static BYTE_SUM_ROUTE_FREE_FORM_BINDING: [LegacyFormBinding; 1] = [LegacyFormBinding {
-        machine_selector: Some(1),
-        form_id: 256,
-        kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
-        semantic_version: 1,
-        abi_version: 1,
-        mode: MODE_OPTIMISTIC_V1,
-        input_spans: &[],
-        input_routes: &[],
-        claimed_output_bytes: 256,
-    }];
-    #[cfg(feature = "sbf-real-lifecycle-test")]
-    pub static BYTE_SUM_REAL_LIFECYCLE_FORMS: [LegacyFormBinding; 3] = [
-        BYTE_SUM_LEGACY_FORMS[0],
-        BYTE_SUM_PRODUCER_FORM_BINDING[0],
-        BYTE_SUM_ROUTE_FREE_FORM_BINDING[0],
-    ];
-    #[cfg(feature = "sbf-unbound-form-test")]
-    pub static BYTE_SUM_UNBOUND_FORM_TEST: [LegacyFormBinding; 1] = [LegacyFormBinding {
-        machine_selector: Some(1),
-        form_id: u16::MAX,
-        kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
-        semantic_version: 1,
-        abi_version: 1,
-        mode: MODE_OPTIMISTIC_V1,
-        input_spans: &BYTE_SUM_INPUTS,
-        input_routes: &BYTE_SUM_INPUT_ROUTES,
-        claimed_output_bytes: 8,
-    }];
     pub static MANIFEST_APP: ApplicationManifest = ApplicationManifest {
         application_id: b"dcg-test-app/1",
         version: 1,
         kernels: &KERNELS,
         optimistic_replays: &REPLAY_BINDINGS,
-        #[cfg(feature = "sbf-unbound-form-test")]
-        legacy_forms: &BYTE_SUM_UNBOUND_FORM_TEST,
-        #[cfg(all(
-            feature = "sbf-real-lifecycle-test",
-            not(feature = "sbf-unbound-form-test")
-        ))]
-        legacy_forms: &BYTE_SUM_REAL_LIFECYCLE_FORMS,
-        #[cfg(all(
-            not(feature = "sbf-real-lifecycle-test"),
-            not(feature = "sbf-unbound-form-test")
-        ))]
-        legacy_forms: &BYTE_SUM_LEGACY_FORMS,
-        require_legacy_form_binding: !cfg!(feature = "sbf-real-lifecycle-test")
-            || cfg!(feature = "sbf-unbound-form-test"),
-        #[cfg(not(feature = "sbf-attested-admission-test"))]
+        legacy_forms: &[],
+        require_legacy_form_binding: false,
         admission_scan: AdmissionScan::Full,
-        #[cfg(feature = "sbf-attested-admission-test")]
-        admission_scan: AdmissionScan::Attested,
         hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
         decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
     };
-
-    /// Test-only adapter used by the generic-dispute SBF suite. The engine
-    /// sees only the hook contract; this application authenticates a tiny
-    /// synthetic weight witness and replays with the existing ByteSum kernel.
-    #[cfg(feature = "test-kernel")]
-    pub struct DisputeHooks;
-
-    #[cfg(feature = "test-kernel")]
-    pub static DISPUTE_HOOKS: DisputeHooks = DisputeHooks;
-
-    #[cfg(feature = "test-kernel")]
-    impl crate::app_api::ApplicationDisputeHooks for DisputeHooks {
-        fn supports_form(&self, machine: u8, form: u16) -> bool {
-            matches!(machine, 0..=2)
-                && matches!(
-                    form,
-                    1 | 4 | 5 | 10 | 13 | 16 | 18 | 19 | 21 | 22 | 28 | 30 | 40..=48 | 256
-                )
-        }
-
-        fn requires_weight_rows(&self, form: u16, _operation: u16) -> bool {
-            matches!(form, 1 | 4 | 22 | 47)
-        }
-
-        fn requires_artifact_block(&self, form: u16, _operation: u16) -> bool {
-            matches!(form, 2 | 10 | 13 | 16 | 18 | 19 | 21 | 28 | 30)
-        }
-
-        fn replay_pt1(
-            &self,
-            request: crate::app_api::ApplicationReplayRequest<'_>,
-            output: &mut [u8],
-        ) -> Result<usize, u32> {
-            if request.instruction_data.len() != 1
-                || request.artifact_operands.first().copied() != Some(b"DCGTEST-ROWS/1")
-            {
-                return Err(740);
-            }
-            if request.form == 22 && request.reads.len() == 1 {
-                return BYTE_SUM.execute(request.reads[0], output).map_err(|_| 734);
-            }
-            if request.form == 47 && request.reads.len() == 2 && output.len() >= 1024 {
-                let input = request
-                    .reads
-                    .iter()
-                    .map(|read| *read)
-                    .find(|read| read.len() >= 64)
-                    .and_then(|read| read.get(..64))
-                    .ok_or(734u32)?;
-                let mut sum = [0u8; 256];
-                BYTE_SUM.execute(input, &mut sum).map_err(|_| 734u32)?;
-                for lane in output[..1024].chunks_exact_mut(4) {
-                    lane.copy_from_slice(&sum[..4]);
-                }
-                return Ok(1024);
-            }
-            Err(740)
-        }
-    }
-
-    #[cfg(feature = "test-kernel")]
-    impl crate::app_api::ArtifactWitnessVerifier for DisputeHooks {
-        fn supplied_read_hash(
-            &self,
-            _machine: u8,
-            _form: u16,
-            _region: u16,
-            _byte_length: u32,
-        ) -> Result<[u8; 32], u32> {
-            Err(734)
-        }
-
-        fn verify_descriptor_row_anchor(
-            &self,
-            descriptor_core: &[u8],
-            model_root: &[u8; 32],
-        ) -> Result<crate::app_api::ArtifactRowAnchor, u32> {
-            if descriptor_core != b"DCGTEST-DESCRIPTOR/1" {
-                return Err(734);
-            }
-            Ok(crate::app_api::ArtifactRowAnchor {
-                root: crate::hash::sha256(&[
-                    b"dcg/test-artifact-row-anchor/1",
-                    descriptor_core,
-                    model_root,
-                ]),
-                leaf_count: 1,
-            })
-        }
-
-        fn verify_weight_rows(
-            &self,
-            _witness: &[u8],
-            _anchor: crate::app_api::ArtifactRowAnchor,
-            _tensor_name: &[u8],
-            _first_row: u32,
-            _row_count: u16,
-            _width: u32,
-        ) -> Result<(), u32> {
-            Err(734)
-        }
-
-        fn verify_weight_rows_for_entry(
-            &self,
-            witness: &[u8],
-            anchor: crate::app_api::ArtifactRowAnchor,
-            _machine: u8,
-            form: u16,
-            _operation: u16,
-            _payload: &[u8],
-            _read_operands: &[&[u8]],
-        ) -> Result<(), u32> {
-            if matches!(form, 22 | 47)
-                && witness == b"DCGTEST-ROWS/1"
-                && anchor.leaf_count == 1
-                && anchor.root != [0; 32]
-            {
-                Ok(())
-            } else {
-                Err(734)
-            }
-        }
-
-        fn verify_artifact_block(
-            &self,
-            _form: u16,
-            _operation: u16,
-            _position: u32,
-            witness: &[u8],
-            descriptor_core: &[u8],
-            _model_root: &[u8; 32],
-        ) -> Result<(), u32> {
-            if descriptor_core == b"DCGTEST-DESCRIPTOR/1" && witness == b"DCGTEST-ARTIFACT/1" {
-                Ok(())
-            } else {
-                Err(734)
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2187,11 +1660,22 @@ mod tests {
 
     #[cfg(feature = "test-kernel")]
     #[test]
-    fn manifest_rejects_zero_span_binding_without_explicit_replay_support() {
+    fn manifest_refuses_retired_legacy_form_bindings() {
+        // Revision 8 is retired: any legacy form binding, or requiring one,
+        // is refused.
         assert_eq!(
             ZERO_INPUT_APP.validate(),
             Err(ManifestError::InvalidLegacyForm(701))
         );
+        assert_eq!(
+            MISALIGNED_INPUT_APP.validate(),
+            Err(ManifestError::InvalidLegacyForm(702))
+        );
+        let requires = ApplicationManifest {
+            legacy_forms: &[],
+            ..ZERO_INPUT_APP
+        };
+        assert_eq!(requires.validate(), Err(ManifestError::MissingRequiredFormBindings));
         assert_eq!(test_kernel::MANIFEST_APP.validate(), Ok(()));
     }
 
@@ -2205,15 +1689,6 @@ mod tests {
             ALIGNMENT_PROBE.replay_input_spans(&[], &[]),
             Err(KernelError::InvalidInput),
             "an empty-input kernel without the opt-in still refuses"
-        );
-    }
-
-    #[cfg(feature = "test-kernel")]
-    #[test]
-    fn manifest_rejects_route_length_outside_input_alignment() {
-        assert_eq!(
-            MISALIGNED_INPUT_APP.validate(),
-            Err(ManifestError::InvalidLegacyForm(702))
         );
     }
 
@@ -2243,128 +1718,10 @@ mod tests {
 
     #[cfg(feature = "test-kernel")]
     #[test]
-    fn manifest_rejects_overflowing_replay_route_slices() {
-        static INVALID_ROUTES: [ReplayRouteBinding; 1] = [ReplayRouteBinding {
-            ordinal: 7,
-            offset: u32::MAX - 1,
-            length: 3,
-        }];
-        static INVALID_FORMS: [LegacyFormBinding; 1] = [LegacyFormBinding {
-            machine_selector: Some(1),
-            form_id: 22,
-            kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
-            semantic_version: 1,
-            abi_version: 1,
-            mode: test_kernel::MODE_OPTIMISTIC_V1,
-            input_spans: &test_kernel::BYTE_SUM_INPUTS,
-            input_routes: &INVALID_ROUTES,
-            claimed_output_bytes: 8,
-        }];
-        static INVALID_APP: ApplicationManifest = ApplicationManifest {
-            application_id: b"dcg-invalid-route-test/1",
-            version: 1,
-            kernels: &test_kernel::KERNELS,
-            optimistic_replays: &test_kernel::REPLAY_BINDINGS,
-            legacy_forms: &INVALID_FORMS,
-            require_legacy_form_binding: true,
-            admission_scan: AdmissionScan::Full,
-            hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
-            decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
-        };
-
-        assert_eq!(
-            INVALID_APP.validate(),
-            Err(ManifestError::InvalidLegacyForm(22))
-        );
-    }
-
-    #[cfg(feature = "test-kernel")]
-    #[test]
-    fn manifest_rejects_multiple_replay_routes_until_supported() {
-        static TWO_SPANS: [ReplayInputLayout; 2] = [
-            ReplayInputLayout {
-                schema: VersionedId { id: 1, version: 1 },
-                max_bytes: 16,
-            },
-            ReplayInputLayout {
-                schema: VersionedId { id: 1, version: 1 },
-                max_bytes: 16,
-            },
-        ];
-        static TWO_ROUTES: [ReplayRouteBinding; 2] = [
-            ReplayRouteBinding {
-                ordinal: 7,
-                offset: 0,
-                length: 3,
-            },
-            ReplayRouteBinding {
-                ordinal: 8,
-                offset: 0,
-                length: 3,
-            },
-        ];
-        static MULTI_ROUTE_FORMS: [LegacyFormBinding; 1] = [LegacyFormBinding {
-            machine_selector: Some(1),
-            form_id: 22,
-            kernel_id: KernelId(*b"dcg-test-sum-v1\0"),
-            semantic_version: 1,
-            abi_version: 1,
-            mode: test_kernel::MODE_OPTIMISTIC_V1,
-            input_spans: &TWO_SPANS,
-            input_routes: &TWO_ROUTES,
-            claimed_output_bytes: 8,
-        }];
-        static MULTI_ROUTE_APP: ApplicationManifest = ApplicationManifest {
-            application_id: b"dcg-multi-route-test/1",
-            version: 1,
-            kernels: &test_kernel::KERNELS,
-            optimistic_replays: &test_kernel::REPLAY_BINDINGS,
-            legacy_forms: &MULTI_ROUTE_FORMS,
-            require_legacy_form_binding: true,
-            admission_scan: AdmissionScan::Full,
-            hooks: &crate::compatibility::REVISION8_COMPATIBILITY,
-            decision_routes: &crate::compatibility::REVISION8_COMPATIBILITY,
-        };
-
-        assert_eq!(
-            MULTI_ROUTE_APP.validate(),
-            Err(ManifestError::InvalidLegacyForm(22))
-        );
-    }
-
-    #[cfg(feature = "test-kernel")]
-    #[test]
     fn static_application_manifest_resolves_exact_semantic_and_abi_versions() {
         use test_kernel::{BYTE_SUM, MODE_CONSENSUS_V1, MODE_OPTIMISTIC_V1};
         let m = &test_kernel::MANIFEST_APP;
         assert_eq!(m.validate(), Ok(()));
-        #[cfg(all(
-            not(feature = "sbf-real-lifecycle-test"),
-            not(feature = "sbf-unbound-form-test")
-        ))]
-        {
-            assert!(m.admits_legacy_form(Some(1), 22));
-            assert!(!m.admits_legacy_form(Some(1), 23));
-            assert!(!m.admits_legacy_form(None, 22));
-        }
-        #[cfg(all(
-            feature = "sbf-real-lifecycle-test",
-            not(feature = "sbf-unbound-form-test")
-        ))]
-        {
-            assert!(m.resolve_legacy_form(1, 22).is_some());
-            assert!(m.resolve_legacy_form(1, 30).is_some());
-            let route_free = m.resolve_legacy_form(1, 256).unwrap();
-            assert!(route_free.input_spans.is_empty());
-            assert!(route_free.input_routes.is_empty());
-            assert_eq!(route_free.claimed_output_bytes, 256);
-        }
-        #[cfg(feature = "sbf-unbound-form-test")]
-        {
-            assert!(!m.admits_legacy_form(Some(1), 22));
-            assert!(!m.admits_legacy_form(Some(1), 256));
-            assert!(m.admits_legacy_form(Some(1), u16::MAX));
-        }
         let kernel = m.resolve(KernelId(*b"dcg-test-sum-v1\0"), 1, 1).unwrap();
         assert_eq!(kernel.manifest().id, BYTE_SUM.manifest().id);
         let mut output = [0u8; 256];
@@ -2424,103 +1781,6 @@ mod tests {
             ),
             Err(ManifestRunError::InputLimit)
         );
-
-        #[cfg(not(feature = "sbf-unbound-form-test"))]
-        let binding = m.resolve_legacy_form(1, 22).unwrap();
-        #[cfg(feature = "sbf-unbound-form-test")]
-        let binding = &test_kernel::BYTE_SUM_LEGACY_FORMS[0];
-        let input = [1u8, 2, 3];
-        let claimed = 6u64.to_le_bytes();
-        let inputs = [ReplayInputSpan {
-            schema: VersionedId { id: 1, version: 1 },
-            data: &input,
-        }];
-        assert_eq!(m.replay_legacy_form(binding, &inputs, &claimed), Ok(true));
-        let bad_claim = 7u64.to_le_bytes();
-        assert_eq!(
-            m.replay_legacy_form(binding, &inputs, &bad_claim),
-            Ok(false)
-        );
-
-        let mut wrong_abi = *binding;
-        wrong_abi.abi_version = 2;
-        assert_eq!(
-            m.replay_legacy_form(&wrong_abi, &inputs, &claimed),
-            Err(ManifestRunError::KernelUnavailable)
-        );
-        let mut unknown_id = *binding;
-        unknown_id.kernel_id = KernelId([0xFF; 16]);
-        assert_eq!(
-            m.replay_legacy_form(&unknown_id, &inputs, &claimed),
-            Err(ManifestRunError::KernelUnavailable)
-        );
-        assert!(m.resolve_legacy_form(2, 22).is_none());
-
-        #[cfg(all(
-            feature = "sbf-real-lifecycle-test",
-            not(feature = "sbf-unbound-form-test")
-        ))]
-        {
-            let replay = m.resolve_legacy_form(1, 22).unwrap();
-            assert_eq!(replay.kernel_id, BYTE_SUM.manifest().id);
-            assert_eq!((replay.semantic_version, replay.abi_version), (1, 1));
-            assert!(m.resolve_legacy_form(2, 22).is_none());
-            let producer = m.resolve_legacy_form(1, 30).unwrap();
-            assert!(producer.input_spans.is_empty());
-            assert!(producer.input_routes.is_empty());
-            assert_eq!(m.validate(), Ok(()));
-        }
-    }
-
-    #[cfg(all(
-        test,
-        feature = "sbf-real-lifecycle-test",
-        not(feature = "sbf-unbound-form-test")
-    ))]
-    #[test]
-    fn form_22_test_app_binding_uses_coordinate_leaf_routes() {
-        let binding = test_kernel::MANIFEST_APP
-            .resolve_legacy_form(1, 22)
-            .unwrap();
-        assert_eq!(binding.input_spans.len(), 1);
-        assert_eq!(
-            binding.input_spans[0].schema,
-            VersionedId { id: 1, version: 1 }
-        );
-        assert_eq!(binding.input_spans[0].max_bytes, 64);
-        assert_eq!(binding.input_routes.len(), 1);
-        assert_eq!(binding.input_routes[0].ordinal, 7);
-        assert_eq!(binding.input_routes[0].length, 3);
-        assert_eq!(binding.claimed_output_bytes, 8);
-    }
-
-    #[test]
-    fn closed_registry_bounds_inheritance_cycles_and_keeps_version_axes_independent() {
-        let row = ClosedRegistryRow {
-            machine_name: Some(b"base"),
-            form_id: 7,
-            geometry_bytes: 4,
-            profile_bytes: 2,
-            closure_execute: false,
-            private_supply_freeze: false,
-        };
-        let rows = [row];
-        let excluded: &'static [u16] = &[];
-        let inheritance = [
-            RegistryInheritance {
-                machine_name: b"child",
-                base_machine_name: b"base",
-                excluded_forms: &excluded,
-            },
-            RegistryInheritance {
-                machine_name: b"base",
-                base_machine_name: b"child",
-                excluded_forms: &excluded,
-            },
-        ];
-        let registry = ClosedRegistryAdapter::new(&rows, &inheritance);
-        assert_eq!(registry.resolve(b"child", 7), Some(&rows[0]));
-        assert_eq!(registry.resolve(b"child", 8), None);
     }
 }
 

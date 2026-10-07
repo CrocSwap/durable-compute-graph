@@ -12,7 +12,7 @@
 //! ```
 //!
 //! ```compile_fail
-//! // Tag 125 belongs to DCG's revision-8 core dispatcher.
+//! // Tag 125 is reserved to DCG core (a retired revision-8 tag).
 //! const _: () = dcg_program::app_api::validate_application_tags(&[125]);
 //! ```
 //!
@@ -189,13 +189,15 @@ use solana_program::{
     pubkey::Pubkey,
 };
 
-/// Tags dispatched by DCG's selected revision-8 core.
+/// Tags reserved to DCG core: no application may register them.
 ///
-/// The application dispute/replay family (120–124 and 126–129) is omitted so
-/// an application can register those handlers. Tag 125 remains core-owned.
-/// Test-only workload tags are not part of this wire-revision set.
+/// The revision-8 rows are the tags revision 8 routed, now retired and refused
+/// (removed after v0.1.0-alpha). They stay reserved so a historical tag number
+/// can never reach an application handler; this includes the former
+/// application dispute family 120–124 and 126–129. Test-only workload tags are
+/// not part of this wire-revision set.
 pub const CORE_INSTRUCTION_TAGS_REVISION_8: &[u8] = &[
-    115, 116, 117, 118, 125, 131, 132, 140, 141, 142, 143, 144, 145, 146, 156, 157, 158, 159, 160,
+    115, 116, 117, 118, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 131, 132, 140, 141, 142, 143, 144, 145, 146, 156, 157, 158, 159, 160,
     161, 162, 163, 164, 165, 166, 167, 168, 169, 172, 173, 174, 175, 176, 177, 178, 183, 184, 185,
     186, 187, 193, 197, 198, 199, 200,
     // The graph lifecycle (208-227) is routed only under its features but is
@@ -291,7 +293,8 @@ pub enum ApplicationSeed {
     },
 }
 
-/// A DCG-owned revision-8 record validated by DCG's own read-only reader.
+/// A revision-8 record kind. Revision 8 is retired: a rule naming one is
+/// refused when the manifest is built. Removed in the next release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplicationCoreRecordKind {
     DocumentV8,
@@ -330,10 +333,10 @@ pub enum ApplicationAccountIdentity {
         owner: Option<&'static Pubkey>,
         executable: bool,
     },
-    /// A core record is checked by DCG's reader with a read-only role.
+    /// Retired with revision 8: refused when the manifest is built.
     CoreRecord { kind: ApplicationCoreRecordKind },
-    /// The closure-v2 DRU1 PDA, whose canonical bump is committed at byte 219
-    /// of an earlier, read-only validated DCR1 v5/v6 record.
+    /// Retired with revision 8 (the closure-v2 DRU1 PDA): refused when the
+    /// manifest is built.
     StoredBumpPda { challenge_account_index: usize },
 }
 
@@ -447,19 +450,21 @@ const CORE_ACCOUNT_MAGICS: &[&[u8]] = &[
     b"DDOC", b"DBND",
 ];
 
+// Seeds of every DCG record, including the retired revision-8 ones, stay
+// reserved so an application PDA cannot alias a DCG record.
 const CORE_PDA_SEEDS: &[&[u8]] = &[
-    crate::unified::address::CONFIG_SEED,
-    crate::unified::address::TEMPLATE_SEAL_SEED,
-    crate::unified::address::TEMPLATE_USE_SEED,
-    crate::unified::address::CHALLENGE_SEED,
-    crate::unified::address::REGISTRY_SEED,
-    crate::unified::address::ADMISSION_SEED,
-    crate::unified::address::DOCUMENT_SEED,
-    crate::unified::address::POSITIONS_SEED,
-    crate::unified::address::FAMILY_SLOTS_SEED,
-    crate::unified::address::RESULT_SEED,
-    crate::unified::address::SETTLEMENT_ESCROW_SEED,
-    crate::unified::address::BOND_ESCROW_SEED,
+    b"dcg-config",
+    b"dcg-template-seal",
+    b"dcg-template-use",
+    b"dcg-unified-challenge",
+    b"dcg-envelope-registry-pt2",
+    b"dcg-envelope-admission-v2",
+    b"dcg-hcl-document",
+    b"dcg-hcl-positions",
+    b"dcg-hcl-family-slots",
+    b"dcg-hcl-result",
+    b"dcg-hcl-settlement",
+    b"dcg-hcl-bond-escrow",
     b"dcg-hcl-checkpoint",
     b"dcg-hcl-producer",
     b"dcg-hcl-response",
@@ -597,27 +602,10 @@ const fn validate_application_rules(
                 validate_app_seeds(application_id, seeds);
             }
             ApplicationAccountIdentity::ExactKey { .. } => {}
-            ApplicationAccountIdentity::CoreRecord { kind } => {
-                if rule.role.writable || rule.role.signer {
-                    panic!("core-record application rules are read-only");
-                }
-                let _ = kind;
-            }
-            ApplicationAccountIdentity::StoredBumpPda {
-                challenge_account_index,
-            } => {
-                if rule.role.writable || rule.role.signer {
-                    panic!("stored-bump PDA application rules must be read-only");
-                }
-                if challenge_account_index >= i {
-                    panic!("stored-bump PDA source must be an earlier account");
-                }
-                match rules[challenge_account_index].identity {
-                    ApplicationAccountIdentity::CoreRecord {
-                        kind: ApplicationCoreRecordKind::ChallengeV8,
-                    } => {}
-                    _ => panic!("stored-bump PDA source must be a validated DCR1 core record"),
-                }
+            // Both read revision-8 records, retired after v0.1.0-alpha.
+            ApplicationAccountIdentity::CoreRecord { .. }
+            | ApplicationAccountIdentity::StoredBumpPda { .. } => {
+                panic!("core-record and stored-bump rules read retired revision-8 records");
             }
         }
         i += 1;
@@ -717,60 +705,10 @@ fn validate_application_account_rules(
                     return Err(ProgramError::InvalidAccountData);
                 }
             }
-            ApplicationAccountIdentity::CoreRecord { kind } => {
-                if rule.role.writable
-                    || rule.role.signer
-                    || account.is_writable
-                    || account.is_signer
-                {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                match kind {
-                    ApplicationCoreRecordKind::DocumentV8 => {
-                        crate::unified::document::document_v8_stored(
-                            program_id,
-                            account,
-                            None,
-                            false,
-                            crate::unified::DCR1_AUTH,
-                        )?;
-                    }
-                    ApplicationCoreRecordKind::ChallengeV8 => {
-                        crate::unified::challenge::validate_v8_readonly(program_id, account)?;
-                    }
-                }
-            }
-            ApplicationAccountIdentity::StoredBumpPda {
-                challenge_account_index,
-            } => {
-                if challenge_account_index >= index
-                    || !validated
-                        .get(challenge_account_index)
-                        .copied()
-                        .unwrap_or(false)
-                {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                let challenge = &accounts[challenge_account_index];
-                let response_bump = challenge
-                    .try_borrow_data()?
-                    .get(crate::unified::challenge::RESPONSE_BUMP_AT)
-                    .copied()
-                    .ok_or(ProgramError::InvalidAccountData)?;
-                let kind = AccountKind::variable(
-                    b"DRU1",
-                    crate::closure_v2_response::HEADER,
-                    crate::closure_v2_response::HEADER + crate::closure_v2_response::MAX_BODY,
-                )
-                .with_version(4, 1);
-                expect_derived_with_bump(
-                    account,
-                    program_id,
-                    &[b"dcg-hcl-response", challenge.key.as_ref()],
-                    response_bump,
-                    kind,
-                    rule.role,
-                )?;
+            // Refused at build time too (validate_application_rules).
+            ApplicationAccountIdentity::CoreRecord { .. }
+            | ApplicationAccountIdentity::StoredBumpPda { .. } => {
+                return Err(ProgramError::InvalidAccountData);
             }
         }
         validated[index] = true;
@@ -824,189 +762,6 @@ pub type ApplicationHandler = for<'accounts, 'info> fn(
     ApplicationInstructionContext<'accounts>,
     &CheckedApplicationAccounts<'accounts, 'info>,
 ) -> ProgramResult;
-
-/// The application-specific part of generic dispute replay.
-///
-/// DCG owns the DCR1/DRU1 state machine, route and witness parsing, and the
-/// point at which a replay result is compared with committed output. An
-/// application supplies only its form catalog and PT1 implementation. The
-/// input and artifact byte slices have already passed the generic envelope
-/// checks when they reach this hook.
-pub trait ApplicationDisputeHooks: Sync {
-    /// Whether this application defines the selected form for the bound
-    /// machine. This does not execute the form.
-    fn supports_form(&self, machine: u8, form: u16) -> bool;
-
-    /// Replay one application form into the caller-provided output buffer.
-    /// `output_range` is used by forms whose result is verified in bounded
-    /// chunks; `None` requests the whole result.
-    fn replay_pt1(
-        &self,
-        request: ApplicationReplayRequest<'_>,
-        output: &mut [u8],
-    ) -> Result<usize, u32>;
-
-    /// Whether the selected application form requires tags 122 and 123
-    /// before replay. The form/operation catalog remains application-owned.
-    fn requires_weight_rows(&self, _form: u16, _operation: u16) -> bool {
-        false
-    }
-
-    /// Whether the selected application form requires tag 127 before replay.
-    fn requires_artifact_block(&self, _form: u16, _operation: u16) -> bool {
-        false
-    }
-}
-
-/// Inputs to one application-owned PT1 replay. The generic handler supplies
-/// ordered authenticated read operands and only artifact operands approved by
-/// [`ArtifactWitnessVerifier`].
-pub struct ApplicationReplayRequest<'a> {
-    pub machine: u8,
-    pub form: u16,
-    pub operation: u16,
-    pub payload: &'a [u8],
-    pub reads: &'a [&'a [u8]],
-    pub artifact_operands: &'a [&'a [u8]],
-    /// Original tag-124 bytes, for application-defined bounded replay
-    /// continuations. DCG validates the tag and passes the bytes unchanged.
-    pub instruction_data: &'a [u8],
-    pub output_range: Option<(u32, u32)>,
-}
-
-/// Row commitment returned by the application when tag 122 validates a
-/// model descriptor core.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArtifactRowAnchor {
-    pub root: [u8; 32],
-    pub leaf_count: u32,
-}
-
-/// Application-owned checks for model-artifact witness bytes used by tags
-/// 122, 123, and 127. Implementations must fail closed; DCG never interprets
-/// model tensor names, quantizer rows, or artifact-root domains.
-pub trait ArtifactWitnessVerifier: Sync {
-    /// Return the committed content digest for a form's application-supplied
-    /// read (for example, a fixed lookup table). The generic verifier binds
-    /// this digest to the DGR1 read row and checks witness bytes against it.
-    fn supplied_read_hash(
-        &self,
-        machine: u8,
-        form: u16,
-        region: u16,
-        byte_length: u32,
-    ) -> Result<[u8; 32], u32>;
-
-    /// Authenticate the staged descriptor core against the document's model
-    /// root and return its committed row anchor (tag 122).
-    fn verify_descriptor_row_anchor(
-        &self,
-        descriptor_core: &[u8],
-        model_root: &[u8; 32],
-    ) -> Result<ArtifactRowAnchor, u32>;
-
-    /// Authenticate the named row range within that descriptor anchor
-    /// (tag 123).
-    fn verify_weight_rows(
-        &self,
-        witness: &[u8],
-        anchor: ArtifactRowAnchor,
-        tensor_name: &[u8],
-        first_row: u32,
-        row_count: u16,
-        width: u32,
-    ) -> Result<(), u32>;
-
-    /// Authenticate the rows required by an application entry. The witness
-    /// envelope is generic DGR1 data; tensor naming and row selection belong
-    /// to the application, so DCG does not decode model-specific payloads.
-    fn verify_weight_rows_for_entry(
-        &self,
-        _witness: &[u8],
-        _anchor: ArtifactRowAnchor,
-        _machine: u8,
-        _form: u16,
-        _operation: u16,
-        _payload: &[u8],
-        _read_operands: &[&[u8]],
-    ) -> Result<(), u32> {
-        Err(734)
-    }
-
-    /// Authenticate a tag-127 artifact block for the selected application
-    /// form and operation against the document model root.
-    fn verify_artifact_block(
-        &self,
-        form: u16,
-        operation: u16,
-        position: u32,
-        witness: &[u8],
-        descriptor_core: &[u8],
-        model_root: &[u8; 32],
-    ) -> Result<(), u32>;
-}
-
-struct RejectDisputeHooks;
-
-impl ApplicationDisputeHooks for RejectDisputeHooks {
-    fn supports_form(&self, _machine: u8, _form: u16) -> bool {
-        false
-    }
-
-    fn replay_pt1(
-        &self,
-        _request: ApplicationReplayRequest<'_>,
-        _output: &mut [u8],
-    ) -> Result<usize, u32> {
-        Err(734)
-    }
-}
-
-impl ArtifactWitnessVerifier for RejectDisputeHooks {
-    fn supplied_read_hash(
-        &self,
-        _machine: u8,
-        _form: u16,
-        _region: u16,
-        _byte_length: u32,
-    ) -> Result<[u8; 32], u32> {
-        Err(734)
-    }
-
-    fn verify_descriptor_row_anchor(
-        &self,
-        _descriptor_core: &[u8],
-        _model_root: &[u8; 32],
-    ) -> Result<ArtifactRowAnchor, u32> {
-        Err(734)
-    }
-
-    fn verify_weight_rows(
-        &self,
-        _witness: &[u8],
-        _anchor: ArtifactRowAnchor,
-        _tensor_name: &[u8],
-        _first_row: u32,
-        _row_count: u16,
-        _width: u32,
-    ) -> Result<(), u32> {
-        Err(734)
-    }
-
-    fn verify_artifact_block(
-        &self,
-        _form: u16,
-        _operation: u16,
-        _position: u32,
-        _witness: &[u8],
-        _descriptor_core: &[u8],
-        _model_root: &[u8; 32],
-    ) -> Result<(), u32> {
-        Err(734)
-    }
-}
-
-static REJECT_DISPUTE_HOOKS: RejectDisputeHooks = RejectDisputeHooks;
 
 /// One statically linked application instruction and its semantic identity.
 #[derive(Clone, Copy)]
@@ -1190,8 +945,6 @@ fn encode_application_account_rule(rule: &ApplicationAccountRule) -> Vec<u8> {
 pub struct ApplicationProgramManifest {
     application: &'static ApplicationManifest,
     instructions: &'static [ApplicationInstruction],
-    dispute_hooks: &'static dyn ApplicationDisputeHooks,
-    artifact_witness_verifier: &'static dyn ArtifactWitnessVerifier,
 }
 
 impl ApplicationProgramManifest {
@@ -1202,23 +955,6 @@ impl ApplicationProgramManifest {
     pub const fn new<const N: usize>(
         application: &'static ApplicationManifest,
         instructions: &'static [ApplicationInstruction; N],
-    ) -> Self {
-        Self::new_with_dispute_hooks(
-            application,
-            instructions,
-            &REJECT_DISPUTE_HOOKS,
-            &REJECT_DISPUTE_HOOKS,
-        )
-    }
-
-    /// Construct a manifest with the application's generic dispute and
-    /// artifact-witness adapters. The handler table retains its compile-time
-    /// tag checks and canonical order.
-    pub const fn new_with_dispute_hooks<const N: usize>(
-        application: &'static ApplicationManifest,
-        instructions: &'static [ApplicationInstruction; N],
-        dispute_hooks: &'static dyn ApplicationDisputeHooks,
-        artifact_witness_verifier: &'static dyn ArtifactWitnessVerifier,
     ) -> Self {
         let mut tags = [0u8; N];
         let mut i = 0usize;
@@ -1231,8 +967,6 @@ impl ApplicationProgramManifest {
         Self {
             application,
             instructions,
-            dispute_hooks,
-            artifact_witness_verifier,
         }
     }
 
@@ -1244,18 +978,6 @@ impl ApplicationProgramManifest {
     /// The canonical ascending static instruction table.
     pub const fn instructions(&self) -> &'static [ApplicationInstruction] {
         self.instructions
-    }
-
-    /// Application-owned form/replay adapter used by generic dispute tags.
-    pub const fn dispute_hooks(&self) -> &'static dyn ApplicationDisputeHooks {
-        self.dispute_hooks
-    }
-
-    /// Application-owned model-artifact verifier used by generic dispute
-    /// tags. Tags that need this hook remain refused until their engine path
-    /// is enabled.
-    pub const fn artifact_witness_verifier(&self) -> &'static dyn ArtifactWitnessVerifier {
-        self.artifact_witness_verifier
     }
 
     /// Versioned identity for the assembled application program contract.
@@ -1309,14 +1031,6 @@ pub fn process_instruction_with_application(
     let Some(tag) = data.first().copied() else {
         return Err(ProgramError::InvalidInstructionData);
     };
-
-    // The application table supplies form/kernel/artifact hooks, while DCG
-    // owns these shared dispute transitions. Keep tag 125 on the core path.
-    if matches!(tag, 120..=124 | 126..=129) {
-        return crate::closure_v2_generic::process_generic_dispute_tag(
-            program_id, accounts, data, manifest,
-        );
-    }
 
     if is_core_instruction_tag_revision_8(tag) {
         return process_instruction_with_manifest(
@@ -1552,31 +1266,26 @@ mod tests {
             .expect("core dispatcher exists");
         let mut found = DispatchMatch(Vec::new());
         syn::visit::Visit::visit_block(&mut found, &function.block);
-        // The dispute family has its own app-hook route and is intentionally
-        // omitted from CORE_INSTRUCTION_TAGS_REVISION_8.
-        found.0.retain(|tag| !matches!(*tag, 120..=124 | 126..=129));
         found.0.sort_unstable();
         found.0.dedup();
         found.0
     }
 
     #[test]
-    fn revision8_core_tag_set_is_sorted_and_matches_the_dispatch_surface() {
-        assert_eq!(
-            CORE_INSTRUCTION_TAGS_REVISION_8,
-            dispatcher_handler_tags().as_slice()
-        );
+    fn core_tag_set_is_sorted_and_covers_the_dispatch_surface_and_retired_tags() {
         assert!(CORE_INSTRUCTION_TAGS_REVISION_8
             .windows(2)
             .all(|pair| pair[0] < pair[1]));
         for tag in CORE_INSTRUCTION_TAGS_REVISION_8 {
             assert!(is_core_instruction_tag_revision_8(*tag));
         }
-        for tag in 120..=124 {
-            assert!(!is_core_instruction_tag_revision_8(tag));
+        // Every tag the core dispatcher routes is reserved.
+        for tag in dispatcher_handler_tags() {
+            assert!(is_core_instruction_tag_revision_8(tag), "dispatched tag {tag} not reserved");
         }
-        for tag in 126..=129 {
-            assert!(!is_core_instruction_tag_revision_8(tag));
+        // The retired application dispute family stays reserved too.
+        for tag in 120..=129 {
+            assert!(is_core_instruction_tag_revision_8(tag));
         }
     }
 
@@ -1633,8 +1342,6 @@ mod tests {
         static FORGED: ApplicationProgramManifest = ApplicationProgramManifest {
             application: &TEST_APPLICATION,
             instructions: &SHADOW_INSTRUCTIONS,
-            dispute_hooks: &REJECT_DISPUTE_HOOKS,
-            artifact_witness_verifier: &REJECT_DISPUTE_HOOKS,
         };
         let program_id = Pubkey::new_unique();
         let data = [125];
@@ -1844,8 +1551,6 @@ mod tests {
             ApplicationProgramManifest {
                 application: &TEST_APPLICATION,
                 instructions: &PROGRAM_KEY_INSTRUCTIONS,
-                dispute_hooks: &REJECT_DISPUTE_HOOKS,
-                artifact_witness_verifier: &REJECT_DISPUTE_HOOKS,
             };
 
         let program_id = Pubkey::new_unique();
@@ -1874,127 +1579,6 @@ mod tests {
             Err(ProgramError::InvalidAccountData)
         );
         assert_eq!(PDA_ORDER.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn core_challenge_and_its_stored_bump_response_are_checked_read_only() {
-        let _lock = PDA_ORDER_LOCK.lock().unwrap();
-        static DISPUTE_RULES: [ApplicationAccountRule; 2] = [
-            ApplicationAccountRule::new(
-                0,
-                ApplicationAccountIdentity::CoreRecord {
-                    kind: ApplicationCoreRecordKind::ChallengeV8,
-                },
-                RoleFlags {
-                    writable: false,
-                    signer: false,
-                },
-            ),
-            ApplicationAccountRule::new(
-                1,
-                ApplicationAccountIdentity::StoredBumpPda {
-                    challenge_account_index: 0,
-                },
-                RoleFlags {
-                    writable: false,
-                    signer: false,
-                },
-            ),
-        ];
-        static DISPUTE_INSTRUCTIONS: [ApplicationInstruction; 1] = [ApplicationInstruction::new(
-            APP_TAG,
-            "example/dispute-account-test",
-            1,
-            &DISPUTE_RULES,
-            pda_preflight,
-            pda_handler,
-        )];
-        static DISPUTE_PROGRAM: ApplicationProgramManifest =
-            ApplicationProgramManifest::new(&TEST_APPLICATION, &DISPUTE_INSTRUCTIONS);
-
-        let program_id = Pubkey::new_unique();
-        let descriptor = [9u8; 32];
-        let challenger = Pubkey::new_unique();
-        let nonce = 17u32.to_le_bytes();
-        let (challenge_key, challenge_bump) = Pubkey::find_program_address(
-            &[
-                crate::unified::address::CHALLENGE_SEED,
-                &descriptor,
-                challenger.as_ref(),
-                &nonce,
-            ],
-            &program_id,
-        );
-        let (response_key, response_bump) = Pubkey::find_program_address(
-            &[b"dcg-hcl-response", challenge_key.as_ref()],
-            &program_id,
-        );
-        let mut challenge_lamports = 1;
-        let mut challenge_data = vec![0u8; crate::unified::challenge::SIZE];
-        challenge_data[..4].copy_from_slice(b"DCR1");
-        challenge_data[4] = crate::unified::challenge::PHASE_RESPOND;
-        challenge_data[6..8].copy_from_slice(&crate::unified::challenge::VERSION.to_le_bytes());
-        challenge_data[8..40].copy_from_slice(challenger.as_ref());
-        challenge_data[72..104].copy_from_slice(&descriptor);
-        challenge_data[crate::unified::challenge::PT2P_MODE_AT] = 1;
-        challenge_data[140..144].copy_from_slice(&nonce);
-        challenge_data[crate::unified::challenge::RECORD_BUMP_AT] = challenge_bump;
-        challenge_data[crate::unified::challenge::RECORD_BUMP_MARKER_AT] = 1;
-        challenge_data[crate::unified::challenge::RESPONSE_BUMP_STAGED_AT] = response_bump;
-        challenge_data[crate::unified::challenge::RESPONSE_BUMP_AT] = response_bump;
-        let challenge_account = AccountInfo::new(
-            &challenge_key,
-            false,
-            false,
-            &mut challenge_lamports,
-            &mut challenge_data,
-            &program_id,
-            false,
-            0,
-        );
-        let original_challenge = challenge_account.try_borrow_data().unwrap().to_vec();
-
-        let mut response_lamports = 1;
-        let mut response_data = vec![0u8; crate::closure_v2_response::HEADER];
-        response_data[..4].copy_from_slice(b"DRU1");
-        response_data[4..6].copy_from_slice(&1u16.to_le_bytes());
-        let response_account = AccountInfo::new(
-            &response_key,
-            false,
-            false,
-            &mut response_lamports,
-            &mut response_data,
-            &program_id,
-            false,
-            0,
-        );
-        let mut writable_challenge = challenge_account.clone();
-        writable_challenge.is_writable = true;
-        assert_eq!(
-            process_instruction_with_application(
-                &program_id,
-                &[writable_challenge, response_account.clone()],
-                &[APP_TAG, 7],
-                &DISPUTE_PROGRAM,
-            ),
-            Err(ProgramError::InvalidAccountData),
-            "a handler cannot receive a writable core challenge through a read-only rule"
-        );
-        PDA_ORDER.store(0, Ordering::SeqCst);
-        assert_eq!(
-            process_instruction_with_application(
-                &program_id,
-                &[challenge_account.clone(), response_account],
-                &[APP_TAG, 7],
-                &DISPUTE_PROGRAM,
-            ),
-            Ok(())
-        );
-        assert_eq!(PDA_ORDER.load(Ordering::SeqCst), HANDLER_MARK);
-        assert_eq!(
-            challenge_account.try_borrow_data().unwrap().as_ref(),
-            original_challenge
-        );
     }
 
     #[cfg(feature = "sbf-lifecycle-test")]
@@ -2054,41 +1638,43 @@ mod tests {
     }
 
     #[test]
-    fn stored_bump_rules_reject_mutating_or_signer_roles() {
-        for role in [
-            RoleFlags {
-                writable: true,
-                signer: false,
+    fn retired_core_record_rules_are_refused_at_build_time() {
+        let read_only = RoleFlags {
+            writable: false,
+            signer: false,
+        };
+        let core = ApplicationAccountRule::new(
+            0,
+            ApplicationAccountIdentity::CoreRecord {
+                kind: ApplicationCoreRecordKind::ChallengeV8,
+            },
+            read_only,
+        );
+        let signer = ApplicationAccountRule::new(
+            0,
+            ApplicationAccountIdentity::ExactKey {
+                source: ApplicationKeySource::SignerSelf,
+                owner: None,
+                executable: false,
             },
             RoleFlags {
                 writable: false,
                 signer: true,
             },
-        ] {
-            let rules = [
-                ApplicationAccountRule::new(
-                    0,
-                    ApplicationAccountIdentity::CoreRecord {
-                        kind: ApplicationCoreRecordKind::ChallengeV8,
-                    },
-                    RoleFlags {
-                        writable: false,
-                        signer: false,
-                    },
-                ),
-                ApplicationAccountRule::new(
-                    1,
-                    ApplicationAccountIdentity::StoredBumpPda {
-                        challenge_account_index: 0,
-                    },
-                    role,
-                ),
-            ];
-            assert!(std::panic::catch_unwind(|| {
-                validate_application_rules(b"test-app", &rules)
-            })
-            .is_err());
-        }
+        );
+        let bump = ApplicationAccountRule::new(
+            1,
+            ApplicationAccountIdentity::StoredBumpPda {
+                challenge_account_index: 0,
+            },
+            read_only,
+        );
+        assert!(std::panic::catch_unwind(|| validate_application_rules(b"test-app", &[core])).is_err());
+        assert!(
+            std::panic::catch_unwind(|| validate_application_rules(b"test-app", &[signer, bump]))
+                .is_err()
+        );
+        validate_application_rules(b"test-app", &[signer]);
     }
 
     #[test]

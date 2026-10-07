@@ -21,7 +21,7 @@ conform = []
 
 [dependencies]
 # An application pins DCG by git revision; this example uses the path.
-dcg-program = { path = "../../crates/dcg-program", default-features = false, features = ["no-entrypoint", "revision-8"] }
+dcg-program = { path = "../../crates/dcg-program", default-features = false, features = ["no-entrypoint"] }
 solana-program = "=2.3.0"
 
 [[bin]]

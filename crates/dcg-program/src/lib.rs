@@ -4,24 +4,16 @@
 //! bounded SVM adapter modules live here. Applications provide kernels through
 //! a compile-time manifest; this repository includes a tiny test kernel only.
 
+// The retired revision-8 manifest fields stay for one release, deprecated;
+// DCG's own manifests still name them.
+#![allow(deprecated)]
+
 pub mod account_provenance;
 /// Static application instruction registration and dispatch seam.
 pub mod app_api;
-#[cfg(feature = "sbf-real-lifecycle-test")]
-pub mod closure_v2;
-#[cfg(not(feature = "sbf-real-lifecycle-test"))]
-pub mod closure_v2;
-pub(crate) mod closure_v2_accounts;
-/// Shared revision-8 dispute verifier used by the statically selected app
-/// manifest. Application form execution remains behind the app API hooks.
-pub mod closure_v2_generic;
-pub mod closure_v2_response;
-pub(crate) mod closure_v2_tree;
 pub mod commit;
+/// Deprecated placeholders for the retired revision-8 manifest hooks.
 pub mod compatibility;
-pub mod desc_upload;
-pub mod descriptor;
-pub mod envelope_seal;
 pub mod graph_v2;
 #[cfg(feature = "graph-v21")]
 pub mod disputes_v21;
@@ -29,47 +21,25 @@ pub mod hash;
 pub mod kernel;
 pub mod kernel_kit;
 pub mod kernel_svm;
-pub mod kernels;
-pub mod position_template;
-pub mod pt1_onchain;
-pub mod pt2p;
-pub mod pt2p_onchain;
-pub mod region_commitment;
-pub mod root_only;
-pub mod root_only_challenge;
-pub mod root_only_sealed;
-pub mod seal;
 pub mod stateful;
 #[cfg(feature = "sbf-real-lifecycle-test")]
 pub mod stateful_test;
 #[cfg(feature = "sbf-lifecycle-test")]
 pub mod test_lifecycle;
-pub mod unified;
 
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
     pubkey::Pubkey,
 };
 
-/// Revision-8 allowlist adapter using the application's statically compiled
-/// manifest. Production app crates can call `process_instruction_with_manifest`
-/// from their own entrypoint to select their compiled manifest.
+/// Dispatch with the application's statically compiled manifest. Production
+/// app crates can call `process_instruction_with_manifest` from their own
+/// entrypoint to select their compiled manifest.
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    touch_runtime_marker(); let Some(tag) = data.first().copied() else {
-        return Err(ProgramError::InvalidInstructionData);
-    }; if !cfg!(feature = "revision-8-lifecycle") && (115..=200).contains(&tag) { return Err(ProgramError::InvalidInstructionData); } // the revision-8 lifecycle routes only with its feature; one line, so linked line numbers do not move
-    if matches!(tag, 120..=124 | 126..=129) {
-        return closure_v2_generic::process_generic_dispute_tag(
-            program_id,
-            accounts,
-            data,
-            application_program_manifest(),
-        );
-    }
     process_instruction_with_manifest(
         program_id,
         accounts,
@@ -84,7 +54,6 @@ pub fn process_instruction(
     feature = "alpha-image",
     any(
         feature = "test-kernel",
-        feature = "revision-8-lifecycle",
         feature = "graph-v2",
         feature = "test-legacy-template-create",
         feature = "sbf-lifecycle-test",
@@ -97,12 +66,7 @@ compile_error!("the alpha-image feature excludes test, legacy and v2.0 features"
 fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
     static NO_INSTRUCTIONS: [app_api::ApplicationInstruction; 0] = [];
     static TEST_APPLICATION: app_api::ApplicationProgramManifest =
-        app_api::ApplicationProgramManifest::new_with_dispute_hooks(
-            &kernel::test_kernel::MANIFEST_APP,
-            &NO_INSTRUCTIONS,
-            &kernel::test_kernel::DISPUTE_HOOKS,
-            &kernel::test_kernel::DISPUTE_HOOKS,
-        );
+        app_api::ApplicationProgramManifest::new(&kernel::test_kernel::MANIFEST_APP, &NO_INSTRUCTIONS);
     &TEST_APPLICATION
 }
 
@@ -144,9 +108,11 @@ pub fn process_instruction_with_manifest(
     data: &[u8],
     manifest: &'static kernel::ApplicationManifest,
 ) -> ProgramResult {
-    touch_runtime_marker(); let Some(tag) = data.first().copied() else {
+    touch_runtime_marker();
+    let Some(tag) = data.first().copied() else {
         return Err(ProgramError::InvalidInstructionData);
-    }; if !cfg!(feature = "revision-8-lifecycle") && (115..=200).contains(&tag) { return Err(ProgramError::InvalidInstructionData); } // the revision-8 lifecycle routes only with its feature; one line, so linked line numbers do not move
+    };
+    let _ = manifest;
     #[cfg(feature = "sbf-lifecycle-test")]
     if (240..=250).contains(&tag) {
         return test_lifecycle::process(program_id, accounts, data);
@@ -156,71 +122,32 @@ pub fn process_instruction_with_manifest(
         return stateful_test::process(program_id, accounts, data);
     }
     match tag {
-        115 => closure_v2_response::begin(program_id, accounts, data),
-        116 => closure_v2_response::grow(program_id, accounts, data),
-        117 => closure_v2_response::write(program_id, accounts, data),
-        118 => closure_v2_response::seal(program_id, accounts, data),
-        125 => closure_v2_response::write_at(program_id, accounts, data),
-        120..=124 | 126..=129 => {
-            let application = app_api::ApplicationProgramManifest::new(manifest, &[]);
-            closure_v2_generic::process_generic_dispute_tag(
-                program_id,
-                accounts,
-                data,
-                &application,
-            )
-        }
         // The v2 graph lifecycle; graph_v2::process routes each tag by feature
         // (208 raw write and 219-226 are testnet-only features).
         #[cfg(feature = "graph-v2")]
         208..=226 => graph_v2::process(program_id, accounts, data),
         #[cfg(feature = "graph-v21")]
         227 => disputes_v21::process(program_id, accounts, data, manifest),
-        140 => pt1_onchain::init_fresh(program_id, accounts, data),
-        141 => pt1_onchain::upload(program_id, accounts, data),
-        142 => pt1_onchain::seal(program_id, accounts, data),
-        143 => pt2p_onchain::init(program_id, accounts, data),
-        144 => pt2p_onchain::hash(program_id, accounts, data),
-        145 => pt2p_onchain::seal(program_id, accounts, data),
-        146 => pt2p_onchain::instantiate_with_selector(
-            program_id,
-            accounts,
-            data,
-            manifest.decision_routes,
-        ),
-        193 => pt2p_onchain::seal_pxr_chunk(program_id, accounts, data),
-        198 => pt1_onchain::close_pt1x_output(program_id, accounts, data),
-        199 => pt2p_onchain::reserve_pt1o_with_selector(
-            program_id,
-            accounts,
-            data,
-            manifest.decision_routes,
-        ),
-        200 => pt2p_onchain::close_pt1o_reservation_with_selector(
-            program_id,
-            accounts,
-            data,
-            manifest.decision_routes,
-        ),
-        131 | 132 | 156..=169 | 172..=178 | 183..=187 | 197 => {
-            unified::process_with_manifest(program_id, accounts, data, manifest)
-                .unwrap_or(Err(ProgramError::InvalidInstructionData))
-        }
+        // Everything else is refused, including the retired revision-8
+        // lifecycle (tags 115-200), which stays reserved to DCG.
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
 
 #[cfg(feature = "test-kernel")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     &kernel::test_kernel::MANIFEST_APP
 }
 
 #[cfg(all(not(feature = "test-kernel"), feature = "example-kernels"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     &kernel::test_kernel::ALPHA_MANIFEST_APP
 }
 
 #[cfg(all(not(feature = "test-kernel"), not(feature = "example-kernels")))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     static EMPTY_KERNELS: [&'static dyn kernel::Kernel; 0] = [];
     static EMPTY_REPLAYS: [kernel::OptimisticReplayBinding; 0] = [];
@@ -246,13 +173,14 @@ mod application_manifest_tests {
         assert_eq!(super::application_manifest().validate(), Ok(()));
     }
 
-    #[cfg(feature = "revision-8")]
     #[test]
-    fn revision8_tag_182_matches_basanos_unsupported_tag_result() {
-        assert_eq!(
-            super::process_instruction(&solana_program::pubkey::Pubkey::new_unique(), &[], &[182]),
-            Err(solana_program::program_error::ProgramError::InvalidInstructionData)
-        );
+    fn retired_revision8_tags_are_refused() {
+        for tag in 115u8..=200 {
+            assert_eq!(
+                super::process_instruction(&solana_program::pubkey::Pubkey::new_unique(), &[], &[tag]),
+                Err(solana_program::program_error::ProgramError::InvalidInstructionData)
+            );
+        }
     }
 }
 

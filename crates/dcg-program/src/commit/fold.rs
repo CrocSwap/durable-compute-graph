@@ -49,7 +49,7 @@
 //! test/offline path, never the on-chain one.
 
 use crate::commit::{err, COMMIT_FRONTIER_LEVELS, TAG_CLOSURE_NODE, TAG_CLOSURE_ROOT};
-use crate::descriptor::DcgError;
+use crate::commit::DcgError;
 use crate::hash::sha256;
 
 /// The membership proof depth DCG accepts: the frontier bound, not the legacy

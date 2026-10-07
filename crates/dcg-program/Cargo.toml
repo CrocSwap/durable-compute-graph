@@ -6,15 +6,7 @@ publish = false
 license = "GPL-3.0-only"
 
 [features]
-default = ["custom-heap", "revision-8"]
-revision-7 = []
-revision-8 = []
-# Routes the revision-8 document lifecycle (tags 115-200). It is Basanos's
-# production path, not part of DCG's public surface, so it is off by default
-# and images that need it name it. The code still compiles under revision-8;
-# without this feature its tags are refused. Planned: retire it once Basanos
-# documents run on v2.1 (docs/plans/v2-roadmap.md).
-revision-8-lifecycle = ["revision-8"]
+default = ["custom-heap"]
 # Routes the DCG v2 trace-committed graph lifecycle (tags 209-218).
 graph-v2 = []
 # Adds the sampling audit (219) and root-committed descent (220-226); under
@@ -26,14 +18,9 @@ graph-v2-raw-write = ["graph-v2"]
 # Optimistic disputes v2.1 skeleton (tag 227). Testnet only: the template's
 # spec root is trusted from the admitter (design O1).
 graph-v21 = []
-test-rev8-before-payer-alias-fix = []
 no-entrypoint = []
 custom-heap = []
 heap-census = []
-test-weakened-class-rule = []
-# Test-only legacy mode: UnifiedInit without the option-range check (an older
-# program's documents), for the fix-point conviction test. Never in a release.
-test-legacy-unchecked-option-range = []
 test-kernel = []
 # Example application kernels (the byte-sum and SHA-256 concat kernels and the
 # toy LX1 machine) under a non-test manifest, `dcg-alpha/1`. No test bindings.
@@ -50,9 +37,6 @@ alpha-image = ["graph-v21", "example-kernels"]
 test-legacy-template-create = []
 sbf-lifecycle-test = ["test-kernel"]
 sbf-real-lifecycle-test = ["test-kernel"]
-sbf-unbound-form-test = ["sbf-real-lifecycle-test"]
-# The test manifest admits app-bound classes as attested (no position scan).
-sbf-attested-admission-test = ["sbf-real-lifecycle-test"]
 
 [lib]
 name = "dcg_program"
@@ -72,7 +56,6 @@ zeroize = "=1.8.1"
 zeroize_derive = "=1.4.3"
 
 [dev-dependencies]
-dcg-test-support = { path = "../dcg-test-support" }
 bincode = "=1.3.3"
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 solana-account = "=2.2.1"

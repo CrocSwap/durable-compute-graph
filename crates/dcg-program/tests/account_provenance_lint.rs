@@ -10,11 +10,7 @@ use syn::{
 
 // These low-level mutators have no identity inputs of their own. Their
 // callers validate the exact account role before delegating the write.
-const CALLER_GATED_WRITERS: &[(&str, &str)] = &[
-    ("unified/bond.rs", "escrow_pot"),
-    ("unified/bond.rs", "assign_to_program"),
-    ("unified/bond.rs", "standard_payout"),
-];
+const CALLER_GATED_WRITERS: &[(&str, &str)] = &[];
 
 // This is not a PDA writer. raw_write is a signer-authorized test upload.
 const TEST_ONLY_EXEMPTIONS: &[(&str, &str)] = &[
@@ -389,28 +385,6 @@ fn production_images_exclude_raw_write_required_for_legacy_forgery() {
     let dcg_manifest = include_str!("../Cargo.toml");
     reject_raw_feature(dcg_manifest, &["default".to_owned()], "DCG default");
 
-    // The Basanos assembly is in this worktree when DCG is nested there;
-    // otherwise it is a sibling checkout of the standalone DCG repository.
-    let dcg_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let basanos_manifest = dcg_root.ancestors()
-        .map(|root| root.join("chain/dcg-program/Cargo.toml"))
-        .chain(dcg_root.ancestors().map(|root| root.join("basanos/chain/dcg-program/Cargo.toml")))
-        .find(|path| path.is_file()).expect("Basanos image Cargo manifest");
-    let basanos = fs::read_to_string(basanos_manifest).unwrap();
-    let dependency = basanos.lines().find(|line| line.starts_with("dcg_core ="))
-        .expect("Basanos DCG dependency");
-    assert!(dependency.contains("default-features = false"));
-    let dependency_features = dependency.split("features =").nth(1).expect("DCG core features");
-    let mut core_features = quoted_values(dependency_features);
-    for wrapper in feature_members(&basanos, "default") {
-        for member in feature_members(&basanos, &wrapper) {
-            if let Some(core) = member.strip_prefix("dcg_core/") {
-                core_features.push(core.to_owned());
-            }
-        }
-    }
-    reject_raw_feature(dcg_manifest, &core_features, "Basanos switchover");
-
     // The shared testnet image is built by scripts/build-alpha-image.sh; its
     // FEATURES line is the feature set that image ships.
     let script = include_str!("../../../scripts/build-alpha-image.sh");
@@ -448,14 +422,6 @@ fn source_audit_matches_the_reviewed_writer_allowlist() {
 // happens at the dispatcher or caller; changing this inventory still requires
 // an explicit review.
 const CURRENT_AUDIT_FINDINGS: &[&str] = &[
-    "closure_v2_accounts.rs::pub finalize_segment",
-    "closure_v2_accounts.rs::pub land_leaves",
-    "closure_v2_accounts.rs::pub publish_checkpoint",
-    "closure_v2_accounts.rs::restricted create",
-    "closure_v2_generic.rs::private rule_v6", // execute authenticates the v5 DCR1 and v6 DCM2 PDAs, size and kind before this helper.
-    "desc_upload.rs::private store_dcd1",
-    "desc_upload.rs::pub process_alloc",
-    "desc_upload.rs::pub process_upload",
     "disputes_v21.rs::private advance", // dispute_ctx authenticates run, template and dispute; the ruled sequence must equal the prefix.
     "disputes_v21.rs::private cache_answer", // dispute_ctx authenticates the target; the cache is an owned, derived D21C for this node.
     "disputes_v21.rs::private change_template_run_count", // init_run and close_run authenticate the tracked D21T before changing its count.
@@ -478,10 +444,6 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "disputes_v21_lx.rs::restricted midpoints", // lx_ctx (dispute_ctx: derived run, template and dispute) and kind 3; recorded executor signer; phase and deadline.
     "disputes_v21_lx.rs::restricted open", // only disputes_v21::open calls it, after template and run_checked; challenger signer; committed run in window; checkpoint paths against the committed root.
     "disputes_v21_lx.rs::restricted pick", // lx_ctx and kind 3; recorded challenger signer; phase and deadline.
-    "envelope_seal.rs::private create_pda",
-    "envelope_seal.rs::pub admission_step",
-    "envelope_seal.rs::pub registry_freeze",
-    "envelope_seal.rs::pub registry_write",
     "graph_v2.rs::private challenge", // run_checked binds DCR2 to DCT2; proved wrong step and challenger signer gate ruling.
     "graph_v2.rs::private choose", // checked run/dispute PDAs, recorded challenger signer and phase gate the choice.
     "graph_v2.rs::private close_run", // run_checked binds DCR2 to DCT2; recorded payer signer and terminal state gate close.
@@ -497,15 +459,6 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "graph_v2.rs::private sample_audit", // run_checked binds DCR2 to DCT2; slot-hash proof gates audit and bond.
     "graph_v2.rs::private settle_descent", // checked run/dispute PDAs, deadlines and payee keys gate timeout rulings.
     "graph_v2.rs::private take_bond", // callers authenticate the run or dispute PDA and recipient before moving excess rent.
-    "pt1_onchain.rs::private init_pt1x",
-    "pt1_onchain.rs::private init_with_magic",
-    "pt1_onchain.rs::pub init_variant",
-    "pt2p_onchain.rs::pub init",
-    "root_only.rs::pub increment_slots",
-    "root_only_sealed.rs::pub bind_manifest",
-    "root_only_sealed.rs::pub init_sealed",
-    "seal.rs::pub process_begin",
-    "seal.rs::pub process_step",
     "stateful.rs::private drain_to_refund",
     "stateful.rs::private encode_session",
     "stateful_v2.rs::private drain_to_refund",
@@ -531,13 +484,6 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "test_lifecycle.rs::private replay",
     "test_lifecycle.rs::private resolve",
     "test_lifecycle.rs::private settle",
-    "unified/challenge.rs::private assign_settlement_escrow",
-    "unified/challenge.rs::private built_in_settlement",
-    "unified/challenge.rs::pub rule",
-    "unified/config.rs::private close_unpublished_pt1x_pt2s",
-    "unified/result.rs::private close_conviction",
-    "unified/result.rs::private conviction",
-    "unified/result.rs::private drain_unchecked",
 ];
 
 #[test]
@@ -592,13 +538,12 @@ fn self_keyed_gates_do_not_cover_writes_and_private_impl_methods_are_audited() {
 }
 
 #[test]
-fn gaps_remain_explicit_and_route_tags_stay_revision_scoped() {
+fn gaps_remain_explicit_and_revision8_routes_stay_retired() {
     let spec = include_str!("../../../docs/spec/account-provenance.md");
-    assert!(spec.contains("Known gaps in the `revision-8` account lists"));
     assert!(spec.contains("self-seeded"));
     assert!(spec.contains("Caller-validated readers"));
     let lib = include_str!("../src/lib.rs");
     assert!(lib.contains("process_instruction_with_manifest"));
-    assert!(lib.contains("131 | 132 | 156..=169"));
+    assert!(!lib.contains("unified::process_with_manifest"));
     assert!(!lib.contains("7 => desc_upload::process_upload"));
 }
