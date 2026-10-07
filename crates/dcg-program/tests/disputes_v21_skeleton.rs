@@ -2522,9 +2522,10 @@ async fn executor_growth_rent_returns_to_the_executor_at_close() {
 
 /// Routing on the alpha SBF image (V21_SBF=1, BPF_OUT_DIR naming an image built
 /// with `--features alpha-image`): every tag other than 227 refuses before any
-/// account is read, including the test-only subtype 250. Native builds cannot
-/// check this, because dcg-test-support turns on revision-8-lifecycle for every
-/// dcg-program dev build (R2 review B, M2/M3).
+/// account is read, including the test-only subtype 250. This file needs the
+/// test kernel, which the alpha-image feature excludes, so the check runs on
+/// the SBF image (R2 review B, M2/M3); `lib.rs`'s native unit test checks that
+/// the retired revision-8 tags are refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn alpha_image_routes_only_tag_227() {
     if !std::env::var("V21_SBF").is_ok_and(|v| v == "1") {
