@@ -33,7 +33,7 @@ Then edit these files:
 
     ```toml
     dcg-program = { git = "<DCG repository URL>", rev = "<commit>", default-features = false,
-                    features = ["no-entrypoint", "revision-8"] }
+                    features = ["no-entrypoint"] }
     ```
 - **`src/bin/tally-conform.rs`:** if you renamed the package, change
   `use dcg_session_app::TALLY;` to your crate name with underscores

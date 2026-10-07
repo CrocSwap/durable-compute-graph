@@ -6,8 +6,9 @@ after that round's independent re-review. It states what every accepted tag 227
 transition must satisfy. It is not a proof that the program satisfies it. Each
 law lists the evidence that exists today and the known violations still open.
 
-This document succeeds [`referee-laws.md`](referee-laws.md) for v2.1. That
-page covers the revision-8 document lifecycle, which is being retired. The
+This document succeeds `referee-laws.md` for v2.1. That page covered the
+revision-8 document lifecycle, which was retired after v0.1.0-alpha (it is in
+that tag). The
 seven law headings are kept so the two can be compared; v2.1 adds two
 (neutrality, and admission bounds) and an LX1 section.
 

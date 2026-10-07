@@ -54,5 +54,5 @@ source in another terminal ([`dev-commands.md`](dev-commands.md)).
 - **Terms:** testnet only; formats may change before beta
   ([`release-terms.md`](release-terms.md)).
 
-The older revision-8 handler walkthrough, which Basanos uses, is in
-[`revision-8-handlers.md`](revision-8-handlers.md).
+The older revision-8 handler walkthrough was removed with revision 8; it is
+in the v0.1.0-alpha tag (`docs/revision-8-handlers.md`).

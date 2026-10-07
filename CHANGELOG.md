@@ -8,9 +8,39 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
 - **Release terms (owner 2026-10-06):** DCG-based programs may be deployed to
   mainnet at the deployer's own risk (alpha, unaudited, formats may change); the
   shared alpha program stays testnet only.
-- **Planned (owner 2026-10-06):** the revision-8 lifecycle is retired from DCG
-  (`docs/plans/retire-revision-8.md`); it stays in git history and in
-  v0.1.0-alpha.
+- **Revision 8 retired (owner 2026-10-06), breaking.** The revision-8
+  document lifecycle is removed from DCG (`docs/plans/retire-revision-8.md`);
+  it stays in git history and in v0.1.0-alpha. Removed: tags 115-200 (still
+  reserved to DCG and refused, so no application can reuse them), the
+  `closure_v2*`, `unified`, `pt1_onchain`, `pt2p*`, `root_only*`, `seal`,
+  `envelope_seal`, `descriptor`, `desc_upload`, `position_template`, `kernels`
+  and `region_commitment` modules; the features `revision-7`, `revision-8`,
+  `revision-8-lifecycle`, `test-rev8-before-payer-alias-fix`,
+  `test-weakened-class-rule`, `test-legacy-unchecked-option-range`,
+  `sbf-unbound-form-test` and `sbf-attested-admission-test`; the
+  `dcg-test-support` crate; `examples/hello-dispute`; and
+  `scripts/run-rev8-sbf-suites.sh`. v2.1 disputes, LX1, sessions and lanes,
+  graph v2, the sequencer and the Python client are unchanged.
+  - **Who is affected:** applications that build with `revision-8` or
+    `revision-8-lifecycle`, call the removed modules, or used
+    `ApplicationProgramManifest::new_with_dispute_hooks`,
+    `ApplicationDisputeHooks` or `ArtifactWitnessVerifier`. Basanos's mainnet
+    program and Doom on DCG are not affected while they pin v0.1.0-alpha.
+  - **Migration:**
+    - drop `revision-8` and `revision-8-lifecycle` from the `dcg-program`
+      features;
+    - build program manifests with `ApplicationProgramManifest::new` (the
+      application dispute and artifact hooks are gone);
+    - `ApplicationManifest` keeps its fields for this release:
+      `legacy_forms`, `require_legacy_form_binding`, `admission_scan`,
+      `hooks` and `decision_routes` are **deprecated** and read by no route.
+      Leave them as they are today (`&[]`, `false`, `AdmissionScan::Full`,
+      `&REVISION8_COMPATIBILITY`); `validate()` now refuses a manifest that
+      declares or requires a legacy form. The next release removes them;
+    - `ApplicationAccountIdentity::CoreRecord` and `StoredBumpPda` read
+      revision-8 records and are refused when the manifest is built;
+    - `compatibility::ApplicationHooks` and `DecisionRouteSelector` are empty
+      marker traits now.
 
 ## v0.1.0-alpha (2026-10-06)
 

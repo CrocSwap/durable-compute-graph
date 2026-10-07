@@ -64,7 +64,7 @@ solana_program::entrypoint!(process_instruction);
 The contract:
 
 - **Dependency.** Depend on `dcg-program` with `default-features = false` and
-  `features = ["no-entrypoint", "revision-8"]`, so DCG's own entrypoint and allocator stay out of your program. Pin DCG by git revision; the example uses a path.
+  `features = ["no-entrypoint"]`, so DCG's own entrypoint and allocator stay out of your program. Pin DCG by git revision; the example uses a path.
 - **Patch.** Add `[patch.crates-io] curve25519-dalek` pointing at DCG's vendored copy, `crates/dcg-program/vendor`. DCG's pinned dependency set needs it.
 - **Toolchain.** Build with `cargo build-sbf --tools-version v1.51 -- --locked` and commit your `Cargo.lock`. `examples/session-app/build.sh OUT` builds the image and writes a receipt with its sha256 and runtime version.
 - **The runtime owns the wire.** Every instruction tag your program receives is DCG's stateful v3 wire. To add instructions of your own, dispatch them before calling `process_with_kernel`, on tags DCG does not use.

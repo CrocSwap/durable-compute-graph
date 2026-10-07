@@ -116,6 +116,13 @@ refuses a manifest that sets legacy forms or requires them.
 so an application cannot reuse a revision-8 tag number. The next release
 removes the deprecated fields.
 
+**Consumer migration note.** Basanos's `chain/dcg-program` selects
+`dcg_core/revision-8` through its `revision-8-code` feature (the mainnet
+image included) and has its own revision-8 code over DCG's modules. Its pin
+stays on v0.1.0-alpha; when it next moves to a DCG release without revision 8,
+Basanos removes its revision-8 code and `revision-8-code` first, then
+rebuilds and requalifies the image (owner's go for any mainnet upgrade).
+
 ## Blocker found 2026-10-06: the Bend settlement pilot builds on revision 8
 
 Another session's uncommitted work in the main DCG checkout (features

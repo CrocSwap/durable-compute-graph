@@ -1,8 +1,8 @@
 # Program account address provenance
 
 Status: implementation rule for DCG program-owned account reads and writes.
-Revision-8 DCR1 uses reserved bytes for the challenge bump, marker, and response
-PDA bump.
+The revision-8 lifecycle, and with it the gaps this page listed for its records,
+was retired after v0.1.0-alpha (that tag keeps the earlier text).
 
 ## Rule
 
@@ -58,76 +58,14 @@ source for a program-owned record, its wire format is preserved and the gap is
 listed below for the next program version. Such a path must not be described as
 meeting the independent-source rule.
 
-Known gaps in the `revision-8` account lists and the compatibility stateful
-adapters:
+Known gaps in the compatibility stateful adapters:
 
-- **DCR1 challenge records and closure-v2 response tags 115–118/125.** Open
-  validates the new address from the instruction descriptor, challenger
-  signer, and nonce, then stores the canonical challenge bump at byte 146,
-  marker `1` at byte 147, and the canonical DRU1 response bump at byte 181
-  and stable byte 219. Tag 164 refreshes byte 219 from byte 181 after it
-  consumes position roots; a tag 132 ruling in POSITION_REVEAL or SELECT does
-  the same before tag 131 settlement.
-  Challenge readers require marker `1`; this image is intended for a fresh
-  program address, so pre-image marker-0 DCR1 records are refused. Revision-8
-  tag 131 uses the stored DCR1 and DRU1 bumps for fixed-cost address checks;
-  tag 132's timeout RULE uses the stored DCR1 bump. Tag 132 has no DRU1 account
-  in its list. Revision-7 settlement retains the canonical DRU1 search because
-  its records predate these bump fields. The account lists provide no independent challenge identity
-  anchor, so the seed source remains self-seeded.
-- **Generic dispute tags 120/121/126/128.** The generic revision-8 engine
-  requires a fresh DCR1 record with marker `1` at byte 147, checks its
-  challenge PDA using the stored canonical bump at byte 146, and checks DRU1
-  using the response bump at byte 219 before tag 120 stages its target. Tag
-  120 retains the source's route and geometry addresses at bytes 216..280,
-  which overlaps byte 219, so DCG copies the already checked response bump to
-  byte 481 and marks byte 480 before writing those addresses. Later generic
-  steps check that marked copy. Tag 126 also requires the staged DRU1 to have
-  the expected sealed revision and challenge key before clearing it.
-  The pre-extraction Basanos handler used its legacy owner/address helpers on
-  these paths; DCG's stored-bump checks are the intentional provenance seam.
-  The byte offsets and account order are unchanged for the unified DCR1 v5
-  path. DCG's generic engine currently accepts only revision-8 unified DCR1
-  records in RESPOND/PT2P mode; older DCR1 v2/v4 formats accepted by the
-  broader Basanos source remain outside this port and are not covered by the
-  parity result. For tags 120/121/128, DCG maps failures from the explicit
-  stored-bump DCR1/DRU1 provenance gate to 734; source DRU1 identity failures
-  could return 731, and source owner-only DCR1 checks could surface
-  `IncorrectProgramId`. The response reader then performs a legacy canonical
-  PDA check as a second defense; only an impossible-by-normal-creation
-  noncanonical stored response bump can reach that check after the stored-bump
-  gate and return 731. The per-tag audit records this edge separately from
-  the intended 731-to-734 mapping.
-- **DCM2 identity for tag 172.** Its account list contains no independent
-  document identity anchor. The close path currently derives the document
-  identity from DCM2/DCR2 data or instruction data. A future account list must
-  provide a validated parent identity before this path can meet the rule for
-  every record.
-- **DCR2 identity for tag 185.** The close-result account list has no validated
-  parent record; it takes the descriptor from instruction data and derives the
-  result PDA from it. The shared gate still checks the result PDA's canonical
-  address, owner, shape, and role, but the descriptor remains an unchecked
-  identity input. A future account list must anchor it independently.
-- **DCRZ tombstone identity for tag 187.** Settlement reads the descriptor
-  from the tombstone and the shared gate checks the DCRZ address, kind, version,
-  and shape from that descriptor. Tag 187 has no parent document account, so
-  this reader remains self-seeded.
 - **Stateful v1/v2 sessions and some v3 operations.** The current adapters
   validate the session PDA canonically and require an independent authority
   signer when the instruction includes that authority. Other instructions do
   not include that signer; they retain self-seeded session validation. Child
   stream, state, resource, and view accounts are checked against keys stored
   in the validated session; anchors derive from the validated session key.
-- **PT1X/PT2S state.** Initialization is authenticated by the account signers.
-  Later PT1X uploads/seals and PT2S hash operations omit an independent state
-  identity anchor; their current state checks validate kind and shape, not
-  provenance from another account. A later wire version must bind the state
-  key through an independently validated parent or signer role on every write.
-- **Generic PT1/PT2P `owned()` helpers and plan readers.** The helpers only
-  check program ownership because they have no parent identity argument. The
-  plan reader checks routes, geometry, payload, and PT1S against keys stored in
-  PT2S. Its callers must first validate that PT2S key against the document or
-  admission record; the helper itself cannot prove that relationship.
 - **Retired-image tags 7, 100, 111, and 112.** Those routes are not dispatched
   by this source revision. This change does not patch or qualify a deployed
   older image; the tag-7 writer and the zeroed-account takeover paths need the
@@ -139,23 +77,9 @@ the gap is specifically that some identity sources are the target's own bytes.
 
 ## Caller-validated readers and current shared-gate coverage
 
-Several readers use identity fields internally but rely on their handler
-caller to supply a separately checked parent identity. `admission::view` and
-`registry::view` validate their PDA and shape from their own header fields;
-document initialization independently compares admission identity against the
-validated registry/PT2S path, and config callers independently authenticate
-the registry. `result::close_v7` validates DCM2 before checking DFS2 against
-the document descriptor. Template seal/use records are gated from the PT2S
-key and digest. These caller relationships must remain in place when call sites
-change.
-
-The shared gate is used by the revision-8 DCM2/DPR2/DCR2 readers, DCR1 readers
-and open creator, DRU1 readers and creator, unified PDA creation,
-descriptor-bound bond escrow validation, stateful session/stream/state/resource/
-view/anchor checks and creators, PT1X signer initialization and PT1O output
-PDAs, PT2S signer initialization, and the selected template, admission,
-registry, and plan readers. Existing direct checks remain where they also
-enforce lifecycle-specific rules.
+The shared gate is used by the stateful session/stream/state/resource/view/
+anchor checks and creators. Existing direct checks remain where they also enforce
+lifecycle-specific rules.
 
 Stateful sessions v3 (review 10-05): every child creator (stream, state,
 views, scratch, workspace) requires the session authority's signature at

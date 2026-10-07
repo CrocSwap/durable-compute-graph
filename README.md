@@ -47,7 +47,7 @@ Consensus mode runs in each application's own program.
 
 | Path | What it is |
 |---|---|
-| `crates/dcg-program` | the on-chain program: the stateful (consensus) runtime, v2.1 disputes (tag 227), the kernel kit, and the revision-8 lifecycle |
+| `crates/dcg-program` | the on-chain program: the stateful (consensus) runtime, v2.1 disputes (tag 227), and the kernel kit (the revision-8 lifecycle was retired after v0.1.0-alpha) |
 | `crates/dcg-disputes` | v2.1 consensus bytes: trees, leaves, run roots, spec records (`no_std`) |
 | `crates/dcg-kernels` | built-in kernels, the same source on the host and in the program |
 | `crates/dcg-wire` | DCGG/DCPL v2 wire decoding and step lowering |

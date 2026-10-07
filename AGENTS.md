@@ -30,7 +30,7 @@ inconsistency instead of silently choosing one.
 
 | Path | What it is |
 |---|---|
-| `crates/dcg-program` | the on-chain program: sessions (consensus runtime), v2.1 disputes (tag 227), the kernel kit, and the revision-8 lifecycle (being retired: `docs/plans/retire-revision-8.md`) |
+| `crates/dcg-program` | the on-chain program: sessions (consensus runtime), v2.1 disputes (tag 227), and the kernel kit (the revision-8 lifecycle was retired after v0.1.0-alpha: `docs/plans/retire-revision-8.md`) |
 | `crates/dcg-disputes` | v2.1 consensus bytes (`no_std`): trees, leaves, run roots, LX1 |
 | `crates/dcg-kernels` | built-in kernels, the same source on host and in the program |
 | `crates/dcg-wire` | DCGG/DCPL wire decoding and step lowering |
