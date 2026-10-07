@@ -26,3 +26,13 @@ Ephemeral state for whoever directs DCG next. Standing rules are in
   - `9CHa…` is retired, so revision 8 is deleted from DCG rather than moved.
 - **Shared checkout:** another session works in the main DCG checkout
   (settlement and bend identity, uncommitted). Work in a worktree.
+
+## Overnight loop 2026-10-06/07 (revision-8 retirement, branch `retire-rev8`)
+
+Progress lines, newest last:
+
+- 10-07 ~01:00: G1 inventory in `docs/plans/retire-revision-8.md` (96f8341).
+  G2 removal committed (3d0d3e9 code, 87858db docs): default offline suite and
+  doc tests pass. **Merge into main held:** the Bend settlement pilot's
+  uncommitted work in the main checkout builds on revision 8 (options a/b/c in
+  the plan). G3 feature-suite comparison against 272ccf7 running.
