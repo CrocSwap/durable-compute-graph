@@ -34,7 +34,6 @@ inconsistency instead of silently choosing one.
 | `crates/dcg-disputes` | v2.1 consensus bytes (`no_std`): trees, leaves, run roots, LX1 |
 | `crates/dcg-kernels` | built-in kernels, the same source on host and in the program |
 | `crates/dcg-wire` | DCGG/DCPL wire decoding and step lowering |
-| `crates/dcg-test-support` | builds test states through real instructions |
 | `python/dcg` | the client: `dcg.session`, `dcg.sequencer`, `dcg.v21`, `dcg.disputes_v21`, `dcg.services`, `dcg.kernel_kit`, `dcg.explain`, the `dcg` command |
 | `examples/` | templates for applications and quickstarts |
 | `docs/` | guides, `design/` (normative), `spec/`, `experiments/` (measured evidence), `plans/` |

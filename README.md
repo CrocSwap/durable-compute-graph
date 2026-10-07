@@ -51,7 +51,6 @@ Consensus mode runs in each application's own program.
 | `crates/dcg-disputes` | v2.1 consensus bytes: trees, leaves, run roots, spec records (`no_std`) |
 | `crates/dcg-kernels` | built-in kernels, the same source on the host and in the program |
 | `crates/dcg-wire` | DCGG/DCPL v2 wire decoding and step lowering |
-| `crates/dcg-test-support` | builds test states through real instructions |
 | `crates/dcg-kernel-conform` | the kernel kit's conformance server for the example kernels |
 | `python/dcg` | the Python client: `dcg.session`, `dcg.sequencer`, `dcg.v21` (tracing), `dcg.disputes_v21`, `dcg.services` (executor and watchtower), `dcg.kernel_kit`, `dcg.explain`, and the `dcg` command |
 | `examples/` | `session-app` and `kernel-app` (templates for your own program), `optimistic-quickstart`, `hello-graph`, `services`, `kernel-kit` |

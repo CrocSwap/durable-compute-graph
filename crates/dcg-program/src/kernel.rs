@@ -7,6 +7,10 @@
 //! both into their image through a static manifest. This module contains no
 //! SVM account types and defines no graph or sweep wire format.
 
+// The retired revision-8 manifest fields stay for one release, deprecated;
+// this module still defines and reads them.
+#![allow(deprecated)]
+
 use crate::hash;
 
 /// A versioned identifier. The value and its version are independently

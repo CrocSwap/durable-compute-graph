@@ -10,8 +10,11 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
   shared alpha program stays testnet only.
 - **Revision 8 retired (owner 2026-10-06), breaking.** The revision-8
   document lifecycle is removed from DCG (`docs/plans/retire-revision-8.md`);
-  it stays in git history and in v0.1.0-alpha. Removed: tags 115-200 (still
-  reserved to DCG and refused, so no application can reuse them), the
+  it stays in git history and in v0.1.0-alpha. Removed: tags 115-200 (refused
+  by DCG's dispatcher; every tag revision 8 routed, and the former application
+  dispute family 120-129, stays in the core tag set, so no application can
+  register it; tags in that range that revision 8 never used remain available
+  to applications, as before), the
   `closure_v2*`, `unified`, `pt1_onchain`, `pt2p*`, `root_only*`, `seal`,
   `envelope_seal`, `descriptor`, `desc_upload`, `position_template`, `kernels`
   and `region_commitment` modules; the features `revision-7`, `revision-8`,
@@ -25,22 +28,37 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
     `revision-8-lifecycle`, call the removed modules, or used
     `ApplicationProgramManifest::new_with_dispute_hooks`,
     `ApplicationDisputeHooks` or `ArtifactWitnessVerifier`. Basanos's mainnet
-    program and Doom on DCG are not affected while they pin v0.1.0-alpha.
+    program (pinned to v0.1.0-alpha) and Doom on DCG (pinned to `4a7faf4`,
+    before the tag) are not affected until they move to a release without
+    revision 8.
   - **Migration:**
-    - drop `revision-8` and `revision-8-lifecycle` from the `dcg-program`
-      features;
+    - drop `revision-7`, `revision-8` and `revision-8-lifecycle` from the
+      `dcg-program` features (Basanos's `revision-7`, `revision-8` and
+      `revision-8-code` wrappers name them; Doom names `revision-8`);
     - build program manifests with `ApplicationProgramManifest::new` (the
       application dispute and artifact hooks are gone);
     - `ApplicationManifest` keeps its fields for this release:
       `legacy_forms`, `require_legacy_form_binding`, `admission_scan`,
       `hooks` and `decision_routes` are **deprecated** and read by no route.
       Leave them as they are today (`&[]`, `false`, `AdmissionScan::Full`,
-      `&REVISION8_COMPATIBILITY`); `validate()` now refuses a manifest that
-      declares or requires a legacy form. The next release removes them;
+      `&REVISION8_COMPATIBILITY`), with `#[allow(deprecated)]` on the
+      manifest to silence the warnings; `validate()` now refuses a manifest
+      that declares or requires a legacy form. Identity digests of manifests
+      with these values are unchanged. The next release removes the fields;
     - `ApplicationAccountIdentity::CoreRecord` and `StoredBumpPda` read
       revision-8 records and are refused when the manifest is built;
     - `compatibility::ApplicationHooks` and `DecisionRouteSelector` are empty
       marker traits now.
+    - other removed public items: the legacy-form methods of
+      `ApplicationManifest` (`resolve_legacy_form`, `admits_legacy_form`,
+      `replay_legacy_form`, `max_arw1_bytes`, `ruling_identity`,
+      `replay_leaf_digest`); `ClosedRegistryRow`, `ClosedRegistryAdapter`,
+      `RegistryInheritance`; `ApplicationReplayRequest`, `ArtifactRowAnchor`,
+      `ApplicationProgramManifest::{dispute_hooks, artifact_witness_verifier}`;
+      the revision-8 statics of `kernel::test_kernel` and `compatibility`
+      (`BASANOS_REV8_ROWS`, `BASANOS_REV8_REGISTRY`, `profile_v1`);
+      `descriptor::DcgError` (the commit fold's error type is now
+      `commit::DcgError`, same values).
 
 ## v0.1.0-alpha (2026-10-06)
 

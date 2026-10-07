@@ -4,9 +4,6 @@
 //! bounded SVM adapter modules live here. Applications provide kernels through
 //! a compile-time manifest; this repository includes a tiny test kernel only.
 
-// The retired revision-8 manifest fields stay for one release, deprecated;
-// DCG's own manifests still name them.
-#![allow(deprecated)]
 
 pub mod account_provenance;
 /// Static application instruction registration and dispatch seam.
@@ -71,7 +68,7 @@ fn application_program_manifest() -> &'static app_api::ApplicationProgramManifes
 }
 
 /// The alpha shared program (owner 10-05): the example kernels under
-/// `dcg-alpha/1`, the default dispute hooks, no application instructions.
+/// `dcg-alpha/1`, no application instructions.
 #[cfg(all(not(feature = "test-kernel"), feature = "example-kernels"))]
 fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
     static ALPHA_PROGRAM: app_api::ApplicationProgramManifest =
@@ -80,6 +77,7 @@ fn application_program_manifest() -> &'static app_api::ApplicationProgramManifes
 }
 
 #[cfg(all(not(feature = "test-kernel"), not(feature = "example-kernels")))]
+#[allow(deprecated)] // the retired revision-8 manifest fields
 fn application_program_manifest() -> &'static app_api::ApplicationProgramManifest {
     static EMPTY_KERNELS: [&'static dyn kernel::Kernel; 0] = [];
     static EMPTY_REPLAYS: [kernel::OptimisticReplayBinding; 0] = [];
@@ -136,18 +134,21 @@ pub fn process_instruction_with_manifest(
 
 #[cfg(feature = "test-kernel")]
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(deprecated)] // the retired revision-8 manifest fields
 pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     &kernel::test_kernel::MANIFEST_APP
 }
 
 #[cfg(all(not(feature = "test-kernel"), feature = "example-kernels"))]
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(deprecated)] // the retired revision-8 manifest fields
 pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     &kernel::test_kernel::ALPHA_MANIFEST_APP
 }
 
 #[cfg(all(not(feature = "test-kernel"), not(feature = "example-kernels")))]
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(deprecated)] // the retired revision-8 manifest fields
 pub(crate) fn application_manifest() -> &'static kernel::ApplicationManifest {
     static EMPTY_KERNELS: [&'static dyn kernel::Kernel; 0] = [];
     static EMPTY_REPLAYS: [kernel::OptimisticReplayBinding; 0] = [];

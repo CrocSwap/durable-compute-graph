@@ -110,7 +110,8 @@ run, and the example does not define a new kernel.
 
 11. **Hello, Dispute now has a mechanics example.** The revision-8 app-bound
     replay seam is merged. The example reuses its ByteSum ProgramTest cases;
-    see [`examples/hello-dispute`](../hello-dispute/README.md). The remaining
+    see `examples/hello-dispute` (removed with revision 8 after v0.1.0-alpha;
+    the optimistic quickstart replaced it). The remaining
     onboarding friction is recorded below. **Owner: program/client.**
 
 ## Newcomer path measurement
@@ -163,7 +164,7 @@ values. This is a line-count estimate, not a semantic code-size metric.
 
 ## Hello Dispute
 
-The new [Hello Dispute example](../hello-dispute/README.md) reuses the merged
+The Hello Dispute example (removed with revision 8 after v0.1.0-alpha) reused the merged
 revision-8 app-bound replay tests. These are the next friction points for making
 it a fresh-checkout developer example:
 

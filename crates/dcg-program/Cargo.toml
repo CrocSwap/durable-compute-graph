@@ -27,7 +27,7 @@ test-kernel = []
 example-kernels = []
 # The DCG alpha shared-program image (owner 10-05, R2 review B-M2): tag 227
 # (v2.1 disputes with LX1) and the example kernels; no test_*, sbf-*-test,
-# v2.0 (208-226) or revision-8 lifecycle routes. Build with
+# or v2.0 (208-226) routes. Build with
 # scripts/build-alpha-image.sh; its routing is pinned by the SBF test
 # `alpha_image_routes_only_tag_227`.
 alpha-image = ["graph-v21", "example-kernels"]

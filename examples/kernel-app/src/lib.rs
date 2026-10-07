@@ -77,6 +77,8 @@ static NO_REPLAYS: [OptimisticReplayBinding; 0] = [];
 static NO_FORMS: [LegacyFormBinding; 0] = [];
 
 /// The application's kernel manifest: the kernels its disputes may replay.
+// The legacy fields are deprecated (revision 8 retired); they go next release.
+#[allow(deprecated)]
 pub static APPLICATION: ApplicationManifest = ApplicationManifest {
     application_id: b"dcg-example-kernel-app/1",
     version: 1,

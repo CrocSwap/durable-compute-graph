@@ -825,6 +825,7 @@ pub mod toy {
 /// session-reject-and-ring-v1 Q2): `bind` refuses a kernel declaring
 /// `REJECTS_INPUT` before it builds the machine (review M2).
 #[cfg(all(test, feature = "test-kernel"))]
+#[allow(deprecated)] // the retired revision-8 manifest fields
 mod reject_capability_tests {
     use super::toy::{TOY_FACTORY, TOY_MANIFEST};
     use super::*;

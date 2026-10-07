@@ -21,7 +21,7 @@ ten rules; a rule born of one incident starts in that task's brief.
    shared program, a consumer's mainnet image) need two equal reproducible
    builds.
 6. **No hand-built state.** Tests reach mid-protocol state through real
-   instructions (`dcg-test-support`) or reference-generated scenarios; a state
+   instructions or reference-generated scenarios; a state
    the current program forbids comes from a named test-only legacy mode. A
    test lives with the code that owns the behavior.
 7. **Endings and payouts are tested adversarially and reviewed

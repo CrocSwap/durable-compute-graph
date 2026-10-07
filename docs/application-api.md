@@ -51,9 +51,11 @@ table falls back to the core dispatcher, preserving feature-gated and future
 core routes. The `process_instruction_with_manifest` and `process_instruction`
 entry points remain available for DCG-only callers.
 
-The core tag set holds the tags DCG routes or reserves: the retired
-revision-8 tags 115-200 (refused, kept so an application cannot reuse a
-historical tag number) and the graph tags 208-227. The test-only workload
+The core tag set holds the tags DCG routes or reserves: every tag revision 8
+routed, plus the former application dispute family 120-129 (all refused now,
+and kept so an application cannot reuse a historical tag number), and the
+graph tags 208-227. Tags between 115 and 200 that revision 8 never used remain
+available to applications. The test-only workload
 tags are not members of the set.
 
 ### Preflight and account context

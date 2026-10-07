@@ -112,8 +112,9 @@ deprecated, so Doom and Basanos compile unchanged when they next pin a tag:
 `decision_routes` stay as fields but no route reads them, and `validate()`
 refuses a manifest that sets legacy forms or requires them.
 `compatibility` shrinks to the two marker traits and the inert
-`REVISION8_COMPATIBILITY` value. Tags 115–200 stay reserved to DCG (refused),
-so an application cannot reuse a revision-8 tag number. The next release
+`REVISION8_COMPATIBILITY` value. Tags 115–200 are refused by DCG's
+dispatcher; every tag revision 8 routed (and 120–129) stays in the core tag
+set, so an application cannot reuse a revision-8 tag number. The next release
 removes the deprecated fields.
 
 **Consumer migration note.** Basanos's `chain/dcg-program` selects
@@ -122,6 +123,12 @@ image included) and has its own revision-8 code over DCG's modules. Its pin
 stays on v0.1.0-alpha; when it next moves to a DCG release without revision 8,
 Basanos removes its revision-8 code and `revision-8-code` first, then
 rebuilds and requalifies the image (owner's go for any mainnet upgrade).
+
+**Follow-up for Basanos (review 10-07, M2).** DCG's provenance lint used to
+read Basanos's `chain/dcg-program/Cargo.toml` and refuse `graph-v2-raw-write`
+in the switchover feature set. That cross-repo check is gone from DCG; port it
+into Basanos's own `chain/dcg-program` tests when Basanos next touches its DCG
+pin.
 
 ## Blocker found 2026-10-06: the Bend settlement pilot builds on revision 8
 

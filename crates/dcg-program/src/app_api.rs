@@ -1075,6 +1075,7 @@ pub fn process_instruction_with_application(
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // the retired revision-8 manifest fields
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
