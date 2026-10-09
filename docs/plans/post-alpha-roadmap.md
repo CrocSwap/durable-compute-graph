@@ -29,8 +29,8 @@
 
 ## Hygiene
 
-- The release terms say "testnet only"; Basanos's mainnet deployment is an
-  owner decision for our own application. The terms need the owner's
-  wording for consumers who deploy DCG-based programs themselves.
-- `disputes_v21_chunked_oracle` needs the `example-kernels` feature; gate it
-  so a plain `graph-v21` run does not report a false failure.
+- Done (owner 2026-10-06): the release terms say mainnet at the deployer's
+  own risk (`docs/release-terms.md`).
+- Done (2026-10-09): `disputes_v21_chunked_oracle` is gated on
+  `graph-v21` and `example-kernels`; a plain `graph-v21` run compiles it to
+  no tests (measured), and with both features its 2 tests pass.

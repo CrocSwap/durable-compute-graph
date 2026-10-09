@@ -5,7 +5,8 @@
 //! ruling. Claims and leaves too large for one transaction go through the
 //! dispute's staging buffers. All scenarios share one test context; each has
 //! its own run nonce.
-#![cfg(feature = "graph-v21")]
+// The chunked scenarios use the example kernels (example-kernels).
+#![cfg(all(feature = "graph-v21", feature = "example-kernels"))]
 
 use dcg_program::disputes_v21 as V;
 use dcg_program::hash::sha256;
