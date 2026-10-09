@@ -49,3 +49,4 @@ Progress lines, newest last:
 - 10-07 morning (owner): Bend pilot deferred; its work committed as-is to
   `wip/bend-settlement-pilot` (c6816ab); main fast-forwarded to `retire-rev8`
   (revision 8 retired on main); Bend docs marked deferred. Not pushed.
+- 10-09 unattended loop: branch `hygiene-chunked-oracle-gate` (ff3a2fe, local, not merged): `disputes_v21_chunked_oracle` gated on `graph-v21` + `example-kernels` (plain graph-v21: 0 tests; both: 2 passed, 24 s); roadmap hygiene items marked done. Owner: merge and push when convenient.
