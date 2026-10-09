@@ -5,6 +5,13 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
 
 ## Unreleased
 
+## v0.2.0-alpha (2026-10-09)
+
+Revision 8 is gone; everything else matches v0.1.0-alpha. The alpha image
+rebuilds reproducibly at `7acbce49…` (344,304 bytes) and is not deployed: the
+shared testnet program `J9Eje…` still runs `8d39d440…`. Crate and package
+versions stay 0.1.0.
+
 - **Release terms (owner 2026-10-06):** DCG-based programs may be deployed to
   mainnet at the deployer's own risk (alpha, unaudited, formats may change); the
   shared alpha program stays testnet only.
