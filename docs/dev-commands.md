@@ -63,8 +63,10 @@ It refuses to build from a crate with uncommitted changes unless you pass
 `--allow-dirty`.
 
 **Measured (2026-10-05):**
-- `dcg build --alpha` reproduced the image deployed on the alpha testnet
-  program, `8d39d440…`, 344,400 bytes;
+- `dcg build --alpha` reproduced the image then deployed on the alpha testnet
+  program, `8d39d440…`, 344,400 bytes (since 2026-10-13 the program runs the
+  v0.2.0-alpha image `7acbce49…`, 344,304 bytes, from
+  `scripts/build-alpha-image.sh` at the tag);
 - the template app also built reproducibly: `11a7b0ba…`, 375,744 bytes.
 
 ## `dcg verify`: is the deployed program the receipt's image?
@@ -85,6 +87,11 @@ it.
 `J9Eje75v3AgEUZZPJJTJNqKmVxiAjhRhQ7iKYBRo1Hi9` verifies against the R4
 receipt. The image matches, 16,080 bytes of zero headroom follow it, and the
 runtime is `dcg-runtime 0.1.0`.
+
+**Measured (2026-10-13):** after the upgrade to v0.2.0-alpha it verifies
+against that image's receipt: the image matches, 32,560 bytes of zero
+headroom follow it, and the runtime is `dcg-runtime 0.1.0`. (The receipt
+from `build-alpha-image.sh` carries no runtime version, so the hash pins it.)
 
 ## `dcg explain`: what a template guarantees and costs
 

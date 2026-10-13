@@ -50,3 +50,4 @@ Progress lines, newest last:
   `wip/bend-settlement-pilot` (c6816ab); main fast-forwarded to `retire-rev8`
   (revision 8 retired on main); Bend docs marked deferred. Not pushed.
 - 10-09 unattended loop: branch `hygiene-chunked-oracle-gate` (ff3a2fe, local, not merged): `disputes_v21_chunked_oracle` gated on `graph-v21` + `example-kernels` (plain graph-v21: 0 tests; both: 2 passed, 24 s); roadmap hygiene items marked done. Owner: merge and push when convenient.
+- 10-13 (owner: fix the publicity gaps 1 and 6): the shared testnet program `J9Eje…` upgraded in place to the v0.2.0-alpha image `7acbce49…` (344,304 bytes, two builds equal at the tag); finalized readback byte-equal, only tag 227 routes, sub 28 routes, `dcg verify` ok, both hello-graph dispute examples rule as the oracle and settle (receipts: Basanos `out/runs/dcg-alpha-v020-2026-10-13/`). README opening grammar fixed; GitHub Releases created for v0.1.0-alpha and v0.2.0-alpha from the CHANGELOG.

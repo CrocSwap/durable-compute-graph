@@ -20,8 +20,8 @@
   before non-LX templates with external inputs are offered on mainnet.
 - **LX watchtower:** checking LX1 runs needs a full re-execution; it follows
   faster executors (GPU work in Basanos).
-- **Version-1 runs on the shared program:** `J9Eje…` predates sub 28; the
-  next alpha image carries it.
+- **Version-1 runs on the shared program:** done 2026-10-13; `J9Eje…` runs
+  the v0.2.0-alpha image `7acbce49…`, which carries sub 28.
 - **Mixed modes in one graph** (per-region guarantees, `explain()` per
   region): designed in `docs/design/` as the long-term direction; not started.
 - **TypeScript client:** a thin layer over the Python reference.

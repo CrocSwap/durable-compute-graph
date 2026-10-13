@@ -5,6 +5,10 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
 
 ## Unreleased
 
+- **Shared testnet program (2026-10-13, owner):** `J9Eje…` now runs the
+  v0.2.0-alpha image `7acbce49…` (344,304 bytes), so version-1 runs (sub 28)
+  are available on it (`docs/hello-graph.md`).
+
 ## v0.2.0-alpha (2026-10-09)
 
 Revision 8 is gone; everything else matches v0.1.0-alpha. The alpha image

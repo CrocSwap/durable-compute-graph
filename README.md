@@ -1,10 +1,10 @@
 # durable-compute-graph
 
-DCG (Durable Compute Graph) is a framework for orchestrating massively multi-transactional workloads in a blockchain context. Well suited applications include AI/ML models, complex derivative pricing and risk engines, clearing large batch auctions, and rich onchain gaming. DCG currently targets SVM based blockchains like Fogo and Solana. 
+DCG (Durable Compute Graph) is a framework for orchestrating massively multi-transactional workloads in a blockchain context. Well-suited applications include AI/ML models, complex derivative pricing and risk engines, clearing large batch auctions, and rich onchain gaming. DCG currently targets SVM-based blockchains like Fogo and Solana.
 
-Modern blockchains have abundant compute in aggregate, but expose only thin transactions with limited compute and data budgets. In that context, scaling compute beyond non-trivial workloads has required manual and low-level coordination of intermediate data between atomic transactions. Traditionally scaling workloads beyond single transactions introduce a steep escalation of developer frictions and error and security risks. DCG solves this by abstracting the multi-transactional coordination into a single highly optimized, highly verified orchestration layer.
+Modern blockchains have abundant compute in aggregate, but expose only thin transactions with limited compute and data budgets. In that context, scaling beyond trivial workloads has required manual and low-level coordination of intermediate data between atomic transactions. Traditionally, scaling workloads beyond single transactions introduces a steep escalation of developer friction, errors and security risks. DCG solves this by abstracting the multi-transactional coordination into a single highly optimized, highly verified orchestration layer.
 
-To write a DCG application, you break down your workload into *kernels* and assemble those kernels into *templates*. Kernels are small, deterministic integer-exact functions that must always execute within a single transaction. The DCG library provides a library of pre-written and validated kernels, but developing new kernels is easily supported by the framework. Templates are written as directed-acyclic-graphs where each node is a kernel. Each workload executes as a run through a pre-defined template. DCG handles both the onchain coalescing of intermediate data, as well as the off chain transport layer to orchestrate interdependent execution transactions at low latency and high throughput.  
+To write a DCG application, you break down your workload into *kernels* and assemble those kernels into *templates*. Kernels are small, deterministic, integer-exact functions that must always execute within a single transaction. DCG provides a library of pre-written and validated kernels, but developing new kernels is easily supported by the framework. Templates are written as directed acyclic graphs, where each node is a kernel. Each workload executes as a run through a pre-defined template. DCG handles both the onchain coalescing of intermediate data and the off-chain transport layer to orchestrate interdependent execution transactions at low latency and high throughput.
 
 DCG has two modes:
 
@@ -39,8 +39,8 @@ does not show that the computation is the right one.
 [`CHANGELOG.md`](CHANGELOG.md) and [`SECURITY.md`](SECURITY.md).
 
 The shared alpha program for optimistic mode on Fogo testnet is
-`J9Eje75v3AgEUZZPJJTJNqKmVxiAjhRhQ7iKYBRo1Hi9`. It runs the reviewed image
-`8d39d440…`; `dcg verify` checks it ([`docs/dev-commands.md`](docs/dev-commands.md)).
+`J9Eje75v3AgEUZZPJJTJNqKmVxiAjhRhQ7iKYBRo1Hi9`. It runs the v0.2.0-alpha
+image `7acbce49…`; `dcg verify` checks it ([`docs/dev-commands.md`](docs/dev-commands.md)).
 Consensus mode runs in each application's own program.
 
 ## Repository map
