@@ -1,6 +1,6 @@
 # DCG after the alpha: roadmap (2026-10-06)
 
-**Status: proposed for owner review.** v0.1.0-alpha is tagged; the alpha plan is
+**Status: accepted by the owner 2026-10-14.** v0.1.0-alpha is tagged; the alpha plan is
 `alpha-release-plan.md` (all exit criteria met), and the milestone history is
 `v2-roadmap.md`. Durations are estimates.
 

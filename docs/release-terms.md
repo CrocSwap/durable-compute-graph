@@ -1,6 +1,6 @@
 # DCG alpha: release terms
 
-**Status:** published 2026-10-05 (alpha plan R5, exit criterion 6); 2026-10-06: mainnet at your own risk (owner). Edits follow as changelog entries.
+**Status:** published 2026-10-05 (alpha plan R5, exit criterion 6); 2026-10-06: mainnet at your own risk (owner); 2026-10-14: reviewed and accepted by the owner, with the runtime-version wording corrected. Edits follow as changelog entries.
 
 ## What this release is
 
@@ -35,9 +35,12 @@ It has two modes:
   account layouts, hashes and domains, receipts, and the Python client's API.
 - Every breaking change is listed in `CHANGELOG.md`, with what changed, who is
   affected, and how to migrate.
-- Each program image carries its runtime version
-  (`dcg-runtime/1 <version> …`), so you can tell which version a deployed
-  program embeds and whether an advisory applies to it.
+- Each program image carries the version of the DCG crates it was built
+  from (`dcg-runtime/1 <version> …`). Crate versions are not bumped at every
+  release tag: v0.1.0-alpha and v0.2.0-alpha both carry `0.1.0`. What
+  identifies an image exactly is its sha256, published for each release
+  (`docs/hello-graph.md`, the GitHub release) and checked by `dcg verify`.
+  Advisories name the affected image hashes as well as runtime versions.
 
 ## What is guaranteed, and what is not
 

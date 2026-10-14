@@ -5,6 +5,12 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
 
 ## Unreleased
 
+- **Release terms (owner 2026-10-14):** reviewed and accepted; the runtime
+  version is now described as the crates' version, which is not bumped at
+  every tag (v0.2.0-alpha images still carry `0.1.0`), and the image sha256
+  is what identifies a deployed image. The post-alpha roadmap is accepted,
+  and the license stays GPL-3.0-only.
+
 - **Shared testnet program (2026-10-13, owner):** `J9Eje…` now runs the
   v0.2.0-alpha image `7acbce49…` (344,304 bytes), so version-1 runs (sub 28)
   are available on it (`docs/hello-graph.md`).
