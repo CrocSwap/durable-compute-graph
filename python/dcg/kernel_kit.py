@@ -262,10 +262,9 @@ def _unhex(w: str) -> bytes:
 class RustKernels:
     """A running conformance server (``kernel_kit::conformance``)."""
 
-    def __init__(self, binary: str | Path):
-        self.proc = subprocess.Popen(
-            [str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
-        )
+    def __init__(self, binary: str | Path | Sequence[str | Path]):
+        argv = [str(binary)] if isinstance(binary, (str, Path)) else [str(a) for a in binary]
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
 
     def ask(self, line: str) -> str:
         assert self.proc.stdin and self.proc.stdout
@@ -530,6 +529,77 @@ def check_stateful(rust: RustKernels, mirror: StatefulMirror, seed: int = 0, wal
     return report
 
 
+# --- the same-source reference (v0.3.0 item 4) --------------------------------------------------
+
+
+class ServerMirror(StatefulMirror):
+    """A stateful "mirror" whose answers come from a second conformance server,
+    for example ``dcg-kernel-conform-sbf`` running the kernel's SBF build.
+    ``check_stateful(native, ServerMirror(sbf, ...))`` then compares the two
+    builds of the same source over the kit's generated cases, with no Python
+    model. It catches platform differences (SBF against native), not logic
+    bugs that both builds share."""
+
+    def __init__(self, reference: RustKernels, decl: KernelDecl, state_spans: tuple[int, ...],
+                 special_inputs: tuple[bytes, ...] = (), resources: tuple[bytes, ...] = (),
+                 resource_schema: tuple[int, int] = (0, 0)):
+        self.reference = reference
+        self.decl = decl
+        self.state_spans = state_spans
+        self.special_inputs = special_inputs
+        self.resources = resources
+        self.resource_schema = resource_schema
+        self._rejectable = False
+
+    def initial_state(self, spans: tuple[int, ...]) -> bytes:
+        got = self.reference.init(self.decl, spans)
+        if got.startswith("state "):
+            return _unhex(got.split()[1])
+        if got.startswith("refused written "):
+            return bytes(int(got.split()[2]))  # wrong length: the kit reports the mismatch
+        raise KernelRefused(got.split()[2] if got.startswith("refused kernel ") else "Refused")
+
+    def _ask(self, command: bytes, state: bytes, resource: bytes | None) -> Outcome:
+        bound = None if resource is None else (self.resource_schema, resource)
+        answer = self.reference.advance(self.decl, self._rejectable, self.state_spans, state, command, bound)
+        if answer == "panic":
+            raise RuntimeError("the reference panicked")
+        words = answer.split()
+        if words[0] == "failed":
+            raise KernelRefused(words[1])
+        kind, code, out, after = words[:4]
+        return Outcome(b"" if out == "-" else _unhex(out), _unhex(after), kind, int(code))
+
+    def transition(self, command: bytes, state: bytes) -> Outcome:
+        return self._ask(command, state, None)
+
+    def transition_with_resource(self, command: bytes, state: bytes, resource: bytes) -> Outcome:
+        return self._ask(command, state, resource)
+
+
+def compare_stateful(native: RustKernels, reference: RustKernels, mirror: StatefulMirror, seed: int = 0,
+                     walk: int = 64) -> Report:
+    """Compare two builds of a stateful kernel over the cases ``mirror``'s
+    declaration generates (its spans, special inputs and sample resources);
+    the mirror's own transition is not used."""
+    proxy = ServerMirror(reference, mirror.decl, mirror.state_spans, mirror.special_inputs,
+                         getattr(mirror, "resources", ()), getattr(mirror, "resource_schema", (0, 0)))
+    # The kit asks for plain and rejectable sessions; the reference must see the same flag.
+    original = native.advance
+
+    def advance(decl, rejectable, spans, state, command, resource=None):
+        proxy._rejectable = rejectable
+        return original(decl, rejectable, spans, state, command, resource)
+
+    native.advance = advance  # type: ignore[method-assign]
+    try:
+        report = check_stateful(native, proxy, seed, walk)
+    finally:
+        native.advance = original  # type: ignore[method-assign]
+    report.kernel += " [native vs reference]"
+    return report
+
+
 # --- command line -------------------------------------------------------------------------------
 
 
@@ -559,8 +629,25 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--bin", required=True, help="the application's conformance server")
     check.add_argument("--seed", type=int, default=0)
     check.add_argument("modules", nargs="+", help="modules or .py files defining mirrors")
+    compare = sub.add_parser("compare", help="compare two builds of the same kernels (native vs SBF)")
+    compare.add_argument("--bin", required=True, help="the native conformance server")
+    compare.add_argument("--reference", required=True, nargs="+",
+                         help="the reference server and its arguments, e.g. dcg-kernel-conform-sbf DIR")
+    compare.add_argument("--seed", type=int, default=0)
+    compare.add_argument("modules", nargs="+", help="modules or .py files defining declarations (mirrors)")
     args = parser.parse_args(argv)
     reports = []
+    if args.cmd == "compare":
+        with RustKernels(args.bin) as native, RustKernels(args.reference) as reference:
+            for target in args.modules:
+                _, states = mirrors_in(_load(target))
+                reports += [compare_stateful(native, reference, m, args.seed) for m in states]
+        for r in reports:
+            print(r.summary())
+        if not reports:
+            print("no stateful declarations found")
+            return 1
+        return 0 if all(r.ok for r in reports) else 1
     with RustKernels(args.bin) as rust:
         for target in args.modules:
             steps, states = mirrors_in(_load(target))

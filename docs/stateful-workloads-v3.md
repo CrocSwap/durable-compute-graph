@@ -204,6 +204,17 @@ requires zero lamports at the session address.
 Tests: `tests/stateful_v3_creators.rs` (native ProgramTest, or the
 feature-built SBF image with `V3_SBF=1` and `BPF_OUT_DIR`).
 
+### Call frames left to a kernel
+
+SBF allows 64 nested call frames per instruction. **Measured** (2026-10-14,
+the `sbf-real-lifecycle-test` image, platform tools v1.51,
+`sbf_call_frames_used_before_the_transition_callback` in
+`tests/stateful_v3_reject_ring.rs`): a probe kernel recursed 57 levels below
+its transition through a real `ADVANCE`, and 58 failed. DCG's runtime thus
+uses at most 6 frames before the kernel's callback, leaving the callback at
+least 58. Inlining in another image can move this by a frame or two; keep a
+margin, and measure your own image the same way.
+
 ### Transitions that read the resource (`READS_RESOURCE`)
 
 Since v0.3.0 (unreleased), a kernel may declare
@@ -211,27 +222,38 @@ Since v0.3.0 (unreleased), a kernel may declare
 session's sealed resource, which otherwise only initialization and rendering
 see:
 
-- `OPEN_SESSION` refuses such a kernel unless the session names a resource
-  (`REFUSAL_RESOURCE`). Only stateful kernels may declare the bit, and turning
-  it on or off is a semantic-version change, so a live session's kernel cannot
-  change it.
+- `OPEN_SESSION` records the capability as the session feature
+  `FEATURE_READS_RESOURCE` (8), which must equal the kernel's declaration, and
+  refuses unless the session names a resource (`REFUSAL_RESOURCE`). Only
+  stateful kernels may declare the bit. `ADVANCE` refuses (`REFUSAL_SESSION`)
+  if the live kernel's declaration no longer matches the recorded feature, so
+  an upgrade cannot change a live session's account list or hook (review M3).
 - `ADVANCE` takes the program-owned copy read-only right after the stream:
   `[state0, authority, session, stream, resource, other spans…]` with the
   headerless primary, `[authority, session, stream, resource, spans…]`
   without it. The copy is checked as initialization checks it (session-bound
   key, schema and commitment, structure, every chunk present; the bytes are
-  not re-hashed), so a missing, foreign, unsealed, writable or wrong-kind
-  account refuses before any transition runs.
+  not re-hashed; a sealed copy must be fully allocated), so a missing,
+  foreign, unsealed, writable or wrong-kind account refuses before any
+  transition runs; a writable copy refuses with `REFUSAL_RESOURCE` even when
+  it is the right one (review M1).
+- The kernel's `AccountSpan` has `is_writable` and `is_signer` false; its
+  `key` and `owner` are the copy's address and the program. A transition must
+  not depend on them (the kernel kit passes zeros): its pure inputs are the
+  command, the state, the resource bytes, its schema and the commitment.
 - The runtime calls `StatefulKernel::transition_spans_with_resource(input,
   resource, commitment, state, output)` for every step in place of
   `transition_spans_with_outcome`. The transition must be a pure function of
   (input, state, resource); outcomes and halts follow the same rules.
 - Measured (SBF ProgramTest, the 1,280-byte fixed engine): a three-step
-  `ADVANCE` reading a 4,096-byte resource costs 11,246 CU in total.
+  `ADVANCE` reading a 4,096-byte resource costs 11,253 CU in total.
 
-Tests: `tests/stateful_v3_resource_advance.rs` (native and SBF), the session
-fuzzer's resource-engine sessions (with ADVANCEs that omit the copy or pass
-the source account in its place), and the kernel kit's `dcg-rsctr-v1`.
+Tests: `tests/stateful_v3_resource_advance.rs` (native and SBF: honest steps
+against a host model in the headerless and the headered layout; a missing,
+foreign, source, writable or wrong-kind resource; feature/capability
+mismatches; no resource at open), the session fuzzer's resource-engine
+sessions (with ADVANCEs that omit the copy or pass the source account in its
+place), and the kernel kit's `dcg-rsctr-v1`.
 
 ### Ticks: steps without stored input (`ACCEPTS_TICKS`)
 
@@ -242,9 +264,14 @@ read or store nothing in the stream. This suits long computations with no
 outside input (a checker, a simulation), which would otherwise write one
 input per step.
 
-- **Conditions.** The kernel declares the bit, the session has a ring stream
-  (ticks use no capacity), and no written input is waiting
-  (`frontier == cursor`); otherwise `REFUSAL_INPUT_GAP`. Cursor, step-count
+- **Opening.** The session feature `FEATURE_TICKS` (4) must equal the
+  kernel's declaration and needs a ring stream and the indexed policy
+  (`REFUSAL_RESOURCE` otherwise). With the indexed policy the authority is
+  the only writer, so it cannot place ticks around another writer's inputs or
+  tick ahead of a pending write (review M2).
+- **Conditions.** The kernel still declares the bit, the session took the
+  feature, and no written input is waiting (`frontier == cursor`); otherwise
+  `REFUSAL_INPUT_GAP`. Cursor, step-count
   and authority checks are those of an ordinary `ADVANCE`, and ticks stop at
   the ring's sequence ceiling.
 - **Effect.** Each committed tick consumes the next sequence number: the
@@ -253,14 +280,25 @@ input per step.
   (`sha256(chain || root || sequence || "")`, under `/2` or, rejectable,
   `/3` with its disposition), so a replay knows exactly where ticks fell
   among written inputs. Halts, rejections and the prefix rule apply as for
-  any step.
+  any step. A rejected tick sets the stream's last-rejection words to a
+  sequence that has no slot (the ring slot `seq % capacity` may hold an older
+  lap), so readers must check the stored sequence.
 - A kernel without the bit never sees an empty command from a tick, so an
   existing kernel's behavior cannot be changed by its authority.
 
 Tests: `tests/stateful_v3_reject_ring.rs` (three laps of ticks with no slot
-written and the chain checked; ticks mixed with written inputs; refusals for
-an undeclared kernel, a linear stream, a waiting input, a stale cursor, zero
-or nine steps and an unknown flag), native and SBF.
+written and the chain checked; ticks mixed with written inputs; ticks on a
+rejectable session with a halt after part of an eight-tick `ADVANCE`;
+refusals for a feature/capability mismatch either way, a linear stream, an
+append session with another writer, an undeclared kernel, a waiting input, a
+stale cursor, zero or nine steps and an unknown flag), native and SBF, and
+the session fuzzer's tick-counter sessions.
+
+**Known limits (sessions v3 capabilities).** The v1 and v2 session handlers
+ignore capability bits: a kernel that also declares a v1 or v2 mode runs its
+plain transition there, without its resource or ticks (as `REJECTS_INPUT`
+already did). The LX1 bind refuses only `REJECTS_INPUT`; LX machines are a
+separate path and never take resources or ticks.
 
 ### Session features: ring streams and declared rejection
 

@@ -91,17 +91,26 @@ pub const REFUSAL_STALE_PUBLICATION: u32 = 2_341;
 /// optional byte after `lanes`. Zero is today's linear stream, no rejection.
 pub const FEATURE_RING_STREAM: u8 = 1;
 pub const FEATURE_REJECTABLE: u8 = 2;
-pub const FEATURES_KNOWN: u8 = FEATURE_RING_STREAM | FEATURE_REJECTABLE;
+/// The session takes ticks (v0.3.0 item 2): equals the kernel's
+/// `ACCEPTS_TICKS`, and needs a ring stream and the indexed policy (the
+/// authority is the only writer, so ticks cannot be placed around another
+/// writer's inputs; review M2).
+pub const FEATURE_TICKS: u8 = 4;
+/// The session's transitions read its resource (v0.3.0 item 1): equals the
+/// kernel's `READS_RESOURCE` and needs a resource. Recorded so that a kernel
+/// upgrade cannot change a live session's account list or hook (review M3).
+pub const FEATURE_READS_RESOURCE: u8 = 8;
+pub const FEATURES_KNOWN: u8 = FEATURE_RING_STREAM | FEATURE_REJECTABLE | FEATURE_TICKS | FEATURE_READS_RESOURCE;
 /// A ring stream holds at least two write windows, so a live input is never
 /// overwritten (§3.2).
 pub const MIN_RING_CAPACITY: u32 = 2 * MAX_STREAM_WINDOW;
 /// Sequences never wrap: a ring stream refuses writes from here on (§3.2).
 pub const RING_SEQUENCE_CEILING: u32 = u32::MAX - MAX_STREAM_WINDOW;
-/// Input-chain domain of a rejectable session: every entry carries its
-/// disposition (0 applied; 1 rejected, then the code) (§2.3).
 /// `ADVANCE`'s optional eighth byte: run the steps as ticks (empty commands,
 /// nothing read from or stored in the stream).
 pub const ADVANCE_TICK: u8 = 1;
+/// Input-chain domain of a rejectable session: every entry carries its
+/// disposition (0 applied; 1 rejected, then the code) (§2.3).
 pub const INPUT_CHAIN_V3: &[u8] = b"dcg/input-chain/3";
 
 const SESSION_BYTES: usize = 1_280;
@@ -202,6 +211,12 @@ impl Session {
     }
     fn rejectable(&self) -> bool {
         self.features & FEATURE_REJECTABLE != 0
+    }
+    fn takes_ticks(&self) -> bool {
+        self.features & FEATURE_TICKS != 0
+    }
+    fn reads_resource(&self) -> bool {
+        self.features & FEATURE_READS_RESOURCE != 0
     }
     /// Byte offset of `sequence`'s slot in the stream account.
     fn slot_at(&self, sequence: u32) -> usize {
@@ -488,7 +503,9 @@ fn checked_resource_bound(
             bit_count += 1;
         }
     }
-    if bit_count != received || (require_sealed && received != chunks) {
+    // A sealed copy is fully allocated (true by construction; checked so a
+    // broken invariant refuses instead of panicking on the slice; review L3).
+    if bit_count != received || (require_sealed && (received != chunks || allocated != len)) {
         return Err(refusal(REFUSAL_RESOURCE));
     }
     Ok(ResourceMeta {
@@ -1026,6 +1043,13 @@ fn open_session(
     if (features & FEATURE_REJECTABLE != 0) != kernel.manifest().capabilities.rejects_input() {
         return Err(refusal(REFUSAL_RESOURCE));
     }
+    // Likewise ticks and resource-reading transitions (review M3).
+    if (features & FEATURE_TICKS != 0) != kernel.manifest().capabilities.accepts_ticks()
+        || (features & FEATURE_READS_RESOURCE != 0) != kernel.manifest().capabilities.reads_resource()
+        || (features & FEATURE_TICKS != 0 && features & FEATURE_RING_STREAM == 0)
+    {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
     if lanes != 0 && kernel.lane_capture_bytes() == 0 {
         return Err(refusal(REFUSAL_LANE));
     }
@@ -1133,6 +1157,7 @@ fn open_session(
         || capacity < 2
         || capacity > MAX_STREAM_CAPACITY
         || (features & FEATURE_RING_STREAM != 0 && capacity < MIN_RING_CAPACITY)
+        || (features & FEATURE_TICKS != 0 && policy != POLICY_INDEXED)
         || max_steps == 0
         || max_steps > MAX_STEPS_PER_ADVANCE
         || max_steps as u32 > manifest.resources.max_operations
@@ -2748,6 +2773,12 @@ fn advance(
     if primary_layout != session.primary_state {
         return Err(refusal(REFUSAL_STATE));
     }
+    // The account list follows the kernel's declaration; a session opened
+    // under another declaration (a kernel upgrade without a version bump)
+    // refuses rather than change hooks (review M3).
+    if session.reads_resource() != reads_resource {
+        return Err(refusal(REFUSAL_SESSION));
+    }
     if session.status != STATUS_ACTIVE || actor.key != &session.authority {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
@@ -2780,6 +2811,9 @@ fn advance(
     }
     stream_pda_check(program, stream, session_account, &session, true)?;
     let resource_meta = match resource_account {
+        // Read-only: a writable copy refuses here, so the kernel never sees a
+        // caller-chosen writability (review M1).
+        Some(resource) if resource.is_writable => return Err(refusal(REFUSAL_RESOURCE)),
         Some(resource) => Some(checked_resource(program, resource, session_account, &session, true, false)?),
         None => None,
     };
@@ -2791,7 +2825,9 @@ fn advance(
         // kernel that declared it takes them, and no written input waiting:
         // the ticked sequence numbers are then exactly the next ones.
         if !kernel.manifest().capabilities.accepts_ticks()
+            || !session.takes_ticks()
             || !session.ring()
+            || session.policy != POLICY_INDEXED
             || session.frontier != expected_cursor
             || end_cursor > RING_SEQUENCE_CEILING
         {
@@ -2824,8 +2860,8 @@ fn advance(
         (Some(account), Some(raw), Some(meta)) => Some(AccountSpan {
             key: account.key.to_bytes(),
             owner: account.owner.to_bytes(),
-            is_signer: account.is_signer,
-            is_writable: account.is_writable,
+            is_signer: false,
+            is_writable: false,
             schema: session.resource_schema,
             offset: 0,
             data: &raw[RESOURCE_HEADER_BYTES..RESOURCE_HEADER_BYTES + meta.len as usize],

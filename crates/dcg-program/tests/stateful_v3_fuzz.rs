@@ -226,11 +226,21 @@ impl Params {
         // The rejecting kernel is the lane counter plus REJECTS_INPUT, so
         // rejectable sessions keep their lanes (the Doom shape, review M1).
         self.reject = !self.ws && self.width == 1 && rng.pct(30);
-        self.tick = !self.ws && !self.reject && self.ring && rng.pct(50);
+        // Ticks need a ring and the indexed policy (review M2): a tick
+        // session is drawn first and then given both.
+        self.tick = !self.ws && !self.reject && rng.pct(15);
+        if self.tick {
+            self.ring = true;
+            self.append = false;
+            self.capacity = rng.range(v3::MIN_RING_CAPACITY, v3::MIN_RING_CAPACITY + 8);
+        }
         self
     }
     fn features(&self) -> u8 {
-        (if self.ring { v3::FEATURE_RING_STREAM } else { 0 }) | (if self.reject { v3::FEATURE_REJECTABLE } else { 0 })
+        (if self.ring { v3::FEATURE_RING_STREAM } else { 0 })
+            | (if self.reject { v3::FEATURE_REJECTABLE } else { 0 })
+            | (if self.tick { v3::FEATURE_TICKS } else { 0 })
+            | (if self.ws && self.rsrc { v3::FEATURE_READS_RESOURCE } else { 0 })
     }
     /// The counter's rejected command (rejecting sessions only).
     fn rejected(&self, cmd: &[u8]) -> bool {
@@ -2743,6 +2753,16 @@ async fn fuzz_smoke() {
     assert!(stats.accepted > 0 && stats.refused > 0);
     assert!(stats.ring_laps > 0 && stats.reject_sequences > 0 && stats.rejected_inputs > 0,
             "ring laps {} reject sequences {} rejected inputs {}", stats.ring_laps, stats.reject_sequences, stats.rejected_inputs);
+}
+
+/// The v0.3.0 capabilities are exercised, not only drawn: accepted
+/// resource-reading advances and accepted ticks (review M4).
+#[tokio::test(flavor = "multi_thread")]
+async fn fuzz_smoke_capabilities() {
+    let stats = campaign(9, 0, 64, 8, false, None).await;
+    let ticks = stats.ops.get("tick").map_or(0, |e| e.0);
+    assert!(stats.resource_advances > 0 && ticks > 0,
+            "resource advances {} accepted ticks {ticks}", stats.resource_advances);
 }
 
 /// Planted checks: a wrong host input chain, a wrong acceptance prediction

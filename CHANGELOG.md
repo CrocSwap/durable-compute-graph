@@ -11,15 +11,32 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
   `StatefulKernel::transition_spans_with_resource`
   (`docs/stateful-workloads-v3.md`). Additive: kernels without the bit, their
   sessions and their account lists are unchanged. For such a kernel,
-  `ADVANCE` takes the resource copy right after the stream, and
-  `OPEN_SESSION` refuses a session without a resource. The kernel kit checks
+  `ADVANCE` takes the resource copy (read-only; a writable one refuses)
+  right after the stream, and `OPEN_SESSION` needs the session feature
+  `FEATURE_READS_RESOURCE` and a resource. The kernel kit checks
   these kernels (`transition_with_resource`, sample `resources`), and the
   conformance protocol's `advance` takes an optional `resource=` word.
 - **Ticks (v0.3.0 item 2).** A kernel declaring
   `KernelCapabilities::ACCEPTS_TICKS` can be advanced with
-  `ADVANCE_TICK`: steps on empty commands, nothing stored, on ring streams
-  with no input waiting; each tick enters the input chain as an empty
+  `ADVANCE_TICK`: steps on empty commands, nothing stored; sessions opt in
+  with `FEATURE_TICKS`, which needs a ring stream and the indexed policy;
+  no input may be waiting; each tick enters the input chain as an empty
   command. Additive: the 7-byte `ADVANCE` is unchanged.
+- **Kernel kit: native vs SBF of the same source (v0.3.0 item 4).**
+  `python -m dcg.kernel_kit compare` checks a kernel's native build against
+  its SBF build over the kit's generated cases, with no Python mirror:
+  `dcg-kernel-conform-sbf` runs each request inside a test image's
+  conformance entry (`kernel_kit::conformance::serve_account_request`,
+  feature `kernel-conform-entry`, never in a production image) under
+  ProgramTest, with state and resource bytes in accounts and the kernel
+  running on them in place. DCG's six example counters agree (1,928 cases).
+- **Call frames (measured):** DCG's runtime uses at most 6 of SBF's 64 call
+  frames before a v3 transition callback (`docs/stateful-workloads-v3.md`).
+- **Review fixes (independent review 2026-10-14):** a writable resource copy
+  refuses in the program; ticks and resource reads are session features
+  recorded at open (`FEATURE_TICKS`, `FEATURE_READS_RESOURCE`) and must keep
+  matching the kernel; ticks need the indexed policy; a sealed copy must be
+  fully allocated.
 - **Fuel meter.** `dcg_program::fuel` (`Fuel`, `budget_units`): a
   deterministic work-unit budget for kernels that split long computations
   across steps, since a transition may not depend on remaining compute. No

@@ -196,7 +196,7 @@ async fn the_rejectable_flag_must_equal_the_kernels_capability() {
                Some(v3::REFUSAL_RESOURCE));
     // The 180-byte form needs a nonzero, known features byte.
     assert_eq!(session(&mut ctx, &app::V3_COUNTER, 16, Some(0)).await.err(), Some(OTHER));
-    assert_eq!(session(&mut ctx, &app::V3_COUNTER, 16, Some(4)).await.err(), Some(OTHER));
+    assert_eq!(session(&mut ctx, &app::V3_COUNTER, 16, Some(16)).await.err(), Some(OTHER), "an unknown bit");
     let s = session(&mut ctx, &app::V3_REJECT_COUNTER, 16, Some(v3::FEATURE_REJECTABLE)).await.unwrap();
     assert_eq!(data(&mut ctx, s.key).await[SESSION_FEATURES], v3::FEATURE_REJECTABLE, "visible in the session record");
 }
@@ -444,11 +444,13 @@ fn tick_chain(commands: &[(u32, Option<u8>)]) -> [u8; 32] {
     root
 }
 
+const TICKS: u8 = v3::FEATURE_RING_STREAM | v3::FEATURE_TICKS;
+
 #[tokio::test]
 async fn ticks_advance_a_ring_session_without_storing_inputs() {
     let mut ctx = start().await;
     let cap = v3::MIN_RING_CAPACITY;
-    let s = session(&mut ctx, &app::V3_TICK_COUNTER, cap, Some(v3::FEATURE_RING_STREAM)).await.unwrap();
+    let s = session(&mut ctx, &app::V3_TICK_COUNTER, cap, Some(TICKS)).await.unwrap();
     let stream_before = data(&mut ctx, stream_pda(&s.key)).await;
     // Three laps of ticks, 8 at a time: no writes, no slots used, no growth.
     let total = 3 * cap + 5;
@@ -481,17 +483,20 @@ async fn ticks_advance_a_ring_session_without_storing_inputs() {
 }
 
 #[tokio::test]
-async fn ticks_are_refused_without_the_capability_a_ring_or_with_input_waiting() {
+async fn ticks_need_the_capability_the_feature_a_ring_and_no_waiting_input() {
     let mut ctx = start().await;
-    // A ring session of a kernel that does not accept ticks.
+    // The feature must equal the capability, either way, and needs a ring.
+    assert_eq!(session(&mut ctx, &app::V3_COUNTER, v3::MIN_RING_CAPACITY, Some(TICKS)).await.err(),
+               Some(v3::REFUSAL_RESOURCE), "the feature without the capability");
+    assert_eq!(session(&mut ctx, &app::V3_TICK_COUNTER, v3::MIN_RING_CAPACITY, Some(v3::FEATURE_RING_STREAM)).await.err(),
+               Some(v3::REFUSAL_RESOURCE), "the capability without the feature");
+    assert_eq!(session(&mut ctx, &app::V3_TICK_COUNTER, 8, Some(v3::FEATURE_TICKS)).await.err(),
+               Some(v3::REFUSAL_RESOURCE), "ticks without a ring");
+    // A plain ring session refuses ticks.
     let plain = session(&mut ctx, &app::V3_COUNTER, v3::MIN_RING_CAPACITY, Some(v3::FEATURE_RING_STREAM)).await.unwrap();
     assert_eq!(tick(&mut ctx, &plain, 0, 1).await, Err(v3::REFUSAL_INPUT_GAP), "undeclared kernel");
     let mut ctx = start().await;
-    // A linear stream.
-    let linear = session(&mut ctx, &app::V3_TICK_COUNTER, 8, None).await.unwrap();
-    assert_eq!(tick(&mut ctx, &linear, 0, 1).await, Err(v3::REFUSAL_INPUT_GAP), "linear stream");
-    let mut ctx = start().await;
-    let s = session(&mut ctx, &app::V3_TICK_COUNTER, v3::MIN_RING_CAPACITY, Some(v3::FEATURE_RING_STREAM)).await.unwrap();
+    let s = session(&mut ctx, &app::V3_TICK_COUNTER, v3::MIN_RING_CAPACITY, Some(TICKS)).await.unwrap();
     // A written input waiting at the cursor.
     write(&mut ctx, &s, 0, 3).await.unwrap();
     assert_eq!(tick(&mut ctx, &s, 0, 1).await, Err(v3::REFUSAL_INPUT_GAP), "input waiting");
@@ -509,5 +514,88 @@ async fn ticks_are_refused_without_the_capability_a_ring_or_with_input_waiting()
     assert_eq!(value(&mut ctx, &s).await, 3, "nothing changed");
     tick(&mut ctx, &s, 1, 1).await.unwrap();
     assert_eq!(value(&mut ctx, &s).await, 4);
+}
+
+#[tokio::test]
+async fn ticks_are_refused_for_an_append_session_with_another_writer() {
+    let mut ctx = start().await;
+    let auth = keypair(7);
+    let payer = ctx.payer.pubkey();
+    let s = session_pda(&auth.pubkey(), 1);
+    let mut p = open_payload(&app::V3_TICK_COUNTER, 1, v3::MIN_RING_CAPACITY, Some(TICKS));
+    p[9] = sw::POLICY_APPEND; // payload byte 9 is the policy (data byte 10)
+    p[74..106].copy_from_slice(&[0x77; 32]); // a separate writer
+    let got = send(&mut ctx, ix(sw::TAG_OPEN_SESSION, p, vec![AccountMeta::new(payer, true), signer(auth.pubkey()), w(s), r(SYSTEM)]), &[&auth]).await;
+    assert_eq!(got, Err(v3::REFUSAL_RESOURCE), "ticks need the indexed policy (review M2)");
+}
+
+/// Ticks on a rejectable session, mixed with rejections, and a tick that
+/// halts after part of an eight-tick ADVANCE (the prefix commits).
+#[tokio::test]
+async fn ticks_mix_with_rejections_and_halt_after_a_prefix() {
+    let mut ctx = start().await;
+    let features = TICKS | v3::FEATURE_REJECTABLE;
+    let s = session(&mut ctx, &app::V3_TICK_REJECT, v3::MIN_RING_CAPACITY, Some(features)).await.unwrap();
+    // value 0 -> 4 by ticks; a rejected input; value 4 -> 6 by ticks.
+    tick(&mut ctx, &s, 0, 4).await.unwrap();
+    write(&mut ctx, &s, 4, app::V3_REJECT_COMMAND).await.unwrap();
+    advance(&mut ctx, &s, 4, 1).await.unwrap();
+    tick(&mut ctx, &s, 5, 2).await.unwrap();
+    assert_eq!(value(&mut ctx, &s).await, 6);
+    // Eight ticks: the fourth reaches 10 and halts after; three are not run.
+    tick(&mut ctx, &s, 7, 8).await.unwrap();
+    assert_eq!(value(&mut ctx, &s).await, 10);
+    let raw = data(&mut ctx, s.key).await;
+    assert_eq!(u32_at(&raw, SESSION_CURSOR), 11, "the prefix of four ticks committed");
+    assert_eq!(u32_at(&raw, SESSION_REJECTED), 1);
+    assert_eq!(raw[6], 2, "halted");
+    let stream = data(&mut ctx, stream_pda(&s.key)).await;
+    assert_eq!(u32_at(&stream, 80), 11, "the frontier stops with the cursor");
+    let entry = |root: [u8; 32], seq: u32, disposition: &[u8], cmd: &[u8]| {
+        sha256(&[v3::INPUT_CHAIN_V3, &root, &seq.to_le_bytes(), disposition, cmd])
+    };
+    let mut root = STREAM_ROOT;
+    for seq in 0..4 { root = entry(root, seq, &[0], &[]); }
+    let mut rejected = vec![1u8];
+    rejected.extend_from_slice(&app::V3_REJECT_CODE.to_le_bytes());
+    root = entry(root, 4, &rejected, &[app::V3_REJECT_COMMAND]);
+    for seq in 5..11 { root = entry(root, seq, &[0], &[]); }
+    assert_eq!(raw[SESSION_INPUT_ROOT..SESSION_INPUT_ROOT + 32], root);
+    assert!(tick(&mut ctx, &s, 11, 1).await.is_err(), "a halted session takes no ticks");
+}
+
+// --- call depth (v0.3.0) -------------------------------------------------------------------------
+
+/// How many of the SBF runtime's 64 call frames DCG uses before a v3
+/// transition callback: the depth probe recurses `n` frames below its
+/// transition; the largest `n` whose ADVANCE succeeds gives the answer.
+/// SBF only (`V3_SBF=1`); native execution has no frame limit.
+#[tokio::test]
+async fn sbf_call_frames_used_before_the_transition_callback() {
+    if !std::env::var("V3_SBF").is_ok_and(|v| v == "1") {
+        return;
+    }
+    let mut ctx = start().await;
+    let s = session(&mut ctx, &app::V3_DEPTH_PROBE, 64, None).await.unwrap();
+    let (mut ok_max, mut seq) = (None, 0u32);
+    for n in (0u8..=64).rev() {
+        write(&mut ctx, &s, seq, n).await.unwrap();
+        if advance(&mut ctx, &s, seq, 1).await.is_ok() {
+            ok_max = Some(n);
+            break;
+        }
+        // A failed ADVANCE leaves the input unconsumed; overwrite is refused,
+        // so open a fresh session for the next depth.
+        ctx = start().await;
+        let fresh = session(&mut ctx, &app::V3_DEPTH_PROBE, 64, None).await.unwrap();
+        let _ = fresh;
+        seq = 0;
+    }
+    let n = ok_max.expect("even depth 0 failed");
+    // Frames: DCG's chain, the transition (1), n recursive frames (each one),
+    // within the 64-frame limit.
+    let dcg = 64 - 1 - n as i32;
+    eprintln!("stateful-v3 call depth: deepest probe recursion {n}; frames before the transition callback <= {dcg}");
+    assert!(dcg >= 1 && dcg <= 20, "unexpected frame count {dcg}");
 }
 

@@ -146,7 +146,7 @@ impl KernelDecl {
             i += 1;
         }
         assert!(!consensus_v3 || m.state.is_some(), "a consensus-v3 kernel declares its state");
-        assert!(!m.capabilities.rejects_input() || m.state.is_some(), "only a stateful kernel rejects inputs");
+        assert!(m.capabilities.0 == 0 || m.state.is_some(), "only a stateful kernel declares capabilities");
         assert!(!m.modes.is_empty(), "a kernel declares at least one mode");
         assert!(m.resources.max_compute_units != 0, "declare the compute ceiling");
         assert!(
@@ -261,7 +261,9 @@ pub fn v3_output_len(manifest: &KernelManifest) -> Option<usize> {
     (len != 0 && len <= 65_536).then_some(len)
 }
 
-#[cfg(not(target_os = "solana"))]
+// On SBF only in a test image that serves the same-source reference
+// (`kernel-conform-entry`); never in a production image.
+#[cfg(any(not(target_os = "solana"), feature = "kernel-conform-entry"))]
 pub mod conformance {
     //! The conformance server: one request per line on standard input, one
     //! answer per line on standard output. Bytes are lowercase hex, `-` for
@@ -287,6 +289,7 @@ pub mod conformance {
     use super::*;
     use crate::kernel::{AccountSpan, StateSpanMut, StatefulKernel};
     use crate::stateful::v3::HALT_BEFORE_RUNTIME_CHECK_BYTES;
+    #[cfg(not(target_os = "solana"))]
     use std::io::{BufRead, Write};
 
     pub struct Registry<'a> {
@@ -296,7 +299,69 @@ pub mod conformance {
         pub stateful: &'a [&'static dyn StatefulKernel],
     }
 
+    /// The instruction tag DCG's own test image routes to
+    /// [`serve_account_request`] (`sbf-real-lifecycle-test` only). An
+    /// application picks any tag of its own in a test-only image.
+    pub const CONFORM_TAG: u8 = 252;
+
+    /// Answer one request inside a program (v0.3.0 item 4: the same-source
+    /// reference). `accounts` are `[request, answer(w, program-owned),
+    /// state(w, program-owned)?, resource?]`; the request account holds
+    /// `len:u32` then the request line, and the answer is written the same
+    /// way. With a state account, `init` and `advance` run in place on it
+    /// (the request's state word is `@`, a resource's bytes `@` from the
+    /// resource account) and the answer carries [`STATE_TOKEN`]. Running a test-only image built with this
+    /// entry under ProgramTest (`dcg-kernel-conform-sbf`) lets the kit compare
+    /// the SBF build of a kernel with its native build, with no mirror.
+    pub fn serve_account_request(
+        registry: &Registry<'_>,
+        program: &solana_program::pubkey::Pubkey,
+        accounts: &[solana_program::account_info::AccountInfo],
+    ) -> solana_program::entrypoint::ProgramResult {
+        use solana_program::program_error::ProgramError;
+        let [request, out, ..] = accounts else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+        if out.owner != program || !out.is_writable {
+            return Err(ProgramError::IllegalOwner);
+        }
+        // Parsed in place, with the state and resource bytes in their own
+        // accounts: the SBF heap is 256 KiB, and decoding hex would spend the
+        // compute the kernel needs.
+        let raw = request.try_borrow_data()?;
+        let len = raw.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or(ProgramError::InvalidAccountData)?;
+        let bytes = raw.get(4..4 + len).ok_or(ProgramError::InvalidAccountData)?;
+        let line = core::str::from_utf8(bytes).map_err(|_| ProgramError::InvalidAccountData)?;
+        let reply = match accounts.get(2) {
+            Some(state) => {
+                if state.owner != program || !state.is_writable {
+                    return Err(ProgramError::IllegalOwner);
+                }
+                let mut state_raw = state.try_borrow_mut_data()?;
+                let resource_raw = match accounts.get(3) {
+                    Some(r) => Some(r.try_borrow_data()?),
+                    None => None,
+                };
+                let place = InPlace { state: &mut state_raw, resource: resource_raw.as_ref().map(|r| &r[..]) };
+                match handle(registry, line.trim_end(), Some(place)) {
+                    Ok(answer) => answer,
+                    Err(message) => format!("error {message}"),
+                }
+            }
+            None => answer(registry, line.trim_end()),
+        };
+        drop(raw);
+        let mut raw = out.try_borrow_mut_data()?;
+        if raw.len() < 4 + reply.len() {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        raw[..4].copy_from_slice(&(reply.len() as u32).to_le_bytes());
+        raw[4..4 + reply.len()].copy_from_slice(reply.as_bytes());
+        Ok(())
+    }
+
     /// Serve requests until end of input.
+    #[cfg(not(target_os = "solana"))]
     pub fn serve(registry: &Registry<'_>, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
         for line in input.lines() {
             let line = line?;
@@ -313,13 +378,25 @@ pub mod conformance {
 
     /// Answer one request line.
     pub fn answer(registry: &Registry<'_>, line: &str) -> String {
-        match handle(registry, line) {
+        match handle(registry, line, None) {
             Ok(answer) => answer,
             Err(message) => format!("error {message}"),
         }
     }
 
-    fn handle(registry: &Registry<'_>, line: &str) -> Result<String, String> {
+    /// Stands for the state's hex in an answer computed in place
+    /// ([`serve_account_request`]); the runner substitutes the account bytes.
+    pub const STATE_TOKEN: &str = "@state";
+
+    /// State and resource bytes held in accounts instead of hex in the
+    /// request (the SBF entry): a request's state word `@` and resource bytes
+    /// `@` refer to them, and the kernel runs on `state` in place.
+    pub struct InPlace<'a> {
+        pub state: &'a mut [u8],
+        pub resource: Option<&'a [u8]>,
+    }
+
+    fn handle(registry: &Registry<'_>, line: &str, in_place: Option<InPlace<'_>>) -> Result<String, String> {
         let words: Vec<&str> = line.split_whitespace().collect();
         let (verb, rest) = words.split_first().ok_or("empty request")?;
         let [id, sv, av, rest @ ..] = rest else {
@@ -346,7 +423,15 @@ pub mod conformance {
             "init" => {
                 let [lens] = rest else { return Err("expected <span lengths>".into()) };
                 let Some(kernel) = stateful(registry, id, sv, av) else { return Ok("not-stateful".into()) };
-                init(kernel, &lengths(lens)?)
+                let lens = lengths(lens)?;
+                match in_place {
+                    Some(place) => init_core(kernel, &lens, place.state),
+                    None => {
+                        let mut state = vec![0u8; lens.iter().sum::<u32>() as usize];
+                        let reply = init_core(kernel, &lens, &mut state)?;
+                        Ok(reply.replace(STATE_TOKEN, &hex(&state)))
+                    }
+                }
             }
             "advance" => {
                 let (rejectable, lens, state, input, resource) = match rest {
@@ -363,7 +448,35 @@ pub mod conformance {
                 if kernel.manifest().capabilities.reads_resource() != resource.is_some() {
                     return Err("a READS_RESOURCE kernel takes a resource, and only it".into());
                 }
-                advance(kernel, rejectable, &lengths(lens)?, unhex(state)?, &unhex(input)?, resource.as_ref())
+                let lens = lengths(lens)?;
+                let input = unhex(input)?;
+                match in_place {
+                    Some(place) => {
+                        if *state != "@" {
+                            return Err("an in-place request's state word is @".into());
+                        }
+                        let resource = match resource {
+                            Some((schema, None)) => Some((schema, place.resource.ok_or("no resource account")?)),
+                            Some((_, Some(_))) => return Err("an in-place request's resource bytes are @".into()),
+                            None => None,
+                        };
+                        advance_core(kernel, rejectable, &lens, place.state, &input, resource)
+                    }
+                    None => {
+                        let mut state = unhex(state)?;
+                        let bytes;
+                        let resource = match resource {
+                            Some((schema, Some(b))) => {
+                                bytes = b;
+                                Some((schema, bytes.as_slice()))
+                            }
+                            Some((_, None)) => return Err("resource bytes @ need an in-place request".into()),
+                            None => None,
+                        };
+                        let reply = advance_core(kernel, rejectable, &lens, &mut state, &input, resource)?;
+                        Ok(reply.replace(STATE_TOKEN, &hex(&state)))
+                    }
+                }
             }
             _ => Err(format!("unknown request {verb}")),
         }
@@ -422,10 +535,14 @@ pub mod conformance {
 
     /// `state <hex>`, `refused kernel <error>`, or `refused written <n>`
     /// when the kernel reports a byte count other than the state's size.
-    fn init(kernel: &'static dyn StatefulKernel, lens: &[u32]) -> Result<String, String> {
+    /// The state is written in place; the answer carries [`STATE_TOKEN`].
+    fn init_core(kernel: &'static dyn StatefulKernel, lens: &[u32], state: &mut [u8]) -> Result<String, String> {
         let total: u32 = lens.iter().sum();
-        let mut state = vec![0u8; total as usize];
-        let mut spans = spans_over(kernel.manifest(), lens, &mut state)?;
+        if state.len() != total as usize {
+            return Err("the state does not match its span lengths".into());
+        }
+        state.fill(0);
+        let mut spans = spans_over(kernel.manifest(), lens, state)?;
         let bind = kernel.bind_invocation_state(&mut spans);
         let init = bind.and_then(|()| kernel.initial_state_spans_with_resources(&[], &[0; 32], &mut spans));
         kernel.unbind_invocation_state();
@@ -433,27 +550,26 @@ pub mod conformance {
         Ok(match init {
             Err(e) => format!("refused kernel {e:?}"),
             Ok(written) if written != total as usize => format!("refused written {written}"),
-            Ok(_) => format!("state {}", hex(&state)),
+            Ok(_) => format!("state {STATE_TOKEN}"),
         })
     }
 
-    /// `<raw> judged <verdict>` where raw is
-    /// `<continue|halt_before|halt_after|reject> <code> <output> <state>` or
-    /// `failed <kernel error>`, and the verdict is `accepted` or `refused`.
-    /// The raw output is `-` when the kernel reports more bytes than the
-    /// buffer, which the runtime refuses.
-    /// `resource=<schema id hex>.<version>:<bytes hex>`.
-    fn resource_word(word: &str) -> Result<(VersionedId, Vec<u8>), String> {
+    /// `resource=<schema id hex>.<version>:<bytes hex>`, or `...:@` for the
+    /// bytes in the request's resource account (in place).
+    fn resource_word(word: &str) -> Result<(VersionedId, Option<Vec<u8>>), String> {
         let rest = word.strip_prefix("resource=").ok_or("expected resource=<id>.<version>:<hex>")?;
         let (schema, bytes) = rest.split_once(':').ok_or("expected resource=<id>.<version>:<hex>")?;
         let (id, version) = schema.split_once('.').ok_or("expected <id>.<version>")?;
         let id = u32::from_str_radix(id, 16).map_err(|_| "bad resource schema id")?;
         let version = version.parse().map_err(|_| "bad resource schema version")?;
+        if bytes == "@" {
+            return Ok((VersionedId { id, version }, None));
+        }
         let bytes = unhex(bytes)?;
         if bytes.is_empty() {
             return Err("a sealed resource is never empty".into());
         }
-        Ok((VersionedId { id, version }, bytes))
+        Ok((VersionedId { id, version }, Some(bytes)))
     }
 
     /// The resource's commitment as `OPEN_SESSION` binds it: the Merkle root
@@ -476,13 +592,19 @@ pub mod conformance {
         level[0]
     }
 
-    fn advance(
+    /// `<raw> judged <verdict>` where raw is
+    /// `<continue|halt_before|halt_after|reject> <code> <output> <state>` or
+    /// `failed <kernel error>`, and the verdict is `accepted` or `refused`.
+    /// The raw output is `-` when the kernel reports more bytes than the
+    /// buffer, which the runtime refuses. The state is advanced in place; the
+    /// answer carries [`STATE_TOKEN`] for it.
+    fn advance_core(
         kernel: &'static dyn StatefulKernel,
         rejectable_session: bool,
         lens: &[u32],
-        mut state: Vec<u8>,
+        state: &mut [u8],
         input: &[u8],
-        resource: Option<&(VersionedId, Vec<u8>)>,
+        resource: Option<(VersionedId, &[u8])>,
     ) -> Result<String, String> {
         let manifest = kernel.manifest();
         if lens.iter().map(|l| *l as usize).sum::<usize>() != state.len() {
@@ -490,9 +612,9 @@ pub mod conformance {
         }
         let Some(output_len) = v3_output_len(manifest) else { return Ok("failed OutputLimit judged refused".into()) };
         let rejectable = rejectable_session && manifest.capabilities.rejects_input();
-        let before = (state.len() <= HALT_BEFORE_RUNTIME_CHECK_BYTES).then(|| state.clone());
+        let before = (state.len() <= HALT_BEFORE_RUNTIME_CHECK_BYTES).then(|| state.to_vec());
         let mut output = vec![0u8; output_len];
-        let mut spans = spans_over(manifest, lens, &mut state)?;
+        let mut spans = spans_over(manifest, lens, state)?;
         let bind = kernel.bind_invocation_state(&mut spans);
         let result = bind.and_then(|()| match resource {
             Some((schema, bytes)) => {
@@ -501,7 +623,7 @@ pub mod conformance {
                     owner: [0; 32],
                     is_signer: false,
                     is_writable: false,
-                    schema: *schema,
+                    schema,
                     offset: 0,
                     data: bytes,
                 };
@@ -515,7 +637,7 @@ pub mod conformance {
             Err(e) => return Ok(format!("failed {e:?} judged refused")),
             Ok(outcome) => outcome,
         };
-        let changed = || before.as_ref().is_some_and(|b| *b != state);
+        let changed = || before.as_ref().is_some_and(|b| b.as_slice() != &*state);
         let verdict = match judge_outcome(outcome, rejectable, output_len, changed) {
             Some(_) => "accepted",
             None => "refused",
@@ -527,7 +649,7 @@ pub mod conformance {
             TransitionDisposition::Reject { code } => ("reject", code),
         };
         let out = output.get(..outcome.output_bytes).map_or("-".to_string(), hex);
-        Ok(format!("{kind} {code} {out} {} judged {verdict}", hex(&state)))
+        Ok(format!("{kind} {code} {out} {STATE_TOKEN} judged {verdict}"))
     }
 
     fn lengths(word: &str) -> Result<Vec<u32>, String> {

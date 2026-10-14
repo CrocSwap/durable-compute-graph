@@ -13,3 +13,13 @@ description = "Conformance server for the DCG example kernels (kernel kit, alpha
 # drives the binary with `python -m dcg.kernel_kit check`.
 [dependencies]
 dcg-program = { path = "../dcg-program", features = ["no-entrypoint", "graph-v21", "example-kernels", "sbf-real-lifecycle-test"] }
+# The same-source SBF reference (src/bin/dcg-kernel-conform-sbf.rs); the
+# versions pinned by dcg-program's ProgramTests.
+solana-account = "=2.2.1"
+solana-compute-budget-interface = "=2.2.2"
+solana-instruction = "=2.3.3"
+solana-program-test = "=2.3.9"
+solana-pubkey = "=2.4.0"
+solana-signer = "=2.2.1"
+solana-transaction = "=2.2.3"
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }

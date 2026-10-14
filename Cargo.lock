@@ -1086,6 +1086,14 @@ name = "dcg-kernel-conform"
 version = "0.1.0"
 dependencies = [
  "dcg-program",
+ "solana-account",
+ "solana-compute-budget-interface",
+ "solana-instruction",
+ "solana-program-test",
+ "solana-pubkey",
+ "solana-signer",
+ "solana-transaction",
+ "tokio",
 ]
 
 [[package]]

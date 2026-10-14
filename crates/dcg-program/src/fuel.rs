@@ -16,6 +16,10 @@
 //! Mollusk with the stock compute metering), then size the budget with
 //! [`budget_units`] so a step that spends its whole budget, plus the
 //! runtime's own overhead, stays under the kernel's declared compute units.
+//! The measurement belongs to one image: requalify the budget after any
+//! rebuild or toolchain change, since a step that exceeds its compute fails
+//! every time it is retried and stalls the session. Give every unit a nonzero
+//! cost (`try_charge(0)` always succeeds, so a zero-cost loop never ends).
 //!
 //! ```
 //! use dcg_program::fuel::{budget_units, Fuel};

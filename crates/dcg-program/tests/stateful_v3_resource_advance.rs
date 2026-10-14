@@ -236,6 +236,7 @@ fn open_primary(payer: Pubkey, authority: Pubkey, id: u64, commitment: [u8; 32])
     payload.extend_from_slice(&app::V3_RESOURCE_SCHEMA.version.to_le_bytes());
     payload.extend_from_slice(&commitment);
     payload.push(1); // primary headerless state account
+    payload.extend_from_slice(&[0, v3::FEATURE_READS_RESOURCE]); // no lanes; the recorded capability
     instruction(
         sw::TAG_OPEN_SESSION,
         payload,
@@ -358,12 +359,17 @@ async fn advance_refuses_a_missing_wrong_or_writable_resource() {
         ("missing (the pre-0.3 account list)", None),
         ("another session's sealed copy", Some(AccountMeta::new_readonly(resource_pda(&other), false))),
         ("the unsealed source account", Some(AccountMeta::new_readonly(RESOURCE, false))),
-        ("the right copy, writable", Some(AccountMeta::new(resource_pda(&session), false))),
+        ("the right copy, writable (refused by the program)", Some(AccountMeta::new(resource_pda(&session), false))),
         ("a state account in the resource slot", Some(AccountMeta::new_readonly(state_pda(&other, 0), false))),
     ];
     for (label, resource) in cases {
+        let program_refusal = label.contains("writable") || label.contains("another session") || label.contains("source") || label.contains("state account");
         let got = try_send(&mut context, advance_accounts(authority.pubkey(), session, 0, 1, resource), &[&authority]).await;
         assert!(got.is_err(), "{label}: ADVANCE was accepted");
+        if program_refusal {
+            let want = format!("Custom({})", v3::REFUSAL_RESOURCE);
+            assert!(got.as_ref().unwrap_err().contains(&want), "{label}: {got:?}, want {want}");
+        }
         assert_eq!(counter(&mut context, &session).await, before, "{label}: state changed");
     }
     // The honest list still advances afterwards.
@@ -387,7 +393,77 @@ async fn open_refuses_a_resource_reading_kernel_without_a_resource() {
     ];
     let got = try_send(&mut context, open.clone(), &[&authority]).await;
     assert!(got.is_err(), "a READS_RESOURCE session opened without a resource");
-    // Control: the same resource-free open succeeds for the plain fixed engine.
+    // Control: the same resource-free open, without the feature, succeeds for
+    // the plain fixed engine.
     open.data[17..33].copy_from_slice(&app::V3_FIXED_ENGINE.manifest().id.0);
+    open.data.truncate(178);
     ok(&mut context, open, &[&authority], "control open").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_recorded_feature_must_equal_the_kernels_declaration() {
+    let mut context = start().await;
+    let authority = keypair(44);
+    let payer = context.payer.pubkey();
+    let resource = resource_bytes();
+    // The resource engine without the feature byte.
+    let mut open = open_primary(payer, authority.pubkey(), 1, resource_root(&resource));
+    open.data.truncate(178);
+    assert!(try_send(&mut context, open, &[&authority]).await.is_err(), "READS_RESOURCE kernel without the feature");
+    // The plain fixed engine with the feature.
+    let mut open = open_primary(payer, authority.pubkey(), 2, resource_root(&resource));
+    open.data[17..33].copy_from_slice(&app::V3_FIXED_ENGINE.manifest().id.0);
+    open.accounts[2] = AccountMeta::new(session_pda(&authority.pubkey(), 2), false);
+    open.accounts[4] = AccountMeta::new(resource_pda(&session_pda(&authority.pubkey(), 2)), false);
+    assert!(try_send(&mut context, open, &[&authority]).await.is_err(), "the feature without the capability");
+}
+
+/// The headered layout: `[authority, session, stream, resource, spans...]`
+/// with the resource counter (two 8-byte headered spans).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_headered_session_reads_the_resource() {
+    let mut context = start().await;
+    let authority = keypair(45);
+    let payer = context.payer.pubkey();
+    let session = session_pda(&authority.pubkey(), 7);
+    let resource = resource_bytes();
+    let mut open = open_primary(payer, authority.pubkey(), 7, resource_root(&resource));
+    let m = app::V3_RESOURCE_COUNTER.manifest();
+    open.data[17..33].copy_from_slice(&m.id.0);
+    open.data[177] = 0; // headered state
+    ok(&mut context, open, &[&authority], "open").await;
+    ok(&mut context, upload_resource_chunk(authority.pubkey(), session, RESOURCE, 0, &resource_proof(&resource, 0)), &[&authority], "chunk").await;
+    ok(&mut context, create_stream(payer, authority.pubkey(), session), &[&authority], "stream").await;
+    let mut p = vec![v3::WIRE_VERSION, 2];
+    p.extend_from_slice(&8u32.to_le_bytes());
+    p.extend_from_slice(&8u32.to_le_bytes());
+    ok(&mut context, instruction(sw::TAG_CREATE_STATE, p, vec![
+        AccountMeta::new(payer, true), AccountMeta::new(session, false), AccountMeta::new_readonly(authority.pubkey(), true),
+        AccountMeta::new_readonly(resource_pda(&session), false),
+        AccountMeta::new(state_pda(&session, 0), false), AccountMeta::new(state_pda(&session, 1), false),
+        AccountMeta::new_readonly(SYSTEM, false)]), &[&authority], "state").await;
+    ok(&mut context, instruction(sw::TAG_CREATE_STATE, vec![v3::WIRE_VERSION, v3::STATE_OP_INITIALIZE], vec![
+        AccountMeta::new_readonly(authority.pubkey(), true), AccountMeta::new(session, false),
+        AccountMeta::new_readonly(resource_pda(&session), false),
+        AccountMeta::new(state_pda(&session, 0), false), AccountMeta::new(state_pda(&session, 1), false)]), &[&authority], "init").await;
+    for (seq, cmd) in [3u8, 9, 1].iter().enumerate() {
+        ok(&mut context, write_input(authority.pubkey(), session, seq as u32, *cmd), &[&authority], "write").await;
+    }
+    let mut d = vec![v3::WIRE_VERSION];
+    d.extend_from_slice(&0u32.to_le_bytes());
+    d.push(3);
+    let accounts = vec![
+        AccountMeta::new_readonly(authority.pubkey(), true), AccountMeta::new(session, false),
+        AccountMeta::new(stream_pda(&session), false), AccountMeta::new_readonly(resource_pda(&session), false),
+        AccountMeta::new(state_pda(&session, 0), false), AccountMeta::new(state_pda(&session, 1), false)];
+    ok(&mut context, instruction(sw::TAG_ADVANCE, d, accounts), &[&authority], "advance").await;
+    let (mut value, mut total) = (0u64, 0u64);
+    for cmd in [3u8, 9, 1] {
+        value += cmd as u64 + resource[(value % resource.len() as u64) as usize] as u64;
+        total += value;
+    }
+    let v = context.banks_client.get_account(state_pda(&session, 0)).await.unwrap().unwrap().data;
+    let t = context.banks_client.get_account(state_pda(&session, 1)).await.unwrap().unwrap().data;
+    assert_eq!(u64::from_le_bytes(v[128..136].try_into().unwrap()), value);
+    assert_eq!(u64::from_le_bytes(t[128..136].try_into().unwrap()), total);
 }

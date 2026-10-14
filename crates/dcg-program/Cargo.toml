@@ -36,7 +36,10 @@ alpha-image = ["graph-v21", "example-kernels"]
 # uses `test-kernel` and does not enable this route.
 test-legacy-template-create = []
 sbf-lifecycle-test = ["test-kernel"]
-sbf-real-lifecycle-test = ["test-kernel"]
+sbf-real-lifecycle-test = ["test-kernel", "kernel-conform-entry"]
+# The kernel kit's conformance entry inside an SBF image (the same-source
+# reference, `dcg-kernel-conform-sbf`). Test images only.
+kernel-conform-entry = []
 
 [lib]
 name = "dcg_program"

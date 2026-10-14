@@ -421,6 +421,82 @@ reject_counter_kernel!(V3TickCounterKernel, V3_TICK_COUNTER_MANIFEST, tick_count
 
 pub static V3_TICK_COUNTER: V3TickCounterKernel = V3TickCounterKernel;
 
+/// Ticks on a rejectable session with halts: the rejecting counter plus
+/// `ACCEPTS_TICKS`, where a tick adds 1 and halts after when the value
+/// reaches a multiple of 10 (`V3_REJECT_HALT_REASON`).
+pub struct V3TickRejectKernel;
+
+static V3_TICK_REJECT_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-tickrej-v1\0\0"),
+    capabilities: crate::kernel::KernelCapabilities(
+        crate::kernel::KernelCapabilities::REJECTS_INPUT.0 | crate::kernel::KernelCapabilities::ACCEPTS_TICKS.0,
+    ),
+    ..V3_LANE_COUNTER_MANIFEST
+};
+
+fn tick_reject_transition(
+    input: &[u8],
+    state: &mut [StateSpanMut<'_>],
+    output: &mut [u8],
+) -> Result<TransitionOutcome, KernelError> {
+    if !input.is_empty() {
+        return reject_counter_transition(input, state, output);
+    }
+    let output_bytes = COUNTER.transition_spans(&[1], state, output)?;
+    let value = state
+        .first()
+        .and_then(|span| span.data.get(..8))
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .ok_or(KernelError::InvalidInput)?;
+    let disposition = if value % 10 == 0 {
+        TransitionDisposition::HaltAfter { reason: V3_REJECT_HALT_REASON }
+    } else {
+        TransitionDisposition::Continue
+    };
+    Ok(TransitionOutcome { output_bytes, disposition })
+}
+
+reject_counter_kernel!(V3TickRejectKernel, V3_TICK_REJECT_MANIFEST, tick_reject_transition);
+
+pub static V3_TICK_REJECT: V3TickRejectKernel = V3TickRejectKernel;
+
+/// Call-depth probe (v0.3.0): a transition that recurses `command[0]` frames
+/// below itself before stepping the counter. Run through ADVANCE on SBF, the
+/// deepest command that succeeds tells how many of the 64 call frames the
+/// runtime uses before the kernel's callback.
+pub struct V3DepthProbeKernel;
+
+static V3_DEPTH_PROBE_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-depth-v1\0\0\0\0"),
+    ..V3_LANE_COUNTER_MANIFEST
+};
+
+#[inline(never)]
+fn depth_probe_recurse(n: u8, acc: u64) -> u64 {
+    if n == 0 {
+        return core::hint::black_box(acc);
+    }
+    // Not a tail call: the addition after the call keeps each frame live.
+    core::hint::black_box(depth_probe_recurse(core::hint::black_box(n - 1), acc.wrapping_mul(31).wrapping_add(n as u64)))
+        .wrapping_add(1)
+}
+
+fn depth_probe_transition(
+    input: &[u8],
+    state: &mut [StateSpanMut<'_>],
+    output: &mut [u8],
+) -> Result<TransitionOutcome, KernelError> {
+    let n = *input.first().ok_or(KernelError::InvalidInput)?;
+    let _ = depth_probe_recurse(n, 7);
+    COUNTER
+        .transition_spans(&[1], state, output)
+        .map(|output_bytes| TransitionOutcome { output_bytes, disposition: TransitionDisposition::Continue })
+}
+
+reject_counter_kernel!(V3DepthProbeKernel, V3_DEPTH_PROBE_MANIFEST, depth_probe_transition);
+
+pub static V3_DEPTH_PROBE: V3DepthProbeKernel = V3DepthProbeKernel;
+
 pub static V3_REJECT_COUNTER: V3RejectCounterKernel = V3RejectCounterKernel;
 pub static V3_UNDECLARED_REJECT: V3UndeclaredRejectKernel = V3UndeclaredRejectKernel;
 
@@ -453,6 +529,15 @@ impl StatefulKernel for V3ResourceCounterKernel {
         Err(KernelError::Refused)
     }
     fn initial_state_spans(&self, spans: &mut [StateSpanMut<'_>]) -> Result<usize, KernelError> {
+        COUNTER.initial_state_spans(spans)
+    }
+    /// The resource is read by transitions, not by initialization.
+    fn initial_state_spans_with_resources(
+        &self,
+        _resources: &[AccountSpan<'_>],
+        _commitment: &[u8; 32],
+        spans: &mut [StateSpanMut<'_>],
+    ) -> Result<usize, KernelError> {
         COUNTER.initial_state_spans(spans)
     }
     fn transition_spans_with_resource(
@@ -1432,6 +1517,10 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_FIXED_ENGINE)
         } else if kernel_id == Some(V3_WORKSPACE_ENGINE.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_WORKSPACE_ENGINE)
+        } else if kernel_id == Some(V3_DEPTH_PROBE.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_DEPTH_PROBE)
+        } else if kernel_id == Some(V3_TICK_REJECT.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_TICK_REJECT)
         } else if kernel_id == Some(V3_TICK_COUNTER.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_TICK_COUNTER)
         } else if kernel_id == Some(V3_RESOURCE_COUNTER.manifest().id) {
@@ -1458,3 +1547,20 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
         })
     }
 }
+
+/// The kernel kit's same-source reference for the v3 test counters
+/// (`kernel_kit::conformance::serve_account_request`, tag `CONFORM_TAG`):
+/// the same kernels `dcg-kernel-conform` serves natively.
+pub fn conform(program: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    static STATEFUL: [&'static dyn StatefulKernel; 6] = [
+        &V3_COUNTER,
+        &V3_LANE_COUNTER,
+        &V3_REJECT_COUNTER,
+        &V3_UNDECLARED_REJECT,
+        &V3_RESOURCE_COUNTER,
+        &V3_TICK_COUNTER,
+    ];
+    let registry = crate::kernel_kit::conformance::Registry { app: None, stateful: &STATEFUL };
+    crate::kernel_kit::conformance::serve_account_request(&registry, program, accounts)
+}
+

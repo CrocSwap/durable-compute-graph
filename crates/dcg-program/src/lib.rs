@@ -55,7 +55,8 @@ pub fn process_instruction(
         feature = "graph-v2",
         feature = "test-legacy-template-create",
         feature = "sbf-lifecycle-test",
-        feature = "sbf-real-lifecycle-test"
+        feature = "sbf-real-lifecycle-test",
+        feature = "kernel-conform-entry"
     )
 ))]
 compile_error!("the alpha-image feature excludes test, legacy and v2.0 features");
@@ -119,6 +120,10 @@ pub fn process_instruction_with_manifest(
     #[cfg(feature = "sbf-real-lifecycle-test")]
     if (230..=239).contains(&tag) || tag == stateful::v3::RESOURCE_CHUNK_TAG {
         return stateful_test::process(program_id, accounts, data);
+    }
+    #[cfg(feature = "sbf-real-lifecycle-test")]
+    if tag == kernel_kit::conformance::CONFORM_TAG {
+        return stateful_test::conform(program_id, accounts);
     }
     match tag {
         // The v2 graph lifecycle; graph_v2::process routes each tag by feature

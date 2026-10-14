@@ -169,6 +169,36 @@ mirror bugs:
 5. a dirty reject modelled as clean;
 6. a missing capability.
 
+## 4. Compare two builds of the same source (no mirror)
+
+For a kernel with no Python model (one ported from C, or extracted from a
+proof assistant), the kit can instead compare its **native** build with its
+**SBF** build over the same generated cases (v0.3.0):
+
+1. Build a test-only image of your program that routes a tag of your choice
+   to `kernel_kit::conformance::serve_account_request(&registry, program,
+   accounts)` with the dependency feature `kernel-conform-entry` (never in a
+   production image; DCG's own `sbf-real-lifecycle-test` image routes tag
+   `CONFORM_TAG` = 252 for its test counters).
+2. Run the comparison, with a declaration-only mirror module (the mirror
+   classes' `decl`, `state_spans`, `special_inputs` and `resources` are used;
+   their transitions are not):
+
+```sh
+python -m dcg.kernel_kit compare --bin target/debug/my-conform \
+    --reference target/debug/dcg-kernel-conform-sbf out/sbf-test-image [--program NAME --tag N] \
+    -- my_declarations.py
+```
+
+`dcg-kernel-conform-sbf` serves the conformance protocol by running each
+request inside the SBF image under ProgramTest (1.4M compute units and the
+256 KiB heap per request); a request whose transaction fails answers `panic`
+and is reported. **What this shows:** the SBF build agrees with the native
+build: no platform difference in integer widths, overflow, layout or
+undefined behavior. **What it does not show:** that either build is the
+computation you meant; a logic bug in the shared source is in both.
+Measured (2026-10-14): DCG's six example counters agree across builds.
+
 ## What the kit does not check
 
 - The server passes zero account keys and owners, binds invocation state per
