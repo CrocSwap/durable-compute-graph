@@ -244,7 +244,8 @@ mod upward_heap {
 /// (`dcg.runtime.runtime_version`) without sending a transaction. Security
 /// advisories name affected versions by it, together with image hashes. The
 /// crate version is not bumped at every release tag (v0.1.0-alpha and
-/// v0.2.0-alpha both carry 0.1.0); an image's sha256 identifies it exactly.
+/// v0.2.0-alpha both carry 0.1.0; v0.3.0 carries 0.3.0); an image's sha256
+/// identifies it exactly.
 pub const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub static RUNTIME_MARKER: &[u8] =
     concat!("\0dcg-runtime/1 ", env!("CARGO_PKG_VERSION"), " stateful-v3 v21\0").as_bytes();

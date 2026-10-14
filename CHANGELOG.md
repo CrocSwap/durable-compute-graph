@@ -5,6 +5,9 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
 
 ## Unreleased
 
+- **Version 0.3.0.** The DCG crates and the Python package `dcg-sequencer`
+  are now version 0.3.0, so images built from this release carry the
+  runtime marker `dcg-runtime/1 0.3.0 stateful-v3 v21`.
 - **Transitions may read the session resource (v0.3.0 item 1).** A stateful
   kernel declaring `KernelCapabilities::READS_RESOURCE` gets the sealed
   resource read-only on every `ADVANCE`, through

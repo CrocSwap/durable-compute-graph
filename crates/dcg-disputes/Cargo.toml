@@ -1,6 +1,6 @@
 [package]
 name = "dcg-disputes"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Optimistic disputes v2.1 consensus bytes: trees, leaves, run roots, spec records (no_std)"

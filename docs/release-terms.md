@@ -37,7 +37,8 @@ It has two modes:
   affected, and how to migrate.
 - Each program image carries the version of the DCG crates it was built
   from (`dcg-runtime/1 <version> …`). Crate versions are not bumped at every
-  release tag: v0.1.0-alpha and v0.2.0-alpha both carry `0.1.0`. What
+  release tag: v0.1.0-alpha and v0.2.0-alpha both carry `0.1.0`, and
+  v0.3.0 carries `0.3.0`. What
   identifies an image exactly is its sha256, published for each release
   (`docs/hello-graph.md`, the GitHub release) and checked by `dcg verify`.
   Advisories name the affected image hashes as well as runtime versions.

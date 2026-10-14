@@ -1075,7 +1075,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "dcg-disputes"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "sha2 0.10.9",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "dcg-kernel-conform"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "dcg-program",
  "solana-account",
@@ -1098,11 +1098,11 @@ dependencies = [
 
 [[package]]
 name = "dcg-kernels"
-version = "0.1.0"
+version = "0.3.0"
 
 [[package]]
 name = "dcg-program"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "dcg-wire"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
 ]
