@@ -5,6 +5,28 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
 
 ## Unreleased
 
+- **Transitions may read the session resource (v0.3.0 item 1).** A stateful
+  kernel declaring `KernelCapabilities::READS_RESOURCE` gets the sealed
+  resource read-only on every `ADVANCE`, through
+  `StatefulKernel::transition_spans_with_resource`
+  (`docs/stateful-workloads-v3.md`). Additive: kernels without the bit, their
+  sessions and their account lists are unchanged. For such a kernel,
+  `ADVANCE` takes the resource copy right after the stream, and
+  `OPEN_SESSION` refuses a session without a resource. The kernel kit checks
+  these kernels (`transition_with_resource`, sample `resources`), and the
+  conformance protocol's `advance` takes an optional `resource=` word.
+- **Ticks (v0.3.0 item 2).** A kernel declaring
+  `KernelCapabilities::ACCEPTS_TICKS` can be advanced with
+  `ADVANCE_TICK`: steps on empty commands, nothing stored, on ring streams
+  with no input waiting; each tick enters the input chain as an empty
+  command. Additive: the 7-byte `ADVANCE` is unchanged.
+- **Fuel meter.** `dcg_program::fuel` (`Fuel`, `budget_units`): a
+  deterministic work-unit budget for kernels that split long computations
+  across steps, since a transition may not depend on remaining compute. No
+  wire or image change.
+- **Design: executor-declared run length (LX2).** Proposed, not built
+  (`docs/design/v2.1-declared-length.md`).
+
 - **Release terms (owner 2026-10-14):** reviewed and accepted; the runtime
   version is now described as the crates' version, which is not bumped at
   every tag (v0.2.0-alpha images still carry `0.1.0`), and the image sha256
