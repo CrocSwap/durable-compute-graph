@@ -1040,6 +1040,11 @@ fn open_session(
         version: u16_at(data, 143),
     };
     let resource_commitment: [u8; 32] = data[145..177].try_into().expect("fixed width");
+    // A kernel whose transitions read the resource needs one at open, before
+    // anyone writes an input (rechecked, sealed, at every ADVANCE).
+    if kernel.manifest().capabilities.reads_resource() && resource_key == Pubkey::default() {
+        return Err(refusal(REFUSAL_RESOURCE));
+    }
     let (payer, authority, session_account, resource_account, resource_copy, system) =
         match accounts {
             [payer, authority, session, system] if resource_key == Pubkey::default() => {
@@ -2695,21 +2700,26 @@ fn advance(
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     let primary_layout = !accounts[0].is_signer;
+    // A kernel declaring READS_RESOURCE takes the sealed resource copy
+    // read-only right after the stream; the state spans follow it.
+    let reads_resource = kernel.manifest().capabilities.reads_resource();
+    let tail = if primary_layout { 4 } else { 3 } + usize::from(reads_resource);
+    if accounts.len() < tail {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let resource_account = reads_resource.then(|| &accounts[tail - 1]);
     let (actor, session_account, stream, state_accounts): (
         &AccountInfo,
         &AccountInfo,
         &AccountInfo,
         Vec<AccountInfo>,
     ) = if primary_layout {
-        if accounts.len() < 4 {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        }
         (
             &accounts[1],
             &accounts[2],
             &accounts[3],
             core::iter::once(accounts[0].clone())
-                .chain(accounts[4..].iter().cloned())
+                .chain(accounts[tail..].iter().cloned())
                 .collect(),
         )
     } else {
@@ -2717,7 +2727,7 @@ fn advance(
             &accounts[0],
             &accounts[1],
             &accounts[2],
-            accounts[3..].to_vec(),
+            accounts[tail..].to_vec(),
         )
     };
     check_unique(accounts)?;
@@ -2760,6 +2770,10 @@ fn advance(
         return Err(refusal(REFUSAL_STATE));
     }
     stream_pda_check(program, stream, session_account, &session, true)?;
+    let resource_meta = match resource_account {
+        Some(resource) => Some(checked_resource(program, resource, session_account, &session, true, false)?),
+        None => None,
+    };
     let end_cursor = expected_cursor
         .checked_add(steps as u32)
         .ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
@@ -2782,6 +2796,22 @@ fn advance(
     }
     let output_len =
         crate::kernel_kit::v3_output_len(kernel.manifest()).ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
+    let resource_guard = match resource_account {
+        Some(resource) => Some(resource.try_borrow_data()?),
+        None => None,
+    };
+    let resource_span = match (resource_account, resource_guard.as_ref(), resource_meta.as_ref()) {
+        (Some(account), Some(raw), Some(meta)) => Some(AccountSpan {
+            key: account.key.to_bytes(),
+            owner: account.owner.to_bytes(),
+            is_signer: account.is_signer,
+            is_writable: account.is_writable,
+            schema: session.resource_schema,
+            offset: 0,
+            data: &raw[RESOURCE_HEADER_BYTES..RESOURCE_HEADER_BYTES + meta.len as usize],
+        }),
+        _ => None,
+    };
     let mut guards = state_accounts
         .iter()
         .map(AccountInfo::try_borrow_mut_data)
@@ -2831,9 +2861,17 @@ fn advance(
                     }
                 }
                 output.fill(0);
-                let outcome = kernel
-                    .transition_spans_with_outcome(command, &mut spans, &mut output)
-                    .map_err(|_| refusal(REFUSAL_KERNEL))?;
+                let outcome = match resource_span.as_ref() {
+                    Some(resource) => kernel.transition_spans_with_resource(
+                        command,
+                        resource,
+                        &session.resource_commitment,
+                        &mut spans,
+                        &mut output,
+                    ),
+                    None => kernel.transition_spans_with_outcome(command, &mut spans, &mut output),
+                }
+                .map_err(|_| refusal(REFUSAL_KERNEL))?;
                 // State unchanged since the snapshot (checked at or below the
                 // snapshot cap; above it, a kernel obligation).
                 let state_changed = |spans: &[StateSpanMut<'_>]| {

@@ -854,11 +854,49 @@ static V3_WORKSPACE_MANIFEST: KernelManifest = KernelManifest {
     capabilities: crate::kernel::KernelCapabilities::NONE,
 };
 
+/// The fixed engine with `READS_RESOURCE`: every transition reads the sealed
+/// resource at a state-chosen offset (v0.3.0 item 1).
+static V3_RESOURCE_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-rsrc-v3\0\0\0\0\0"),
+    semantic_version: 1,
+    abi_version: 1,
+    input: PortLayout {
+        id: VersionedId {
+            id: 0x494e_5054,
+            version: 3,
+        },
+        max_bytes: 1,
+        alignment: 1,
+    },
+    output: PortLayout {
+        id: VersionedId {
+            id: 0x4f55_5450,
+            version: 3,
+        },
+        max_bytes: 8,
+        alignment: 1,
+    },
+    state: Some(StateSchema {
+        id: V3_STATE_SCHEMA,
+        max_bytes: V3_FIXED_STATE_LEN,
+    }),
+    resources: ResourceLimits {
+        max_input_bytes: 1,
+        max_output_bytes: 8,
+        max_state_bytes: V3_FIXED_STATE_LEN,
+        max_operations: 8,
+        max_compute_units: 100_000,
+    },
+    modes: &V3_MODES,
+    capabilities: crate::kernel::KernelCapabilities::READS_RESOURCE,
+};
+
 /// Small Rust engine used by the SBF test. It rejects any state pointer except
 /// the legacy account-0 data address and exposes resource-backed rendering.
 pub struct V3FixedAddressKernel {
     context: AtomicPtr<u8>,
     workspace_first: bool,
+    reads_resource: bool,
 }
 
 impl V3FixedAddressKernel {
@@ -866,6 +904,7 @@ impl V3FixedAddressKernel {
         Self {
             context: AtomicPtr::new(core::ptr::null_mut()),
             workspace_first: false,
+            reads_resource: false,
         }
     }
 
@@ -873,6 +912,17 @@ impl V3FixedAddressKernel {
         Self {
             context: AtomicPtr::new(core::ptr::null_mut()),
             workspace_first: true,
+            reads_resource: false,
+        }
+    }
+
+    /// Transitions add the input and the resource byte at
+    /// `value % resource_len` to the counter: a data-dependent read.
+    pub const fn reading_resource() -> Self {
+        Self {
+            context: AtomicPtr::new(core::ptr::null_mut()),
+            workspace_first: false,
+            reads_resource: true,
         }
     }
 
@@ -919,7 +969,9 @@ impl V3FixedAddressKernel {
 
 impl Kernel for V3FixedAddressKernel {
     fn manifest(&self) -> &'static KernelManifest {
-        if self.workspace_first {
+        if self.reads_resource {
+            &V3_RESOURCE_MANIFEST
+        } else if self.workspace_first {
             &V3_WORKSPACE_MANIFEST
         } else {
             &V3_MANIFEST
@@ -965,6 +1017,9 @@ impl StatefulKernel for V3FixedAddressKernel {
         state: &mut [StateSpanMut<'_>],
         output: &mut [u8],
     ) -> Result<TransitionOutcome, KernelError> {
+        if self.reads_resource {
+            return Err(KernelError::Refused);
+        }
         self.check_fixed_address(state)?;
         if self.context.load(Ordering::Relaxed) != state[0].data.as_mut_ptr() {
             return Err(KernelError::Refused);
@@ -998,6 +1053,44 @@ impl StatefulKernel for V3FixedAddressKernel {
         let written = self.transition_one(input, state, output)?;
         Ok(TransitionOutcome {
             output_bytes: written,
+            disposition: TransitionDisposition::Continue,
+        })
+    }
+
+    fn transition_spans_with_resource(
+        &self,
+        input: &[u8],
+        resource: &AccountSpan<'_>,
+        _commitment: &[u8; 32],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<TransitionOutcome, KernelError> {
+        if !self.reads_resource {
+            return Err(KernelError::Refused);
+        }
+        self.check_fixed_address(state)?;
+        if self.context.load(Ordering::Relaxed) != state[0].data.as_mut_ptr() {
+            return Err(KernelError::Refused);
+        }
+        if input.len() != 1
+            || output.len() < 8
+            || resource.data.is_empty()
+            || resource.schema != V3_RESOURCE_SCHEMA
+            || resource.owner != V3_RESOURCE_OWNER
+            || resource.is_writable
+        {
+            return Err(KernelError::InvalidInput);
+        }
+        let at = state[0].data.len() - 8;
+        let value = u64::from_le_bytes(state[0].data[at..at + 8].try_into().unwrap());
+        let read = resource.data[(value % resource.data.len() as u64) as usize];
+        let next = value
+            .checked_add(input[0] as u64 + read as u64)
+            .ok_or(KernelError::Refused)?;
+        state[0].data[at..at + 8].copy_from_slice(&next.to_le_bytes());
+        output[..8].copy_from_slice(&next.to_le_bytes());
+        Ok(TransitionOutcome {
+            output_bytes: 8,
             disposition: TransitionDisposition::Continue,
         })
     }
@@ -1201,6 +1294,7 @@ impl StatefulKernel for V3FixedAddressKernel {
 
 pub const V3_FIXED_ENGINE: V3FixedAddressKernel = V3FixedAddressKernel::new();
 pub const V3_WORKSPACE_ENGINE: V3FixedAddressKernel = V3FixedAddressKernel::workspace_first();
+pub const V3_RESOURCE_ENGINE: V3FixedAddressKernel = V3FixedAddressKernel::reading_resource();
 
 fn test_session_kernel_id(accounts: &[AccountInfo]) -> Option<KernelId> {
     for account in accounts {
@@ -1233,6 +1327,8 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_FIXED_ENGINE)
         } else if kernel_id == Some(V3_WORKSPACE_ENGINE.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_WORKSPACE_ENGINE)
+        } else if kernel_id == Some(V3_RESOURCE_ENGINE.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_RESOURCE_ENGINE)
         } else if kernel_id == Some(V3_LANE_COUNTER.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_LANE_COUNTER)
         } else if kernel_id == Some(V3_REJECT_COUNTER.manifest().id) {

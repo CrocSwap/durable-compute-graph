@@ -77,10 +77,20 @@ impl KernelCapabilities {
     /// unchanged. Sessions and templates binding such a kernel are marked
     /// rejectable ahead of time.
     pub const REJECTS_INPUT: Self = Self(1);
-    pub const KNOWN: u32 = Self::REJECTS_INPUT.0;
+    /// The kernel's v3 transitions read the session's sealed resource:
+    /// `ADVANCE` passes the program-owned copy read-only, right after the
+    /// stream account, and calls
+    /// `StatefulKernel::transition_spans_with_resource`. A session binding
+    /// such a kernel must name a resource (checked at `OPEN_SESSION`).
+    pub const READS_RESOURCE: Self = Self(2);
+    pub const KNOWN: u32 = Self::REJECTS_INPUT.0 | Self::READS_RESOURCE.0;
 
     pub const fn rejects_input(self) -> bool {
         self.0 & Self::REJECTS_INPUT.0 != 0
+    }
+
+    pub const fn reads_resource(self) -> bool {
+        self.0 & Self::READS_RESOURCE.0 != 0
     }
 }
 
@@ -538,6 +548,25 @@ pub trait StatefulKernel: Kernel {
             })
     }
 
+    /// Stateful wire v3 transition for a kernel declaring
+    /// `KernelCapabilities::READS_RESOURCE`. `resource` is the session's
+    /// sealed program-owned copy, read-only, checked against the
+    /// session-bound key, schema and commitment, its structure and its chunk
+    /// count (the bytes are not re-hashed per call). The transition must be a
+    /// pure function of (input, state, resource). The default refuses, so a
+    /// kernel declaring the capability must override it.
+    fn transition_spans_with_resource(
+        &self,
+        input: &[u8],
+        resource: &AccountSpan<'_>,
+        commitment: &[u8; 32],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<TransitionOutcome, KernelError> {
+        let _ = (input, resource, commitment, state, output);
+        Err(KernelError::Refused)
+    }
+
     /// Largest deterministic state-initialization chunk accepted per call.
     fn max_initialization_phase_bytes(&self) -> u32 {
         65_536
@@ -993,10 +1022,11 @@ impl ApplicationManifest {
             if is_builtin_kernel_name(&a.id.0) {
                 return Err(ManifestError::BuiltinKernelCollision(a.id));
             }
-            // Only stateful transitions can reject; a stateless (replay) kernel
-            // with the bit would make the rev-8 admission digest silent about it.
+            // Only stateful transitions can reject or read a session resource;
+            // a stateless (replay) kernel with either bit would make the
+            // admission digest silent about it.
             if a.capabilities.0 & !KernelCapabilities::KNOWN != 0
-                || (a.capabilities.rejects_input() && a.state.is_none())
+                || ((a.capabilities.rejects_input() || a.capabilities.reads_resource()) && a.state.is_none())
             {
                 return Err(ManifestError::InvalidCapabilities(a.id));
             }
@@ -1651,7 +1681,10 @@ mod tests {
         assert_eq!(capability_app(KernelCapabilities::NONE, false), Ok(()));
         assert_eq!(capability_app(KernelCapabilities::REJECTS_INPUT, true), Ok(()));
         assert_eq!(capability_app(KernelCapabilities::REJECTS_INPUT, false), Err(ManifestError::InvalidCapabilities(id)));
-        assert_eq!(capability_app(KernelCapabilities(2), true), Err(ManifestError::InvalidCapabilities(id)));
+        assert_eq!(capability_app(KernelCapabilities::READS_RESOURCE, true), Ok(()));
+        assert_eq!(capability_app(KernelCapabilities::READS_RESOURCE, false), Err(ManifestError::InvalidCapabilities(id)));
+        assert_eq!(capability_app(KernelCapabilities(3), true), Ok(()));
+        assert_eq!(capability_app(KernelCapabilities(4), true), Err(ManifestError::InvalidCapabilities(id)));
     }
 
     #[test]
