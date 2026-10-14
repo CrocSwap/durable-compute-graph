@@ -423,3 +423,91 @@ async fn a_rejectable_session_with_lanes_rejects() {
     assert_eq!(value(&mut ctx, &s).await, 11);
     assert_eq!(u32_at(&data(&mut ctx, s.key).await, SESSION_REJECTED), 1);
 }
+
+// --- ticks (v0.3.0 item 2) -----------------------------------------------------------------------
+
+async fn tick(ctx: &mut ProgramTestContext, s: &Session, cursor: u32, steps: u8) -> Result<(), u32> {
+    let mut p = vec![v3::WIRE_VERSION];
+    p.extend_from_slice(&cursor.to_le_bytes());
+    p.extend_from_slice(&[steps, v3::ADVANCE_TICK]);
+    send(ctx, ix(sw::TAG_ADVANCE, p, vec![signer(s.auth.pubkey()), w(s.key), w(stream_pda(&s.key)),
+                                          w(state_pda(&s.key, 0)), w(state_pda(&s.key, 1))]), &[&s.auth]).await
+}
+
+/// The `/2` chain with ticks as empty commands.
+fn tick_chain(commands: &[(u32, Option<u8>)]) -> [u8; 32] {
+    let mut root = STREAM_ROOT;
+    for &(seq, cmd) in commands {
+        let bytes: &[u8] = match &cmd { Some(c) => core::slice::from_ref(c), None => &[] };
+        root = sha256(&[b"dcg/input-chain/2", &root, &seq.to_le_bytes(), bytes]);
+    }
+    root
+}
+
+#[tokio::test]
+async fn ticks_advance_a_ring_session_without_storing_inputs() {
+    let mut ctx = start().await;
+    let cap = v3::MIN_RING_CAPACITY;
+    let s = session(&mut ctx, &app::V3_TICK_COUNTER, cap, Some(v3::FEATURE_RING_STREAM)).await.unwrap();
+    let stream_before = data(&mut ctx, stream_pda(&s.key)).await;
+    // Three laps of ticks, 8 at a time: no writes, no slots used, no growth.
+    let total = 3 * cap + 5;
+    let mut cursor = 0u32;
+    while cursor < total {
+        let steps = (total - cursor).min(8) as u8;
+        tick(&mut ctx, &s, cursor, steps).await.unwrap();
+        cursor += steps as u32;
+    }
+    assert_eq!(value(&mut ctx, &s).await, total as u64);
+    let stream_after = data(&mut ctx, stream_pda(&s.key)).await;
+    assert_eq!(stream_after.len(), stream_before.len(), "no growth");
+    assert_eq!(stream_after[128..], stream_before[128..], "no slot written");
+    assert_eq!(u32_at(&stream_after, 76), total, "stream cursor");
+    assert_eq!(u32_at(&stream_after, 80), total, "stream frontier moves with the cursor");
+    let session_raw = data(&mut ctx, s.key).await;
+    assert_eq!(u32_at(&session_raw, SESSION_CURSOR), total);
+    let ticks: Vec<(u32, Option<u8>)> = (0..total).map(|q| (q, None)).collect();
+    assert_eq!(session_raw[SESSION_INPUT_ROOT..SESSION_INPUT_ROOT + 32], tick_chain(&ticks), "ticks enter the chain as empty commands");
+    // Written inputs still work after ticks, and mix in order.
+    write(&mut ctx, &s, total, 5).await.unwrap();
+    advance(&mut ctx, &s, total, 1).await.unwrap();
+    tick(&mut ctx, &s, total + 1, 2).await.unwrap();
+    assert_eq!(value(&mut ctx, &s).await, total as u64 + 5 + 2);
+    let mut all = ticks;
+    all.push((total, Some(5)));
+    all.extend([(total + 1, None), (total + 2, None)]);
+    let session_raw = data(&mut ctx, s.key).await;
+    assert_eq!(session_raw[SESSION_INPUT_ROOT..SESSION_INPUT_ROOT + 32], tick_chain(&all));
+}
+
+#[tokio::test]
+async fn ticks_are_refused_without_the_capability_a_ring_or_with_input_waiting() {
+    let mut ctx = start().await;
+    // A ring session of a kernel that does not accept ticks.
+    let plain = session(&mut ctx, &app::V3_COUNTER, v3::MIN_RING_CAPACITY, Some(v3::FEATURE_RING_STREAM)).await.unwrap();
+    assert_eq!(tick(&mut ctx, &plain, 0, 1).await, Err(v3::REFUSAL_INPUT_GAP), "undeclared kernel");
+    let mut ctx = start().await;
+    // A linear stream.
+    let linear = session(&mut ctx, &app::V3_TICK_COUNTER, 8, None).await.unwrap();
+    assert_eq!(tick(&mut ctx, &linear, 0, 1).await, Err(v3::REFUSAL_INPUT_GAP), "linear stream");
+    let mut ctx = start().await;
+    let s = session(&mut ctx, &app::V3_TICK_COUNTER, v3::MIN_RING_CAPACITY, Some(v3::FEATURE_RING_STREAM)).await.unwrap();
+    // A written input waiting at the cursor.
+    write(&mut ctx, &s, 0, 3).await.unwrap();
+    assert_eq!(tick(&mut ctx, &s, 0, 1).await, Err(v3::REFUSAL_INPUT_GAP), "input waiting");
+    advance(&mut ctx, &s, 0, 1).await.unwrap();
+    // A stale cursor, zero or too many steps, and a bad flag.
+    assert_eq!(tick(&mut ctx, &s, 0, 1).await, Err(v3::REFUSAL_CURSOR));
+    assert_eq!(tick(&mut ctx, &s, 1, 0).await, Err(v3::REFUSAL_RESOURCE));
+    assert_eq!(tick(&mut ctx, &s, 1, 9).await, Err(v3::REFUSAL_RESOURCE));
+    let mut p = vec![v3::WIRE_VERSION];
+    p.extend_from_slice(&1u32.to_le_bytes());
+    p.extend_from_slice(&[1, 2]);
+    let bad = send(&mut ctx, ix(sw::TAG_ADVANCE, p, vec![signer(s.auth.pubkey()), w(s.key), w(stream_pda(&s.key)),
+                                                         w(state_pda(&s.key, 0)), w(state_pda(&s.key, 1))]), &[&s.auth]).await;
+    assert!(bad.is_err(), "an unknown flag byte");
+    assert_eq!(value(&mut ctx, &s).await, 3, "nothing changed");
+    tick(&mut ctx, &s, 1, 1).await.unwrap();
+    assert_eq!(value(&mut ctx, &s).await, 4);
+}
+

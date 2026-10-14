@@ -116,7 +116,8 @@ def test_judge_matches_runtime_rules():
 def test_examples_conform(rust):
     reports = [kit.check_step(rust, appkernels.sha256_concat)]
     reports += [kit.check_stateful(rust, m, seed=s) for m in (CM.COUNTER, CM.REJECT_COUNTER,
-                                                                CM.UNDECLARED_REJECT, CM.LANE_COUNTER)
+                                                                CM.UNDECLARED_REJECT, CM.LANE_COUNTER,
+                                                                CM.RESOURCE_COUNTER, CM.TICK_COUNTER)
                 for s in (0, 1)]
     for r in reports:
         assert r.ok, r.summary()
@@ -188,8 +189,31 @@ class UndeclaredCapability(CM.RejectCounter):
     decl = dataclasses.replace(CM.RejectCounter.decl, rejects_input=False)
 
 
+class ResourceIgnored(CM.ResourceCounter):
+    """Reads the resource at the total instead of the value."""
+
+    def transition_with_resource(self, command, state, resource):
+        value, total = struct.unpack("<QQ", state)
+        shifted = struct.pack("<QQ", total, total)
+        moved = super().transition_with_resource(command, shifted, resource)
+        delta = struct.unpack("<QQ", moved.state)[0] - total
+        nxt = struct.pack("<QQ", value + delta, total + value + delta)
+        if value + delta > CM.MASK or total + value + delta > CM.MASK:
+            raise kit.KernelRefused("Refused")
+        return kit.Outcome(nxt, nxt)
+
+
+class ResourceUndeclared(CM.ResourceCounter):
+    decl = dataclasses.replace(CM.ResourceCounter.decl, reads_resource=False)
+
+
+class ResourceWithoutSamples(CM.ResourceCounter):
+    resources = ()
+
+
 @needs_server
-@pytest.mark.parametrize("mutant", [WrappingCounter(), CleanDirtyReject(), UndeclaredCapability()])
+@pytest.mark.parametrize("mutant", [WrappingCounter(), CleanDirtyReject(), UndeclaredCapability(),
+                                    ResourceIgnored(), ResourceUndeclared(), ResourceWithoutSamples()])
 def test_catches_stateful_mutants(rust, mutant):
     assert not kit.check_stateful(rust, mutant).ok
 

@@ -19,7 +19,8 @@ from dcg.kernel_kit import MODE_CONSENSUS_V3, KernelDecl, KernelRefused, Outcome
 MASK = (1 << 64) - 1
 
 
-def counter_decl(name: str, rejects_input: bool = False) -> KernelDecl:
+def counter_decl(name: str, rejects_input: bool = False, reads_resource: bool = False,
+                 accepts_ticks: bool = False) -> KernelDecl:
     return KernelDecl(
         name=name,
         max_input_bytes=8,
@@ -29,6 +30,8 @@ def counter_decl(name: str, rejects_input: bool = False) -> KernelDecl:
         max_operations=8,
         modes=(MODE_CONSENSUS_V3,),
         rejects_input=rejects_input,
+        reads_resource=reads_resource,
+        accepts_ticks=accepts_ticks,
     )
 
 
@@ -97,7 +100,39 @@ class LaneCounter(Counter):
     decl = counter_decl("dcg-lanectr-v1")
 
 
+class ResourceCounter(Counter):
+    """The counter declaring ``READS_RESOURCE``: a command adds
+    ``command + resource[value % len(resource)]`` to the value, then the value
+    to the total (``V3_RESOURCE_COUNTER``)."""
+
+    decl = counter_decl("dcg-rsctr-v1", reads_resource=True)
+    resources = (b"\x00", bytes(range(256)), bytes((i * 7 + 3) % 251 for i in range(4096)), b"\xff" * 70_000)
+
+    def transition_with_resource(self, command: bytes, state: bytes, resource: bytes) -> Outcome:
+        if len(command) != 1 or len(state) != 16 or not resource:
+            raise KernelRefused("InvalidInput")
+        value, total = struct.unpack("<QQ", state)
+        value += command[0] + resource[value % len(resource)]
+        total += value
+        if value > MASK or total > MASK:
+            raise KernelRefused("Refused", "overflow")
+        nxt = struct.pack("<QQ", value, total)
+        return Outcome(output=nxt, state=nxt)
+
+
+class TickCounter(Counter):
+    """The counter declaring ``ACCEPTS_TICKS``: a tick (the empty command)
+    adds 1 (``V3_TICK_COUNTER``)."""
+
+    decl = counter_decl("dcg-tickctr-v1", accepts_ticks=True)
+
+    def transition(self, command: bytes, state: bytes) -> Outcome:
+        return count(command or b"\x01", state)
+
+
 COUNTER = Counter()
 REJECT_COUNTER = RejectCounter()
 UNDECLARED_REJECT = UndeclaredRejectCounter()
 LANE_COUNTER = LaneCounter()
+RESOURCE_COUNTER = ResourceCounter()
+TICK_COUNTER = TickCounter()

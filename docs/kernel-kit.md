@@ -79,6 +79,19 @@ An `Outcome` carries the output, the state after the call, and the disposition w
 `examples/kernel-kit/counter_mirrors.py` mirrors DCG's v3 test counters,
 including the rejecting ones.
 
+**A kernel whose transitions read the session resource** (declared with
+`.reads_resource()` in Rust, `reads_resource=True` in its `KernelDecl`)
+implements `transition_with_resource(command, state, resource) -> Outcome`
+instead of `transition`, and lists sample sealed resources in `resources`
+(non-empty `bytes`) with their `resource_schema` (id, version). The kit checks
+every generated case against each sample, passing the Rust kernel the same
+bytes read-only with their `OPEN_SESSION` Merkle root as the commitment.
+`ResourceCounter` in the example file is one.
+
+**A kernel that takes ticks** (`.accepts_ticks()`, `accepts_ticks=True`)
+needs nothing more: the generator always tries the empty command, which is
+what a tick passes. `TickCounter` is the example.
+
 ## 3. Check them against each other
 
 An application builds a small conformance server that names its kernels. It

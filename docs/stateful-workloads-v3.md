@@ -204,6 +204,64 @@ requires zero lamports at the session address.
 Tests: `tests/stateful_v3_creators.rs` (native ProgramTest, or the
 feature-built SBF image with `V3_SBF=1` and `BPF_OUT_DIR`).
 
+### Transitions that read the resource (`READS_RESOURCE`)
+
+Since v0.3.0 (unreleased), a kernel may declare
+`KernelCapabilities::READS_RESOURCE` (bit 1). Its transitions then read the
+session's sealed resource, which otherwise only initialization and rendering
+see:
+
+- `OPEN_SESSION` refuses such a kernel unless the session names a resource
+  (`REFUSAL_RESOURCE`). Only stateful kernels may declare the bit, and turning
+  it on or off is a semantic-version change, so a live session's kernel cannot
+  change it.
+- `ADVANCE` takes the program-owned copy read-only right after the stream:
+  `[state0, authority, session, stream, resource, other spans…]` with the
+  headerless primary, `[authority, session, stream, resource, spans…]`
+  without it. The copy is checked as initialization checks it (session-bound
+  key, schema and commitment, structure, every chunk present; the bytes are
+  not re-hashed), so a missing, foreign, unsealed, writable or wrong-kind
+  account refuses before any transition runs.
+- The runtime calls `StatefulKernel::transition_spans_with_resource(input,
+  resource, commitment, state, output)` for every step in place of
+  `transition_spans_with_outcome`. The transition must be a pure function of
+  (input, state, resource); outcomes and halts follow the same rules.
+- Measured (SBF ProgramTest, the 1,280-byte fixed engine): a three-step
+  `ADVANCE` reading a 4,096-byte resource costs 11,246 CU in total.
+
+Tests: `tests/stateful_v3_resource_advance.rs` (native and SBF), the session
+fuzzer's resource-engine sessions (with ADVANCEs that omit the copy or pass
+the source account in its place), and the kernel kit's `dcg-rsctr-v1`.
+
+### Ticks: steps without stored input (`ACCEPTS_TICKS`)
+
+Since v0.3.0 (unreleased), a kernel may declare
+`KernelCapabilities::ACCEPTS_TICKS` (bit 2). `ADVANCE` then takes an optional
+eighth payload byte, `ADVANCE_TICK` (1): its steps run on empty commands and
+read or store nothing in the stream. This suits long computations with no
+outside input (a checker, a simulation), which would otherwise write one
+input per step.
+
+- **Conditions.** The kernel declares the bit, the session has a ring stream
+  (ticks use no capacity), and no written input is waiting
+  (`frontier == cursor`); otherwise `REFUSAL_INPUT_GAP`. Cursor, step-count
+  and authority checks are those of an ordinary `ADVANCE`, and ticks stop at
+  the ring's sequence ceiling.
+- **Effect.** Each committed tick consumes the next sequence number: the
+  cursor and the frontier (session and stream header) move together, and the
+  input chain records it as an empty command
+  (`sha256(chain || root || sequence || "")`, under `/2` or, rejectable,
+  `/3` with its disposition), so a replay knows exactly where ticks fell
+  among written inputs. Halts, rejections and the prefix rule apply as for
+  any step.
+- A kernel without the bit never sees an empty command from a tick, so an
+  existing kernel's behavior cannot be changed by its authority.
+
+Tests: `tests/stateful_v3_reject_ring.rs` (three laps of ticks with no slot
+written and the chain checked; ticks mixed with written inputs; refusals for
+an undeclared kernel, a linear stream, a waiting input, a stale cursor, zero
+or nine steps and an unknown flag), native and SBF.
+
 ### Session features: ring streams and declared rejection
 
 Design [`design/session-reject-and-ring-v1.md`](design/session-reject-and-ring-v1.md)

@@ -172,6 +172,13 @@ struct Params {
     ring: bool,
     /// The rejecting counter (declares REJECTS_INPUT; no lanes) opened rejectable.
     reject: bool,
+    /// The fixed engine declaring READS_RESOURCE (v0.3.0 item 1): every
+    /// transition adds the resource byte at `value % len`, and ADVANCE takes
+    /// the sealed copy after the stream.
+    rsrc: bool,
+    /// The lane counter declaring ACCEPTS_TICKS (v0.3.0 item 2), on a ring:
+    /// ticked steps add 1 and store nothing.
+    tick: bool,
 }
 
 impl Params {
@@ -206,6 +213,8 @@ impl Params {
             view_len: if rng.pct(80) { 16 } else { 32 },
             ring: false,
             reject: false,
+            rsrc: ws && rng.pct(40),
+            tick: false,
         }
         .with_features(rng)
     }
@@ -217,6 +226,7 @@ impl Params {
         // The rejecting kernel is the lane counter plus REJECTS_INPUT, so
         // rejectable sessions keep their lanes (the Doom shape, review M1).
         self.reject = !self.ws && self.width == 1 && rng.pct(30);
+        self.tick = !self.ws && !self.reject && self.ring && rng.pct(50);
         self
     }
     fn features(&self) -> u8 {
@@ -233,8 +243,12 @@ impl Params {
         if self.ws { 1 } else { 2 }
     }
     fn kernel_id(&self) -> [u8; 16] {
-        if self.ws {
+        if self.ws && self.rsrc {
+            app::V3_RESOURCE_ENGINE.manifest().id.0
+        } else if self.ws {
             app::V3_WORKSPACE_ENGINE.manifest().id.0
+        } else if self.tick {
+            app::V3_TICK_COUNTER.manifest().id.0
         } else if self.reject {
             app::V3_REJECT_COUNTER.manifest().id.0
         } else {
@@ -291,6 +305,11 @@ enum Op {
     GrowView { payer: Actor, role: u8 },
     Write { actor: Actor, seq: u32, bytes: Vec<u8> },
     Advance { actor: Actor, cursor: u32, steps: u8 },
+    /// A resource-reading session's ADVANCE without the sealed copy (or, with
+    /// `wrong`, with the source account in its place): always refused.
+    AdvanceNoResource { cursor: u32, steps: u8, wrong: bool },
+    /// `ADVANCE_TICK`: `steps` empty commands, nothing read from the stream.
+    Tick { cursor: u32, steps: u8 },
     Begin { actor: Actor, cursor: u32 },
     Run { actor: Actor, at: u32, phases: Option<u8> },
     Commit { actor: Actor, cursor: u32, staged: u32 },
@@ -333,6 +352,8 @@ impl Op {
             Op::GrowView { .. } => "grow_view",
             Op::Write { .. } => "write_input",
             Op::Advance { .. } => "advance",
+            Op::AdvanceNoResource { .. } => "advance-no-resource",
+            Op::Tick { .. } => "tick",
             Op::Begin { .. } => "begin_phase",
             Op::Run { .. } => "run_phase",
             Op::Commit { .. } => "commit_phase",
@@ -519,6 +540,10 @@ struct Stats {
     lane_sequences: u64,
     ring_sequences: u64,
     reject_sequences: u64,
+    /// Sessions of the READS_RESOURCE engine, and their accepted advances.
+    resource_sequences: u64,
+    tick_sequences: u64,
+    resource_advances: u64,
     /// Inputs consumed by a Reject outcome, across the campaign.
     rejected_inputs: u64,
     /// Ring bursts that carried the cursor a full lap.
@@ -562,6 +587,9 @@ impl Stats {
         self.lane_sequences += o.lane_sequences;
         self.ring_sequences += o.ring_sequences;
         self.reject_sequences += o.reject_sequences;
+        self.resource_sequences += o.resource_sequences;
+        self.tick_sequences += o.tick_sequences;
+        self.resource_advances += o.resource_advances;
         self.rejected_inputs += o.rejected_inputs;
         self.ring_laps += o.ring_laps;
         self.max_cursor = self.max_cursor.max(o.max_cursor);
@@ -769,8 +797,12 @@ impl Fuzz {
         d.extend_from_slice(&[u8::from(p.append), p.width]);
         d.extend_from_slice(&p.capacity.to_le_bytes());
         d.push(p.max_steps);
-        let manifest = if p.ws {
+        let manifest = if p.ws && p.rsrc {
+            app::V3_RESOURCE_ENGINE.manifest()
+        } else if p.ws {
             app::V3_WORKSPACE_ENGINE.manifest()
+        } else if p.tick {
+            app::V3_TICK_COUNTER.manifest()
         } else if p.reject {
             app::V3_REJECT_COUNTER.manifest()
         } else {
@@ -933,13 +965,42 @@ impl Fuzz {
                 let mut d = vec![ver];
                 d.extend_from_slice(&cursor.to_le_bytes());
                 d.push(steps);
-                let a = if self.p.ws {
+                let mut a = if self.p.ws {
                     vec![w(k.states[0]), self.signer(actor), w(s), w(k.stream)]
                 } else {
                     let mut a = vec![self.signer(actor), w(s), w(k.stream)];
                     a.extend(self.state_metas(true));
                     a
                 };
+                if self.p.rsrc {
+                    a.push(r(k.resource));
+                }
+                one(ix(sw::TAG_ADVANCE, d, a))
+            }
+            Op::Tick { cursor, steps } => {
+                let mut d = vec![ver];
+                d.extend_from_slice(&cursor.to_le_bytes());
+                d.extend_from_slice(&[steps, v3::ADVANCE_TICK]);
+                let mut a = if self.p.ws {
+                    vec![w(k.states[0]), self.signer(Actor::Authority), w(s), w(k.stream)]
+                } else {
+                    let mut a = vec![self.signer(Actor::Authority), w(s), w(k.stream)];
+                    a.extend(self.state_metas(true));
+                    a
+                };
+                if self.p.rsrc {
+                    a.push(r(k.resource));
+                }
+                one(ix(sw::TAG_ADVANCE, d, a))
+            }
+            Op::AdvanceNoResource { cursor, steps, wrong } => {
+                let mut d = vec![ver];
+                d.extend_from_slice(&cursor.to_le_bytes());
+                d.push(steps);
+                let mut a = vec![w(k.states[0]), self.signer(Actor::Authority), w(s), w(k.stream)];
+                if wrong {
+                    a.push(r(RESOURCE_SRC));
+                }
                 one(ix(sw::TAG_ADVANCE, d, a))
             }
             Op::Begin { actor, cursor } => {
@@ -1137,7 +1198,8 @@ impl Fuzz {
             st[..n].copy_from_slice(&self.p.resource[..n]);
             let mut v = u64::from_le_bytes(st[len - 8..].try_into().unwrap());
             for i in 0..cursor as usize {
-                v = v.wrapping_add(m.slots[i].as_ref().unwrap()[0] as u64);
+                let read = if self.p.rsrc { self.p.resource[(v % self.p.resource.len() as u64) as usize] as u64 } else { 0 };
+                v = v.wrapping_add(m.slots[i].as_ref().unwrap()[0] as u64 + read);
             }
             st[len - 8..].copy_from_slice(&v.to_le_bytes());
             st
@@ -1148,7 +1210,13 @@ impl Fuzz {
                 if self.p.rejected(cmd) {
                     continue;
                 }
-                let add = if self.p.reject && cmd[0] == app::V3_REJECT_HALT_AFTER_COMMAND { 1 } else { cmd[0] as u64 };
+                let add = if cmd.is_empty() {
+                    1 // a tick (tick counter)
+                } else if self.p.reject && cmd[0] == app::V3_REJECT_HALT_AFTER_COMMAND {
+                    1
+                } else {
+                    cmd[0] as u64
+                };
                 value += add + u64::from(self.cfg.plant == 3);
                 total += value;
             }
@@ -1258,6 +1326,21 @@ impl Fuzz {
                 };
                 next - m.cursor <= v3::MAX_STREAM_WINDOW && m.slots.get(seq as usize).is_none_or(|slot| slot.is_none())
             }
+            Op::AdvanceNoResource { .. } => false,
+            Op::Tick { cursor, steps } => {
+                live && p.tick
+                    && p.ring
+                    && m.phase == PH_NONE
+                    && m.mask == 0
+                    && *cursor == m.cursor
+                    && *steps >= 1
+                    && *steps <= p.max_steps
+                    && m.stream
+                    && m.states > 0
+                    && m.initialized
+                    && m.frontier == m.cursor
+                    && m.cursor + *steps as u32 <= v3::RING_SEQUENCE_CEILING
+            }
             Op::Advance { actor, cursor, steps } => {
                 let end = m.cursor + *steps as u32;
                 live && *actor == A
@@ -1273,6 +1356,9 @@ impl Fuzz {
                     && m.initialized
                     && (m.cursor..end).all(|i| m.slots.get(i as usize).is_some_and(|slot| slot.is_some()))
                     && self.kernel_advance(m, *steps).is_some()
+                    // The resource engine refuses a copy the transaction marks
+                    // writable (as its initialization and render do).
+                    && !(p.rsrc && self.res_writable)
             }
             Op::Begin { actor, cursor } => {
                 live && *actor == A
@@ -1422,6 +1508,19 @@ impl Fuzz {
                 }
                 m.slots[*seq as usize] = Some(bytes.clone());
                 m.frontier = if p.append { seq + 1 } else { m.frontier.max(seq + 1) };
+            }
+            Op::AdvanceNoResource { .. } => unreachable!("always refused"),
+            Op::Tick { steps, .. } => {
+                let end = m.cursor + *steps as u32;
+                if m.slots.len() < end as usize {
+                    m.slots.resize(end as usize, None);
+                }
+                for seq in m.cursor..end {
+                    m.slots[seq as usize] = Some(Vec::new());
+                }
+                m.last_start = m.cursor;
+                m.cursor = end;
+                m.frontier = end;
             }
             Op::Advance { steps, .. } => {
                 let (cursor, halt) = self.kernel_advance(m, *steps).unwrap();
@@ -1858,7 +1957,8 @@ impl Fuzz {
             // it (linear: itself; ring: seq mod capacity, design §3).
             let mut want_slots = vec![[0u8; 16]; capacity as usize];
             for (seq, slot) in m.slots.iter().enumerate() {
-                if let Some(bytes) = slot {
+                // A tick consumes a sequence number without writing a slot.
+                if let Some(bytes) = slot.as_ref().filter(|b| !b.is_empty()) {
                     let at = if self.p.ring { seq % capacity as usize } else { seq };
                     let want = &mut want_slots[at];
                     *want = [0u8; 16];
@@ -1985,6 +2085,9 @@ impl Fuzz {
             }
             7 => Op::CreateWorkspace { payer, auth: A, len: 64 },
             8 => Op::CreateScratch { payer, auth: A, len: if p.ws { 32 } else { 16 } },
+            9 if p.tick && m.frontier == m.cursor && self.rng.pct(60) => {
+                Op::Tick { cursor: m.cursor, steps: self.rng.range(1, p.max_steps as u32) as u8 }
+            }
             9 => {
                 let seq = if p.append || self.rng.pct(50) {
                     m.frontier
@@ -2017,6 +2120,9 @@ impl Fuzz {
                 let mut ready = 0u32;
                 while m.cursor + ready < m.frontier && m.slots.get((m.cursor + ready) as usize).is_some_and(|s| s.is_some()) {
                     ready += 1;
+                }
+                if p.tick && m.frontier == m.cursor && self.rng.pct(60) {
+                    return Some(Op::Tick { cursor: m.cursor, steps: self.rng.range(1, p.max_steps as u32) as u8 });
                 }
                 let steps = self.rng.range(1, ready.clamp(1, p.max_steps as u32)) as u8;
                 Op::Advance { actor: A, cursor: m.cursor, steps }
@@ -2134,10 +2240,16 @@ impl Fuzz {
                     Op::Write { actor, seq, bytes: b }
                 }
             },
-            Op::Advance { actor, cursor, steps } => match self.rng.below(3) {
+            Op::Advance { actor, cursor, steps } => match self.rng.below(if self.p.rsrc { 4 } else { 3 }) {
+                3 => Op::AdvanceNoResource { cursor, steps, wrong: self.rng.pct(50) },
                 0 => Op::Advance { actor: a, cursor, steps },
                 1 => Op::Advance { actor, cursor: d(&mut self.rng, cursor), steps },
                 _ => Op::Advance { actor, cursor, steps: if self.rng.pct(50) { steps.saturating_add(1) } else { self.rng.pick(&[0u8, 9]) } },
+            },
+            Op::Tick { cursor, steps } => if flip {
+                Op::Tick { cursor: d(&mut self.rng, cursor), steps }
+            } else {
+                Op::Tick { cursor, steps: self.rng.pick(&[0u8, 9]) }
             },
             Op::Begin { actor, cursor } => if flip { Op::Begin { actor: a, cursor } } else { Op::Begin { actor, cursor: d(&mut self.rng, cursor) } },
             Op::Run { actor, at, phases } => if flip { Op::Run { actor: a, at, phases } } else { Op::Run { actor, at: d(&mut self.rng, at), phases } },
@@ -2547,7 +2659,7 @@ async fn run_sequence(seed: u64, index: u64, sbf: bool, verbose: bool, plant: u8
     let mut keys_tracked = vec![ctx.payer.pubkey(), RESOURCE_SRC];
     keys_tracked.extend(k.actors.iter().map(|a| a.pubkey()));
     keys_tracked.extend(k.derived().into_iter().map(|(_, key)| key));
-    let tag = format!("seed {seed} index {index} ({} lanes {} append {} width {} cap {} steps {} ring {} sbf {sbf})", if p.ws { "fixed-engine" } else if p.reject { "reject-counter" } else { "lane-counter" }, p.lanes, p.append, p.width, p.capacity, p.max_steps, p.ring);
+    let tag = format!("seed {seed} index {index} ({} lanes {} append {} width {} cap {} steps {} ring {} sbf {sbf})", if p.ws && p.rsrc { "resource-engine" } else if p.ws { "fixed-engine" } else if p.tick { "tick-counter" } else if p.reject { "reject-counter" } else { "lane-counter" }, p.lanes, p.append, p.width, p.capacity, p.max_steps, p.ring);
     let mut f = Fuzz { ctx, p, k, m: M::default(), rng, cfg: Config { sbf, verbose, plant }, stats: Stats::default(), nonce: 0, history: Vec::new(), tag, log: Vec::new(), keys_tracked, rent0, halt_late: false, last_logs: String::new(), res_writable: false };
     f.halt_late = f.rng.pct(50);
     f.stats.sequences = 1;
@@ -2558,11 +2670,16 @@ async fn run_sequence(seed: u64, index: u64, sbf: bool, verbose: bool, plant: u8
     }
     f.stats.ring_sequences = u64::from(f.p.ring);
     f.stats.reject_sequences = u64::from(f.p.reject);
+    f.stats.resource_sequences = u64::from(f.p.ws && f.p.rsrc);
+    f.stats.tick_sequences = u64::from(f.p.tick);
     f.run().await;
     f.stats.commits = f.stats.ops.get("commit_phase").map_or(0, |e| e.0);
     f.stats.lane_commits = f.stats.ops.get("lane_commit").map_or(0, |e| e.0);
     f.stats.anchors_finished = f.stats.ops.get("anchor_finish").map_or(0, |e| e.0);
     f.stats.one_shot_anchors = f.stats.ops.get("anchor_one_shot").map_or(0, |e| e.0);
+    if f.p.ws && f.p.rsrc {
+        f.stats.resource_advances = f.stats.ops.get("advance").map_or(0, |e| e.0);
+    }
     f.stats
 }
 
@@ -2599,7 +2716,7 @@ fn report(s: &Stats) {
         "v3 fuzz stats: sequences {} (lane-counter {}, fixed-engine {}), txs {} (accepted {}, refused {}, not run {}), compute failures {}, resends {}, reordered pairs {}, bundles {}, invariant checks {}, max cursor {}, non-lane commits {}, lane commits {}, chunked anchors {}, one-shot anchors {}, prefunds {}, reopened {}, liveness {} (publish {}), closability {}",
         s.sequences, s.lane_sequences, s.ws_sequences, s.txs, s.accepted, s.refused, s.not_run, s.cu_failures, s.resends, s.reorders, s.bundles, s.checks, s.max_cursor, s.commits, s.lane_commits, s.anchors_finished, s.one_shot_anchors, s.prefunds, s.reopened, s.liveness_runs, s.liveness_publish, s.closability_runs
     );
-    eprintln!("v3 fuzz features: ring sequences {}, full laps {}, reject sequences {}, rejected inputs {}", s.ring_sequences, s.ring_laps, s.reject_sequences, s.rejected_inputs);
+    eprintln!("v3 fuzz features: ring sequences {}, full laps {}, reject sequences {}, rejected inputs {}, resource sequences {} (accepted advances {}), tick sequences {}", s.ring_sequences, s.ring_laps, s.reject_sequences, s.rejected_inputs, s.resource_sequences, s.resource_advances, s.tick_sequences);
     eprintln!("v3 fuzz liveness skipped: {:?}", s.liveness_skipped);
     eprintln!("v3 fuzz halts: {:?}", s.halts);
     let ops: Vec<String> = s.ops.iter().map(|(k, (a, r))| format!("{k} {a}/{r}")).collect();
@@ -2669,7 +2786,7 @@ async fn fuzz_catches_a_planted_kernel_error() {
 async fn finding_f1_open_anchor_closes_under_a_wrong_kind() {
     let ctx = start(false, &[]).await;
     let mut rng = Rng::new(0xF1, 0);
-    let p = Params { ws: false, lanes: 0, append: false, width: 1, capacity: 4, max_steps: 1, root: [7; 32], id: 1, resource: Vec::new(), state_len: 1_280, view_len: 16, ring: false, reject: false };
+    let p = Params { ws: false, lanes: 0, append: false, width: 1, capacity: 4, max_steps: 1, root: [7; 32], id: 1, resource: Vec::new(), rsrc: false, tick: false, state_len: 1_280, view_len: 16, ring: false, reject: false };
     let k = Keys::new(&mut rng, p.id);
     let mut f = Fuzz { ctx, p, k, m: M::default(), rng, cfg: Config { sbf: false, verbose: true, plant: 0 }, stats: Stats::default(), nonce: 0, history: Vec::new(), tag: "F1".into(), log: Vec::new(), keys_tracked: Vec::new(), rent0: 0, halt_late: false, last_logs: String::new(), res_writable: false };
     let auth = f.auth();

@@ -116,6 +116,20 @@ impl KernelDecl {
         self
     }
 
+    /// Declare `KernelCapabilities::READS_RESOURCE`: v3 transitions read the
+    /// session's sealed resource (`transition_spans_with_resource`).
+    pub const fn reads_resource(mut self) -> Self {
+        self.manifest.capabilities = KernelCapabilities(self.manifest.capabilities.0 | KernelCapabilities::READS_RESOURCE.0);
+        self
+    }
+
+    /// Declare `KernelCapabilities::ACCEPTS_TICKS`: `ADVANCE_TICK` steps run
+    /// on empty commands.
+    pub const fn accepts_ticks(mut self) -> Self {
+        self.manifest.capabilities = KernelCapabilities(self.manifest.capabilities.0 | KernelCapabilities::ACCEPTS_TICKS.0);
+        self
+    }
+
     /// The finished manifest. Panics (at compile time in a `static`) on an
     /// incomplete declaration.
     pub const fn build(self) -> KernelManifest {
@@ -257,7 +271,10 @@ pub mod conformance {
     //! - `step <id> <semver> <abi> <input>...` (zero or more input spans;
     //!   `builtin` for a built-in kernel or reduction name)
     //! - `init <id> <semver> <abi> <span lengths, comma separated>`
-    //! - `advance <id> <semver> <abi> <rejectable 0|1> <span lengths> <state> <input>`
+    //! - `advance <id> <semver> <abi> <rejectable 0|1> <span lengths> <state> <input> [resource=<schema id hex>.<version>:<hex>]`
+    //!   (the resource word is required for, and only for, a kernel
+    //!   declaring `READS_RESOURCE`; the kernel sees it read-only with its
+    //!   `OPEN_SESSION` Merkle root as the commitment)
     //!
     //! `step` runs [`super::step_kernel_call`]; `init` and `advance` run a
     //! stateful kernel the way the v3 runtime does (state spans at
@@ -268,7 +285,7 @@ pub mod conformance {
     //! compute budget; those are tested by running the program.
 
     use super::*;
-    use crate::kernel::{StateSpanMut, StatefulKernel};
+    use crate::kernel::{AccountSpan, StateSpanMut, StatefulKernel};
     use crate::stateful::v3::HALT_BEFORE_RUNTIME_CHECK_BYTES;
     use std::io::{BufRead, Write};
 
@@ -332,8 +349,10 @@ pub mod conformance {
                 init(kernel, &lengths(lens)?)
             }
             "advance" => {
-                let [rejectable, lens, state, input] = rest else {
-                    return Err("expected <rejectable> <span lengths> <state> <input>".into());
+                let (rejectable, lens, state, input, resource) = match rest {
+                    [r, l, s, i] => (r, l, s, i, None),
+                    [r, l, s, i, res] => (r, l, s, i, Some(resource_word(res)?)),
+                    _ => return Err("expected <rejectable> <span lengths> <state> <input> [resource=<id>.<version>:<hex>]".into()),
                 };
                 let Some(kernel) = stateful(registry, id, sv, av) else { return Ok("not-stateful".into()) };
                 let rejectable = match *rejectable {
@@ -341,7 +360,10 @@ pub mod conformance {
                     "1" => true,
                     _ => return Err("rejectable is 0 or 1".into()),
                 };
-                advance(kernel, rejectable, &lengths(lens)?, unhex(state)?, &unhex(input)?)
+                if kernel.manifest().capabilities.reads_resource() != resource.is_some() {
+                    return Err("a READS_RESOURCE kernel takes a resource, and only it".into());
+                }
+                advance(kernel, rejectable, &lengths(lens)?, unhex(state)?, &unhex(input)?, resource.as_ref())
             }
             _ => Err(format!("unknown request {verb}")),
         }
@@ -420,12 +442,47 @@ pub mod conformance {
     /// `failed <kernel error>`, and the verdict is `accepted` or `refused`.
     /// The raw output is `-` when the kernel reports more bytes than the
     /// buffer, which the runtime refuses.
+    /// `resource=<schema id hex>.<version>:<bytes hex>`.
+    fn resource_word(word: &str) -> Result<(VersionedId, Vec<u8>), String> {
+        let rest = word.strip_prefix("resource=").ok_or("expected resource=<id>.<version>:<hex>")?;
+        let (schema, bytes) = rest.split_once(':').ok_or("expected resource=<id>.<version>:<hex>")?;
+        let (id, version) = schema.split_once('.').ok_or("expected <id>.<version>")?;
+        let id = u32::from_str_radix(id, 16).map_err(|_| "bad resource schema id")?;
+        let version = version.parse().map_err(|_| "bad resource schema version")?;
+        let bytes = unhex(bytes)?;
+        if bytes.is_empty() {
+            return Err("a sealed resource is never empty".into());
+        }
+        Ok((VersionedId { id, version }, bytes))
+    }
+
+    /// The resource's commitment as `OPEN_SESSION` binds it: the Merkle root
+    /// over 65,536-byte chunks (`dcg/resource-chunk/1` leaves binding index,
+    /// total length and bytes; `dcg/resource-node/1` nodes; the last node
+    /// duplicated at odd widths).
+    pub fn resource_root(bytes: &[u8]) -> [u8; 32] {
+        let len = (bytes.len() as u32).to_le_bytes();
+        let mut level: Vec<[u8; 32]> = bytes
+            .chunks(65_536)
+            .enumerate()
+            .map(|(i, chunk)| crate::hash::sha256(&[b"dcg/resource-chunk/1", &(i as u32).to_le_bytes(), &len, chunk]))
+            .collect();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| crate::hash::sha256(&[b"dcg/resource-node/1", &pair[0], pair.get(1).unwrap_or(&pair[0])]))
+                .collect();
+        }
+        level[0]
+    }
+
     fn advance(
         kernel: &'static dyn StatefulKernel,
         rejectable_session: bool,
         lens: &[u32],
         mut state: Vec<u8>,
         input: &[u8],
+        resource: Option<&(VersionedId, Vec<u8>)>,
     ) -> Result<String, String> {
         let manifest = kernel.manifest();
         if lens.iter().map(|l| *l as usize).sum::<usize>() != state.len() {
@@ -437,7 +494,21 @@ pub mod conformance {
         let mut output = vec![0u8; output_len];
         let mut spans = spans_over(manifest, lens, &mut state)?;
         let bind = kernel.bind_invocation_state(&mut spans);
-        let result = bind.and_then(|()| kernel.transition_spans_with_outcome(input, &mut spans, &mut output));
+        let result = bind.and_then(|()| match resource {
+            Some((schema, bytes)) => {
+                let span = AccountSpan {
+                    key: [0; 32],
+                    owner: [0; 32],
+                    is_signer: false,
+                    is_writable: false,
+                    schema: *schema,
+                    offset: 0,
+                    data: bytes,
+                };
+                kernel.transition_spans_with_resource(input, &span, &resource_root(bytes), &mut spans, &mut output)
+            }
+            None => kernel.transition_spans_with_outcome(input, &mut spans, &mut output),
+        });
         kernel.unbind_invocation_state();
         drop(spans);
         let outcome = match result {

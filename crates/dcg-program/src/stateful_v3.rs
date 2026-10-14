@@ -99,6 +99,9 @@ pub const MIN_RING_CAPACITY: u32 = 2 * MAX_STREAM_WINDOW;
 pub const RING_SEQUENCE_CEILING: u32 = u32::MAX - MAX_STREAM_WINDOW;
 /// Input-chain domain of a rejectable session: every entry carries its
 /// disposition (0 applied; 1 rejected, then the code) (§2.3).
+/// `ADVANCE`'s optional eighth byte: run the steps as ticks (empty commands,
+/// nothing read from or stored in the stream).
+pub const ADVANCE_TICK: u8 = 1;
 pub const INPUT_CHAIN_V3: &[u8] = b"dcg/input-chain/3";
 
 const SESSION_BYTES: usize = 1_280;
@@ -2695,7 +2698,13 @@ fn advance(
     data: &[u8],
     kernel: &dyn StatefulKernel,
 ) -> ProgramResult {
-    exact_data(data, 7)?;
+    // An optional eighth byte: ADVANCE_TICK runs the steps on empty commands
+    // without reading the stream (v0.3.0 item 2).
+    let tick = match data.len() {
+        7 => false,
+        8 if data[7] == ADVANCE_TICK => true,
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
     if accounts.len() < 4 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
@@ -2777,7 +2786,18 @@ fn advance(
     let end_cursor = expected_cursor
         .checked_add(steps as u32)
         .ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
-    if (!session.ring() && end_cursor > session.capacity) || end_cursor > session.frontier {
+    if tick {
+        // Ticks store nothing, so they need a ring (no capacity is used), a
+        // kernel that declared it takes them, and no written input waiting:
+        // the ticked sequence numbers are then exactly the next ones.
+        if !kernel.manifest().capabilities.accepts_ticks()
+            || !session.ring()
+            || session.frontier != expected_cursor
+            || end_cursor > RING_SEQUENCE_CEILING
+        {
+            return Err(refusal(REFUSAL_INPUT_GAP));
+        }
+    } else if (!session.ring() && end_cursor > session.capacity) || end_cursor > session.frontier {
         return Err(refusal(REFUSAL_INPUT_GAP));
     }
     let schema = validate_kernel(kernel)?;
@@ -2792,7 +2812,7 @@ fn advance(
     )?;
     let mut commands = Vec::with_capacity(steps as usize);
     for seq in expected_cursor..end_cursor {
-        commands.push(read_slot(stream, &session, seq)?);
+        commands.push(if tick { Vec::new() } else { read_slot(stream, &session, seq)? });
     }
     let output_len =
         crate::kernel_kit::v3_output_len(kernel.manifest()).ok_or_else(|| refusal(REFUSAL_RESOURCE))?;
@@ -2939,6 +2959,14 @@ fn advance(
     {
         let mut raw = stream.try_borrow_mut_data()?;
         put_u32(&mut raw, 76, final_cursor);
+        if tick {
+            // The committed ticks are consumed sequence numbers that hold no
+            // slot; the frontier moves with the cursor.
+            put_u32(&mut raw, 80, final_cursor);
+        }
+    }
+    if tick {
+        session.frontier = final_cursor;
     }
     session.cursor = final_cursor;
     let mut input_root = if session.input_root == [0; 32] {

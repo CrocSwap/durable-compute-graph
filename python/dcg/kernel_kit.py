@@ -82,6 +82,12 @@ class KernelDecl:
     abi_version: int = 1
     max_state_bytes: int | None = None
     rejects_input: bool = False
+    reads_resource: bool = False
+    accepts_ticks: bool = False
+
+    @property
+    def capabilities(self) -> int:
+        return int(self.rejects_input) | (int(self.reads_resource) << 1) | (int(self.accepts_ticks) << 2)
 
     @property
     def id(self) -> bytes:
@@ -100,7 +106,7 @@ class KernelDecl:
             f"ok input={self.max_input_bytes}/{self.max_input_bytes} "
             f"output={self.max_output_bytes}/{self.max_output_bytes} state={state} "
             f"operations={self.max_operations} compute={self.max_compute_units} "
-            f"capabilities={int(self.rejects_input)} modes={modes} stateful={int(stateful)}"
+            f"capabilities={self.capabilities} modes={modes} stateful={int(stateful)}"
         )
 
 
@@ -194,7 +200,12 @@ class StatefulMirror:
     """Base class for a stateful v3 kernel's mirror. Subclasses set ``decl``
     and ``state_spans`` (the span lengths sessions open with) and implement
     ``initial_state`` and ``transition``; both raise :class:`KernelRefused`
-    to refuse. ``special_inputs`` lists commands the generator should try."""
+    to refuse. ``special_inputs`` lists commands the generator should try.
+
+    A mirror of a kernel declaring ``READS_RESOURCE`` implements
+    ``transition_with_resource`` instead of ``transition`` and lists sample
+    sealed resources in ``resources`` (bytes, never empty) with their
+    ``resource_schema`` (id, version); the kit checks every case against each."""
 
     decl: KernelDecl
     state_spans: tuple[int, ...]
@@ -203,7 +214,13 @@ class StatefulMirror:
     def initial_state(self, spans: tuple[int, ...]) -> bytes:
         raise NotImplementedError
 
+    resources: tuple[bytes, ...] = ()
+    resource_schema: tuple[int, int] = (0, 0)
+
     def transition(self, command: bytes, state: bytes) -> Outcome:
+        raise NotImplementedError
+
+    def transition_with_resource(self, command: bytes, state: bytes, resource: bytes) -> Outcome:
         raise NotImplementedError
 
 
@@ -285,10 +302,13 @@ class RustKernels:
     def init(self, decl: KernelDecl, spans: Sequence[int]) -> str:
         return self.ask(f"init {self._who(decl)} {','.join(map(str, spans))}")
 
-    def advance(self, decl: KernelDecl, rejectable: bool, spans: Sequence[int], state: bytes, command: bytes) -> str:
-        return self.ask(
-            f"advance {self._who(decl)} {int(rejectable)} {','.join(map(str, spans))} {_hex(state)} {_hex(command)}"
-        )
+    def advance(self, decl: KernelDecl, rejectable: bool, spans: Sequence[int], state: bytes, command: bytes,
+                resource: tuple[tuple[int, int], bytes] | None = None) -> str:
+        line = f"advance {self._who(decl)} {int(rejectable)} {','.join(map(str, spans))} {_hex(state)} {_hex(command)}"
+        if resource is not None:
+            (sid, sver), data = resource
+            line += f" resource={sid:x}.{sver}:{data.hex()}"
+        return self.ask(line)
 
 
 # --- reports ------------------------------------------------------------------------------------
@@ -464,11 +484,22 @@ def check_stateful(rust: RustKernels, mirror: StatefulMirror, seed: int = 0, wal
         if got != want and not (got.startswith("refused") and want.startswith("refused")):
             report.disagreements.append(f"init {list(split)}: rust {got!r}, mirror {want!r}")
 
-    def one(state: bytes, command: bytes, rejectable: bool) -> tuple[bool, Outcome | None, str]:
+    if decl.reads_resource and not mirror.resources:
+        report.disagreements.append("a READS_RESOURCE mirror lists no sample resources")
+        return report
+    if any(not r for r in mirror.resources):
+        report.disagreements.append("a sealed resource is never empty")
+        return report
+    resources: list[bytes | None] = list(mirror.resources) if decl.reads_resource else [None]
+
+    def one(state: bytes, command: bytes, rejectable: bool,
+            resource: bytes | None = None) -> tuple[bool, Outcome | None, str]:
         report.cases += 1
-        got = _rust_advance(rust.advance(decl, rejectable, spans, state, command))
+        bound = None if resource is None else (mirror.resource_schema, resource)
+        got = _rust_advance(rust.advance(decl, rejectable, spans, state, command, bound))
         try:
-            want: Outcome | None = mirror.transition(command, state)
+            want: Outcome | None = (mirror.transition(command, state) if resource is None
+                                    else mirror.transition_with_resource(command, state, resource))
             want_ok = judge(decl, want, state, rejectable)
         except ValueError:
             want, want_ok = None, False
@@ -476,19 +507,22 @@ def check_stateful(rust: RustKernels, mirror: StatefulMirror, seed: int = 0, wal
             report.disagreements.append(f"mirror raised {type(e).__name__}: {e}")
             want, want_ok = None, False
         label = f"state {state.hex()[:32]} command {command.hex()[:32] or '-'} rejectable {int(rejectable)}"
+        if resource is not None:
+            label += f" resource {len(resource)} B {resource.hex()[:16]}"
         _compare(report, label, state, got, want, want_ok)
         return got
 
     if not initial:
         return report
     commands = _commands(mirror, rng)
-    for state in _states(mirror, initial, rng):
-        for command in commands:
-            for rejectable in (False, True):
-                one(state, command, rejectable)
+    for resource in resources:
+        for state in _states(mirror, initial, rng):
+            for command in commands:
+                for rejectable in (False, True):
+                    one(state, command, rejectable, resource)
     state = initial
     for _ in range(walk):
-        ok, raw, _ = one(state, rng.choice(commands), rng.random() < 0.5)
+        ok, raw, _ = one(state, rng.choice(commands), rng.random() < 0.5, rng.choice(resources))
         if ok and raw is not None and raw.disposition in ("continue", "reject"):
             state = raw.state
         elif ok and raw is not None and raw.disposition == "halt_after":

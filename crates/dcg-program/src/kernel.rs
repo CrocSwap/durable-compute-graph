@@ -83,7 +83,11 @@ impl KernelCapabilities {
     /// `StatefulKernel::transition_spans_with_resource`. A session binding
     /// such a kernel must name a resource (checked at `OPEN_SESSION`).
     pub const READS_RESOURCE: Self = Self(2);
-    pub const KNOWN: u32 = Self::REJECTS_INPUT.0 | Self::READS_RESOURCE.0;
+    /// The kernel accepts ticks: `ADVANCE` with the tick flag runs its steps
+    /// with an empty command and stores no input (v0.3.0 item 2). Ticks need
+    /// a ring stream and no written input waiting.
+    pub const ACCEPTS_TICKS: Self = Self(4);
+    pub const KNOWN: u32 = Self::REJECTS_INPUT.0 | Self::READS_RESOURCE.0 | Self::ACCEPTS_TICKS.0;
 
     pub const fn rejects_input(self) -> bool {
         self.0 & Self::REJECTS_INPUT.0 != 0
@@ -91,6 +95,10 @@ impl KernelCapabilities {
 
     pub const fn reads_resource(self) -> bool {
         self.0 & Self::READS_RESOURCE.0 != 0
+    }
+
+    pub const fn accepts_ticks(self) -> bool {
+        self.0 & Self::ACCEPTS_TICKS.0 != 0
     }
 }
 
@@ -1022,11 +1030,11 @@ impl ApplicationManifest {
             if is_builtin_kernel_name(&a.id.0) {
                 return Err(ManifestError::BuiltinKernelCollision(a.id));
             }
-            // Only stateful transitions can reject or read a session resource;
-            // a stateless (replay) kernel with either bit would make the
-            // admission digest silent about it.
+            // Only stateful transitions can reject, read a session resource or
+            // take ticks; a stateless (replay) kernel with any of these bits
+            // would make the admission digest silent about it.
             if a.capabilities.0 & !KernelCapabilities::KNOWN != 0
-                || ((a.capabilities.rejects_input() || a.capabilities.reads_resource()) && a.state.is_none())
+                || (a.capabilities.0 != 0 && a.state.is_none())
             {
                 return Err(ManifestError::InvalidCapabilities(a.id));
             }
@@ -1684,7 +1692,10 @@ mod tests {
         assert_eq!(capability_app(KernelCapabilities::READS_RESOURCE, true), Ok(()));
         assert_eq!(capability_app(KernelCapabilities::READS_RESOURCE, false), Err(ManifestError::InvalidCapabilities(id)));
         assert_eq!(capability_app(KernelCapabilities(3), true), Ok(()));
-        assert_eq!(capability_app(KernelCapabilities(4), true), Err(ManifestError::InvalidCapabilities(id)));
+        assert_eq!(capability_app(KernelCapabilities::ACCEPTS_TICKS, true), Ok(()));
+        assert_eq!(capability_app(KernelCapabilities::ACCEPTS_TICKS, false), Err(ManifestError::InvalidCapabilities(id)));
+        assert_eq!(capability_app(KernelCapabilities(7), true), Ok(()));
+        assert_eq!(capability_app(KernelCapabilities(8), true), Err(ManifestError::InvalidCapabilities(id)));
     }
 
     #[test]

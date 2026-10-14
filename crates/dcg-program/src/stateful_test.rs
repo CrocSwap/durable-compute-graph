@@ -316,6 +316,9 @@ static V3_UNDECLARED_REJECT_MANIFEST: KernelManifest = KernelManifest {
 
 macro_rules! reject_counter_kernel {
     ($kernel:ty, $manifest:expr) => {
+        reject_counter_kernel!($kernel, $manifest, reject_counter_transition);
+    };
+    ($kernel:ty, $manifest:expr, $transition:path) => {
         impl Kernel for $kernel {
             fn manifest(&self) -> &'static KernelManifest {
                 &$manifest
@@ -346,7 +349,7 @@ macro_rules! reject_counter_kernel {
                 state: &mut [StateSpanMut<'_>],
                 output: &mut [u8],
             ) -> Result<TransitionOutcome, KernelError> {
-                reject_counter_transition(input, state, output)
+                $transition(input, state, output)
             }
             fn view_abis(&self) -> &'static [ViewAbi] {
                 V3_LANE_COUNTER.view_abis()
@@ -394,8 +397,102 @@ macro_rules! reject_counter_kernel {
 reject_counter_kernel!(V3RejectCounterKernel, V3_REJECT_COUNTER_MANIFEST);
 reject_counter_kernel!(V3UndeclaredRejectKernel, V3_UNDECLARED_REJECT_MANIFEST);
 
+/// The lane counter declaring `ACCEPTS_TICKS` (v0.3.0 item 2): a tick (the
+/// empty command) adds 1; any other command is the counter's ordinary step.
+pub struct V3TickCounterKernel;
+
+static V3_TICK_COUNTER_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-tickctr-v1\0\0"),
+    capabilities: crate::kernel::KernelCapabilities::ACCEPTS_TICKS,
+    ..V3_LANE_COUNTER_MANIFEST
+};
+
+fn tick_counter_transition(
+    input: &[u8],
+    state: &mut [StateSpanMut<'_>],
+    output: &mut [u8],
+) -> Result<TransitionOutcome, KernelError> {
+    COUNTER
+        .transition_spans(if input.is_empty() { &[1] } else { input }, state, output)
+        .map(|output_bytes| TransitionOutcome { output_bytes, disposition: TransitionDisposition::Continue })
+}
+
+reject_counter_kernel!(V3TickCounterKernel, V3_TICK_COUNTER_MANIFEST, tick_counter_transition);
+
+pub static V3_TICK_COUNTER: V3TickCounterKernel = V3TickCounterKernel;
+
 pub static V3_REJECT_COUNTER: V3RejectCounterKernel = V3RejectCounterKernel;
 pub static V3_UNDECLARED_REJECT: V3UndeclaredRejectKernel = V3UndeclaredRejectKernel;
+
+/// The v3 counter declaring `READS_RESOURCE` (v0.3.0 item 1): a 1-byte
+/// command adds `command + resource[value % len]` to the value, then the value
+/// to the total, refusing on overflow or an empty resource. The kernel kit's
+/// example of a resource-reading transition (`counter_mirrors.py`).
+pub struct V3ResourceCounterKernel;
+
+static V3_RESOURCE_COUNTER_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-rsctr-v1\0\0\0\0"),
+    capabilities: crate::kernel::KernelCapabilities::READS_RESOURCE,
+    ..V3_COUNTER_MANIFEST
+};
+
+impl Kernel for V3ResourceCounterKernel {
+    fn manifest(&self) -> &'static KernelManifest {
+        &V3_RESOURCE_COUNTER_MANIFEST
+    }
+    fn execute(&self, _input: &[u8], _output: &mut [u8]) -> Result<usize, KernelError> {
+        Err(KernelError::Refused)
+    }
+}
+
+impl StatefulKernel for V3ResourceCounterKernel {
+    fn initial_state(&self, output: &mut [u8]) -> Result<usize, KernelError> {
+        COUNTER.initial_state(output)
+    }
+    fn transition(&self, _: &[u8], _: &[u8], _: &mut [u8], _: &mut [u8]) -> Result<(usize, usize), KernelError> {
+        Err(KernelError::Refused)
+    }
+    fn initial_state_spans(&self, spans: &mut [StateSpanMut<'_>]) -> Result<usize, KernelError> {
+        COUNTER.initial_state_spans(spans)
+    }
+    fn transition_spans_with_resource(
+        &self,
+        input: &[u8],
+        resource: &AccountSpan<'_>,
+        _commitment: &[u8; 32],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<TransitionOutcome, KernelError> {
+        let total: usize = state.iter().map(|span| span.data.len()).sum();
+        if input.len() != 1 || total != 16 || output.len() < 16 || resource.data.is_empty() {
+            return Err(KernelError::InvalidInput);
+        }
+        let mut flat = [0u8; 16];
+        let mut at = 0;
+        for span in state.iter() {
+            flat[at..at + span.data.len()].copy_from_slice(span.data);
+            at += span.data.len();
+        }
+        let value = u64::from_le_bytes(flat[..8].try_into().unwrap());
+        let total_sum = u64::from_le_bytes(flat[8..].try_into().unwrap());
+        let read = resource.data[(value % resource.data.len() as u64) as usize] as u64;
+        let value = value.checked_add(input[0] as u64 + read).ok_or(KernelError::Refused)?;
+        let total_sum = total_sum.checked_add(value).ok_or(KernelError::Refused)?;
+        flat[..8].copy_from_slice(&value.to_le_bytes());
+        flat[8..].copy_from_slice(&total_sum.to_le_bytes());
+        at = 0;
+        for span in state.iter_mut() {
+            let len = span.data.len();
+            span.data.copy_from_slice(&flat[at..at + len]);
+            at += len;
+        }
+        output[..16].copy_from_slice(&flat);
+        Ok(TransitionOutcome { output_bytes: 16, disposition: TransitionDisposition::Continue })
+    }
+}
+
+pub static V3_RESOURCE_COUNTER: V3ResourceCounterKernel = V3ResourceCounterKernel;
+
 
 /// The v3 counter with render lanes (design `stateful-session-lanes-v1.md`
 /// §10): a capture copies the 16 state bytes into the lane workspace in
@@ -916,12 +1013,13 @@ impl V3FixedAddressKernel {
         }
     }
 
-    /// Transitions add the input and the resource byte at
-    /// `value % resource_len` to the counter: a data-dependent read.
+    /// The workspace-first engine with `READS_RESOURCE`: transitions add the
+    /// input and the resource byte at `value % resource_len` to the counter
+    /// (a data-dependent read), with the same halt and refusal commands.
     pub const fn reading_resource() -> Self {
         Self {
             context: AtomicPtr::new(core::ptr::null_mut()),
-            workspace_first: false,
+            workspace_first: true,
             reads_resource: true,
         }
     }
@@ -946,6 +1044,62 @@ impl V3FixedAddressKernel {
         state: &mut [StateSpanMut<'_>],
         output: &mut [u8],
     ) -> Result<usize, KernelError> {
+        self.transition_one_reading(input, state, output, None)
+    }
+
+    /// The fixed engine's v3 outcome: 0xEE halts before, 0xED changes state
+    /// and halts before (refused at or below the snapshot cap), 0xEF steps
+    /// and halts after, anything else steps.
+    fn fixed_outcome(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+        resource: Option<&[u8]>,
+    ) -> Result<TransitionOutcome, KernelError> {
+        self.check_fixed_address(state)?;
+        if self.context.load(Ordering::Relaxed) != state[0].data.as_mut_ptr() {
+            return Err(KernelError::Refused);
+        }
+        if input == [0xEE] {
+            return Ok(TransitionOutcome {
+                output_bytes: 0,
+                disposition: TransitionDisposition::HaltBefore {
+                    reason: V3_HALT_REASON,
+                },
+            });
+        }
+        if input == [0xED] {
+            state[0].data[0] ^= 1;
+            return Ok(TransitionOutcome {
+                output_bytes: 0,
+                disposition: TransitionDisposition::HaltBefore {
+                    reason: V3_HALT_REASON,
+                },
+            });
+        }
+        let written = self.transition_one_reading(input, state, output, resource)?;
+        Ok(TransitionOutcome {
+            output_bytes: written,
+            disposition: if input == [0xEF] {
+                TransitionDisposition::HaltAfter {
+                    reason: V3_HALT_AFTER_REASON,
+                }
+            } else {
+                TransitionDisposition::Continue
+            },
+        })
+    }
+
+    /// One counter step; with a resource, the byte at `value % len` is added
+    /// as well.
+    fn transition_one_reading(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+        resource: Option<&[u8]>,
+    ) -> Result<usize, KernelError> {
         if input.len() != 1 || output.len() < 8 {
             return Err(KernelError::InvalidInput);
         }
@@ -958,8 +1112,13 @@ impl V3FixedAddressKernel {
         }
         let at = state[0].data.len() - 8;
         let value = u64::from_le_bytes(state[0].data[at..at + 8].try_into().unwrap());
+        let read = match resource {
+            Some(bytes) if bytes.is_empty() => return Err(KernelError::InvalidInput),
+            Some(bytes) => bytes[(value % bytes.len() as u64) as usize] as u64,
+            None => 0,
+        };
         let next = value
-            .checked_add(input[0] as u64)
+            .checked_add(input[0] as u64 + read)
             .ok_or(KernelError::Refused)?;
         state[0].data[at..at + 8].copy_from_slice(&next.to_le_bytes());
         output[..8].copy_from_slice(&next.to_le_bytes());
@@ -1020,41 +1179,7 @@ impl StatefulKernel for V3FixedAddressKernel {
         if self.reads_resource {
             return Err(KernelError::Refused);
         }
-        self.check_fixed_address(state)?;
-        if self.context.load(Ordering::Relaxed) != state[0].data.as_mut_ptr() {
-            return Err(KernelError::Refused);
-        }
-        if input == [0xEE] {
-            return Ok(TransitionOutcome {
-                output_bytes: 0,
-                disposition: TransitionDisposition::HaltBefore {
-                    reason: V3_HALT_REASON,
-                },
-            });
-        }
-        if input == [0xED] {
-            state[0].data[0] ^= 1;
-            return Ok(TransitionOutcome {
-                output_bytes: 0,
-                disposition: TransitionDisposition::HaltBefore {
-                    reason: V3_HALT_REASON,
-                },
-            });
-        }
-        if input == [0xEF] {
-            let written = self.transition_one(input, state, output)?;
-            return Ok(TransitionOutcome {
-                output_bytes: written,
-                disposition: TransitionDisposition::HaltAfter {
-                    reason: V3_HALT_AFTER_REASON,
-                },
-            });
-        }
-        let written = self.transition_one(input, state, output)?;
-        Ok(TransitionOutcome {
-            output_bytes: written,
-            disposition: TransitionDisposition::Continue,
-        })
+        self.fixed_outcome(input, state, output, None)
     }
 
     fn transition_spans_with_resource(
@@ -1065,34 +1190,14 @@ impl StatefulKernel for V3FixedAddressKernel {
         state: &mut [StateSpanMut<'_>],
         output: &mut [u8],
     ) -> Result<TransitionOutcome, KernelError> {
-        if !self.reads_resource {
-            return Err(KernelError::Refused);
-        }
-        self.check_fixed_address(state)?;
-        if self.context.load(Ordering::Relaxed) != state[0].data.as_mut_ptr() {
-            return Err(KernelError::Refused);
-        }
-        if input.len() != 1
-            || output.len() < 8
-            || resource.data.is_empty()
+        if !self.reads_resource
             || resource.schema != V3_RESOURCE_SCHEMA
             || resource.owner != V3_RESOURCE_OWNER
             || resource.is_writable
         {
-            return Err(KernelError::InvalidInput);
+            return Err(KernelError::Refused);
         }
-        let at = state[0].data.len() - 8;
-        let value = u64::from_le_bytes(state[0].data[at..at + 8].try_into().unwrap());
-        let read = resource.data[(value % resource.data.len() as u64) as usize];
-        let next = value
-            .checked_add(input[0] as u64 + read as u64)
-            .ok_or(KernelError::Refused)?;
-        state[0].data[at..at + 8].copy_from_slice(&next.to_le_bytes());
-        output[..8].copy_from_slice(&next.to_le_bytes());
-        Ok(TransitionOutcome {
-            output_bytes: 8,
-            disposition: TransitionDisposition::Continue,
-        })
+        self.fixed_outcome(input, state, output, Some(resource.data))
     }
 
     fn bind_invocation_state(&self, state: &mut [StateSpanMut<'_>]) -> Result<(), KernelError> {
@@ -1327,6 +1432,10 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_FIXED_ENGINE)
         } else if kernel_id == Some(V3_WORKSPACE_ENGINE.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_WORKSPACE_ENGINE)
+        } else if kernel_id == Some(V3_TICK_COUNTER.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_TICK_COUNTER)
+        } else if kernel_id == Some(V3_RESOURCE_COUNTER.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_RESOURCE_COUNTER)
         } else if kernel_id == Some(V3_RESOURCE_ENGINE.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_RESOURCE_ENGINE)
         } else if kernel_id == Some(V3_LANE_COUNTER.manifest().id) {
