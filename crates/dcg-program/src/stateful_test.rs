@@ -1554,6 +1554,7 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     }
 }
 
+#[cfg(feature = "kernel-conform-entry")]
 /// The kernel kit's same-source reference for the v3 test counters
 /// (`kernel_kit::conformance::serve_account_request`, tag `CONFORM_TAG`):
 /// the same kernels `dcg-kernel-conform` serves natively.

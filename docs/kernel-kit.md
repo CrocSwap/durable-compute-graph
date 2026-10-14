@@ -177,27 +177,39 @@ proof assistant), the kit can instead compare its **native** build with its
 
 1. Build a test-only image of your program that routes a tag of your choice
    to `kernel_kit::conformance::serve_account_request(&registry, program,
-   accounts)` with the dependency feature `kernel-conform-entry` (never in a
-   production image; DCG's own `sbf-real-lifecycle-test` image routes tag
-   `CONFORM_TAG` = 252 for its test counters).
+   accounts)`, with the dependency feature `kernel-conform-entry`. Never
+   deploy it: the entry writes without a signature (it refuses any account
+   that lacks its kit header, so it cannot touch program records, but it is
+   still a test surface). DCG's own test image routes `CONFORM_TAG` (252)
+   for its test counters when built with
+   `--features sbf-real-lifecycle-test,kernel-conform-entry`.
 2. Run the comparison, with a declaration-only mirror module (the mirror
-   classes' `decl`, `state_spans`, `special_inputs` and `resources` are used;
-   their transitions are not):
+   classes' `decl`, `state_spans`, `special_inputs` and `resources` choose
+   the cases; their transitions are not used). The reference is one quoted
+   command line:
 
 ```sh
 python -m dcg.kernel_kit compare --bin target/debug/my-conform \
-    --reference target/debug/dcg-kernel-conform-sbf out/sbf-test-image [--program NAME --tag N] \
-    -- my_declarations.py
+    --reference "target/debug/dcg-kernel-conform-sbf out/sbf-test-image --program my_program --tag 200" \
+    my_declarations.py
 ```
 
 `dcg-kernel-conform-sbf` serves the conformance protocol by running each
 request inside the SBF image under ProgramTest (1.4M compute units and the
-256 KiB heap per request); a request whose transaction fails answers `panic`
-and is reported. **What this shows:** the SBF build agrees with the native
-build: no platform difference in integer widths, overflow, layout or
-undefined behavior. **What it does not show:** that either build is the
-computation you meant; a logic bug in the shared source is in both.
-Measured (2026-10-14): DCG's six example counters agree across builds.
+256 KiB heap per request), with the state and resource bytes in accounts and
+the kernel running on them in place. Every request the kit makes (manifest,
+init, advance) goes to both servers, and the answers must be identical: the
+manifest, the outcome, the output, the state and the runtime's verdict.
+
+**What this shows:** on the generated cases, the SBF build gives exactly the
+native build's answers; a platform difference (integer widths, overflow,
+layout, undefined behavior) that changes an answer on those cases is
+reported. Most generated cases are refusals, where only the refusal and its
+kind are compared. **What it does not show:** anything about cases the
+generator does not produce, or that either build is the computation you
+meant; a logic bug in the shared source is in both. It compares stateful
+kernels only (STEP kernels are not compared). **Measured** (2026-10-14):
+DCG's six example counters give identical answers (1,928 cases).
 
 ## What the kit does not check
 

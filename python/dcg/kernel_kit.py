@@ -26,6 +26,7 @@ because the program treats every kernel error alike.
 from __future__ import annotations
 
 import argparse
+import shlex
 import importlib
 import importlib.util
 import random
@@ -581,21 +582,34 @@ def compare_stateful(native: RustKernels, reference: RustKernels, mirror: Statef
                      walk: int = 64) -> Report:
     """Compare two builds of a stateful kernel over the cases ``mirror``'s
     declaration generates (its spans, special inputs and sample resources);
-    the mirror's own transition is not used."""
+    the mirror's own transition is not used. Every request the kit sends to
+    the native build (manifest, init, advance) also goes to the reference,
+    and the two answers must be identical, byte for byte: outcome, output,
+    state and the runtime's verdict (re-review M-b)."""
     proxy = ServerMirror(reference, mirror.decl, mirror.state_spans, mirror.special_inputs,
                          getattr(mirror, "resources", ()), getattr(mirror, "resource_schema", (0, 0)))
-    # The kit asks for plain and rejectable sessions; the reference must see the same flag.
-    original = native.advance
+    mismatches: list[str] = []
+    original = native.ask
 
-    def advance(decl, rejectable, spans, state, command, resource=None):
-        proxy._rejectable = rejectable
-        return original(decl, rejectable, spans, state, command, resource)
+    def ask(line: str) -> str:
+        mine = original(line)
+        try:
+            theirs = reference.ask(line)
+        except RuntimeError as e:
+            theirs = f"<{e}>"
+        if mine != theirs:
+            mismatches.append(f"request {line[:96]!r}: native {mine[:96]!r}, reference {theirs[:96]!r}")
+        words = line.split()
+        if words and words[0] == "advance":
+            proxy._rejectable = words[4] == "1"
+        return mine
 
-    native.advance = advance  # type: ignore[method-assign]
+    native.ask = ask  # type: ignore[method-assign]
     try:
         report = check_stateful(native, proxy, seed, walk)
     finally:
-        native.advance = original  # type: ignore[method-assign]
+        native.ask = original  # type: ignore[method-assign]
+    report.disagreements.extend(mismatches)
     report.kernel += " [native vs reference]"
     return report
 
@@ -631,14 +645,14 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("modules", nargs="+", help="modules or .py files defining mirrors")
     compare = sub.add_parser("compare", help="compare two builds of the same kernels (native vs SBF)")
     compare.add_argument("--bin", required=True, help="the native conformance server")
-    compare.add_argument("--reference", required=True, nargs="+",
-                         help="the reference server and its arguments, e.g. dcg-kernel-conform-sbf DIR")
+    compare.add_argument("--reference", required=True,
+                         help="the reference server command line, quoted, e.g. 'dcg-kernel-conform-sbf DIR --tag 252'")
     compare.add_argument("--seed", type=int, default=0)
     compare.add_argument("modules", nargs="+", help="modules or .py files defining declarations (mirrors)")
     args = parser.parse_args(argv)
     reports = []
     if args.cmd == "compare":
-        with RustKernels(args.bin) as native, RustKernels(args.reference) as reference:
+        with RustKernels(args.bin) as native, RustKernels(shlex.split(args.reference)) as reference:
             for target in args.modules:
                 _, states = mirrors_in(_load(target))
                 reports += [compare_stateful(native, reference, m, args.seed) for m in states]

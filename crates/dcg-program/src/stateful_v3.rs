@@ -803,6 +803,11 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || raw[1182] > 1
         || raw[1189] > 1
         || raw[1273] & !FEATURES_KNOWN != 0
+        // Ticks imply a ring and the indexed policy (open checks it; a
+        // record that says otherwise is not one the program wrote).
+        || (raw[1273] & FEATURE_TICKS != 0 && (raw[1273] & FEATURE_RING_STREAM == 0 || raw[7] != POLICY_INDEXED))
+        // (No such rule for FEATURE_READS_RESOURCE: closing the resource copy
+        // of a halted session clears the resource key.)
         || raw[1278..].iter().any(|byte| *byte != 0)
         || (raw[1273] & FEATURE_REJECTABLE == 0 && u32_at(raw, 1274) != 0)
         || (raw[1273] & FEATURE_RING_STREAM != 0 && u32_at(raw, 10) < MIN_RING_CAPACITY)

@@ -516,6 +516,19 @@ async fn ticks_need_the_capability_the_feature_a_ring_and_no_waiting_input() {
     assert_eq!(value(&mut ctx, &s).await, 4);
 }
 
+/// The ADVANCE half of review M3 for ticks: a live session whose recorded
+/// tick feature is cleared (the record edited directly) refuses ticks.
+#[tokio::test]
+async fn ticks_need_the_recorded_feature_at_advance() {
+    let mut ctx = start().await;
+    let s = session(&mut ctx, &app::V3_TICK_COUNTER, v3::MIN_RING_CAPACITY, Some(TICKS)).await.unwrap();
+    tick(&mut ctx, &s, 0, 1).await.unwrap();
+    let mut edited = ctx.banks_client.get_account(s.key).await.unwrap().unwrap();
+    edited.data[SESSION_FEATURES] &= !v3::FEATURE_TICKS;
+    ctx.set_account(&s.key, &edited.into());
+    assert_eq!(tick(&mut ctx, &s, 1, 1).await, Err(v3::REFUSAL_INPUT_GAP));
+}
+
 #[tokio::test]
 async fn ticks_are_refused_for_an_append_session_with_another_writer() {
     let mut ctx = start().await;
@@ -599,3 +612,33 @@ async fn sbf_call_frames_used_before_the_transition_callback() {
     assert!(dcg >= 1 && dcg <= 20, "unexpected frame count {dcg}");
 }
 
+
+/// Re-review H1: the kit's conformance entry (tag 252, only in an image
+/// built with `kernel-conform-entry`) refuses to write any account without
+/// its kit header, so it cannot overwrite or zero a session record. On an
+/// SBF image built with the entry (`V3_SBF=1`) this exercises the header
+/// check; elsewhere tag 252 is not routed and the instruction refuses too.
+#[tokio::test]
+async fn the_conformance_entry_never_writes_a_program_record() {
+    let mut ctx = start().await;
+    let s = session(&mut ctx, &app::V3_COUNTER, 16, None).await.unwrap();
+    let before = data(&mut ctx, s.key).await;
+    let request = solana_keypair::Keypair::new();
+    let line = format!("init {} 1 1 1280", hex_of(&app::V3_COUNTER.manifest().id.0));
+    let mut req = (line.len() as u32).to_le_bytes().to_vec();
+    req.extend_from_slice(line.as_bytes());
+    ctx.set_account(&request.pubkey(), &solana_account::AccountSharedData::from(Account {
+        lamports: 1_000_000_000, data: req, owner: Pubkey::default(), executable: false, rent_epoch: 0,
+    }));
+    let tag = dcg_program::kernel_kit::conformance::CONFORM_TAG;
+    // The session record as the answer account, then as the state account.
+    for accounts in [vec![r(request.pubkey()), w(s.key)], vec![r(request.pubkey()), w(state_pda(&s.key, 0)), w(s.key)]] {
+        let got = send(&mut ctx, ix(tag, vec![], accounts), &[]).await;
+        assert!(got.is_err(), "tag 252 wrote a program record");
+        assert_eq!(data(&mut ctx, s.key).await, before, "the session record is unchanged");
+    }
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}

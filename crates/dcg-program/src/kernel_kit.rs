@@ -300,17 +300,27 @@ pub mod conformance {
     }
 
     /// The instruction tag DCG's own test image routes to
-    /// [`serve_account_request`] (`sbf-real-lifecycle-test` only). An
-    /// application picks any tag of its own in a test-only image.
+    /// [`serve_account_request`] (`sbf-real-lifecycle-test` with
+    /// `kernel-conform-entry` only). An application picks any tag of its own
+    /// in a test-only image.
     pub const CONFORM_TAG: u8 = 252;
+
+    /// The first 16 bytes of the answer and state accounts the entry writes:
+    /// it refuses any other account, so it can never overwrite a program
+    /// record (re-review H1). The runner creates them with this header.
+    pub const ANSWER_HEADER: &[u8; 16] = b"dcg-kit-answer/1";
+    pub const STATE_HEADER: &[u8; 16] = b"dcg-kit-state/1\0";
 
     /// Answer one request inside a program (v0.3.0 item 4: the same-source
     /// reference). `accounts` are `[request, answer(w, program-owned),
     /// state(w, program-owned)?, resource?]`; the request account holds
-    /// `len:u32` then the request line, and the answer is written the same
-    /// way. With a state account, `init` and `advance` run in place on it
-    /// (the request's state word is `@`, a resource's bytes `@` from the
-    /// resource account) and the answer carries [`STATE_TOKEN`]. Running a test-only image built with this
+    /// `len:u32` then the request line; the answer account starts with
+    /// [`ANSWER_HEADER`], then `len:u32` and the answer. With a state account
+    /// (starting with [`STATE_HEADER`], the state after it), `init` and
+    /// `advance` run in place on it (the request's state word is `@`, a
+    /// resource's bytes `@` from the resource account) and the answer
+    /// carries [`STATE_TOKEN`]. Test images only: it writes without a
+    /// signature, so it refuses any account without its header. Running a test-only image built with this
     /// entry under ProgramTest (`dcg-kernel-conform-sbf`) lets the kit compare
     /// the SBF build of a kernel with its native build, with no mirror.
     pub fn serve_account_request(
@@ -322,7 +332,7 @@ pub mod conformance {
         let [request, out, ..] = accounts else {
             return Err(ProgramError::NotEnoughAccountKeys);
         };
-        if out.owner != program || !out.is_writable {
+        if out.owner != program || !out.is_writable || !out.try_borrow_data()?.starts_with(ANSWER_HEADER) {
             return Err(ProgramError::IllegalOwner);
         }
         // Parsed in place, with the state and resource bytes in their own
@@ -334,15 +344,16 @@ pub mod conformance {
         let line = core::str::from_utf8(bytes).map_err(|_| ProgramError::InvalidAccountData)?;
         let reply = match accounts.get(2) {
             Some(state) => {
-                if state.owner != program || !state.is_writable {
+                if state.owner != program || !state.is_writable || !state.try_borrow_data()?.starts_with(STATE_HEADER) {
                     return Err(ProgramError::IllegalOwner);
                 }
-                let mut state_raw = state.try_borrow_mut_data()?;
+                let mut state_guard = state.try_borrow_mut_data()?;
+                let state_raw = &mut state_guard[STATE_HEADER.len()..];
                 let resource_raw = match accounts.get(3) {
                     Some(r) => Some(r.try_borrow_data()?),
                     None => None,
                 };
-                let place = InPlace { state: &mut state_raw, resource: resource_raw.as_ref().map(|r| &r[..]) };
+                let place = InPlace { state: state_raw, resource: resource_raw.as_ref().map(|r| &r[..]) };
                 match handle(registry, line.trim_end(), Some(place)) {
                     Ok(answer) => answer,
                     Err(message) => format!("error {message}"),
@@ -352,11 +363,12 @@ pub mod conformance {
         };
         drop(raw);
         let mut raw = out.try_borrow_mut_data()?;
-        if raw.len() < 4 + reply.len() {
+        let at = ANSWER_HEADER.len();
+        if raw.len() < at + 4 + reply.len() {
             return Err(ProgramError::AccountDataTooSmall);
         }
-        raw[..4].copy_from_slice(&(reply.len() as u32).to_le_bytes());
-        raw[4..4 + reply.len()].copy_from_slice(reply.as_bytes());
+        raw[at..at + 4].copy_from_slice(&(reply.len() as u32).to_le_bytes());
+        raw[at + 4..at + 4 + reply.len()].copy_from_slice(reply.as_bytes());
         Ok(())
     }
 

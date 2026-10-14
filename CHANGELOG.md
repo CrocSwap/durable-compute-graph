@@ -38,6 +38,15 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
   it binds; an example registry copies a verdict before the session closes.
 - **Call frames (measured):** DCG's runtime uses at most 6 of SBF's 64 call
   frames before a v3 transition callback (`docs/stateful-workloads-v3.md`).
+- **Re-review fixes (2026-10-14):** the conformance entry is routed only
+  with its own feature `kernel-conform-entry` (not implied by
+  `sbf-real-lifecycle-test`) and writes only accounts carrying its kit
+  header (H1); `compare` requires identical answers from both builds,
+  manifest and verdict included, and takes the reference as one quoted
+  command (M-b, M-c); tests for the recorded features at `ADVANCE` and the
+  full-allocation check (M-a); the Python session client knows the new
+  feature bits; a session record with ticks must show a ring and the
+  indexed policy.
 - **Review fixes (independent review 2026-10-14):** a writable resource copy
   refuses in the program; ticks and resource reads are session features
   recorded at open (`FEATURE_TICKS`, `FEATURE_READS_RESOURCE`) and must keep

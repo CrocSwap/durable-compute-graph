@@ -32,11 +32,14 @@ const ANSWER: Pubkey = Pubkey::new_from_array([0xC5; 32]);
 const STATE: Pubkey = Pubkey::new_from_array([0xC6; 32]);
 const RESOURCE: Pubkey = Pubkey::new_from_array([0xC7; 32]);
 
-fn unhex(word: &str) -> Vec<u8> {
+fn unhex(word: &str) -> Option<Vec<u8>> {
     if word == "-" {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    (0..word.len() / 2).map(|i| u8::from_str_radix(&word[2 * i..2 * i + 2], 16).expect("hex")).collect()
+    if word.len() % 2 != 0 {
+        return None;
+    }
+    (0..word.len() / 2).map(|i| u8::from_str_radix(&word[2 * i..2 * i + 2], 16).ok()).collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -49,28 +52,44 @@ fn hex(bytes: &[u8]) -> String {
 /// Move a stateful request's state and resource bytes into accounts: the
 /// program then runs the kernel on them in place, without decoding hex.
 /// Returns the rewritten line, the state bytes (or the zeroed state for
-/// `init`) and the resource bytes, if any.
+/// `init`) and the resource bytes, if any. A request it cannot rewrite
+/// (malformed hex or lengths, an empty resource) goes to the program as
+/// text, which answers it as the native server does.
 fn in_place(line: &str) -> (String, Option<Vec<u8>>, Option<Vec<u8>>) {
     let mut words: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+    let as_text = || (line.to_string(), None, None);
     match words.first().map(String::as_str) {
         Some("init") if words.len() == 5 => {
-            let total: usize = words[4].split(',').map(|n| n.parse::<usize>().expect("a span length")).sum();
-            (line.to_string(), Some(vec![0; total]), None)
+            let lens: Option<Vec<usize>> = words[4].split(',').map(|n| n.parse::<u32>().ok().map(|n| n as usize)).collect();
+            match lens.and_then(|l| l.iter().try_fold(0usize, |a, n| a.checked_add(*n))) {
+                Some(total) if total <= 10 * 1024 * 1024 => (line.to_string(), Some(vec![0; total]), None),
+                _ => as_text(),
+            }
         }
         Some("advance") if words.len() == 8 || words.len() == 9 => {
-            let state = unhex(&words[6]);
+            let Some(state) = unhex(&words[6]) else { return as_text() };
             words[6] = "@".into();
             let mut resource = None;
             if words.len() == 9 {
-                if let Some((head, bytes)) = words[8].split_once(':') {
-                    resource = Some(unhex(bytes));
-                    words[8] = format!("{head}:@");
+                match words[8].split_once(':') {
+                    Some((head, bytes)) if bytes != "-" && !bytes.is_empty() => {
+                        let Some(b) = unhex(bytes) else { return as_text() };
+                        resource = Some(b);
+                        words[8] = format!("{head}:@");
+                    }
+                    _ => return as_text(),
                 }
             }
             (words.join(" "), Some(state), resource)
         }
-        _ => (line.to_string(), None, None),
+        _ => as_text(),
     }
+}
+
+fn with_header(header: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut data = header.to_vec();
+    data.extend_from_slice(body);
+    data
 }
 
 #[tokio::main]
@@ -107,12 +126,13 @@ async fn main() -> std::io::Result<()> {
         let (line, state, resource) = in_place(&line);
         let mut request = (line.len() as u32).to_le_bytes().to_vec();
         request.extend_from_slice(line.as_bytes());
-        let answer_len = 4 + 3 * line.len() + 65_536;
+        // An answer is at most the output (64 KiB) and the state token in hex.
+        let answer_len = 16 + 4 + 3 * line.len() + 2 * 65_536 + 4_096;
         let mut accounts = vec![AccountMeta::new_readonly(REQUEST, false), AccountMeta::new(ANSWER, false)];
         if let Some(state) = &state {
             ctx.set_account(&STATE, &AccountSharedData::from(Account {
                 lamports: 1_000_000_000_000,
-                data: state.clone(),
+                data: with_header(dcg_program::kernel_kit::conformance::STATE_HEADER, state),
                 owner: PROGRAM,
                 executable: false,
                 rent_epoch: 0,
@@ -138,7 +158,7 @@ async fn main() -> std::io::Result<()> {
         }));
         ctx.set_account(&ANSWER, &AccountSharedData::from(Account {
             lamports: 1_000_000_000_000,
-            data: vec![0; answer_len],
+            data: with_header(dcg_program::kernel_kit::conformance::ANSWER_HEADER, &vec![0; answer_len]),
             owner: PROGRAM,
             executable: false,
             rent_epoch: 0,
@@ -162,11 +182,12 @@ async fn main() -> std::io::Result<()> {
         let reply = match ctx.banks_client.process_transaction(tx).await {
             Ok(()) => {
                 let raw = ctx.banks_client.get_account(ANSWER).await.unwrap().unwrap().data;
+                let raw = &raw[16..];
                 let len = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
                 let text = String::from_utf8_lossy(&raw[4..4 + len]).into_owned();
                 if state.is_some() && text.contains(dcg_program::kernel_kit::conformance::STATE_TOKEN) {
                     let after = ctx.banks_client.get_account(STATE).await.unwrap().unwrap().data;
-                    text.replace(dcg_program::kernel_kit::conformance::STATE_TOKEN, &hex(&after))
+                    text.replace(dcg_program::kernel_kit::conformance::STATE_TOKEN, &hex(&after[16..]))
                 } else {
                     text
                 }

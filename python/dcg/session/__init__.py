@@ -49,8 +49,10 @@ from .journal import (
 )
 from .layout import (
     ACCOUNT_LAYOUTS,
+    FEATURE_READS_RESOURCE,
     FEATURE_REJECTABLE,
     FEATURE_RING_STREAM,
+    FEATURE_TICKS,
     MIN_RING_CAPACITY,
     AccountLayout,
     SessionAddresses,
@@ -62,8 +64,10 @@ from .manifest import COUNTER_MANIFEST, KernelRef
 from .signers import SessionSigners
 
 __all__ = [
+    "FEATURE_READS_RESOURCE",
     "FEATURE_REJECTABLE",
     "FEATURE_RING_STREAM",
+    "FEATURE_TICKS",
     "MIN_RING_CAPACITY",
     "SessionInfo",
     "slot_offset",

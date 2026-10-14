@@ -121,7 +121,7 @@ pub fn process_instruction_with_manifest(
     if (230..=239).contains(&tag) || tag == stateful::v3::RESOURCE_CHUNK_TAG {
         return stateful_test::process(program_id, accounts, data);
     }
-    #[cfg(feature = "sbf-real-lifecycle-test")]
+    #[cfg(all(feature = "sbf-real-lifecycle-test", feature = "kernel-conform-entry"))]
     if tag == kernel_kit::conformance::CONFORM_TAG {
         return stateful_test::conform(program_id, accounts);
     }

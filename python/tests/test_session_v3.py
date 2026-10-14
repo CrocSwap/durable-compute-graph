@@ -81,7 +81,7 @@ class SessionV3Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.open_ix(k, capacity=MIN_RING_CAPACITY - 1, features=FEATURE_RING_STREAM)
         with self.assertRaises(ValueError):
-            self.open_ix(k, features=4)
+            self.open_ix(k, features=16)  # an unknown bit (4 and 8 are ticks and resource reads, v0.3.0)
         with self.assertRaises(ValueError):
             self.open_ix(k, lanes=5)
         payer, authority = keys()
@@ -192,7 +192,7 @@ class SessionV3Tests(unittest.TestCase):
         session[1273] = 0
         plain = SessionInfo.decode(bytes(session))
         self.assertIn("rejectable: no", plain.explain())
-        session[1273] = 4
+        session[1273] = 16  # an unknown bit
         with self.assertRaises(ValueError):
             SessionInfo.decode(bytes(session))
 

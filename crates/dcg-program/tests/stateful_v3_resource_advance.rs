@@ -407,15 +407,52 @@ async fn the_recorded_feature_must_equal_the_kernels_declaration() {
     let payer = context.payer.pubkey();
     let resource = resource_bytes();
     // The resource engine without the feature byte.
+    let want = format!("Custom({})", v3::REFUSAL_RESOURCE);
     let mut open = open_primary(payer, authority.pubkey(), 1, resource_root(&resource));
     open.data.truncate(178);
-    assert!(try_send(&mut context, open, &[&authority]).await.is_err(), "READS_RESOURCE kernel without the feature");
+    let got = try_send(&mut context, open, &[&authority]).await;
+    assert!(got.as_ref().is_err_and(|e| e.contains(&want)), "READS_RESOURCE kernel without the feature: {got:?}");
     // The plain fixed engine with the feature.
     let mut open = open_primary(payer, authority.pubkey(), 2, resource_root(&resource));
     open.data[17..33].copy_from_slice(&app::V3_FIXED_ENGINE.manifest().id.0);
     open.accounts[2] = AccountMeta::new(session_pda(&authority.pubkey(), 2), false);
     open.accounts[4] = AccountMeta::new(resource_pda(&session_pda(&authority.pubkey(), 2)), false);
-    assert!(try_send(&mut context, open, &[&authority]).await.is_err(), "the feature without the capability");
+    let got = try_send(&mut context, open, &[&authority]).await;
+    assert!(got.as_ref().is_err_and(|e| e.contains(&want)), "the feature without the capability: {got:?}");
+}
+
+/// The ADVANCE half of review M3: a live session whose recorded feature no
+/// longer matches the kernel's declaration (as after an upgrade without a
+/// version bump; here the record is edited directly) refuses with
+/// REFUSAL_SESSION. And review L3: a sealed copy that is not fully allocated
+/// refuses with REFUSAL_RESOURCE.
+#[tokio::test(flavor = "multi_thread")]
+async fn advance_refuses_a_changed_feature_or_a_partly_allocated_copy() {
+    let mut context = start().await;
+    let authority = keypair(46);
+    let session = open_reading_session(&mut context, &authority, 1).await;
+    ok(&mut context, write_input(authority.pubkey(), session, 0, 5), &[&authority], "write").await;
+    let honest = || advance_accounts(authority.pubkey(), session, 0, 1, Some(AccountMeta::new_readonly(resource_pda(&session), false)));
+    // The feature byte cleared.
+    let original = context.banks_client.get_account(session).await.unwrap().unwrap();
+    let mut edited = original.clone();
+    edited.data[1273] &= !v3::FEATURE_READS_RESOURCE;
+    context.set_account(&session, &edited.into());
+    let got = try_send(&mut context, honest(), &[&authority]).await;
+    assert!(got.as_ref().is_err_and(|e| e.contains(&format!("Custom({})", v3::REFUSAL_SESSION))), "{got:?}");
+    context.set_account(&session, &original.into());
+    // The copy shortened by 8 bytes with `allocated` to match: still every
+    // chunk received, but not the whole resource.
+    let copy = context.banks_client.get_account(resource_pda(&session)).await.unwrap().unwrap();
+    let mut short = copy.clone();
+    let allocated = u32::from_le_bytes(short.data[112..116].try_into().unwrap());
+    short.data[112..116].copy_from_slice(&(allocated - 8).to_le_bytes());
+    short.data.truncate(short.data.len() - 8);
+    context.set_account(&resource_pda(&session), &short.into());
+    let got = try_send(&mut context, honest(), &[&authority]).await;
+    assert!(got.as_ref().is_err_and(|e| e.contains(&format!("Custom({})", v3::REFUSAL_RESOURCE))), "{got:?}");
+    context.set_account(&resource_pda(&session), &copy.into());
+    ok(&mut context, honest(), &[&authority], "restored").await;
 }
 
 /// The headered layout: `[authority, session, stream, resource, spans...]`

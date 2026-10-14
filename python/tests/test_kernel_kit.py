@@ -227,3 +227,41 @@ def test_builtin_names_are_refused():
 def test_server_reports_builtin_shadowing(rust):
     decl = dataclasses.replace(appkernels.sha256_concat.decl, name="add_i32/v1", semantic_version=2)
     assert rust.step(decl, [b"abcd"]) == "builtin"
+
+
+# --- compare (v0.3.0 item 4) ---------------------------------------------------------------------
+
+_FAKE_REFERENCE = r'''
+import subprocess, sys
+mode, binary = sys.argv[1], sys.argv[2]
+server = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+for line in sys.stdin:
+    server.stdin.write(line)
+    server.stdin.flush()
+    answer = server.stdout.readline()
+    if mode == "verdict":
+        answer = answer.replace("judged accepted", "judged refused")
+    elif mode == "manifest" and answer.startswith("ok "):
+        answer = answer.replace("compute=", "compute=1")
+    sys.stdout.write(answer)
+    sys.stdout.flush()
+'''
+
+
+@needs_server
+@pytest.mark.parametrize("mode", ["same", "verdict", "manifest"])
+def test_compare_requires_identical_answers(tmp_path, mode):
+    """``compare`` reports a reference that changes only the verdict or only
+    the manifest (re-review M-b), and agrees with an identical one."""
+    script = tmp_path / "fake_reference.py"
+    script.write_text(_FAKE_REFERENCE)
+    with kit.RustKernels(SERVER) as native, kit.RustKernels([sys.executable, script, mode, SERVER]) as reference:
+        report = kit.compare_stateful(native, reference, CM.TICK_COUNTER)
+    assert report.ok == (mode == "same"), report.summary()
+
+
+def test_compare_cli_takes_a_quoted_reference_command():
+    parser_args = ["compare", "--bin", "x", "--reference", "runner DIR --program p --tag 9", "m.py"]
+    import argparse  # noqa: F401  (the CLI parses without running)
+    with pytest.raises(Exception):  # the binaries do not exist; parsing itself must pass
+        kit.main(parser_args)
