@@ -459,6 +459,10 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "graph_v2.rs::private sample_audit", // run_checked binds DCR2 to DCT2; slot-hash proof gates audit and bond.
     "graph_v2.rs::private settle_descent", // checked run/dispute PDAs, deadlines and payee keys gate timeout rulings.
     "graph_v2.rs::private take_bond", // callers authenticate the run or dispute PDA and recipient before moving excess rent.
+    // Test images only: on SBF it exists only with `kernel-conform-entry`,
+    // which cannot combine with `alpha-image`; it writes only program-owned
+    // accounts already carrying ANSWER_HEADER / STATE_HEADER (re-review H1).
+    "kernel_kit.rs::pub serve_account_request",
     "stateful.rs::private drain_to_refund",
     "stateful.rs::private encode_session",
     "stateful_v2.rs::private drain_to_refund",

@@ -24,7 +24,8 @@ def test_the_rust_marker_matches_the_reader():
     got = runtime.runtime_version(image)
     assert got.version == version and got.surfaces == ("stateful-v3", "v21")
     # The entry points read the marker so it stays in every image.
-    assert lib.count("touch_runtime_marker(); let Some(tag)") == 2
+    # One entry point since revision 8 was removed (3d0d3e9).
+    assert len(re.findall(r"touch_runtime_marker\(\);\s*let Some\(tag\)", lib)) == 1
     assert "crate::touch_runtime_marker();" in (ROOT / "crates/dcg-program/src/stateful_v3.rs").read_text()
 
 
