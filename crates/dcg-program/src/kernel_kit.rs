@@ -117,7 +117,7 @@ impl KernelDecl {
     }
 
     /// Declare `KernelCapabilities::READS_RESOURCE`: v3 transitions read the
-    /// session's sealed resource (`transition_spans_with_resource`).
+    /// session's sealed resource (`transition_spans_with_resources`).
     pub const fn reads_resource(mut self) -> Self {
         self.manifest.capabilities = KernelCapabilities(self.manifest.capabilities.0 | KernelCapabilities::READS_RESOURCE.0);
         self
@@ -627,7 +627,7 @@ pub mod conformance {
                     offset: 0,
                     data: bytes,
                 };
-                kernel.transition_spans_with_resource(input, &span, &resource_root(bytes), &mut spans, &mut output)
+                kernel.transition_spans_with_resources(input, core::slice::from_ref(&span), &resource_root(bytes), &mut spans, &mut output)
             }
             None => kernel.transition_spans_with_outcome(input, &mut spans, &mut output),
         });

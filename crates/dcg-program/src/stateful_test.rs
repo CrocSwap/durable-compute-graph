@@ -540,14 +540,17 @@ impl StatefulKernel for V3ResourceCounterKernel {
     ) -> Result<usize, KernelError> {
         COUNTER.initial_state_spans(spans)
     }
-    fn transition_spans_with_resource(
+    fn transition_spans_with_resources(
         &self,
         input: &[u8],
-        resource: &AccountSpan<'_>,
+        resources: &[AccountSpan<'_>],
         _commitment: &[u8; 32],
         state: &mut [StateSpanMut<'_>],
         output: &mut [u8],
     ) -> Result<TransitionOutcome, KernelError> {
+        let [resource] = resources else {
+            return Err(KernelError::InvalidInput);
+        };
         let total: usize = state.iter().map(|span| span.data.len()).sum();
         if input.len() != 1 || total != 16 || output.len() < 16 || resource.data.is_empty() {
             return Err(KernelError::InvalidInput);
@@ -1267,14 +1270,17 @@ impl StatefulKernel for V3FixedAddressKernel {
         self.fixed_outcome(input, state, output, None)
     }
 
-    fn transition_spans_with_resource(
+    fn transition_spans_with_resources(
         &self,
         input: &[u8],
-        resource: &AccountSpan<'_>,
+        resources: &[AccountSpan<'_>],
         _commitment: &[u8; 32],
         state: &mut [StateSpanMut<'_>],
         output: &mut [u8],
     ) -> Result<TransitionOutcome, KernelError> {
+        let [resource] = resources else {
+            return Err(KernelError::Refused);
+        };
         if !self.reads_resource
             || resource.schema != V3_RESOURCE_SCHEMA
             || resource.owner != V3_RESOURCE_OWNER

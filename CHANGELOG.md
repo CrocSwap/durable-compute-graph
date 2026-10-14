@@ -8,7 +8,9 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
 - **Transitions may read the session resource (v0.3.0 item 1).** A stateful
   kernel declaring `KernelCapabilities::READS_RESOURCE` gets the sealed
   resource read-only on every `ADVANCE`, through
-  `StatefulKernel::transition_spans_with_resource`
+  `StatefulKernel::transition_spans_with_resources` (a list, of one entry
+  today, so several resources per session can come later without changing
+  the hook)
   (`docs/stateful-workloads-v3.md`). Additive: kernels without the bit, their
   sessions and their account lists are unchanged. For such a kernel,
   `ADVANCE` takes the resource copy (read-only; a writable one refuses)

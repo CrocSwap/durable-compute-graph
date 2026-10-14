@@ -2918,9 +2918,9 @@ fn advance(
                 }
                 output.fill(0);
                 let outcome = match resource_span.as_ref() {
-                    Some(resource) => kernel.transition_spans_with_resource(
+                    Some(resource) => kernel.transition_spans_with_resources(
                         command,
-                        resource,
+                        core::slice::from_ref(resource),
                         &session.resource_commitment,
                         &mut spans,
                         &mut output,

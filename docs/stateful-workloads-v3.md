@@ -271,10 +271,14 @@ see:
   `key` and `owner` are the copy's address and the program. A transition must
   not depend on them (the kernel kit passes zeros): its pure inputs are the
   command, the state, the resource bytes, its schema and the commitment.
-- The runtime calls `StatefulKernel::transition_spans_with_resource(input,
-  resource, commitment, state, output)` for every step in place of
-  `transition_spans_with_outcome`. The transition must be a pure function of
-  (input, state, resource); outcomes and halts follow the same rules.
+- The runtime calls `StatefulKernel::transition_spans_with_resources(input,
+  resources, commitment, state, output)` for every step in place of
+  `transition_spans_with_outcome`, with the same resource arguments as
+  initialization. Sessions name one resource today, so `resources` has
+  exactly one entry; the list form keeps the hook unchanged if sessions
+  later name several (v0.3.0 item 3, deferred by the owner 2026-10-14). The
+  transition must be a pure function of (input, state, resources); outcomes
+  and halts follow the same rules.
 - Measured (SBF ProgramTest, the 1,280-byte fixed engine): a three-step
   `ADVANCE` reading a 4,096-byte resource costs 11,253 CU in total.
 

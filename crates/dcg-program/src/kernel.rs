@@ -80,7 +80,7 @@ impl KernelCapabilities {
     /// The kernel's v3 transitions read the session's sealed resource:
     /// `ADVANCE` passes the program-owned copy read-only, right after the
     /// stream account, and calls
-    /// `StatefulKernel::transition_spans_with_resource`. A session binding
+    /// `StatefulKernel::transition_spans_with_resources`. A session binding
     /// such a kernel must name a resource (checked at `OPEN_SESSION`).
     pub const READS_RESOURCE: Self = Self(2);
     /// The kernel accepts ticks: `ADVANCE` with the tick flag runs its steps
@@ -557,21 +557,24 @@ pub trait StatefulKernel: Kernel {
     }
 
     /// Stateful wire v3 transition for a kernel declaring
-    /// `KernelCapabilities::READS_RESOURCE`. `resource` is the session's
-    /// sealed program-owned copy, read-only, checked against the
-    /// session-bound key, schema and commitment, its structure and its chunk
-    /// count (the bytes are not re-hashed per call). The transition must be a
-    /// pure function of (input, state, resource). The default refuses, so a
-    /// kernel declaring the capability must override it.
-    fn transition_spans_with_resource(
+    /// `KernelCapabilities::READS_RESOURCE`, with the same resource arguments
+    /// as initialization: `resources` are the session's sealed program-owned
+    /// copies, read-only, each checked against the session-bound key, schema
+    /// and commitment, its structure and its chunk count (the bytes are not
+    /// re-hashed per call), and `commitment` is the session's commitment.
+    /// Sessions name one resource today, so the list has exactly one entry; a
+    /// list keeps the hook unchanged if sessions later name several. The
+    /// transition must be a pure function of (input, state, resources). The
+    /// default refuses, so a kernel declaring the capability must override it.
+    fn transition_spans_with_resources(
         &self,
         input: &[u8],
-        resource: &AccountSpan<'_>,
+        resources: &[AccountSpan<'_>],
         commitment: &[u8; 32],
         state: &mut [StateSpanMut<'_>],
         output: &mut [u8],
     ) -> Result<TransitionOutcome, KernelError> {
-        let _ = (input, resource, commitment, state, output);
+        let _ = (input, resources, commitment, state, output);
         Err(KernelError::Refused)
     }
 
