@@ -30,6 +30,10 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
   feature `kernel-conform-entry`, never in a production image) under
   ProgramTest, with state and resource bytes in accounts and the kernel
   running on them in place. DCG's six example counters agree (1,928 cases).
+- **Verdict reader.** `stateful::v3::read_verdict` / `read_verdict_bytes`
+  and `SessionVerdict::require`: a CPI-free check of a finished session
+  (owner, address, layout, kernel halt with a nonzero reason) returning what
+  it binds; an example registry copies a verdict before the session closes.
 - **Call frames (measured):** DCG's runtime uses at most 6 of SBF's 64 call
   frames before a v3 transition callback (`docs/stateful-workloads-v3.md`).
 - **Review fixes (independent review 2026-10-14):** a writable resource copy

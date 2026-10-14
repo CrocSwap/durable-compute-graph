@@ -4646,3 +4646,142 @@ pub fn process_with_kernel(
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
+
+// --- verdict reader (v0.3.0) -----------------------------------------------------------------
+
+/// What a finished v3 session proves, read by another program or a client
+/// without a CPI (v0.3.0): the host program executed every input in order on
+/// the committed state, and its kernel halted with `halt_reason`. Fields are
+/// copied from the authenticated session record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionVerdict {
+    pub session: Pubkey,
+    pub authority: Pubkey,
+    pub id: u64,
+    pub kernel: KernelId,
+    pub semantic_version: u16,
+    pub abi_version: u16,
+    pub state_schema: VersionedId,
+    /// The source account named at open (`Pubkey::default()` without one),
+    /// its schema and the Merkle root its sealed copy was checked against.
+    pub resource_key: Pubkey,
+    pub resource_schema: VersionedId,
+    pub resource_commitment: [u8; 32],
+    pub features: u8,
+    /// The kernel's halt reason: nonzero (an authority's `HALT_SESSION`
+    /// records 0 and is refused as [`VerdictError::NoKernelVerdict`]).
+    pub halt_reason: u32,
+    pub halt_cursor: u32,
+    /// The input chain over every consumed input (and tick), and its root.
+    pub input_root: [u8; 32],
+    pub stream_root: [u8; 32],
+    /// The latest anchor: its cursor and digest (zero if never anchored).
+    pub anchor_cursor: u32,
+    pub state_anchor: [u8; 32],
+}
+
+/// Why a session account is not a verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerdictError {
+    /// Not owned by the named host program.
+    Owner,
+    /// Not a v3 session record.
+    Layout,
+    /// The account's address is not the session address its record names.
+    Address,
+    /// The session has not halted.
+    NotHalted,
+    /// The session was halted by its authority (reason 0), not by its kernel.
+    NoKernelVerdict,
+    /// The kernel, its versions or the state schema differ from those required.
+    Kernel,
+    /// The resource differs from the one required.
+    Resource,
+    /// The halt reason is not one the consumer accepts.
+    Reason,
+}
+
+/// What a consumer requires of a verdict; `None` fields are not checked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VerdictRequirements {
+    pub kernel: Option<(KernelId, u16, u16)>,
+    pub state_schema: Option<VersionedId>,
+    pub resource_commitment: Option<[u8; 32]>,
+    pub resource_schema: Option<VersionedId>,
+    pub halt_reason: Option<u32>,
+}
+
+/// Read a finished session's verdict from its account. `host` is the program
+/// the session must belong to: the application program that embeds DCG. The
+/// verdict is only as trustworthy as that program's image and upgrade
+/// authority; check them separately (`dcg verify`). The record must be read
+/// before the session account is closed; a consumer that needs it longer
+/// copies the verdict into its own account.
+pub fn read_verdict(host: &Pubkey, account: &AccountInfo) -> Result<SessionVerdict, VerdictError> {
+    let raw = account.try_borrow_data().map_err(|_| VerdictError::Layout)?;
+    read_verdict_bytes(host, account.key, account.owner, &raw)
+}
+
+/// [`read_verdict`] over an account's key, owner and data (for clients).
+pub fn read_verdict_bytes(host: &Pubkey, key: &Pubkey, owner: &Pubkey, raw: &[u8]) -> Result<SessionVerdict, VerdictError> {
+    if owner != host {
+        return Err(VerdictError::Owner);
+    }
+    let session = decode_session(raw).map_err(|_| VerdictError::Layout)?;
+    if session.mode != MODE_CONSENSUS_V3 {
+        return Err(VerdictError::Layout);
+    }
+    let derived = Pubkey::create_program_address(
+        &[SESSION_SEED, session.authority.as_ref(), &session.id.to_le_bytes(), &[session.bump]],
+        host,
+    )
+    .map_err(|_| VerdictError::Address)?;
+    if &derived != key || session.self_key != *key {
+        return Err(VerdictError::Address);
+    }
+    if session.status != STATUS_HALTED {
+        return Err(VerdictError::NotHalted);
+    }
+    if session.halt_reason == 0 {
+        return Err(VerdictError::NoKernelVerdict);
+    }
+    Ok(SessionVerdict {
+        session: *key,
+        authority: session.authority,
+        id: session.id,
+        kernel: session.kernel_id,
+        semantic_version: session.semantic_version,
+        abi_version: session.abi_version,
+        state_schema: session.state_schema,
+        resource_key: session.resource_key,
+        resource_schema: session.resource_schema,
+        resource_commitment: session.resource_commitment,
+        features: session.features,
+        halt_reason: session.halt_reason,
+        halt_cursor: session.halt_cursor,
+        input_root: session.input_root,
+        stream_root: session.stream_root,
+        anchor_cursor: session.anchor_cursor,
+        state_anchor: session.state_anchor,
+    })
+}
+
+impl SessionVerdict {
+    /// Check the verdict against what the consumer requires.
+    pub fn require(&self, r: &VerdictRequirements) -> Result<(), VerdictError> {
+        if r.kernel.is_some_and(|k| k != (self.kernel, self.semantic_version, self.abi_version))
+            || r.state_schema.is_some_and(|s| s != self.state_schema)
+        {
+            return Err(VerdictError::Kernel);
+        }
+        if r.resource_commitment.is_some_and(|c| c != self.resource_commitment)
+            || r.resource_schema.is_some_and(|s| s != self.resource_schema)
+        {
+            return Err(VerdictError::Resource);
+        }
+        if r.halt_reason.is_some_and(|h| h != self.halt_reason) {
+            return Err(VerdictError::Reason);
+        }
+        Ok(())
+    }
+}

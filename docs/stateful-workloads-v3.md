@@ -204,6 +204,36 @@ requires zero lamports at the session address.
 Tests: `tests/stateful_v3_creators.rs` (native ProgramTest, or the
 feature-built SBF image with `V3_SBF=1` and `BPF_OUT_DIR`).
 
+### Reading a finished session's verdict (v0.3.0)
+
+Another program, or a client, reads what a finished session proves without
+calling DCG: `stateful::v3::read_verdict(host, session_account)` (or
+`read_verdict_bytes` over key, owner and data) checks that the account is
+owned by `host`, is a v3 session record, sits at the session address its
+record names (authority, id and bump re-derived), and has halted with a
+nonzero kernel reason. It returns a `SessionVerdict`: the kernel and its
+versions, the state schema, the resource key, schema and commitment, the
+features, the halt reason and cursor, the input chain and stream roots, and
+the latest anchor. `SessionVerdict::require` checks what the consumer needs
+(kernel and versions, schema, resource commitment, reason).
+
+- **An authority's halt is not a verdict.** `HALT_SESSION` records reason 0,
+  and `read_verdict` refuses it (`NoKernelVerdict`); a kernel's halt needs a
+  nonzero reason. The authority can withhold a verdict, never forge one.
+- **The host program is trusted.** The verdict is only as good as the image
+  and upgrade authority of `host`; check them separately (`dcg verify`), or
+  make the program immutable.
+- **Read before close.** The record exists until the session account
+  closes. A consumer that needs the verdict longer copies it: the example
+  registry in `tests/stateful_v3_verdict.rs` reads the verdict, checks the
+  kernel and reason, writes its own record at `["verdict", session]`, and
+  the session then closes completely while the record stays. Once copied,
+  the registry program is in the consumer's trusted base too.
+
+Tests: `tests/stateful_v3_verdict.rs` (native): a kernel halt read, required
+and recorded, then the session closed; an authority halt, a foreign owner,
+another address, a short record and a changed magic refused.
+
 ### Call frames left to a kernel
 
 SBF allows 64 nested call frames per instruction. **Measured** (2026-10-14,
