@@ -14,6 +14,7 @@ pub mod compatibility;
 pub mod graph_v2;
 #[cfg(feature = "graph-v21")]
 pub mod disputes_v21;
+pub mod fuel;
 pub mod hash;
 pub mod kernel;
 pub mod kernel_kit;
