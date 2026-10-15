@@ -1,7 +1,7 @@
 # Mixed modes in one template: pipelines of single-mode stages (2026-10-15)
 
 **Status: designed, not started (owner 2026-10-15: design mixed regions
-now).** Numbers are *estimated* unless marked *measured*. Builds on
+now; mode results §8 answered the same day, folded into slice 1).** Numbers are *estimated* unless marked *measured*. Builds on
 `mode-results-v1.md` (merged to main 2026-10-15) and on the v2.1 design
 (`optimistic-descent-v2.1.md`, §11 reserved per-region modes). Follows the
 composition rules of Basanos `docs/design/dcg-graph-sweeps-modes-2026-09-30.md`
@@ -109,9 +109,11 @@ what pipelines use to bind stages.
 `magic "DIM1" external_id:u32 source:u8 (1 a pipeline stage, 2 any result)
 scheme:u8 reserved:u8[2] stage:u32 reserved:u32 out_index:u64
 requirements_digest:[32] reserved:u8[40]`.
-- `scheme` is `OUT_TREE_V21` in v1 (one output becomes one external input).
-  Whole-state imports from a sealed session need the state posted as a
-  chunked input and wait for tree seals (§8 of mode results, and §9 Q3 here).
+- `scheme` is `OUT_TREE_V21` (one output becomes one external input) or
+  `STATE_TREE_V1` (a tree-sealed session's whole state becomes one chunked
+  external input, or one of its chunks a plain one; §3.4 C). `out_index` is
+  the output index, or for a single chunk its chunk index plus one (zero
+  means the whole state).
 - `requirements_digest` is `SHA256("dcg.requirements.v1\0" || DRQ1)`, where
   `DRQ1` is a new canonical, fixed-length encoding of `ResultRequirements`
   (every field present, with a presence bitmap). For `source = 1` it is zero;
@@ -129,8 +131,11 @@ gains the form under its versioning rule, and `read_run_result` accepts it.
 1. reads the source result: a `FINAL` run through `read_run_result`, or a
    pipeline record's stored stage result (§3.3);
 2. checks it against the import's requirements with `ResultRef::require`;
-3. opens output `out_index` with the 55-byte ref recorded in the run (the run
-   id already binds it) and `path`;
+3. opens the value against the result's root with the 55-byte ref recorded
+   in the run (the run id already binds it): output `out_index` with its
+   `path`; or, for a whole tree-sealed state, checks that the ref's digest
+   equals the root and its `byte_length` the state bytes (no path, no
+   posting: the chunked-value digest is the root); or one chunk with its path;
 4. sets the input's bit.
 
 The commit deadline starts when the last import bit is set. This is the
@@ -254,6 +259,61 @@ another program (for example a v3 session in an app program, sealed as in
 mode results §3.2) are a later extension through the `host` field of the
 `ResultRef`; they need a decision about which hosts a pipeline may trust.
 
+### 3.4 Folded into slice 1 (owner 2026-10-15)
+
+The owner's answers to mode results §8 (2026-10-15) put three more changes
+into slice 1, so the shared image changes once.
+
+**A. Run receipts carry the template id (mode results §8 Q2).** A run closes
+into a new receipt form `D21Q`, 348 bytes: bytes 0..312 as in `D21P` (magic
+replaced), then `template_id` (32, the template's offset 96), the template
+kind byte (1, the template's offset 5) and 3 zero bytes. `read_run_result`
+reads a `D21Q` without the template account, so a result stays readable after
+its template closes. `D21P` receipts already written keep their form and still
+need the template. The run read layout becomes run-read v2 (new magic, under
+v1's versioning rule); the live run's version 2 (imports) is in the same
+document.
+
+**B. Anyone may seal a halted session (mode results §8 Q1).**
+- `SEAL` begin, chunk and finish no longer require the authority's
+  signature. Whoever begins pays the seal accumulator's rent and gets it back
+  at finish or abort.
+- Anyone may continue and finish a seal someone else began. The hash is fixed
+  by the frozen state, so who sends the chunks does not matter. A seal begun
+  and abandoned therefore blocks the session's closes only until someone
+  finishes it; the authority can always finish it itself (about 33,000 CU per
+  64 KiB, *estimated*).
+- Only the authority may abort a seal in progress. Once sealed, a session is
+  never sealed again, so a griefer cannot keep re-beginning.
+- A seal still needs a kernel halt and the halt cursor, and still refuses
+  while an anchor is in progress, as today.
+
+**C. Tree seals (mode results §8 Q3).** A second seal scheme,
+`STATE_TREE_V1` (scheme 4), lets a consumer open part of a large state and
+lets an optimistic run take a session's state as a chunked input.
+- The sealer chooses `chunk_log2 = v`, `6 ≤ v ≤ 16`, at begin.
+- The tree is exactly a v2.1 chunked value (v2.1 §4.2, layout 3) over the
+  state bytes: leaves `SHA256("dcg.chunk.leaf.v2.1\0" || index:u64 || chunk)`,
+  nodes in the chunk tree's domain, `EMPTY_CHUNK` padding. The program folds it
+  with a frontier as the chunks arrive, in the same 65,536-byte instructions
+  as the linear seal.
+- The record's `state_anchor` holds that chunked-value digest; byte 1278 bit 2
+  marks a tree seal and byte 1279 (zero today, refused if nonzero) holds `v`.
+  The `ResultRef` has `root` = the chunked-value digest, `count` = state bytes,
+  and the body's spare bytes 33..36 hold `v`. Its other body fields (kernel,
+  schemas, halt reason and cursor, input chain and stream roots) are as for
+  the linear seal, so the requirements bind the computation as before.
+- Openings: one chunk with its path (about 0.5 CU per byte plus about 150 CU
+  per level, *estimated*), or the whole state.
+- Because the root is a chunked-value digest, an imported whole state needs
+  no posting: the run's ref names the digest and length, `IMPORT` checks them
+  against the root, and kind 5 inputs and chunk openings then work unchanged
+  in disputes. The bytes stay available to a challenger on chain while the
+  session's state accounts are open; a template importing a state should set
+  its windows so the payer can keep them open, or the challenger relies on its
+  own copy taken at seal (stated in the result's basis).
+- The linear seal stays for small states read whole on chain.
+
 ## 4. Additions to mode results
 
 - `(MODE_CONSENSUS, SCHEME_OUT_TREE_V21)`: a consensus v2.1 run. The body is
@@ -264,6 +324,8 @@ mode results §3.2) are a later extension through the `host` field of the
 - `DRQ1`: the canonical encoding of `ResultRequirements`, with its digest, and
   Python mirror and goldens.
 - A `pipeline_id` and stage requirement for `read_pipeline_result`.
+- Scheme `STATE_TREE_V1` (4) with its chunk openings, and the `D21Q` receipt
+  in `read_run_result` (§3.4).
 
 ## 5. Finality, basis and `explain()`
 
@@ -330,13 +392,14 @@ choose to adopt it.
 
 | Slice | Content | Estimate |
 |---|---|---|
-| 1 | `DRQ1`; `ImportSpec`; run version 2; `IMPORT` with `source = 2`; Python mirror; native and SBF tests; rule-10 review | 1.5–2 weeks |
+| 1 | `DRQ1`; `ImportSpec`; run version 2; `IMPORT` with `source = 2`; `D21Q` receipts; permissionless seals; tree seals and state imports (§3.4); Python mirror; native and SBF tests; fuzzer seal ops for B and C; rule-10 review | 3–4 weeks |
 | 2 | consensus v2.1 runs: template mode, `EXECUTE`, `EXECUTE_SKIP`, `FOLD_OUTPUTS`, the result pair; equality with the optimistic run root on the same template body; review | 2–3 weeks |
 | 3 | pipelines: `DPT1`, `DPR1`, stage instructions, `read_pipeline_result`; Python builder, client, `explain()`; review | 2–2.5 weeks |
 | 4 | an example pipeline (consensus tokenize → optimistic body → consensus verdict) native and SBF, then the shared-image upgrade | about 1 week |
 
-Total about 6.5 to 8.5 engineer-weeks, low confidence (*estimated*). Slice 1
-alone already lets an optimistic run take a verified chain input; slice 2
+Total about 8 to 10.5 engineer-weeks, low confidence (*estimated*). Slice 1
+alone already lets an optimistic run take a verified chain input, including
+a large session state; slice 2
 alone lets a whole template run in consensus.
 
 ## 10. Tests (rule 10 for each slice)
@@ -355,10 +418,22 @@ alone lets a whole template run in consensus.
   cannot be copied from a run that is not the record's; a refuted stage
   re-runs and its descendants see only the new attempt; closing returns rent;
   who profits calling first, for every crank.
+- Slice 1 additions: a `D21Q` reads the same as the live run and needs no
+  template; a seal begun by a stranger is finished by another stranger and by
+  the authority, and equals the authority's own; a stranger cannot abort; a
+  sealed session refuses a new seal; a tree seal's root equals the Python
+  chunked-value digest for `v = 6` and `v = 16` and a state that is not a
+  multiple of the chunk; a state imported whole into an optimistic run is
+  disputed through kind 5 and rules as the oracle.
 - Fuzz: a pipeline-level sequence fuzzer in the style of the session fuzzer,
   with the tracer as the reference model.
 
 ## 11. Owner decisions
+
+Decided 2026-10-15: mode results §8 Q1 (anyone seals; §3.4 B), Q2 (receipts
+carry the template id; §3.4 A) and Q3 (tree seals; §3.4 C), all in slice 1.
+
+Open:
 
 1. Adopt the stage model (pipelines of single-mode stages) as the meaning of
    "mixed regions", rejecting proven blocks inside one tree (§2.1).

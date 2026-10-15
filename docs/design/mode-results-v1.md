@@ -232,13 +232,18 @@ option, not v1.
 Example: `examples/composed-app` is a consensus session whose only inputs
 are verified outputs of FINAL v2.1 runs of one template (native and SBF).
 
-## 8. Open questions
+## 8. Questions answered (owner 2026-10-15)
 
-1. Should anyone be able to seal a halted session, not only its authority? The
-   state is frozen, so sealing is deterministic; v1 keeps the authority, as for
-   anchors.
-2. Should the v2.1 receipt carry the template id, so results stay readable
-   after the template closes? That is a program change to the receipt form
-   (a new magic under run-read v1's versioning rule).
-3. Merkle openings for part of a session's state (a tree seal), for large
-   states consumed on chain.
+All three go into slice 1 of `mixed-mode-pipelines-v1.md` (its §3.4), so the
+shared image changes once.
+
+1. **Anyone may seal a halted session.** Anyone may begin, continue and
+   finish a seal; only the authority may abort one; a sealed session is never
+   sealed again. An abandoned seal blocks closes only until someone finishes
+   it.
+2. **Run receipts carry the template id.** A new receipt form `D21Q` adds the
+   template id and kind, and `read_run_result` reads it without the template.
+   `D21P` receipts keep their form.
+3. **Tree seals.** Scheme `STATE_TREE_V1`: the seal is the v2.1 chunked-value
+   digest of the state, so one chunk opens with a path and the whole state
+   imports into an optimistic run as a chunked input without posting it.
