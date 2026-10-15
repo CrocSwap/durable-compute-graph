@@ -63,6 +63,7 @@ const PH_NONE: u8 = 0;
 const PH_VIEW: u8 = 1;
 const PH_INIT: u8 = 2;
 const PH_ANCHOR: u8 = 3;
+const PH_SEAL: u8 = 4;
 const L_IDLE: u8 = 0;
 const L_CAP: u8 = 1;
 const L_REN: u8 = 2;
@@ -338,6 +339,9 @@ enum Op {
     AnchorChunk { auth: Actor, cursor: u32, offset: u32 },
     AnchorFinish { auth: Actor, cursor: u32 },
     AnchorAbort { auth: Actor, cursor: u32 },
+    /// Mode results v1: seal a kernel-halted session's final state (chunks,
+    /// finish and abort are the anchor ops in the seal phase).
+    SealBegin { payer: Actor, auth: Actor, cursor: u32 },
     Close { child: Child, kind: u8, refund: Actor },
     CloseSession { refund: Actor },
     Prefund { target: Pubkey, lamports: u64 },
@@ -379,6 +383,7 @@ impl Op {
             Op::Halt { .. } => "halt",
             Op::AnchorOne { .. } => "anchor_one_shot",
             Op::AnchorBegin { .. } => "anchor_begin",
+            Op::SealBegin { .. } => "seal_begin",
             Op::AnchorChunk { .. } => "anchor_chunk",
             Op::AnchorFinish { .. } => "anchor_finish",
             Op::AnchorAbort { .. } => "anchor_abort",
@@ -458,6 +463,10 @@ struct M {
     lane_sc: [bool; 4],
     last_captured: u32,
     mask: u8,
+    /// Mode results v1: the final state is sealed / a span or the resource
+    /// closed after the halt (record byte 1278, bits 0 and 1).
+    sealed: bool,
+    trimmed: bool,
     /// Newest stamp ever published (for monotonicity).
     newest_stamp: Option<u32>,
 }
@@ -1143,6 +1152,14 @@ impl Fuzz {
                 a.push(r(SYSTEM));
                 one(ix(sw::TAG_ANCHOR, d, a))
             }
+            Op::SealBegin { payer, auth, cursor } => {
+                let mut d = vec![ver, v3::ANCHOR_OP_SEAL];
+                d.extend_from_slice(&cursor.to_le_bytes());
+                let mut a = vec![self.payer_meta(payer), self.signer(auth), w(s), r(k.stream), w(k.anchor)];
+                a.extend(self.state_metas(false));
+                a.push(r(SYSTEM));
+                one(ix(sw::TAG_ANCHOR, d, a))
+            }
             Op::AnchorChunk { auth, cursor, offset } => {
                 let mut d = vec![ver, v3::ANCHOR_OP_CHUNK];
                 d.extend_from_slice(&cursor.to_le_bytes());
@@ -1280,6 +1297,8 @@ impl Fuzz {
         use Actor::Authority as A;
         let p = &self.p;
         let live = m.open && m.active;
+        // An anchor on a live session, or a seal on a halted one.
+        let in_anchor = (live && m.phase == PH_ANCHOR) || (m.open && !m.active && m.phase == PH_SEAL);
         match op {
             Op::Open { payer, auth, lanes } => {
                 let lanes_ok = match lanes {
@@ -1435,21 +1454,27 @@ impl Fuzz {
             }
             Op::AnchorChunk { auth, cursor, offset } => {
                 let Some(a) = &m.anchor else { return false };
-                live && *auth == A && m.phase == PH_ANCHOR && *cursor == m.ph_state && m.cursor == *cursor && *offset == m.ph_at && a.open && a.progress == *offset && a.progress < a.total && m.stream
+                in_anchor && *auth == A && *cursor == m.ph_state && m.cursor == *cursor && *offset == m.ph_at && a.open && a.progress == *offset && a.progress < a.total && m.stream
             }
             Op::AnchorFinish { auth, cursor } => {
                 let Some(a) = &m.anchor else { return false };
-                live && *auth == A && m.phase == PH_ANCHOR && m.cursor == *cursor && m.ph_state == *cursor && m.ph_at == m.ph_total && a.open && a.progress == a.total
+                in_anchor && *auth == A && m.cursor == *cursor && m.ph_state == *cursor && m.ph_at == m.ph_total && a.open && a.progress == a.total
             }
             Op::AnchorAbort { auth, cursor } => {
                 let Some(a) = &m.anchor else { return false };
-                live && *auth == A && m.phase == PH_ANCHOR && *cursor == m.ph_state && a.open && a.progress == m.ph_at
+                in_anchor && *auth == A && *cursor == m.ph_state && a.open && a.progress == m.ph_at
+            }
+            Op::SealBegin { payer, auth, cursor } => {
+                m.open && !m.active && m.halt_reason != 0 && !m.sealed && !m.trimmed && *payer != A && *auth == A
+                    && m.phase == PH_NONE && m.initialized && *cursor == m.cursor && m.anchor_cursor <= *cursor && m.stream && m.states > 0
+                    && m.anchor.as_ref().is_none_or(|a| !a.open)
             }
             Op::Close { child, kind, refund } => {
                 // Finding F1 (fixed 10-05): the requested kind must be the
                 // child's own, including the anchor and the headerless primary.
+                // Nothing closes during a seal (mode results review F2, F3).
                 let kind_ok = *kind == child.kind();
-                m.open && !m.active && *refund == A && m.has(*child) && kind_ok && match child {
+                m.open && !m.active && m.phase != PH_SEAL && *refund == A && m.has(*child) && kind_ok && match child {
                     Child::State(i) => *i + 1 == m.states,
                     _ => true,
                 }
@@ -1632,18 +1657,33 @@ impl Fuzz {
                 m.ph_at = 0;
                 m.ph_total = total;
             }
+            Op::SealBegin { cursor, .. } => {
+                let (sid, sver) = self.schema_parts();
+                let input_root = self.input_root(m);
+                let total = p.state_bytes();
+                let acc = sha256(&[dcg_program::result::SEAL_INIT_DOMAIN, &input_root, &p.kernel_id(), &sid, &sver, &cursor.to_le_bytes(), &total.to_le_bytes()]);
+                m.anchor = Some(AnchorM { open: true, cursor: *cursor, total, progress: 0, input_root, acc });
+                m.phase = PH_SEAL;
+                m.ph_state = *cursor;
+                m.ph_at = 0;
+                m.ph_total = total;
+            }
             Op::AnchorChunk { offset, .. } => {
                 let state = self.state_at(m, m.cursor);
+                let domain: &[u8] = if m.phase == PH_SEAL { dcg_program::result::SEAL_CHUNK_DOMAIN } else { b"dcg/state-anchor-chunk/3" };
                 let a = m.anchor.as_mut().unwrap();
                 let end = (a.total - offset).min(v3::ANCHOR_CHUNK_BYTES) + offset;
-                a.acc = sha256(&[b"dcg/state-anchor-chunk/3", &a.acc, &offset.to_le_bytes(), &state[*offset as usize..end as usize]]);
+                a.acc = sha256(&[domain, &a.acc, &offset.to_le_bytes(), &state[*offset as usize..end as usize]]);
                 a.progress = end;
                 m.ph_at = end;
             }
             Op::AnchorFinish { cursor, .. } => {
                 let (sid, sver) = self.schema_parts();
+                let sealing = m.phase == PH_SEAL;
+                m.sealed |= sealing;
+                let domain: &[u8] = if sealing { dcg_program::result::SEAL_DOMAIN } else { b"dcg/state-anchor-chunked/3" };
                 let a = m.anchor.as_mut().unwrap();
-                m.state_anchor = sha256(&[b"dcg/state-anchor-chunked/3", &a.acc, &a.input_root, &p.kernel_id(), &sid, &sver, &cursor.to_le_bytes(), &a.total.to_le_bytes()]);
+                m.state_anchor = sha256(&[domain, &a.acc, &a.input_root, &p.kernel_id(), &sid, &sver, &cursor.to_le_bytes(), &a.total.to_le_bytes()]);
                 a.open = false;
                 m.anchor_cursor = *cursor;
                 m.clear_phase();
@@ -1654,13 +1694,19 @@ impl Fuzz {
             }
             Op::Close { child, .. } => match child {
                 Child::Stream => m.stream = false,
-                Child::State(_) => m.states -= 1,
+                Child::State(_) => {
+                    m.states -= 1;
+                    m.trimmed = true;
+                }
                 Child::View(role) => {
                     m.views.remove(role);
                 }
                 Child::Workspace => m.workspace = None,
                 Child::Scratch => m.scratch = None,
-                Child::Resource => m.resource = false,
+                Child::Resource => {
+                    m.resource = false;
+                    m.trimmed = true;
+                }
                 Child::Anchor => m.anchor = None,
                 Child::Lane(k) => m.lane[*k as usize] = None,
                 Child::LaneWs(k) => m.lane_ws[*k as usize] = false,
@@ -1883,7 +1929,8 @@ impl Fuzz {
             fail!(self, "child count {} != live children {live}", u16_at(d, 120));
         }
         let want_status = if m.active { 1 } else { 2 };
-        let checks: [(&str, u64, u64); 16] = [
+        let checks: [(&str, u64, u64); 17] = [
+            ("seal flags", d[1278] as u64, m.sealed as u64 | (m.trimmed as u64) << 1),
             ("status", d[6] as u64, want_status),
             ("cursor", cursor as u64, m.cursor as u64),
             ("frontier", frontier as u64, m.frontier as u64),
@@ -1911,6 +1958,18 @@ impl Fuzz {
         }
         if u32_at(d, 1263) != m.last_start {
             fail!(self, "last advance start");
+        }
+        // Mode results v1: a result exactly when the model says the whole
+        // final state is sealed, and it opens with the model's state.
+        let result = v3::read_session_result_bytes(&PROGRAM, &self.k.session, &sess.owner, d);
+        match (m.sealed && !m.trimmed, result) {
+            (true, Ok(r)) => {
+                if r.open_state(&self.state_at(&m, m.cursor)).is_err() {
+                    fail!(self, "the sealed result does not open with the host state");
+                }
+            }
+            (false, Err(_)) => {}
+            (want, got) => fail!(self, "session result {got:?}, model sealed-and-whole {want}"),
         }
         let rejected = self.consumed(&m).iter().filter(|c| self.p.rejected(c)).count() as u32;
         if d[1273] != self.p.features() || u32_at(d, 1274) != rejected {
@@ -2204,11 +2263,17 @@ impl Fuzz {
                 Op::GrowView { payer, role }
             }
             22 => Op::LaneGrow { payer, k: self.rng.below(4) as u8, scratch: self.rng.pct(50) },
+            23 => match (m.phase, m.anchor.as_ref()) {
+                (PH_SEAL, Some(a)) if a.progress < a.total => Op::AnchorChunk { auth: A, cursor: m.ph_state, offset: m.ph_at },
+                (PH_SEAL, _) if self.rng.pct(85) => Op::AnchorFinish { auth: A, cursor: m.ph_state },
+                (PH_SEAL, _) => Op::AnchorAbort { auth: A, cursor: m.ph_state },
+                _ => Op::SealBegin { payer: nonauth_payer, auth: A, cursor: m.cursor },
+            },
             _ => return None,
         })
     }
 
-    const KINDS: u32 = 23;
+    const KINDS: u32 = 24;
 
     /// Perturb one field of an op (wrong actor, off-by-one cursor or offset,
     /// another lane, a malformed variant).
@@ -2314,6 +2379,11 @@ impl Fuzz {
                 1 => Op::AnchorBegin { payer, auth: a, cursor },
                 _ => Op::AnchorBegin { payer, auth, cursor: d(&mut self.rng, cursor) },
             },
+            Op::SealBegin { payer, auth, cursor } => match self.rng.below(3) {
+                0 => Op::SealBegin { payer: a, auth, cursor },
+                1 => Op::SealBegin { payer, auth: a, cursor },
+                _ => Op::SealBegin { payer, auth, cursor: d(&mut self.rng, cursor) },
+            },
             Op::AnchorChunk { auth, cursor, offset } => match self.rng.below(3) {
                 0 => Op::AnchorChunk { auth: a, cursor, offset },
                 1 => Op::AnchorChunk { auth, cursor: d(&mut self.rng, cursor), offset },
@@ -2358,6 +2428,7 @@ impl Fuzz {
                     19 => 2,
                     15 => 4,
                     17 => 8,
+                    23 => 20,
                     _ => 15,
                 };
                 cands.push((op, weight));
@@ -2610,6 +2681,12 @@ impl Fuzz {
         if self.m.active {
             let cursor = self.m.cursor;
             self.step(vec![Op::Halt { actor: A, cursor }], None, "close", true).await;
+        }
+        // A seal in progress blocks every close; the authority can always
+        // abort it, and then everything closes (mode results review F2).
+        if self.m.phase == PH_SEAL {
+            let cursor = self.m.ph_state;
+            self.step(vec![Op::AnchorAbort { auth: A, cursor }], None, "close", true).await;
         }
         // Closes need no signer; the order: everything but states, then states
         // from the highest index down.
