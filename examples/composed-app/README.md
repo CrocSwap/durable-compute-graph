@@ -16,8 +16,26 @@ instruction, which:
    `WRITE_INPUT` checks.
 
 So every input the consensus session consumes is a verified output of a final
-optimistic run. What it does not do, and an application might: count each
-output once (it can be imported twice), or trust more than one template.
+optimistic run of the trusted template. What that does and does not give:
+
+- **FINAL means unchallenged, not checked.** A run is FINAL when its challenge
+  window passed with no successful challenge. The input is as good as that
+  template's dispute game: an honest, live challenger, the window and the
+  bonds.
+- **Anyone can make such a run.** Anyone, the session authority included, can
+  initialize a run of the trusted template with external inputs they choose
+  and execute it. If the inputs or the executor matter, also pin them: require
+  the run id (which binds the executor, nonce and external inputs), or check
+  them in the kernel.
+- **The authority picks what enters.** It chooses which outputs to import, in
+  what order, and can leave any out. The example does not count each output
+  once (one can be imported twice); a kernel that must, records the run id and
+  index it has seen.
+- **The host program is trusted.** Results are only as trustworthy as the
+  program at `RUN_HOST` (a placeholder here): its image and upgrade authority.
+  An image with test or raw-write routes could write records no honest run
+  wrote. Check the host with `dcg verify`.
+- The kernel never halts, so this session never produces a result of its own.
 
 ```sh
 CARGO_TARGET_DIR=/private/tmp/dcg-extract-target cargo test            # native

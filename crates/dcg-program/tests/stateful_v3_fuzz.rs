@@ -1454,7 +1454,7 @@ impl Fuzz {
             }
             Op::AnchorChunk { auth, cursor, offset } => {
                 let Some(a) = &m.anchor else { return false };
-                in_anchor && *auth == A && *cursor == m.ph_state && m.cursor == *cursor && *offset == m.ph_at && a.open && a.progress == *offset && a.progress < a.total && m.stream
+                in_anchor && *auth == A && *cursor == m.ph_state && m.cursor == *cursor && *offset == m.ph_at && a.open && a.progress == *offset && a.progress < a.total && (m.stream || m.phase == PH_SEAL)
             }
             Op::AnchorFinish { auth, cursor } => {
                 let Some(a) = &m.anchor else { return false };
@@ -1466,7 +1466,7 @@ impl Fuzz {
             }
             Op::SealBegin { payer, auth, cursor } => {
                 m.open && !m.active && m.halt_reason != 0 && !m.sealed && !m.trimmed && *payer != A && *auth == A
-                    && m.phase == PH_NONE && m.initialized && *cursor == m.cursor && m.anchor_cursor <= *cursor && m.stream && m.states > 0
+                    && m.phase == PH_NONE && m.initialized && *cursor == m.cursor && m.anchor_cursor <= *cursor && m.states > 0
                     && m.anchor.as_ref().is_none_or(|a| !a.open)
             }
             Op::Close { child, kind, refund } => {
@@ -2428,6 +2428,8 @@ impl Fuzz {
                     19 => 2,
                     15 => 4,
                     17 => 8,
+                    // Seals are rare (they need a kernel halt): favour them then.
+                    23 if !self.m.active && self.m.halt_reason != 0 => 120,
                     23 => 20,
                     _ => 15,
                 };

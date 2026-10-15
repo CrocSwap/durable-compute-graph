@@ -198,6 +198,19 @@ async fn a_final_runs_output_is_the_sessions_input() {
     other[96] ^= 1;
     fx.set(&mut ctx, fx.template, other);
     assert_eq!(send(&mut ctx, fx.import_ix(auth.pubkey(), s, 2, &forty_two, None), &[&auth]).await, Err(err(ResultError::Computation)));
+    // A template account that is not the run's.
+    let elsewhere = Pubkey::new_from_array([0x7E; 32]);
+    fx.set(&mut ctx, elsewhere, unhex(&fx.f["template_data"]));
+    fx.set(&mut ctx, fx.template, unhex(&fx.f["template_data"]));
+    let mut swapped = fx.import_ix(auth.pubkey(), s, 2, &forty_two, None);
+    swapped.accounts[4] = r(elsewhere);
+    assert_eq!(send(&mut ctx, swapped, &[&auth]).await, Err(err(ResultError::Template)));
+    // A template whose challenge window is shorter than the app accepts (its
+    // id unchanged here, so only the window check refuses it).
+    let mut short = unhex(&fx.f["template_data"]);
+    short[24..32].copy_from_slice(&(app::MIN_CHALLENGE_WINDOW - 1).to_le_bytes());
+    fx.set(&mut ctx, fx.template, short);
+    assert_eq!(send(&mut ctx, fx.import_ix(auth.pubkey(), s, 2, &forty_two, None), &[&auth]).await, Err(err(ResultError::Security)));
     // A run under another owner.
     let mut foreign = solana_account::Account { lamports: 1_000_000_000, data: unhex(&fx.f["live"]), owner: APP, executable: false, rent_epoch: 0 };
     foreign.data[4] = 2;

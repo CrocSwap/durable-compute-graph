@@ -276,8 +276,8 @@ of the final state, with its own domains and no link to earlier anchors
 
   Most of a run read is re-deriving the run address (`find_program_address`),
   whose cost depends on the address's bump. *Estimated* from these: opening
-  a state costs about 34,000 CU per 64 KiB, so one 1.4M-CU transaction opens
-  states up to about 2.6 MB; each further level of an output's path adds one
+  a state costs about 33,000 CU per 64 KiB ((41,898 - 1,545) / 80,000 bytes),
+  so one 1.4M-CU transaction opens states up to about 2.7 MB; each further level of an output's path adds one
   SHA-256 over about 100 bytes.
 
 Tests: `tests/stateful_v3_result.rs` (native and SBF): a seal read, required,

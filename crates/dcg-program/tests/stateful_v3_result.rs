@@ -437,6 +437,14 @@ async fn a_seal_covers_the_whole_final_state_or_nothing() {
     send(&mut ctx, ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, v3::KIND_SESSION], vec![w(s), w(auth.pubkey())]), &[]).await.unwrap();
     assert!(ctx.banks_client.get_account(s).await.unwrap().is_none(), "every ending reclaims the session");
 
+    // Re-review 10-15: a stream closed after the halt does not block a seal
+    // (the seal never reads it).
+    let s = halted(&mut ctx, &auth, 4).await;
+    send(&mut ctx, close(s, stream_pda(&s), auth.pubkey(), v3::KIND_STREAM), &[]).await.unwrap();
+    seal(&mut ctx, &auth, s, 10).await.unwrap();
+    let after_stream = read(&mut ctx, s).await.unwrap();
+    assert_eq!(after_stream.open_state(&state_bytes(&mut ctx, s).await), Ok(()));
+
     // F4: a sealed result reads until its state is cleaned up. Closing the
     // anchor or the stream leaves it; closing a state span ends it.
     let s = halted(&mut ctx, &auth, 3).await;

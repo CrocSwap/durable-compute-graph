@@ -177,9 +177,10 @@ Merkle openings of parts of a session's state are a later scheme, not v1.
 
 On chain cost, *measured* on SBF (2026-10-15; table in
 `docs/stateful-workloads-v3.md`, seal section): reading a session result is
-about 5,300 CU and a run result 2,400-3,900 CU; opening an 80,000-byte state
-is 41,898 CU (about 34,000 per 64 KiB, *estimated*); opening one output of a
-one-output run is 285 CU.
+about 5,300 CU and a run result 2,400-3,900 CU for the runs measured (the
+run read re-derives the run address, whose cost depends on its bump);
+opening an 80,000-byte state is 41,898 CU (about 33,000 per 64 KiB,
+*estimated*); opening one output of a one-output run is 285 CU.
 
 ## 5. What a consumer checks
 

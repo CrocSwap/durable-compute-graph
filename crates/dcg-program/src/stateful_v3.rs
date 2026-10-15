@@ -4258,7 +4258,11 @@ fn begin_anchor(
     {
         return Err(refusal(REFUSAL_CURSOR));
     }
-    stream_pda_check(program, stream, session_account, &session, false)?;
+    // A seal never reads the stream, so a stream closed after the halt does
+    // not block it (re-review 10-15); the account in its place is ignored.
+    if !seal {
+        stream_pda_check(program, stream, session_account, &session, false)?;
+    }
     let schema = validate_kernel(kernel)?;
     validate_state_set(
         program,
@@ -4368,7 +4372,11 @@ fn run_anchor_chunk(
     {
         return Err(refusal(REFUSAL_PHASE_CURSOR));
     }
-    stream_pda_check(program, stream, session_account, &session, false)?;
+    // A seal never reads the stream, so a stream closed after the halt does
+    // not block it (re-review 10-15); the account in its place is ignored.
+    if session.phase != PHASE_STATE_SEAL {
+        stream_pda_check(program, stream, session_account, &session, false)?;
+    }
     let anchor = checked_anchor(program, anchor_account, session_account, true)?;
     if !anchor.open
         || anchor.cursor != cursor
@@ -4791,7 +4799,10 @@ pub struct VerdictRequirements {
 /// verdict is only as trustworthy as that program's image and upgrade
 /// authority; check them separately (`dcg verify`). The record must be read
 /// before the session account is closed; a consumer that needs it longer
-/// copies the verdict into its own account.
+/// copies the verdict into its own account. Read it before cleaning up, too:
+/// closing the resource copy zeroes the resource key, schema and commitment
+/// the verdict reports (`read_session_result` refuses such a session as
+/// trimmed instead).
 pub fn read_verdict(host: &Pubkey, account: &AccountInfo) -> Result<SessionVerdict, VerdictError> {
     let raw = account.try_borrow_data().map_err(|_| VerdictError::Layout)?;
     read_verdict_bytes(host, account.key, account.owner, &raw)
