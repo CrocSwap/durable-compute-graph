@@ -247,7 +247,7 @@ margin, and measure your own image the same way.
 
 ### Transitions that read the resource (`READS_RESOURCE`)
 
-Since v0.3.0 (unreleased), a kernel may declare
+Since v0.3.0-alpha, a kernel may declare
 `KernelCapabilities::READS_RESOURCE` (bit 1). Its transitions then read the
 session's sealed resource, which otherwise only initialization and rendering
 see:
@@ -291,7 +291,7 @@ place), and the kernel kit's `dcg-rsctr-v1`.
 
 ### Ticks: steps without stored input (`ACCEPTS_TICKS`)
 
-Since v0.3.0 (unreleased), a kernel may declare
+Since v0.3.0-alpha, a kernel may declare
 `KernelCapabilities::ACCEPTS_TICKS` (bit 2). `ADVANCE` then takes an optional
 eighth payload byte, `ADVANCE_TICK` (1): its steps run on empty commands and
 read or store nothing in the stream. This suits long computations with no
