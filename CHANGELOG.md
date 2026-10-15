@@ -3,7 +3,13 @@
 Breaking changes are marked **breaking**, with who is affected and how to
 migrate. Formats may change before beta (see `docs/release-terms.md`).
 
-## Unreleased
+## v0.3.0-alpha (2026-10-14)
+
+Additive for existing kernels and sessions: new kernel capabilities
+(resource reads, ticks), the kit's native-vs-SBF compare, a fuel meter and a
+verdict reader. The alpha image bytes change (`1da74d34…`, 344,304 bytes,
+reproducible); the shared testnet program `J9Eje…` keeps running v0.2.0-alpha
+(`7acbce49…`) until it is upgraded after a week's notice.
 
 - **Version 0.3.0.** The DCG crates and the Python package `dcg-sequencer`
   are now version 0.3.0, so images built from this release carry the
