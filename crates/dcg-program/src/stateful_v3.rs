@@ -144,6 +144,7 @@ const PHASE_INITIALIZATION: u8 = 2;
 const PHASE_STATE_ANCHOR: u8 = 3;
 const PHASE_STATE_SEAL: u8 = 4;
 use crate::result::{SEAL_CHUNK_DOMAIN, SEAL_DOMAIN, SEAL_INIT_DOMAIN};
+const _: () = assert!(crate::result::SEAL_CHUNK_BYTES == ANCHOR_CHUNK_BYTES as usize);
 const RESOURCE_SEED: &[u8] = b"dcg-resource-v3";
 const ANCHOR_SEED: &[u8] = b"dcg-anchor-v3";
 const RESOURCE_HEADER_BYTES: usize = 128;
@@ -211,8 +212,12 @@ struct Session {
     /// Inputs consumed by a `Reject` outcome (rejectable sessions only).
     rejected_count: u32,
     /// The final state is sealed: `state_anchor` is the seal at the halt
-    /// cursor (byte 1278).
+    /// cursor (byte 1278, bit 0).
     sealed: bool,
+    /// A state span or the resource copy has closed since the halt (byte
+    /// 1278, bit 1): the record no longer describes the whole final state, so
+    /// it takes no seal and reads as no result (review 10-14 findings 1, 4).
+    trimmed: bool,
 }
 
 impl Session {
@@ -787,7 +792,7 @@ fn encode_session(account: &AccountInfo, session: &Session) -> ProgramResult {
     put_u32(&mut raw, 1269, session.last_captured);
     raw[1273] = session.features;
     put_u32(&mut raw, 1274, session.rejected_count);
-    raw[1278] = u8::from(session.sealed);
+    raw[1278] = u8::from(session.sealed) | (u8::from(session.trimmed) << 1);
     Ok(())
 }
 
@@ -819,7 +824,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || (raw[1273] & FEATURE_TICKS != 0 && (raw[1273] & FEATURE_RING_STREAM == 0 || raw[7] != POLICY_INDEXED))
         // (No such rule for FEATURE_READS_RESOURCE: closing the resource copy
         // of a halted session clears the resource key.)
-        || raw[1278] > 1
+        || raw[1278] & !3 != 0
         || raw[1279] != 0
         || (raw[1273] & FEATURE_REJECTABLE == 0 && u32_at(raw, 1274) != 0)
         || (raw[1273] & FEATURE_RING_STREAM != 0 && u32_at(raw, 10) < MIN_RING_CAPACITY)
@@ -894,7 +899,8 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         // A seal is taken only on a session its kernel halted, at the halt
         // cursor, and only with the session halted (mode results v1 §3.2).
         || (raw[1164] == PHASE_STATE_SEAL && (raw[6] != STATUS_HALTED || raw[1278] != 0))
-        || (raw[1278] == 1
+        || (raw[1278] & 2 != 0 && raw[6] != STATUS_HALTED)
+        || (raw[1278] & 1 == 1
             && (raw[6] != STATUS_HALTED
                 || u32_at(raw, 1254) == 0
                 || u32_at(raw, 188) != u32_at(raw, 1258)
@@ -960,7 +966,8 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         last_captured: u32_at(raw, 1269),
         features: raw[1273],
         rejected_count: u32_at(raw, 1274),
-        sealed: raw[1278] == 1,
+        sealed: raw[1278] & 1 == 1,
+        trimmed: raw[1278] & 2 != 0,
     })
 }
 
@@ -1279,6 +1286,7 @@ fn open_session(
             features,
             rejected_count: 0,
             sealed: false,
+            trimmed: false,
         },
     )
 }
@@ -3400,6 +3408,7 @@ mod workspace_first_account_tests {
             features: 0,
             rejected_count: 0,
             sealed: false,
+            trimmed: false,
         }
     }
 
@@ -3917,6 +3926,11 @@ fn close_child(
     if session.status != STATUS_HALTED {
         return Err(refusal(REFUSAL_LIVE));
     }
+    // Nothing closes while a seal is in progress: an abort can always end it,
+    // and the seal covers the accounts it began with (review 10-14 F2, F3).
+    if session.phase == PHASE_STATE_SEAL {
+        return Err(refusal(REFUSAL_LIVE));
+    }
     if refund.key != &session.authority {
         return Err(refusal(REFUSAL_REFUND));
     }
@@ -4038,6 +4052,7 @@ fn close_child(
                 .ok_or_else(|| refusal(REFUSAL_STATE))?;
             session.state_keys[state_index] = Pubkey::default();
             session.state_lengths[state_index] = 0;
+            session.trimmed = true;
             session.state_span_count = session
                 .state_span_count
                 .checked_sub(1)
@@ -4056,6 +4071,7 @@ fn close_child(
             session.resource_key = Pubkey::default();
             session.resource_schema = VersionedId { id: 0, version: 0 };
             session.resource_commitment = [0; 32];
+            session.trimmed = true;
         }
         KIND_ANCHOR => {}
         _ => unreachable!(),
@@ -4230,6 +4246,9 @@ fn begin_anchor(
     } else {
         session.status == STATUS_ACTIVE
     };
+    if seal && session.trimmed {
+        return Err(refusal(REFUSAL_STATE));
+    }
     if !status_ok
         || session.phase != PHASE_NONE
         || !session.state_initialized
@@ -4460,6 +4479,9 @@ fn finish_anchor(
     let schema_id = schema.id.id.to_le_bytes();
     let schema_version = schema.id.version.to_le_bytes();
     let sealing = session.phase == PHASE_STATE_SEAL;
+    if sealing && (anchor.total != session.state_bytes || session.trimmed) {
+        return Err(refusal(REFUSAL_STATE));
+    }
     let final_domain: &[u8] = if sealing { SEAL_DOMAIN } else { b"dcg/state-anchor-chunked/3" };
     session.state_anchor = crate::hash::sha256(&[
         final_domain,
@@ -4847,6 +4869,9 @@ pub fn read_session_result_bytes(
     let session = decode_session(raw).map_err(|_| ResultError::Layout)?;
     if !session.sealed {
         return Err(ResultError::NotSealed);
+    }
+    if session.trimmed {
+        return Err(ResultError::Trimmed);
     }
     Ok(ResultRef {
         scheme: SCHEME_STATE_SEAL_V1,

@@ -106,9 +106,19 @@ own domains and no link to earlier anchors.
                 || schema_id:u32 || schema_version:u16 || cursor:u32 || total:u32)
   ```
 - Finishing writes `seal` into the record's `state_anchor`, the halt cursor
-  into `anchor_cursor`, and sets byte 1278 (sealed) to 1. A sealed session
+  into `anchor_cursor`, and sets bit 0 (sealed) of byte 1278. A sealed session
   cannot be sealed again. Decoding refuses a sealed flag on a session that is
   not halted by its kernel at `anchor_cursor`.
+- **The seal covers the whole final state or nothing** (independent review
+  2026-10-14, findings 1 to 4):
+  - while a seal is in progress no child of the session closes, so an abort
+    always ends it and the seal covers the accounts it began with;
+  - closing a state span or the resource copy after the halt sets bit 1
+    (trimmed) of byte 1278. A trimmed session takes no seal, and its record
+    reads as no result (`Trimmed`), since it no longer describes the whole
+    final state;
+  - finishing checks that the hashed total still equals the record's state
+    bytes.
 
 The reader requires the same as `read_verdict` (owner, layout, address,
 kernel halt) plus the seal. Scheme `STATE_SEAL_V1` (3), `root` = seal,
@@ -170,12 +180,17 @@ Merkle openings of parts of a session's state are a later scheme, not v1.
 `ResultRef::require(&ResultRequirements)` refuses unless every stated
 requirement holds:
 - the mode;
-- the computation: the template id (optimistic) or the kernel, its versions and
-  state schema (consensus);
-- the instance, where pinned: run id, or session address;
-- for consensus, the halt reason and the resource commitment, where stated;
-- for optimistic, a minimum challenge window and a minimum executor bond,
-  where stated, since they are what an optimistic result's security rests on.
+- the computation: the template id and, for LX1, the parameters digest
+  (`root_aux`, which the template does not fix) for optimistic; the kernel,
+  its versions and state schema for consensus;
+- the instance, where pinned: the run id (which binds the executor, nonce and
+  external inputs), or the session address with its input chain and stream
+  roots (a session address can be reused after the session closes);
+- for consensus, the halt reason and the resource schema and commitment,
+  where stated;
+- for optimistic, the least challenge and phase windows and executor and
+  challenger bonds, where stated, since an optimistic result's security rests
+  on them.
 
 `ResultRef::basis()` reports the security basis as typed assumptions, never
 one scalar: host program trust for every result, then chain execution
@@ -185,8 +200,9 @@ its finality is the latest finality in it (09-30 design §4).
 
 ## 6. Keeping a result
 
-Both sources can disappear: a session closes completely, and a run's receipt
-stays but its template may close. A consumer that needs a result later copies
+Both sources can disappear: a session closes completely (and its result stops
+reading as soon as a state span or its resource copy closes), and a run's
+receipt stays but its template may close. A consumer that needs a result later copies
 the 256-byte `ResultRef` into its own account when it first reads it (the
 pattern of the verdict registry in `tests/stateful_v3_verdict.rs`). The copy
 is then in the consumer's trusted base. A DCG-run result registry is a later

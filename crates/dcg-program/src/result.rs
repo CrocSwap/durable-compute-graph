@@ -108,6 +108,9 @@ pub enum ResultError {
     Security,
     /// An opening does not match the result's root.
     Opening,
+    /// A state span or the resource copy of the sealed session has closed:
+    /// read a session's result before its state is cleaned up.
+    Trimmed,
 }
 
 /// What an optimistic (v2.1) result's body records.
@@ -169,18 +172,27 @@ pub struct ResultRef {
 pub struct ResultRequirements {
     pub mode: Option<u8>,
     pub source: Option<Pubkey>,
-    /// Optimistic: the template id, the run id, and the least challenge window
-    /// and executor bond the consumer accepts.
+    /// Optimistic: the template id; the run id (which binds the executor,
+    /// nonce and external inputs); `root_aux` (an LX1 run's parameters
+    /// digest, which the template does not fix); and the least windows and
+    /// bonds the consumer accepts.
     pub template_id: Option<[u8; 32]>,
     pub run_id: Option<[u8; 32]>,
+    pub root_aux: Option<[u8; 32]>,
     pub min_challenge_window: Option<u64>,
+    pub min_phase_window: Option<u64>,
     pub min_executor_bond: Option<u64>,
+    pub min_challenger_bond: Option<u64>,
     /// Consensus: the kernel and its versions, the state schema, the halt
-    /// reason and the resource commitment.
+    /// reason, the resource schema and commitment, and the input chain and
+    /// stream roots (which tell two sessions at one reused address apart).
     pub kernel: Option<(KernelId, u16, u16)>,
     pub state_schema: Option<VersionedId>,
     pub halt_reason: Option<u32>,
+    pub resource_schema: Option<VersionedId>,
     pub resource_commitment: Option<[u8; 32]>,
+    pub input_root: Option<[u8; 32]>,
+    pub stream_root: Option<[u8; 32]>,
 }
 
 /// What a result's security rests on (design §5): always the host program,
@@ -355,22 +367,33 @@ impl ResultRef {
         }
         let optimistic = r.template_id.is_some()
             || r.run_id.is_some()
+            || r.root_aux.is_some()
             || r.min_challenge_window.is_some()
-            || r.min_executor_bond.is_some();
-        let consensus = r.kernel.is_some() || r.state_schema.is_some() || r.halt_reason.is_some() || r.resource_commitment.is_some();
+            || r.min_phase_window.is_some()
+            || r.min_executor_bond.is_some()
+            || r.min_challenger_bond.is_some();
+        let consensus = r.kernel.is_some()
+            || r.state_schema.is_some()
+            || r.halt_reason.is_some()
+            || r.resource_schema.is_some()
+            || r.resource_commitment.is_some()
+            || r.input_root.is_some()
+            || r.stream_root.is_some();
         match &self.body {
             Body::Optimistic(o) => {
                 if consensus {
                     return Err(ResultError::Mode);
                 }
-                if r.template_id.is_some_and(|t| t != o.template_id) {
+                if r.template_id.is_some_and(|t| t != o.template_id) || r.root_aux.is_some_and(|a| a != o.root_aux) {
                     return Err(ResultError::Computation);
                 }
                 if r.run_id.is_some_and(|id| id != o.run_id) {
                     return Err(ResultError::Instance);
                 }
                 if r.min_challenge_window.is_some_and(|w| o.challenge_window < w)
+                    || r.min_phase_window.is_some_and(|w| o.phase_window < w)
                     || r.min_executor_bond.is_some_and(|b| o.executor_bond < b)
+                    || r.min_challenger_bond.is_some_and(|b| o.challenger_bond < b)
                 {
                     return Err(ResultError::Security);
                 }
@@ -384,10 +407,15 @@ impl ResultRef {
                 {
                     return Err(ResultError::Computation);
                 }
+                if r.input_root.is_some_and(|x| x != c.input_root) || r.stream_root.is_some_and(|x| x != c.stream_root) {
+                    return Err(ResultError::Instance);
+                }
                 if r.halt_reason.is_some_and(|h| h != c.halt_reason) {
                     return Err(ResultError::Reason);
                 }
-                if r.resource_commitment.is_some_and(|x| x != c.resource_commitment) {
+                if r.resource_commitment.is_some_and(|x| x != c.resource_commitment)
+                    || r.resource_schema.is_some_and(|x| x != c.resource_schema)
+                {
                     return Err(ResultError::Resource);
                 }
             }
@@ -463,8 +491,12 @@ pub fn seal_digest(c: &ConsensusBody, state: &[u8]) -> [u8; 32] {
 
 /// [`seal_digest`] over the state's spans in order. Chunks are 64 KiB of the
 /// concatenated state, so a chunk may cross spans.
+///
+/// Panics if the spans total more than `u32::MAX` bytes (no session state
+/// can: the cap is 10,000,000).
 pub fn seal_digest_spans(c: &ConsensusBody, spans: &[&[u8]]) -> [u8; 32] {
     let total_len: usize = spans.iter().map(|s| s.len()).sum();
+    assert!(total_len <= u32::MAX as usize, "state longer than u32::MAX bytes");
     let total = (total_len as u32).to_le_bytes();
     let cursor = c.halt_cursor.to_le_bytes();
     let schema_id = c.state_schema.id.to_le_bytes();
@@ -676,6 +708,18 @@ mod tests {
         let reason = ResultRequirements { halt_reason: Some(8), ..Default::default() };
         assert_eq!(c.require(&reason), Err(ResultError::Reason));
         assert_eq!(o.require(&reason), Err(ResultError::Mode));
+        // Review 10-14 F5: the parameters digest, the other windows and bonds,
+        // the input and stream roots and the resource schema.
+        let aux = ResultRequirements { root_aux: Some([0; 32]), ..Default::default() };
+        assert_eq!(o.require(&aux), Err(ResultError::Computation));
+        assert_eq!(o.require(&ResultRequirements { root_aux: Some([10; 32]), ..Default::default() }), Ok(()));
+        assert_eq!(c.require(&aux), Err(ResultError::Mode));
+        assert_eq!(o.require(&ResultRequirements { min_challenger_bond: Some(1_000_001), ..Default::default() }), Err(ResultError::Security));
+        assert_eq!(o.require(&ResultRequirements { min_phase_window: Some(751), ..Default::default() }), Err(ResultError::Security));
+        assert_eq!(c.require(&ResultRequirements { stream_root: Some([0; 32]), ..Default::default() }), Err(ResultError::Instance));
+        assert_eq!(c.require(&ResultRequirements { input_root: Some([4; 32]), stream_root: Some([5; 32]), ..Default::default() }), Ok(()));
+        assert_eq!(c.require(&ResultRequirements { resource_schema: Some(VersionedId { id: 1, version: 1 }), ..Default::default() }), Err(ResultError::Resource));
+        assert_eq!(o.require(&ResultRequirements { input_root: Some([4; 32]), ..Default::default() }), Err(ResultError::Mode));
         let source = ResultRequirements { source: Some(Pubkey::new_from_array([2; 32])), ..Default::default() };
         assert_eq!(c.require(&source), Ok(()));
         assert_eq!(o.require(&source), Err(ResultError::Instance));

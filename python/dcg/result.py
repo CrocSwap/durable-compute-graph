@@ -237,7 +237,13 @@ def read_session_result(host: Pubkey, key: Pubkey, owner: Pubkey, raw: bytes) ->
     if owner != host:
         raise ResultError("Owner")
     if (len(raw) != 1280 or raw[:4] != b"DSS3" or struct.unpack_from("<H", raw, 4)[0] != 3
-            or struct.unpack_from("<IH", raw, 106) != (0x434F_4E53, 3) or raw[1278] > 1 or raw[1279]):
+            or struct.unpack_from("<IH", raw, 106) != (0x434F_4E53, 3) or raw[1278] & ~3 or raw[1279]):
+        raise ResultError("Layout")
+    sealed, trimmed = raw[1278] & 1, raw[1278] & 2
+    # The program's record rules for the flags (decode_session).
+    if (sealed or trimmed) and raw[6] != 2:
+        raise ResultError("Layout")
+    if sealed and (raw[1164] != 0 or _u32(raw, 1254) == 0 or _u32(raw, 188) != _u32(raw, 1258)):
         raise ResultError("Layout")
     authority, sid, bump = raw[22:54], raw[14:22], raw[1262]
     try:
@@ -250,10 +256,10 @@ def read_session_result(host: Pubkey, key: Pubkey, owner: Pubkey, raw: bytes) ->
         raise ResultError("NotHalted")
     if _u32(raw, 1254) == 0:
         raise ResultError("NoKernelVerdict")
-    if raw[1278] != 1:
+    if not sealed:
         raise ResultError("NotSealed")
-    if _u32(raw, 188) != _u32(raw, 1258):
-        raise ResultError("Layout")
+    if trimmed:
+        raise ResultError("Trimmed")
     sv, av = struct.unpack_from("<HH", raw, 102)
     body = ConsensusBody(
         kernel_id=raw[86:102], semantic_version=sv, abi_version=av,

@@ -401,3 +401,53 @@ async fn seals_need_a_kernel_halt_the_authority_and_the_halt_cursor() {
     assert_eq!(v3::read_session_result_bytes(&CONSUMER, &s, &sealed.owner, &sealed.data), Err(ResultError::Owner));
     assert_eq!(v3::read_session_result_bytes(&PROGRAM, &unsealed, &sealed.owner, &sealed.data), Err(ResultError::Address));
 }
+
+/// Review 10-14 findings 1-4: the seal covers the whole final state or
+/// nothing. No child closes during a seal (an abort always ends it); a state
+/// span or the resource copy closed after the halt marks the session trimmed,
+/// which takes no seal and reads as no result.
+#[tokio::test]
+async fn a_seal_covers_the_whole_final_state_or_nothing() {
+    let mut ctx = start().await;
+    let auth = keypair(74);
+    let payer = ctx.payer.pubkey();
+
+    // F1: a span closed after the halt, then a seal of what is left: refused.
+    let s = halted(&mut ctx, &auth, 1).await;
+    send(&mut ctx, close(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
+    assert_eq!(send(&mut ctx, begin(payer, auth.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&auth]).await, Err(v3::REFUSAL_STATE));
+    // The rest still closes, and the session with it.
+    for (key, kind) in [(state_pda(&s, 0), v3::KIND_STATE), (stream_pda(&s), v3::KIND_STREAM)] {
+        send(&mut ctx, close(s, key, auth.pubkey(), kind), &[]).await.unwrap();
+    }
+    send(&mut ctx, ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, v3::KIND_SESSION], vec![w(s), w(auth.pubkey())]), &[]).await.unwrap();
+
+    // F2, F3: during a seal nothing closes, the anchor and the spans included;
+    // an abort ends it and the closes then go through.
+    let s = halted(&mut ctx, &auth, 2).await;
+    send(&mut ctx, begin(payer, auth.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&auth]).await.unwrap();
+    send(&mut ctx, chunk(auth.pubkey(), s, 10, 0), &[&auth]).await.unwrap();
+    for (key, kind) in [(anchor_pda(&s), v3::KIND_ANCHOR), (state_pda(&s, 1), v3::KIND_STATE), (stream_pda(&s), v3::KIND_STREAM)] {
+        assert_eq!(send(&mut ctx, close(s, key, auth.pubkey(), kind), &[]).await, Err(v3::REFUSAL_LIVE), "kind {kind} mid-seal");
+    }
+    send(&mut ctx, abort(auth.pubkey(), s, 10), &[&auth]).await.unwrap();
+    for (key, kind) in [(anchor_pda(&s), v3::KIND_ANCHOR), (state_pda(&s, 1), v3::KIND_STATE), (state_pda(&s, 0), v3::KIND_STATE), (stream_pda(&s), v3::KIND_STREAM)] {
+        send(&mut ctx, close(s, key, auth.pubkey(), kind), &[]).await.unwrap();
+    }
+    send(&mut ctx, ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, v3::KIND_SESSION], vec![w(s), w(auth.pubkey())]), &[]).await.unwrap();
+    assert!(ctx.banks_client.get_account(s).await.unwrap().is_none(), "every ending reclaims the session");
+
+    // F4: a sealed result reads until its state is cleaned up. Closing the
+    // anchor or the stream leaves it; closing a state span ends it.
+    let s = halted(&mut ctx, &auth, 3).await;
+    seal(&mut ctx, &auth, s, 10).await.unwrap();
+    let sealed = read(&mut ctx, s).await.unwrap();
+    for (key, kind) in [(anchor_pda(&s), v3::KIND_ANCHOR), (stream_pda(&s), v3::KIND_STREAM)] {
+        send(&mut ctx, close(s, key, auth.pubkey(), kind), &[]).await.unwrap();
+        assert_eq!(read(&mut ctx, s).await, Ok(sealed), "after closing kind {kind}");
+    }
+    send(&mut ctx, close(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
+    assert_eq!(read(&mut ctx, s).await, Err(ResultError::Trimmed));
+    let payer = ctx.payer.pubkey();
+    assert_eq!(send(&mut ctx, keep(payer, s, app::V3_REJECT_HALT_REASON), &[]).await, Err(100 + ResultError::Trimmed as u32));
+}

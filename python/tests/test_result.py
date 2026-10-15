@@ -64,10 +64,16 @@ def test_a_sealed_session_record_reads_as_the_programs_result():
     unsealed[1278] = 0
     with pytest.raises(R.ResultError, match="NotSealed"):
         R.read_session_result(host, k, owner, bytes(unsealed))
+    # A sealed flag on a record the program would not write (no kernel
+    # reason) is refused as Rust's decode refuses it.
     authority_halt = bytearray(record)
     authority_halt[1254:1258] = bytes(4)
-    with pytest.raises(R.ResultError, match="NoKernelVerdict"):
+    with pytest.raises(R.ResultError, match="Layout"):
         R.read_session_result(host, k, owner, bytes(authority_halt))
+    trimmed = bytearray(record)
+    trimmed[1278] |= 2
+    with pytest.raises(R.ResultError, match="Trimmed"):
+        R.read_session_result(host, k, owner, bytes(trimmed))
 
 
 def test_a_final_run_reads_the_same_live_and_as_its_receipt_and_an_output_opens():

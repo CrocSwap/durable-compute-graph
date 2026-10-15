@@ -247,8 +247,13 @@ of the final state, with its own domains and no link to earlier anchors
   and abort operations are the anchor's; the session's phase
   (`PHASE_STATE_SEAL`) selects the seal's domains.
 - Finishing writes the seal into the record's state anchor, the halt cursor
-  into the anchor cursor, and the sealed flag (byte 1278). A session is sealed
-  once; a live session, an authority halt and another cursor refuse.
+  into the anchor cursor, and the sealed flag (byte 1278, bit 0). A session is
+  sealed once; a live session, an authority halt and another cursor refuse.
+- The seal covers the whole final state or nothing: no child closes while a
+  seal is in progress (abort ends it), and closing a state span or the
+  resource copy after the halt marks the session trimmed (bit 1), which takes
+  no seal and reads as no result. Read a session's result before cleaning up
+  its state.
 - `stateful::v3::read_session_result` then reads the session as a
   `result::ResultRef` (mode consensus, scheme `STATE_SEAL_V1`), and
   `ResultRef::open_state` / `open_state_spans` check the state bytes against
@@ -259,7 +264,8 @@ Tests: `tests/stateful_v3_result.rs` (native and SBF): a seal read, required,
 opened on chain by an example consumer that keeps the result, then the
 session closed; refusals for a live session, an authority halt, another
 cursor, another signer, early finish and a wrong chunk offset; abort and
-reseal; record bytes claiming a seal the program did not write.
+reseal; record bytes claiming a seal the program did not write; a seal after a
+span closed, closes during a seal, and a result read after cleanup.
 
 ### Call frames left to a kernel
 

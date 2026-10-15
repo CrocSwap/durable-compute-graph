@@ -16,7 +16,12 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
     (`stateful::v3::read_session_result`); the state opens against the seal.
   Additive: the seal is a new anchor operation (`ANCHOR_OP_SEAL`) on halted
   sessions, recorded in a byte that was zero; nothing else in the session
-  record or any other format changes. Rust and Python agree on goldens and on
+  record or any other format changes. After the independent review
+  (2026-10-14): no child of a session closes while it is being sealed, and
+  closing a state span or the resource copy after the halt marks the session
+  trimmed (no seal, no result); requirements cover an LX1 run's parameters,
+  every window and bond, the input chain and stream roots and the resource
+  schema. Rust and Python agree on goldens and on
   real account bytes (`tests/golden/dcg/result/`).
 - **Docs:** the v2.1 run read layout gives the live length of a version-1 run
   (32 more bytes).
