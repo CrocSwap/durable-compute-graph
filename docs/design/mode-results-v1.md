@@ -228,6 +228,9 @@ option, not v1.
   cases (wrong owner, address, template, status, padding; a seal on an
   authority halt; a forged opening path; a changed value).
 
+Example: `examples/composed-app` is a consensus session whose only inputs
+are verified outputs of FINAL v2.1 runs of one template (native and SBF).
+
 ## 8. Open questions
 
 1. Should anyone be able to seal a halted session, not only its authority? The

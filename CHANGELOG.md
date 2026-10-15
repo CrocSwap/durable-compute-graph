@@ -23,6 +23,8 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
   every window and bond, the input chain and stream roots and the resource
   schema. Rust and Python agree on goldens and on
   real account bytes (`tests/golden/dcg/result/`).
+- **Example `examples/composed-app`:** a consensus session whose only inputs
+  are verified outputs of FINAL v2.1 runs (mode composition), native and SBF.
 - **Docs:** the v2.1 run read layout gives the live length of a version-1 run
   (32 more bytes).
 

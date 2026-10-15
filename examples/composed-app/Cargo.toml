@@ -1,0 +1,40 @@
+[package]
+name = "dcg-composed-app"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+description = "Example of mode composition (mode results v1): a consensus session whose every input is a verified output of a FINAL optimistic (v2.1) run."
+
+# A standalone workspace, as an application's own repository would be.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+
+[dependencies]
+dcg-program = { path = "../../crates/dcg-program", default-features = false, features = ["no-entrypoint"] }
+solana-program = "=2.3.0"
+
+[dev-dependencies]
+solana-account = "=2.2.1"
+solana-instruction = "=2.3.3"
+solana-keypair = "=2.2.3"
+solana-message = "=2.4.0"
+solana-program-test = "=2.3.9"
+solana-signer = "=2.2.1"
+solana-transaction = "=2.2.3"
+solana-transaction-error = "=2.2.1"
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
+serde_json = "=1.0.151"
+
+[patch.crates-io]
+curve25519-dalek = { path = "../../crates/dcg-program/vendor" }
+
+[profile.release]
+overflow-checks = false
+lto = true
+codegen-units = 1
