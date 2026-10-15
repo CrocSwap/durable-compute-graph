@@ -1655,6 +1655,8 @@ async fn a_refuted_run_closes_after_the_pot_and_buffers_refund_their_creator() {
     assert!(ch.close_template().await.is_err(), "a refuted run still needs the template until it becomes a receipt");
     ch.close_run(0xE1).await.unwrap();
     assert_eq!(ch.receipt().await.1, V::RUN_REFUTED, "the receipt keeps the refutation");
+    // Mode results v1: a refuted receipt is never a result.
+    assert_eq!(run_result(&mut ch).await, Err(dcg_program::result::ResultError::NotFinal));
     ch.close_template().await.unwrap();
     assert!(ch.gone(ch.template).await);
     for k in [d0, d1, buf] {

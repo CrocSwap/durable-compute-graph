@@ -451,3 +451,105 @@ async fn a_seal_covers_the_whole_final_state_or_nothing() {
     let payer = ctx.payer.pubkey();
     assert_eq!(send(&mut ctx, keep(payer, s, app::V3_REJECT_HALT_REASON), &[]).await, Err(100 + ResultError::Trimmed as u32));
 }
+
+/// An open, initialized session of the big-seal kernel (two 40,000-byte
+/// spans, grown 8 KiB at a time), with `commands` written and advanced, the
+/// last one halting it.
+async fn big_halted(ctx: &mut ProgramTestContext, auth: &Keypair, id: u64, commands: &[u8]) -> Pubkey {
+    let m = app::V3_BIG_SEAL.manifest();
+    let payer = ctx.payer.pubkey();
+    let s = session_pda(&auth.pubkey(), id);
+    let mut p = vec![v3::WIRE_VERSION];
+    p.extend_from_slice(&id.to_le_bytes());
+    p.extend_from_slice(&[0, 1]);
+    p.extend_from_slice(&v3::MIN_RING_CAPACITY.to_le_bytes());
+    p.push(8);
+    p.extend_from_slice(&m.id.0);
+    p.extend_from_slice(&m.semantic_version.to_le_bytes());
+    p.extend_from_slice(&m.abi_version.to_le_bytes());
+    p.extend_from_slice(&v3::MODE_CONSENSUS_V3.id.to_le_bytes());
+    p.extend_from_slice(&v3::MODE_CONSENSUS_V3.version.to_le_bytes());
+    p.extend_from_slice(&STREAM_ROOT);
+    p.extend_from_slice(&[0; 32]);
+    p.extend_from_slice(&[0; 32]);
+    p.extend_from_slice(&0u32.to_le_bytes());
+    p.extend_from_slice(&0u16.to_le_bytes());
+    p.extend_from_slice(&[0; 32]);
+    p.push(0); // headered state, no lanes, no features: the 178-byte form
+    send(ctx, ix(sw::TAG_OPEN_SESSION, p, vec![AccountMeta::new(payer, true), signer(auth.pubkey()), w(s), r(SYSTEM)]), &[auth]).await.unwrap();
+    send(ctx, ix(sw::TAG_CREATE_STREAM, vec![v3::WIRE_VERSION, 0],
+                 vec![AccountMeta::new(payer, true), w(s), signer(auth.pubkey()), w(stream_pda(&s)), r(SYSTEM)]), &[auth]).await.unwrap();
+    let n = app::V3_BIG_SEAL_SPAN_BYTES;
+    let mut p = vec![v3::WIRE_VERSION, 2];
+    p.extend_from_slice(&n.to_le_bytes());
+    p.extend_from_slice(&n.to_le_bytes());
+    send(ctx, ix(sw::TAG_CREATE_STATE, p, vec![AccountMeta::new(payer, true), w(s), signer(auth.pubkey()),
+                                                w(state_pda(&s, 0)), w(state_pda(&s, 1)), r(SYSTEM)]), &[auth]).await.unwrap();
+    for i in 0..2u8 {
+        for _ in 0..8 {
+            let len = ctx.banks_client.get_account(state_pda(&s, i)).await.unwrap().unwrap().data.len();
+            if len == v3::CHILD_HEADER_BYTES + n as usize {
+                break;
+            }
+            send(ctx, ix(sw::TAG_CREATE_STATE, vec![v3::WIRE_VERSION, v3::STATE_OP_GROW, i],
+                         vec![AccountMeta::new(payer, true), r(s), w(state_pda(&s, i)), r(SYSTEM)]), &[]).await.unwrap();
+        }
+    }
+    send(ctx, ix(sw::TAG_CREATE_STATE, vec![v3::WIRE_VERSION, v3::STATE_OP_INITIALIZE],
+                 vec![signer(auth.pubkey()), w(s), w(state_pda(&s, 0)), w(state_pda(&s, 1))]), &[auth]).await.unwrap();
+    for (seq, cmd) in commands.iter().enumerate() {
+        let mut p = vec![v3::WIRE_VERSION];
+        p.extend_from_slice(&(seq as u32).to_le_bytes());
+        p.extend_from_slice(&[1, *cmd]);
+        send(ctx, ix(sw::TAG_WRITE_INPUT, p, vec![signer(auth.pubkey()), w(s), w(stream_pda(&s))]), &[auth]).await.unwrap();
+    }
+    let mut p = vec![v3::WIRE_VERSION];
+    p.extend_from_slice(&0u32.to_le_bytes());
+    p.push(commands.len() as u8);
+    send(ctx, ix(sw::TAG_ADVANCE, p, vec![signer(auth.pubkey()), w(s), w(stream_pda(&s)), w(state_pda(&s, 0)), w(state_pda(&s, 1))]), &[auth]).await.unwrap();
+    s
+}
+
+/// Review 10-14 gap: a seal over more than 64 KiB through the program's chunk
+/// handler, its first chunk crossing the span boundary and its last chunk
+/// short, opened against the state bytes and the host model's state.
+#[tokio::test]
+async fn a_large_state_seals_in_chunks_that_cross_spans() {
+    let mut ctx = start().await;
+    let auth = keypair(75);
+    let commands = [7u8, 9, app::V3_BIG_SEAL_HALT_COMMAND];
+    let s = big_halted(&mut ctx, &auth, 1, &commands).await;
+    let account = ctx.banks_client.get_account(s).await.unwrap().unwrap();
+    let verdict = v3::read_verdict_bytes(&PROGRAM, &s, &account.owner, &account.data).unwrap();
+    assert_eq!((verdict.halt_reason, verdict.halt_cursor), (app::V3_BIG_SEAL_HALT_REASON, 3));
+
+    let payer = ctx.payer.pubkey();
+    send(&mut ctx, begin(payer, auth.pubkey(), s, v3::ANCHOR_OP_SEAL, 3), &[&auth]).await.unwrap();
+    assert_eq!(send(&mut ctx, finish(auth.pubkey(), s, 3), &[&auth]).await, Err(v3::REFUSAL_PHASE_CURSOR), "two chunks to go");
+    send(&mut ctx, chunk(auth.pubkey(), s, 3, 0), &[&auth]).await.unwrap();
+    assert_eq!(send(&mut ctx, finish(auth.pubkey(), s, 3), &[&auth]).await, Err(v3::REFUSAL_PHASE_CURSOR), "one chunk to go");
+    assert_eq!(send(&mut ctx, chunk(auth.pubkey(), s, 3, 0), &[&auth]).await, Err(v3::REFUSAL_PHASE_CURSOR), "a chunk twice");
+    send(&mut ctx, chunk(auth.pubkey(), s, 3, res::SEAL_CHUNK_BYTES as u32), &[&auth]).await.unwrap();
+    send(&mut ctx, finish(auth.pubkey(), s, 3), &[&auth]).await.unwrap();
+
+    let result = read(&mut ctx, s).await.unwrap();
+    assert_eq!(result.count, 80_000);
+    // The host model of the kernel's final state.
+    let n = app::V3_BIG_SEAL_SPAN_BYTES as usize;
+    let mut want = vec![0u8; 2 * n];
+    for (step, cmd) in commands.iter().enumerate() {
+        want[8 + (step * 7_919) % (2 * n - 8)] = *cmd;
+    }
+    want[..8].copy_from_slice(&(commands.len() as u64).to_le_bytes());
+    let state = state_bytes(&mut ctx, s).await;
+    assert_eq!(state, want, "the kernel's final state");
+    assert_eq!(result.open_state(&state), Ok(()));
+    let (a, b) = state.split_at(n);
+    assert_eq!(result.open_state_spans(&[a, b]), Ok(()));
+    let mut forged = state.clone();
+    forged[79_999] ^= 1;
+    assert_eq!(result.open_state(&forged), Err(ResultError::Opening), "a change in the short last chunk");
+    forged[79_999] ^= 1;
+    forged[n] ^= 1;
+    assert_eq!(result.open_state(&forged), Err(ResultError::Opening), "a change just past the span boundary");
+}

@@ -1510,6 +1510,99 @@ fn test_session_kernel_id(accounts: &[AccountInfo]) -> Option<KernelId> {
     None
 }
 
+// --- mode results v1: a large halting state for seals --------------------------------------
+
+/// Halt reason of [`V3_BIG_SEAL`].
+pub const V3_BIG_SEAL_HALT_REASON: u32 = 0x5EA1;
+/// Its halt command: applied, then the kernel halts.
+pub const V3_BIG_SEAL_HALT_COMMAND: u8 = 0xFF;
+/// Its two state spans (80,000 bytes in all), so a seal's first 64 KiB chunk
+/// crosses the span boundary and its last chunk is short.
+pub const V3_BIG_SEAL_SPAN_BYTES: u32 = 40_000;
+
+static V3_BIG_SEAL_MANIFEST: KernelManifest = KernelManifest {
+    id: KernelId(*b"dcg-bigseal-v1\0\0"),
+    semantic_version: 1,
+    abi_version: 1,
+    input: PortLayout { id: INPUT_LAYOUT, max_bytes: 1, alignment: 1 },
+    output: PortLayout { id: OUTPUT_LAYOUT, max_bytes: 16, alignment: 1 },
+    state: Some(StateSchema {
+        id: VersionedId { id: 0x4249_4753, version: 1 },
+        max_bytes: 2 * V3_BIG_SEAL_SPAN_BYTES,
+    }),
+    resources: ResourceLimits {
+        max_input_bytes: 1,
+        max_output_bytes: 16,
+        max_state_bytes: 2 * V3_BIG_SEAL_SPAN_BYTES,
+        max_operations: 8,
+        max_compute_units: 80_000,
+    },
+    modes: &V3_COUNTER_MODES,
+    capabilities: crate::kernel::KernelCapabilities::NONE,
+};
+
+/// A test kernel with an 80,000-byte state that halts on a command (mode
+/// results v1 seal tests): state bytes 0..8 count the steps; each step
+/// writes its command byte at a position that moves through both spans;
+/// `V3_BIG_SEAL_HALT_COMMAND` is applied and halts the session.
+pub struct V3BigSealKernel;
+
+impl Kernel for V3BigSealKernel {
+    fn manifest(&self) -> &'static KernelManifest {
+        &V3_BIG_SEAL_MANIFEST
+    }
+
+    fn execute(&self, _input: &[u8], _output: &mut [u8]) -> Result<usize, KernelError> {
+        Err(KernelError::Refused)
+    }
+}
+
+impl StatefulKernel for V3BigSealKernel {
+    fn initial_state(&self, _output: &mut [u8]) -> Result<usize, KernelError> {
+        Err(KernelError::Refused)
+    }
+
+    fn transition(&self, _: &[u8], _: &[u8], _: &mut [u8], _: &mut [u8]) -> Result<(usize, usize), KernelError> {
+        Err(KernelError::Refused)
+    }
+
+    fn initial_state_spans(&self, spans: &mut [StateSpanMut<'_>]) -> Result<usize, KernelError> {
+        let n = V3_BIG_SEAL_SPAN_BYTES as usize;
+        if spans.len() != 2 || spans[0].data.len() != n || spans[1].data.len() != n || spans[1].offset != n as u32 {
+            return Err(KernelError::InvalidInput);
+        }
+        for span in spans.iter_mut() {
+            span.data.fill(0);
+        }
+        Ok(2 * n)
+    }
+
+    fn transition_spans_with_outcome(
+        &self,
+        input: &[u8],
+        state: &mut [StateSpanMut<'_>],
+        output: &mut [u8],
+    ) -> Result<TransitionOutcome, KernelError> {
+        let n = V3_BIG_SEAL_SPAN_BYTES as usize;
+        let (&[command], [a, b]) = (input, state) else {
+            return Err(KernelError::InvalidInput);
+        };
+        let steps = u64::from_le_bytes(a.data[..8].try_into().unwrap());
+        let at = 8 + (steps as usize * 7_919) % (2 * n - 8);
+        if at < n { a.data[at] = command } else { b.data[at - n] = command }
+        a.data[..8].copy_from_slice(&(steps + 1).to_le_bytes());
+        let _ = output;
+        let disposition = if command == V3_BIG_SEAL_HALT_COMMAND {
+            TransitionDisposition::HaltAfter { reason: V3_BIG_SEAL_HALT_REASON }
+        } else {
+            TransitionDisposition::Continue
+        };
+        Ok(TransitionOutcome { output_bytes: 0, disposition })
+    }
+}
+
+pub static V3_BIG_SEAL: V3BigSealKernel = V3BigSealKernel;
+
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if data.get(1) == Some(&crate::stateful::v3::WIRE_VERSION) {
         let kernel_id = if data.first() == Some(&stateful::TAG_OPEN_SESSION) {
@@ -1523,6 +1616,8 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_FIXED_ENGINE)
         } else if kernel_id == Some(V3_WORKSPACE_ENGINE.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_WORKSPACE_ENGINE)
+        } else if kernel_id == Some(V3_BIG_SEAL.manifest().id) {
+            crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_BIG_SEAL)
         } else if kernel_id == Some(V3_DEPTH_PROBE.manifest().id) {
             crate::stateful::v3::process_with_kernel(program, accounts, data, &V3_DEPTH_PROBE)
         } else if kernel_id == Some(V3_TICK_REJECT.manifest().id) {

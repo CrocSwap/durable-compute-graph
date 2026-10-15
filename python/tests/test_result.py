@@ -96,3 +96,24 @@ def test_a_final_run_reads_the_same_live_and_as_its_receipt_and_an_output_opens(
         R.read_run_result(host, (run, host, bytes.fromhex(f["live"])), (Pubkey.default(), host, t[2]))
     with pytest.raises(R.ResultError, match="Address"):
         R.read_run_result(host, (Pubkey.default(), host, bytes.fromhex(f["live"])), t)
+    # A refuted receipt (status 3) is never a result.
+    refuted = bytearray.fromhex(f["receipt"])
+    refuted[4] = 3
+    with pytest.raises(R.ResultError, match="NotFinal"):
+        R.read_run_result(host, (run, host, bytes(refuted)), t)
+
+
+def test_a_final_lx_run_reads_as_the_programs_result_and_its_outputs_open():
+    f = load("lx_run")
+    host, run, template = key(f["host"]), key(f["run"]), key(f["template"])
+    t = (template, host, bytes.fromhex(f["template_data"]))
+    live = R.read_run_result(host, (run, host, bytes.fromhex(f["live"])), t)
+    receipt = R.read_run_result(host, (run, host, bytes.fromhex(f["receipt"])), t)
+    assert live.encode().hex() == f["result"] == receipt.encode().hex()
+    assert live.scheme == R.SCHEME_LX_OUTPUTS_V1 and live.count == 0
+    outputs = [None if o is None else bytes.fromhex(o) for o in f["outputs"]]
+    live.open_lx_outputs(outputs)
+    with pytest.raises(R.ResultError, match="Opening"):
+        live.open_lx_outputs(outputs[:-1] + [b"x"])
+    with pytest.raises(R.ResultError, match="Opening"):
+        live.open_output(0, bytes(55), [])

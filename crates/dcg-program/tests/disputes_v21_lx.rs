@@ -1237,6 +1237,19 @@ fn prestage_mask_matches_python() {
     assert_eq!(hex_of(&b), "c8573628a73cb18e957c7bce105933e989a47f152d9e5094e3a4ac80a7670e77c8a2597389c8acfda18f1bd640ea9dc94c312e06be4b97c26c6116983ea5a970e292cda41b03");
 }
 
+/// Real account bytes for the Python reader's cross-check
+/// (`python/tests/test_result.py`): written with `DCG_WRITE_GOLDENS=1`,
+/// otherwise compared.
+fn result_fixture(name: &str, value: serde_json::Value) {
+    let path = format!("{}/../../tests/golden/dcg/result/{name}.json", env!("CARGO_MANIFEST_DIR"));
+    if std::env::var("DCG_WRITE_GOLDENS").is_ok_and(|v| v == "1") {
+        std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap() + "\n").unwrap();
+    } else {
+        let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(kept, value, "{name}.json: regenerate with DCG_WRITE_GOLDENS=1 if the change is intended");
+    }
+}
+
 /// Mode results v1 (docs/design/mode-results-v1.md §3.1): a FINAL LX1 run
 /// reads as an optimistic result under `LX_OUTPUTS_V1`, the same live and as
 /// its receipt, and its outputs open against the outputs digest.
@@ -1276,4 +1289,9 @@ async fn a_final_lx_run_is_a_result_whose_outputs_open() {
     let receipt = ch.account(ch.run).await;
     assert_eq!(&receipt.data[0..4], b"D21P");
     assert_eq!(read(&receipt, &t, &ch).unwrap().encode(), live.encode());
+    result_fixture("lx_run", serde_json::json!({
+        "host": hex_of(PROGRAM.as_ref()), "run": hex_of(ch.run.as_ref()), "template": hex_of(ch.template.as_ref()),
+        "live": hex_of(&run.data), "receipt": hex_of(&receipt.data), "template_data": hex_of(&t.data),
+        "result": hex_of(&live.encode()), "outputs": p["commitment"]["outputs"].clone(),
+    }));
 }
