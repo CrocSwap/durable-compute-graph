@@ -59,6 +59,10 @@ pub const ANCHOR_OP_BEGIN: u8 = 0xFE;
 pub const ANCHOR_OP_CHUNK: u8 = 0xFD;
 pub const ANCHOR_OP_FINISH: u8 = 0xFC;
 pub const ANCHOR_OP_ABORT: u8 = 0xFB;
+/// Begin sealing a halted session's final state (mode results v1, design
+/// `docs/design/mode-results-v1.md` §3.2). Chunks, finish and abort use the
+/// anchor operations; the session's phase says which digest they build.
+pub const ANCHOR_OP_SEAL: u8 = 0xFA;
 pub const RESOURCE_CHUNK_TAG: u8 = 240;
 pub const RESOURCE_GROW_OP: u8 = 0xFE;
 pub const RESOURCE_CHUNK_BYTES: u32 = 65_536;
@@ -119,7 +123,8 @@ const SESSION_SEED: &[u8] = b"dcg-session-v3";
 const STREAM_SEED: &[u8] = b"dcg-input-v3";
 const STATE_SEED: &[u8] = b"dcg-state-v3";
 const VIEW_SEED: &[u8] = b"dcg-view-v3";
-const CHILD_HEADER_BYTES: usize = 128;
+/// Bytes before the state in a state account (and other session children).
+pub const CHILD_HEADER_BYTES: usize = 128;
 const STREAM_MAGIC: &[u8; 4] = b"DSB3";
 const STATE_MAGIC: &[u8; 4] = b"DSE3";
 const VIEW_MAGIC: &[u8; 4] = b"DVW3";
@@ -137,6 +142,8 @@ const PHASE_NONE: u8 = 0;
 const PHASE_VIEW_PUBLICATION: u8 = 1;
 const PHASE_INITIALIZATION: u8 = 2;
 const PHASE_STATE_ANCHOR: u8 = 3;
+const PHASE_STATE_SEAL: u8 = 4;
+use crate::result::{SEAL_CHUNK_DOMAIN, SEAL_DOMAIN, SEAL_INIT_DOMAIN};
 const RESOURCE_SEED: &[u8] = b"dcg-resource-v3";
 const ANCHOR_SEED: &[u8] = b"dcg-anchor-v3";
 const RESOURCE_HEADER_BYTES: usize = 128;
@@ -203,6 +210,9 @@ struct Session {
     features: u8,
     /// Inputs consumed by a `Reject` outcome (rejectable sessions only).
     rejected_count: u32,
+    /// The final state is sealed: `state_anchor` is the seal at the halt
+    /// cursor (byte 1278).
+    sealed: bool,
 }
 
 impl Session {
@@ -777,6 +787,7 @@ fn encode_session(account: &AccountInfo, session: &Session) -> ProgramResult {
     put_u32(&mut raw, 1269, session.last_captured);
     raw[1273] = session.features;
     put_u32(&mut raw, 1274, session.rejected_count);
+    raw[1278] = u8::from(session.sealed);
     Ok(())
 }
 
@@ -799,7 +810,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || u16_at(raw, 4) != WIRE_VERSION as u16
         || raw[1130..1132] != [0; 2]
         || raw[1165] != 0
-        || raw[1164] > PHASE_STATE_ANCHOR
+        || raw[1164] > PHASE_STATE_SEAL
         || raw[1182] > 1
         || raw[1189] > 1
         || raw[1273] & !FEATURES_KNOWN != 0
@@ -808,7 +819,8 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || (raw[1273] & FEATURE_TICKS != 0 && (raw[1273] & FEATURE_RING_STREAM == 0 || raw[7] != POLICY_INDEXED))
         // (No such rule for FEATURE_READS_RESOURCE: closing the resource copy
         // of a halted session clears the resource key.)
-        || raw[1278..].iter().any(|byte| *byte != 0)
+        || raw[1278] > 1
+        || raw[1279] != 0
         || (raw[1273] & FEATURE_REJECTABLE == 0 && u32_at(raw, 1274) != 0)
         || (raw[1273] & FEATURE_RING_STREAM != 0 && u32_at(raw, 10) < MIN_RING_CAPACITY)
         || raw[1267] as usize > lanes::MAX_LANES
@@ -879,6 +891,14 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
                 || state_length_sum != u32_at(raw, 224)))
         || (raw[6] == STATUS_ACTIVE && (u32_at(raw, 1254) != 0 || u32_at(raw, 1258) != 0))
         || (raw[6] == STATUS_HALTED && u32_at(raw, 1258) != u32_at(raw, 112))
+        // A seal is taken only on a session its kernel halted, at the halt
+        // cursor, and only with the session halted (mode results v1 §3.2).
+        || (raw[1164] == PHASE_STATE_SEAL && (raw[6] != STATUS_HALTED || raw[1278] != 0))
+        || (raw[1278] == 1
+            && (raw[6] != STATUS_HALTED
+                || u32_at(raw, 1254) == 0
+                || u32_at(raw, 188) != u32_at(raw, 1258)
+                || raw[1164] != PHASE_NONE))
     {
         return Err(refusal(REFUSAL_SESSION));
     }
@@ -940,6 +960,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         last_captured: u32_at(raw, 1269),
         features: raw[1273],
         rejected_count: u32_at(raw, 1274),
+        sealed: raw[1278] == 1,
     })
 }
 
@@ -1257,6 +1278,7 @@ fn open_session(
             last_captured: 0,
             features,
             rejected_count: 0,
+            sealed: false,
         },
     )
 }
@@ -3274,6 +3296,12 @@ fn phase_declaration(kernel: &dyn StatefulKernel, declared: u32) -> ProgramResul
     Ok(())
 }
 
+/// An anchor in progress on a live session, or a seal on a halted one.
+fn in_anchor_phase(session: &Session) -> bool {
+    (session.status == STATUS_ACTIVE && session.phase == PHASE_STATE_ANCHOR)
+        || (session.status == STATUS_HALTED && session.phase == PHASE_STATE_SEAL)
+}
+
 fn clear_phase(session: &mut Session) {
     session.phase = PHASE_NONE;
     session.phase_state_cursor = 0;
@@ -3371,6 +3399,7 @@ mod workspace_first_account_tests {
             last_captured: 0,
             features: 0,
             rejected_count: 0,
+            sealed: false,
         }
     }
 
@@ -4171,6 +4200,7 @@ fn begin_anchor(
     accounts: &[AccountInfo],
     data: &[u8],
     kernel: &dyn StatefulKernel,
+    seal: bool,
 ) -> ProgramResult {
     exact_data(data, 7)?;
     if accounts.len() < 7 {
@@ -4193,7 +4223,14 @@ fn begin_anchor(
     let mut session =
         checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     let cursor = u32_at(data, 3);
-    if session.status != STATUS_ACTIVE
+    // An anchor runs on a live session; a seal only on a session its kernel
+    // halted, once (the halt cursor is the session cursor).
+    let status_ok = if seal {
+        session.status == STATUS_HALTED && session.halt_reason != 0 && !session.sealed
+    } else {
+        session.status == STATUS_ACTIVE
+    };
+    if !status_ok
         || session.phase != PHASE_NONE
         || !session.state_initialized
         || cursor != session.cursor
@@ -4223,9 +4260,14 @@ fn begin_anchor(
     let cursor_bytes = cursor.to_le_bytes();
     let total_bytes = session.state_bytes.to_le_bytes();
     let mut initial = crate::hash::Parts::new();
+    if seal {
+        // No link to earlier anchors: the seal is recomputable from the
+        // final state and the record alone.
+        initial.push(SEAL_INIT_DOMAIN);
+    } else {
+        initial.push(b"dcg/state-anchor-init/3").push(&session.state_anchor);
+    }
     initial
-        .push(b"dcg/state-anchor-init/3")
-        .push(&session.state_anchor)
         .push(&input_root)
         .push(&session.kernel_id.0)
         .push(&schema_id)
@@ -4271,7 +4313,7 @@ fn begin_anchor(
             accumulator: initial.finish(),
         },
     )?;
-    session.phase = PHASE_STATE_ANCHOR;
+    session.phase = if seal { PHASE_STATE_SEAL } else { PHASE_STATE_ANCHOR };
     session.phase_state_cursor = cursor;
     session.phase_cursor = 0;
     session.phase_total = session.state_bytes;
@@ -4300,8 +4342,7 @@ fn run_anchor_chunk(
         checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     let cursor = u32_at(data, 3);
     let offset = u32_at(data, 7);
-    if session.status != STATUS_ACTIVE
-        || session.phase != PHASE_STATE_ANCHOR
+    if !in_anchor_phase(&session)
         || cursor != session.phase_state_cursor
         || session.cursor != cursor
         || offset != session.phase_cursor
@@ -4338,8 +4379,13 @@ fn run_anchor_chunk(
         .collect::<Result<Vec<_>, _>>()?;
     let mut digest = crate::hash::Parts::new();
     let offset_bytes = offset.to_le_bytes();
+    let chunk_domain: &[u8] = if session.phase == PHASE_STATE_SEAL {
+        SEAL_CHUNK_DOMAIN
+    } else {
+        b"dcg/state-anchor-chunk/3"
+    };
     digest
-        .push(b"dcg/state-anchor-chunk/3")
+        .push(chunk_domain)
         .push(&anchor.accumulator)
         .push(&offset_bytes);
     let mut covered = 0u32;
@@ -4395,8 +4441,7 @@ fn finish_anchor(
     let mut session =
         checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
     let cursor = u32_at(data, 3);
-    if session.status != STATUS_ACTIVE
-        || session.phase != PHASE_STATE_ANCHOR
+    if !in_anchor_phase(&session)
         || session.cursor != cursor
         || session.phase_state_cursor != cursor
         || session.phase_cursor != session.phase_total
@@ -4414,8 +4459,10 @@ fn finish_anchor(
     let schema = validate_kernel(kernel)?;
     let schema_id = schema.id.id.to_le_bytes();
     let schema_version = schema.id.version.to_le_bytes();
+    let sealing = session.phase == PHASE_STATE_SEAL;
+    let final_domain: &[u8] = if sealing { SEAL_DOMAIN } else { b"dcg/state-anchor-chunked/3" };
     session.state_anchor = crate::hash::sha256(&[
-        b"dcg/state-anchor-chunked/3",
+        final_domain,
         &anchor.accumulator,
         &anchor.input_root,
         &session.kernel_id.0,
@@ -4426,6 +4473,7 @@ fn finish_anchor(
     ]);
     session.input_root = anchor.input_root;
     session.anchor_cursor = cursor;
+    session.sealed = sealing;
     clear_phase(&mut session);
     write_anchor(
         anchor_account,
@@ -4454,8 +4502,7 @@ fn abort_anchor(
     }
     let mut session =
         checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
-    if session.status != STATUS_ACTIVE
-        || session.phase != PHASE_STATE_ANCHOR
+    if !in_anchor_phase(&session)
         || u32_at(data, 3) != session.phase_state_cursor
     {
         return Err(refusal(REFUSAL_LIVE));
@@ -4578,7 +4625,8 @@ fn anchor(
         return Err(ProgramError::InvalidInstructionData);
     };
     match operation {
-        ANCHOR_OP_BEGIN => begin_anchor(program, accounts, data, kernel),
+        ANCHOR_OP_BEGIN => begin_anchor(program, accounts, data, kernel, false),
+        ANCHOR_OP_SEAL => begin_anchor(program, accounts, data, kernel, true),
         ANCHOR_OP_CHUNK => run_anchor_chunk(program, accounts, data, kernel),
         ANCHOR_OP_FINISH => finish_anchor(program, accounts, data, kernel),
         ANCHOR_OP_ABORT => abort_anchor(program, accounts, data, kernel),
@@ -4768,6 +4816,57 @@ pub fn read_verdict_bytes(host: &Pubkey, key: &Pubkey, owner: &Pubkey, raw: &[u8
         stream_root: session.stream_root,
         anchor_cursor: session.anchor_cursor,
         state_anchor: session.state_anchor,
+    })
+}
+
+/// Read a finished session's result (mode results v1, design
+/// `docs/design/mode-results-v1.md` §3.2): the checks of [`read_verdict`]
+/// (owner, layout, address, a kernel halt), and the final state sealed. The
+/// result's root is the seal, which [`crate::result::ResultRef::open_state`]
+/// checks against the state bytes.
+pub fn read_session_result(host: &Pubkey, account: &AccountInfo) -> Result<crate::result::ResultRef, crate::result::ResultError> {
+    let raw = account.try_borrow_data().map_err(|_| crate::result::ResultError::Layout)?;
+    read_session_result_bytes(host, account.key, account.owner, &raw)
+}
+
+/// [`read_session_result`] over an account's key, owner and data (for clients).
+pub fn read_session_result_bytes(
+    host: &Pubkey,
+    key: &Pubkey,
+    owner: &Pubkey,
+    raw: &[u8],
+) -> Result<crate::result::ResultRef, crate::result::ResultError> {
+    use crate::result::{Body, ConsensusBody, ResultError, ResultRef, SCHEME_STATE_SEAL_V1};
+    let verdict = read_verdict_bytes(host, key, owner, raw).map_err(|e| match e {
+        VerdictError::Owner => ResultError::Owner,
+        VerdictError::Address => ResultError::Address,
+        VerdictError::NotHalted => ResultError::NotHalted,
+        VerdictError::NoKernelVerdict => ResultError::NoKernelVerdict,
+        _ => ResultError::Layout,
+    })?;
+    let session = decode_session(raw).map_err(|_| ResultError::Layout)?;
+    if !session.sealed {
+        return Err(ResultError::NotSealed);
+    }
+    Ok(ResultRef {
+        scheme: SCHEME_STATE_SEAL_V1,
+        host: *host,
+        source: *key,
+        root: verdict.state_anchor,
+        count: u64::from(session.state_bytes),
+        body: Body::Consensus(ConsensusBody {
+            kernel_id: verdict.kernel,
+            semantic_version: verdict.semantic_version,
+            abi_version: verdict.abi_version,
+            state_schema: verdict.state_schema,
+            resource_schema: verdict.resource_schema,
+            features: verdict.features,
+            halt_reason: verdict.halt_reason,
+            halt_cursor: verdict.halt_cursor,
+            input_root: verdict.input_root,
+            stream_root: verdict.stream_root,
+            resource_commitment: verdict.resource_commitment,
+        }),
     })
 }
 

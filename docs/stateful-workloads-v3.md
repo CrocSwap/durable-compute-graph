@@ -234,6 +234,33 @@ Tests: `tests/stateful_v3_verdict.rs` (native): a kernel halt read, required
 and recorded, then the session closed; an authority halt, a foreign owner,
 another address, a short record and a changed magic refused.
 
+### Sealing the final state: a session's result (mode results v1)
+
+A finished session's state anchor chains every earlier anchor, so nobody can
+recompute it from the final state alone. A **seal** is one more chunked hash
+of the final state, with its own domains and no link to earlier anchors
+(design `docs/design/mode-results-v1.md` §3.2):
+
+- `ANCHOR` (239) with `ANCHOR_OP_SEAL` (0xFA) begins it, on a session its
+  kernel halted (nonzero reason), at the halt cursor, signed by the recorded
+  authority, with the same accounts as `ANCHOR_OP_BEGIN`. The chunk, finish
+  and abort operations are the anchor's; the session's phase
+  (`PHASE_STATE_SEAL`) selects the seal's domains.
+- Finishing writes the seal into the record's state anchor, the halt cursor
+  into the anchor cursor, and the sealed flag (byte 1278). A session is sealed
+  once; a live session, an authority halt and another cursor refuse.
+- `stateful::v3::read_session_result` then reads the session as a
+  `result::ResultRef` (mode consensus, scheme `STATE_SEAL_V1`), and
+  `ResultRef::open_state` / `open_state_spans` check the state bytes against
+  it, on chain or on a client. The record closes with the session, so a
+  consumer that needs the result later keeps the 256-byte reference.
+
+Tests: `tests/stateful_v3_result.rs` (native and SBF): a seal read, required,
+opened on chain by an example consumer that keeps the result, then the
+session closed; refusals for a live session, an authority halt, another
+cursor, another signer, early finish and a wrong chunk offset; abort and
+reseal; record bytes claiming a seal the program did not write.
+
 ### Call frames left to a kernel
 
 SBF allows 64 nested call frames per instruction. **Measured** (2026-10-14,

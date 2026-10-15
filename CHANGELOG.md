@@ -3,6 +3,24 @@
 Breaking changes are marked **breaking**, with who is affected and how to
 migrate. Formats may change before beta (see `docs/release-terms.md`).
 
+## Unreleased
+
+- **Mode results v1 (design `docs/design/mode-results-v1.md`).** One 256-byte
+  result reference (`dcg_program::result::ResultRef`, Python `dcg.result`)
+  for a finished computation in any mode, with its digest, the consumer's
+  requirements (`require`), its security basis (`basis`) and openings:
+  - optimistic: a `FINAL` v2.1 run, live or as its receipt, with its template
+    (`read_run_result`); one output opens against the out tree, or an LX1
+    run's outputs against its outputs digest;
+  - consensus: a session its kernel halted, once its final state is sealed
+    (`stateful::v3::read_session_result`); the state opens against the seal.
+  Additive: the seal is a new anchor operation (`ANCHOR_OP_SEAL`) on halted
+  sessions, recorded in a byte that was zero; nothing else in the session
+  record or any other format changes. Rust and Python agree on goldens and on
+  real account bytes (`tests/golden/dcg/result/`).
+- **Docs:** the v2.1 run read layout gives the live length of a version-1 run
+  (32 more bytes).
+
 ## v0.3.0-alpha (2026-10-14)
 
 Additive for existing kernels and sessions: new kernel capabilities

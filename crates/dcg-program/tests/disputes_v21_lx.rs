@@ -1236,3 +1236,44 @@ fn prestage_mask_matches_python() {
     LX::prestage_mask(&[0x11; 32], &Pubkey::new_from_array([0x22; 32]), &mut b);
     assert_eq!(hex_of(&b), "c8573628a73cb18e957c7bce105933e989a47f152d9e5094e3a4ac80a7670e77c8a2597389c8acfda18f1bd640ea9dc94c312e06be4b97c26c6116983ea5a970e292cda41b03");
 }
+
+/// Mode results v1 (docs/design/mode-results-v1.md §3.1): a FINAL LX1 run
+/// reads as an optimistic result under `LX_OUTPUTS_V1`, the same live and as
+/// its receipt, and its outputs open against the outputs digest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_final_lx_run_is_a_result_whose_outputs_open() {
+    use dcg_program::result::{self as res, ResultError};
+    let g = golden();
+    let p = &g["plays"][0];
+    let mut ch = Chain::new(p["arity"].as_u64().unwrap() as u8, 3_000).await;
+    ch.commit(&p["commitment"]).await.unwrap();
+    let read = |run: &Account, t: &Account, ch: &Chain| {
+        res::read_run_result_bytes(&PROGRAM, (&ch.run, &run.owner, &run.data), (&ch.template, &t.owner, &t.data))
+    };
+    let (run, t) = (ch.account(ch.run).await, ch.account(ch.template).await);
+    assert_eq!(read(&run, &t, &ch), Err(ResultError::NotFinal));
+    ch.warp(3_100).await;
+    let i = ch.caller_ix(V::SUB_FINALIZE, vec![AccountMeta::new(kp(0xE1).pubkey(), false)]);
+    ch.by_bystander(i).await.unwrap();
+    let run = ch.account(ch.run).await;
+    let live = read(&run, &t, &ch).unwrap();
+    assert_eq!((live.mode(), live.scheme, live.count), (res::MODE_OPTIMISTIC, res::SCHEME_LX_OUTPUTS_V1, 0));
+    assert_eq!(live.root, h32(&p["commitment"]["outputs_digest"]));
+    let res::Body::Optimistic(o) = live.body else { panic!("optimistic body") };
+    assert_eq!((o.run_id, o.root_aux, o.steps, o.challenge_window), (ch.run_id, sha256(&[LX::PARAMS_DOMAIN, &ch.params]), ch.positions, 3_000));
+    let outputs: Vec<Option<Vec<u8>>> =
+        p["commitment"]["outputs"].as_array().unwrap().iter().map(|x| x.as_str().map(hex)).collect();
+    let views: Vec<Option<&[u8]>> = outputs.iter().map(|x| x.as_deref()).collect();
+    assert_eq!(live.open_lx_outputs(&views), Ok(()));
+    let mut changed = outputs.clone();
+    if let Some(Some(first)) = changed.first_mut() {
+        first[0] ^= 1;
+    }
+    let views: Vec<Option<&[u8]>> = changed.iter().map(|x| x.as_deref()).collect();
+    assert_eq!(live.open_lx_outputs(&views), Err(ResultError::Opening));
+    assert_eq!(live.open_output(0, &[0; 55], &[]), Err(ResultError::Opening), "no single-output opening for LX1");
+    ch.close_run().await.unwrap();
+    let receipt = ch.account(ch.run).await;
+    assert_eq!(&receipt.data[0..4], b"D21P");
+    assert_eq!(read(&receipt, &t, &ch).unwrap().encode(), live.encode());
+}

@@ -19,6 +19,7 @@ pub mod hash;
 pub mod kernel;
 pub mod kernel_kit;
 pub mod kernel_svm;
+pub mod result;
 pub mod stateful;
 #[cfg(feature = "sbf-real-lifecycle-test")]
 pub mod stateful_test;

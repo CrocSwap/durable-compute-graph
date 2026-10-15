@@ -2716,3 +2716,118 @@ fn the_growth_record_fits_the_largest_buffer() {
     let rent = solana_program::rent::Rent::default().minimum_balance(V::STAGE_HEADER + V::MAX_STAGE);
     assert!(rent * 4 < u32::MAX as u64, "{rent}");
 }
+
+// --- mode results v1 (docs/design/mode-results-v1.md §3.1) ----------------------------------
+
+/// Real account bytes for the Python reader's cross-check
+/// (`python/tests/test_result.py`): written with `DCG_WRITE_GOLDENS=1`,
+/// otherwise compared, so a change in either reader or the program shows.
+fn result_fixture(name: &str, value: serde_json::Value) {
+    let path = format!("{}/../../tests/golden/dcg/result/{name}.json", env!("CARGO_MANIFEST_DIR"));
+    if std::env::var("DCG_WRITE_GOLDENS").is_ok_and(|v| v == "1") {
+        std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap() + "\n").unwrap();
+    } else {
+        let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(kept, value, "{name}.json: regenerate with DCG_WRITE_GOLDENS=1 if the change is intended");
+    }
+}
+
+fn hex_of(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+async fn run_result(ch: &mut Chain) -> Result<dcg_program::result::ResultRef, dcg_program::result::ResultError> {
+    let run = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
+    let template = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap();
+    dcg_program::result::read_run_result_bytes(&PROGRAM, (&ch.run, &run.owner, &run.data), (&ch.template, &template.owner, &template.data))
+}
+
+/// A FINAL run reads as an optimistic result, the same live and as its
+/// receipt, and an output opens against it; before that it is not one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_final_run_is_a_result_live_and_as_its_receipt() {
+    use dcg_program::result::{self as res, ResultError, ResultRequirements};
+    let mut ch = Chain::new(750).await;
+    let c = ch.honest();
+    assert_eq!(run_result(&mut ch).await, Err(ResultError::NotFinal), "open");
+    ch.commit(&c).await;
+    assert_eq!(run_result(&mut ch).await, Err(ResultError::NotFinal), "committed");
+    ch.ctx.warp_to_slot(800).unwrap();
+    let caller = kp(0xA1);
+    send(&mut ch.ctx, ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(kp(0xE1).pubkey(), false)]), &[&caller]).await.unwrap();
+
+    let live = run_result(&mut ch).await.unwrap();
+    let t = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap().data;
+    assert_eq!((live.mode(), live.scheme, live.host, live.source), (res::MODE_OPTIMISTIC, res::SCHEME_OUT_TREE_V21, PROGRAM, ch.run));
+    assert_eq!((live.root.as_slice(), live.count), (&c.root_bytes[144..176], c.outs.len() as u64));
+    let res::Body::Optimistic(o) = live.body else { panic!("optimistic body") };
+    assert_eq!((o.template_id.as_slice(), o.run_id, o.root_aux), (&t[96..128], ch.run_id, ch.g.spec_root));
+    assert_eq!((o.challenge_window, o.executor_bond, o.challenger_bond, o.steps), (750, EXECUTOR_BOND, CHALLENGER_BOND, c.leaves.len() as u64));
+    assert_eq!(live.basis(), res::Basis::Optimistic { host: PROGRAM, challenge_window: 750, phase_window: o.phase_window, executor_bond: EXECUTOR_BOND, challenger_bond: CHALLENGER_BOND });
+    let want = ResultRequirements { template_id: Some(o.template_id), run_id: Some(ch.run_id), min_challenge_window: Some(750), ..Default::default() };
+    assert_eq!(live.require(&want), Ok(()));
+    assert_eq!(live.require(&ResultRequirements { min_challenge_window: Some(751), ..want }), Err(ResultError::Security));
+
+    // Every output opens against the out tree; a swapped output does not.
+    let out_hashes: Vec<D::Hash> = c.outs.iter().enumerate().map(|(j, e)| D::out_leaf(&Soft, j as u64, Some(e))).collect();
+    let out_levels = levels(D::Tree::Out, &out_hashes);
+    for (j, entry) in c.outs.iter().enumerate() {
+        let entry: [u8; 55] = entry.as_slice().try_into().unwrap();
+        assert_eq!(live.open_output(j as u64, &entry, &path(&out_levels, j)), Ok(()), "output {j}");
+    }
+    let first: [u8; 55] = c.outs[0].as_slice().try_into().unwrap();
+    if c.outs.len() > 1 {
+        assert_eq!(live.open_output(1, &first, &path(&out_levels, 1)), Err(ResultError::Opening));
+    }
+
+    // Owner, address and template must be the run's.
+    let run = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
+    let other = Pubkey::new_from_array([7; 32]);
+    let read = |host: &Pubkey, key: &Pubkey, tkey: &Pubkey, tdata: &[u8]| {
+        res::read_run_result_bytes(host, (key, &run.owner, &run.data), (tkey, &run.owner, tdata))
+    };
+    assert_eq!(read(&other, &ch.run, &ch.template, &t), Err(ResultError::Owner));
+    assert_eq!(read(&PROGRAM, &other, &ch.template, &t), Err(ResultError::Address));
+    assert_eq!(read(&PROGRAM, &ch.run, &other, &t), Err(ResultError::Template));
+    assert_eq!(read(&PROGRAM, &ch.run, &ch.template, &run.data), Err(ResultError::Template), "the run is not a template");
+    let mut cut = run.data.clone();
+    cut.pop();
+    assert_eq!(res::read_run_result_bytes(&PROGRAM, (&ch.run, &run.owner, &cut), (&ch.template, &run.owner, &t)), Err(ResultError::Layout));
+
+    // The receipt reads as the same result.
+    ch.close_run(0xC1).await.unwrap();
+    assert_eq!(ch.receipt().await.0, b"D21P".to_vec());
+    let receipt = run_result(&mut ch).await.unwrap();
+    assert_eq!(receipt.encode(), live.encode(), "receipt and live run give the same result");
+    let receipt_data = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap().data;
+    let first_ref = c.outs[0].clone();
+    result_fixture("run", serde_json::json!({
+        "host": hex_of(PROGRAM.as_ref()), "run": hex_of(ch.run.as_ref()), "template": hex_of(ch.template.as_ref()),
+        "live": hex_of(&run.data), "receipt": hex_of(&receipt_data), "template_data": hex_of(&t),
+        "result": hex_of(&live.encode()), "output0": hex_of(&first_ref),
+        "output0_path": path(&out_levels, 0).iter().map(|h| hex_of(h)).collect::<Vec<_>>(),
+    }));
+}
+
+/// A refuted run is never a result.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refuted_run_is_not_a_result() {
+    let mut ch = Chain::new(1_000).await;
+    let mut c = ch.honest();
+    let mut l = c.leaves[1].clone().unwrap();
+    let n = l.len();
+    let wrong = D::value_digest(&Soft, &43i32.to_le_bytes());
+    l[n - 64 - 32..n - 64].copy_from_slice(&wrong);
+    c = commitment(&ch.g, &ch.run_id, vec![c.leaves[0].clone(), Some(l)], c.outs.clone());
+    ch.commit(&c).await;
+    let d = ch.open(1, V::KIND_STEP_DESCEND).await;
+    ch.step(d, &c, 1).await;
+    let mut body = vec![V::CLAIM_STEP, 0];
+    body.extend(ch.spec_opening(STEP_BASE as usize + 1));
+    body.push(1);
+    body.extend_from_slice(&4u32.to_le_bytes());
+    body.extend_from_slice(&42i32.to_le_bytes());
+    ch.claim(d, body).await.unwrap();
+    assert_eq!(ch.run_status().await, V::RUN_REFUTED);
+    assert_eq!(run_result(&mut ch).await, Err(dcg_program::result::ResultError::NotFinal));
+}
