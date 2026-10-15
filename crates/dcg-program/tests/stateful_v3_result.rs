@@ -553,3 +553,94 @@ async fn a_large_state_seals_in_chunks_that_cross_spans() {
     forged[n] ^= 1;
     assert_eq!(result.open_state(&forged), Err(ResultError::Opening), "a change just past the span boundary");
 }
+
+/// Compute units of one transaction holding `i` (with the metadata's count).
+async fn send_cu(ctx: &mut ProgramTestContext, i: Instruction) -> Result<u64, u32> {
+    let blockhash = ctx.get_new_latest_blockhash().await.unwrap();
+    let tx = Transaction::new(&[&ctx.payer], solana_message::Message::new(&[i], Some(&ctx.payer.pubkey())), blockhash);
+    let out = ctx.banks_client.process_transaction_with_metadata(tx).await.unwrap();
+    match out.result {
+        Ok(()) => Ok(out.metadata.map_or(0, |m| m.compute_units_consumed)),
+        Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => Err(code),
+        Err(_) => Err(u32::MAX),
+    }
+}
+
+fn probe(op: u8, host: &Pubkey, rest: &[u8], accounts: Vec<AccountMeta>) -> Instruction {
+    let mut data = vec![app::RESULT_PROBE_TAG, op];
+    data.extend_from_slice(host.as_ref());
+    data.extend_from_slice(rest);
+    Instruction { program_id: PROGRAM, accounts, data }
+}
+
+fn fixture(name: &str) -> serde_json::Value {
+    let path = format!("{}/../../tests/golden/dcg/result/{name}.json", env!("CARGO_MANIFEST_DIR"));
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn unhex(s: &serde_json::Value) -> Vec<u8> {
+    let s = s.as_str().unwrap();
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
+
+/// Mode results v1: the compute of the readers and openings on chain, through
+/// the test image's probe (tag 251). Meaningful with `V3_SBF=1`; natively it
+/// checks the probe accepts real results and refuses a forged state.
+#[tokio::test]
+async fn the_readers_and_openings_cost_on_chain() {
+    let mut ctx = start().await;
+    let auth = keypair(76);
+    let mut line = Vec::new();
+    let base = send_cu(&mut ctx, probe(0, &PROGRAM, &[], vec![])).await.unwrap();
+    line.push(format!("baseline {base}"));
+
+    // Sessions: the 16-byte tick-and-reject state and the 80,000-byte state.
+    let small = halted(&mut ctx, &auth, 1).await;
+    seal(&mut ctx, &auth, small, 10).await.unwrap();
+    let big = big_halted(&mut ctx, &auth, 2, &[7, 9, app::V3_BIG_SEAL_HALT_COMMAND]).await;
+    let payer = ctx.payer.pubkey();
+    send(&mut ctx, begin(payer, auth.pubkey(), big, v3::ANCHOR_OP_SEAL, 3), &[&auth]).await.unwrap();
+    for offset in [0, res::SEAL_CHUNK_BYTES as u32] {
+        send(&mut ctx, chunk(auth.pubkey(), big, 3, offset), &[&auth]).await.unwrap();
+    }
+    send(&mut ctx, finish(auth.pubkey(), big, 3), &[&auth]).await.unwrap();
+    for (name, s) in [("16 B", small), ("80,000 B", big)] {
+        let states = vec![r(s), r(state_pda(&s, 0)), r(state_pda(&s, 1))];
+        let read = send_cu(&mut ctx, probe(1, &PROGRAM, &[], vec![r(s)])).await.unwrap();
+        let open = send_cu(&mut ctx, probe(2, &PROGRAM, &[], states)).await.unwrap();
+        line.push(format!("session {name}: read {} open_state {}", read - base, open - read));
+    }
+    // A forged state refuses (the probe opens what the accounts hold).
+    let mut forged = ctx.banks_client.get_account(state_pda(&big, 1)).await.unwrap().unwrap();
+    forged.data[v3::CHILD_HEADER_BYTES] ^= 1;
+    ctx.set_account(&state_pda(&big, 1), &forged.into());
+    assert_eq!(send_cu(&mut ctx, probe(2, &PROGRAM, &[], vec![r(big), r(state_pda(&big, 0)), r(state_pda(&big, 1))])).await,
+               Err(100 + ResultError::Opening as u32));
+
+    // Runs: the real generic and LX1 accounts from the fixtures, under their host.
+    for name in ["run", "lx_run"] {
+        let f = fixture(name);
+        let host = Pubkey::new_from_array(unhex(&f["host"]).try_into().unwrap());
+        let run = Pubkey::new_from_array(unhex(&f["run"]).try_into().unwrap());
+        let template = Pubkey::new_from_array(unhex(&f["template"]).try_into().unwrap());
+        let account = |data: Vec<u8>| solana_account::Account { lamports: Rent::default().minimum_balance(data.len()), data, owner: host, executable: false, rent_epoch: 0 };
+        ctx.set_account(&template, &account(unhex(&f["template_data"])).into());
+        for form in ["live", "receipt"] {
+            ctx.set_account(&run, &account(unhex(&f[form])).into());
+            let read = send_cu(&mut ctx, probe(3, &host, &[], vec![r(run), r(template)])).await.unwrap();
+            let mut text = format!("{name} {form}: read {}", read - base);
+            if name == "run" {
+                let mut rest = 0u64.to_le_bytes().to_vec();
+                rest.extend(unhex(&f["output0"]));
+                let path = f["output0_path"].as_array().unwrap();
+                for p in path {
+                    rest.extend(unhex(p));
+                }
+                let open = send_cu(&mut ctx, probe(4, &host, &rest, vec![r(run), r(template)])).await.unwrap();
+                text += &format!(" open_output (path {}) {}", path.len(), open - read);
+            }
+            line.push(text);
+        }
+    }
+    println!("result compute (sbf {}): {}", std::env::var("V3_SBF").unwrap_or_default(), line.join("; "));
+}

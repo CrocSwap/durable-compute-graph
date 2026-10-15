@@ -260,6 +260,26 @@ of the final state, with its own domains and no link to earlier anchors
   it, on chain or on a client. The record closes with the session, so a
   consumer that needs the result later keeps the 256-byte reference.
 
+- **Measured** (2026-10-15, SBF ProgramTest on the `sbf-real-lifecycle-test`
+  image, platform tools v1.51, through its test-only probe, tag 251, net of
+  the probe's 153 CU baseline; `the_readers_and_openings_cost_on_chain` in
+  `tests/stateful_v3_result.rs`):
+
+  | Call | Compute units |
+  |---|---:|
+  | `read_session_result` (16-byte or 80,000-byte state) | 5,256-5,268 |
+  | `open_state_spans`, 16 bytes | 1,545 |
+  | `open_state_spans`, 80,000 bytes in two spans | 41,898 |
+  | `read_run_result`, generic run, live or receipt | 3,871-3,878 |
+  | `read_run_result`, LX1 run, live or receipt | 2,372-2,379 |
+  | `open_output`, one-output run (no path) | 285 |
+
+  Most of a run read is re-deriving the run address (`find_program_address`),
+  whose cost depends on the address's bump. *Estimated* from these: opening
+  a state costs about 34,000 CU per 64 KiB, so one 1.4M-CU transaction opens
+  states up to about 2.6 MB; each further level of an output's path adds one
+  SHA-256 over about 100 bytes.
+
 Tests: `tests/stateful_v3_result.rs` (native and SBF): a seal read, required,
 opened on chain by an example consumer that keeps the result, then the
 session closed; refusals for a live session, an authority halt, another

@@ -1603,6 +1603,60 @@ impl StatefulKernel for V3BigSealKernel {
 
 pub static V3_BIG_SEAL: V3BigSealKernel = V3BigSealKernel;
 
+/// Mode results v1 compute probe (tag 251, this test image only): runs the
+/// CPI-free result readers and openings on chain so their compute can be
+/// measured on SBF. It writes nothing. `data` = `[251, op, host[32], ...]`:
+/// - op 0: nothing (the baseline);
+/// - op 1: `read_session_result(host, accounts[0])`;
+/// - op 2: op 1, then `open_state_spans` over `accounts[1..]` past their
+///   `CHILD_HEADER_BYTES`;
+/// - op 3: `read_run_result(host, accounts[0], accounts[1])`;
+/// - op 4: op 3, then `open_output(index:u64, value_ref[55], path[32 x])`.
+pub const RESULT_PROBE_TAG: u8 = 251;
+
+pub fn result_probe(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    use crate::result::ResultError;
+    use solana_program::program_error::ProgramError;
+    let fail = |e: ResultError| ProgramError::Custom(100 + e as u32);
+    let (Some(&op), Some(host)) = (data.get(1), data.get(2..34)) else {
+        return Err(ProgramError::InvalidInstructionData);
+    };
+    let host = Pubkey::new_from_array(host.try_into().unwrap());
+    match op {
+        0 => Ok(()),
+        1 | 2 => {
+            let result = crate::stateful::v3::read_session_result(&host, accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?).map_err(fail)?;
+            if op == 2 {
+                let guards = accounts[1..].iter().map(|a| a.try_borrow_data()).collect::<Result<Vec<_>, _>>()?;
+                let spans: Vec<&[u8]> = guards
+                    .iter()
+                    .map(|g| g.get(crate::stateful::v3::CHILD_HEADER_BYTES..).ok_or(ProgramError::InvalidAccountData))
+                    .collect::<Result<_, _>>()?;
+                result.open_state_spans(&spans).map_err(fail)?;
+            }
+            Ok(())
+        }
+        3 | 4 => {
+            let [run, template, ..] = accounts else {
+                return Err(ProgramError::NotEnoughAccountKeys);
+            };
+            let result = crate::result::read_run_result(&host, run, template).map_err(fail)?;
+            if op == 4 {
+                let rest = data.get(34..).ok_or(ProgramError::InvalidInstructionData)?;
+                if rest.len() < 63 || (rest.len() - 63) % 32 != 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let index = u64::from_le_bytes(rest[..8].try_into().unwrap());
+                let value_ref: [u8; 55] = rest[8..63].try_into().unwrap();
+                let path: Vec<[u8; 32]> = rest[63..].chunks_exact(32).map(|c| c.try_into().unwrap()).collect();
+                result.open_output(index, &value_ref, &path).map_err(fail)?;
+            }
+            Ok(())
+        }
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if data.get(1) == Some(&crate::stateful::v3::WIRE_VERSION) {
         let kernel_id = if data.first() == Some(&stateful::TAG_OPEN_SESSION) {
