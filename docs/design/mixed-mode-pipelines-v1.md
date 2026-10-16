@@ -281,18 +281,32 @@ needs the template. The run read layout gains the form as run-read v2
 the same document. Implemented 2026-10-16 behind feature `pipelines-v1`.
 
 **B. Anyone may seal a halted session (mode results §8 Q1).**
-- `SEAL` begin, chunk and finish no longer require the authority's
-  signature. Whoever begins pays the seal accumulator's rent and gets it back
-  at finish or abort.
-- Anyone may continue and finish a seal someone else began. The hash is fixed
-  by the frozen state, so who sends the chunks does not matter. A seal begun
-  and abandoned therefore blocks the session's closes only until someone
-  finishes it; the authority can always finish it itself (about 33,000 CU per
-  64 KiB, *estimated*).
+- `SEAL` begin needs only the payer's signature; the authority slot is not
+  checked. Chunk and finish in the seal phase take any signer, so anyone may
+  continue and finish a seal someone else began; the hash is fixed by the
+  frozen state, so who sends the chunks does not matter.
 - Only the authority may abort a seal in progress. Once sealed, a session is
-  never sealed again, so a griefer cannot keep re-beginning.
-- A seal still needs a kernel halt and the halt cursor, and still refuses
-  while an anchor is in progress, as today.
+  never sealed again.
+- A payer who begins on a session with no anchor account yet pays that
+  account's rent; it goes to the authority when the anchor closes, like every
+  child's rent.
+- A seal still needs a kernel halt and the halt cursor. An anchor on a live
+  session still needs the authority.
+- **Found while implementing (2026-10-16): anyone could deny a session's
+  result.** Closing a halted session's children needs no signature (the rent
+  goes to the authority), so anyone could close one state span right after a
+  kernel halt. That trims the session, and a trimmed session takes no seal.
+  With `pipelines-v1`, until a kernel-halted session is sealed, closing a state
+  span or the resource copy needs the authority's signature. Anyone may seal,
+  so the rent can always be released; once sealed or trimmed, anyone closes as
+  before; an authority halt (no result) is unaffected.
+- A stranger's begun seal blocks closes until it ends. The authority ends it
+  with an abort and a signed close in one transaction, which leaves no gap for
+  another begin; or anyone finishes it.
+
+Implemented 2026-10-16 behind feature `pipelines-v1`; tests in
+`tests/stateful_v3_result.rs`, and the session fuzzer models open seals and
+signed closes (campaign seed 1050, 300 sequences, 37 seals begun, clean).
 
 **C. Tree seals (mode results §8 Q3).** A second seal scheme,
 `STATE_TREE_V1` (scheme 4), lets a consumer open part of a large state and

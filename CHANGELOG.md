@@ -35,6 +35,11 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
     `D21P`. **Breaking for the unreleased mode-results API:**
     `read_run_result` and `read_run_result_bytes` take the template as an
     `Option` (Python: an optional argument).
+  - anyone may begin, continue and finish a session seal; only the authority
+    aborts. **Breaking with the feature:** until a kernel-halted session is
+    sealed, closing a state span or the resource copy needs the authority's
+    signature (otherwise anyone could trim the session first and deny its
+    result).
 
 ## v0.3.0-alpha (2026-10-14)
 

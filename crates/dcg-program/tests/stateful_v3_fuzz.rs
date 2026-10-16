@@ -50,6 +50,8 @@ use solana_transaction_error::TransactionError;
 
 /// The fixed engine checks that the resource copy's owner is `[0xD9; 32]`.
 const PROGRAM: Pubkey = Pubkey::new_from_array([0xD9; 32]);
+/// With `pipelines-v1` anyone may seal (pipelines design §3.4 B).
+const OPEN_SEAL: bool = cfg!(feature = "pipelines-v1");
 const SYSTEM: Pubkey = system_program::ID;
 const RESOURCE_SRC: Pubkey = Pubkey::new_from_array(app::V3_RESOURCE_KEY);
 const VALUE: u8 = sw::KIND_VIEW_COUNTER;
@@ -342,7 +344,9 @@ enum Op {
     /// Mode results v1: seal a kernel-halted session's final state (chunks,
     /// finish and abort are the anchor ops in the seal phase).
     SealBegin { payer: Actor, auth: Actor, cursor: u32 },
-    Close { child: Child, kind: u8, refund: Actor },
+    /// `signed`: the refund (the authority) signs; with `pipelines-v1` the
+    /// only way to close a kernel-halted session's state before its seal.
+    Close { child: Child, kind: u8, refund: Actor, signed: bool },
     CloseSession { refund: Actor },
     Prefund { target: Pubkey, lamports: u64 },
 }
@@ -1174,8 +1178,9 @@ impl Fuzz {
                 d.extend_from_slice(&cursor.to_le_bytes());
                 one(ix(sw::TAG_ANCHOR, d, vec![self.signer(auth), w(s), w(k.anchor)]))
             }
-            Op::Close { child, kind, refund } => {
-                one(ix(sw::TAG_CLOSE_ACCOUNT, vec![ver, kind], vec![w(s), w(k.child(child)), w(self.actor_key(refund))]))
+            Op::Close { child, kind, refund, signed } => {
+                let refund = if signed { AccountMeta::new(self.actor_key(refund), true) } else { w(self.actor_key(refund)) };
+                one(ix(sw::TAG_CLOSE_ACCOUNT, vec![ver, kind], vec![w(s), w(k.child(child)), refund]))
             }
             Op::CloseSession { refund } => one(ix(sw::TAG_CLOSE_ACCOUNT, vec![ver, v3::KIND_SESSION], vec![w(s), w(self.actor_key(refund))])),
             Op::Prefund { target, lamports } => one(system_instruction::transfer(&self.actor_key(Actor::Prefunder), &target, lamports)),
@@ -1454,22 +1459,28 @@ impl Fuzz {
             }
             Op::AnchorChunk { auth, cursor, offset } => {
                 let Some(a) = &m.anchor else { return false };
-                in_anchor && *auth == A && *cursor == m.ph_state && m.cursor == *cursor && *offset == m.ph_at && a.open && a.progress == *offset && a.progress < a.total && (m.stream || m.phase == PH_SEAL)
+                in_anchor && (*auth == A || (OPEN_SEAL && m.phase == PH_SEAL)) && *cursor == m.ph_state && m.cursor == *cursor && *offset == m.ph_at && a.open && a.progress == *offset && a.progress < a.total && (m.stream || m.phase == PH_SEAL)
             }
             Op::AnchorFinish { auth, cursor } => {
                 let Some(a) = &m.anchor else { return false };
-                in_anchor && *auth == A && m.cursor == *cursor && m.ph_state == *cursor && m.ph_at == m.ph_total && a.open && a.progress == a.total
+                in_anchor && (*auth == A || (OPEN_SEAL && m.phase == PH_SEAL)) && m.cursor == *cursor && m.ph_state == *cursor && m.ph_at == m.ph_total && a.open && a.progress == a.total
             }
             Op::AnchorAbort { auth, cursor } => {
                 let Some(a) = &m.anchor else { return false };
                 in_anchor && *auth == A && *cursor == m.ph_state && a.open && a.progress == m.ph_at
             }
             Op::SealBegin { payer, auth, cursor } => {
-                m.open && !m.active && m.halt_reason != 0 && !m.sealed && !m.trimmed && *payer != A && *auth == A
+                m.open && !m.active && m.halt_reason != 0 && !m.sealed && !m.trimmed && *payer != A && (*auth == A || OPEN_SEAL)
                     && m.phase == PH_NONE && m.initialized && *cursor == m.cursor && m.anchor_cursor <= *cursor && m.states > 0
                     && m.anchor.as_ref().is_none_or(|a| !a.open)
             }
-            Op::Close { child, kind, refund } => {
+            Op::Close { child, kind, refund, signed } => {
+                // With `pipelines-v1`, the unsealed final state of a kernel
+                // halt closes only with the authority's signature.
+                let guarded = OPEN_SEAL && matches!(child, Child::State(_) | Child::Resource) && m.halt_reason != 0 && !m.sealed && !m.trimmed;
+                if guarded && !*signed {
+                    return false;
+                }
                 // Finding F1 (fixed 10-05): the requested kind must be the
                 // child's own, including the anchor and the headerless primary.
                 // Nothing closes during a seal (mode results review F2, F3).
@@ -1882,6 +1893,7 @@ impl Fuzz {
             Op::CreateStream { payer, auth, signed } => Op::CreateStream { payer, auth, signed: signed || signs(&auth) },
             Op::CreateState { payer, auth, signed } => Op::CreateState { payer, auth, signed: signed || signs(&auth) },
             Op::CreateView { payer, auth, signed, role, bad_abi } => Op::CreateView { payer, auth, signed: signed || signs(&auth), role, bad_abi },
+            Op::Close { child, kind, refund, signed } => Op::Close { child, kind, refund, signed: signed || signs(&refund) },
             other => other,
         }
     }
@@ -2248,7 +2260,7 @@ impl Fuzz {
                 } else {
                     // Highest state first is required; other children in any order.
                     let child = self.rng.pick(&kids);
-                    Op::Close { child, kind: child.kind(), refund: A }
+                    Op::Close { child, kind: child.kind(), refund: A, signed: self.rng.below(2) == 0 }
                 }
             }
             19 => {
@@ -2391,13 +2403,14 @@ impl Fuzz {
             },
             Op::AnchorFinish { auth, cursor } => if flip { Op::AnchorFinish { auth: a, cursor } } else { Op::AnchorFinish { auth, cursor: d(&mut self.rng, cursor) } },
             Op::AnchorAbort { auth, cursor } => if flip { Op::AnchorAbort { auth: a, cursor } } else { Op::AnchorAbort { auth, cursor: d(&mut self.rng, cursor) } },
-            Op::Close { child, kind, refund } => match self.rng.below(3) {
-                0 => Op::Close { child, kind, refund: a },
-                1 => Op::Close { child, kind: self.rng.range(1, 10) as u8, refund },
+            Op::Close { child, kind, refund, signed } => match self.rng.below(4) {
+                0 => Op::Close { child, kind, refund: a, signed },
+                1 => Op::Close { child, kind: self.rng.range(1, 10) as u8, refund, signed },
+                2 => Op::Close { child, kind, refund, signed: !signed },
                 _ => {
                     let derived = self.k.derived();
                     let other = derived[1 + self.rng.below(derived.len() as u64 - 1) as usize].0.unwrap();
-                    Op::Close { child: other, kind: other.kind(), refund }
+                    Op::Close { child: other, kind: other.kind(), refund, signed }
                 }
             },
             Op::CloseSession { .. } => Op::CloseSession { refund: a },
@@ -2690,7 +2703,8 @@ impl Fuzz {
             let cursor = self.m.ph_state;
             self.step(vec![Op::AnchorAbort { auth: A, cursor }], None, "close", true).await;
         }
-        // Closes need no signer; the order: everything but states, then states
+        // Closes are signed by the authority (needed with `pipelines-v1` for an
+        // unsealed kernel halt's state, harmless otherwise); the order: everything but states, then states
         // from the highest index down.
         let mut kids: Vec<Child> = self.m.children().into_iter().filter(|c| !matches!(c, Child::State(_))).collect();
         let mut states: Vec<Child> = self.m.children().into_iter().filter(|c| matches!(c, Child::State(_))).collect();
@@ -2698,7 +2712,7 @@ impl Fuzz {
         states.reverse();
         kids.extend(states);
         for child in kids {
-            self.step(vec![Op::Close { child, kind: child.kind(), refund: A }], None, "close", true).await;
+            self.step(vec![Op::Close { child, kind: child.kind(), refund: A, signed: true }], None, "close", true).await;
         }
         self.step(vec![Op::CloseSession { refund: A }], None, "close", true).await;
         let after = self.snapshot().await;
@@ -2906,11 +2920,11 @@ async fn finding_f1_open_anchor_closes_under_a_wrong_kind() {
         assert_eq!(outcome, Outcome::Ok, "{op:?}");
     }
     // The anchor is still open (byte 6 == 1); close it as a stream.
-    let wrong = Op::Close { child: Child::Anchor, kind: v3::KIND_STREAM, refund: A };
+    let wrong = Op::Close { child: Child::Anchor, kind: v3::KIND_STREAM, refund: A, signed: false };
     let (outcome, _) = f.send(f.build(&wrong), None).await;
     assert_ne!(outcome, Outcome::Ok, "an anchor closed under kind {} (stream)", v3::KIND_STREAM);
     // The refusal is about the kind, not the anchor: its own kind closes it.
-    let right = Op::Close { child: Child::Anchor, kind: v3::KIND_ANCHOR, refund: A };
+    let right = Op::Close { child: Child::Anchor, kind: v3::KIND_ANCHOR, refund: A, signed: false };
     let (outcome, _) = f.send(f.build(&right), None).await;
     assert_eq!(outcome, Outcome::Ok, "the anchor closes under its own kind");
 }

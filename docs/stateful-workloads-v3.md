@@ -254,6 +254,21 @@ of the final state, with its own domains and no link to earlier anchors
   resource copy after the halt marks the session trimmed (bit 1), which takes
   no seal and reads as no result. Read a session's result before cleaning up
   its state.
+- **With feature `pipelines-v1`** (pipelines design §3.4 B, test images until
+  the workload trial):
+  - anyone may begin, continue and finish a seal: the begin needs only the
+    payer's signature (the authority slot is not checked), and the chunk and
+    finish any signer. Only the authority aborts. A payer who begins on a
+    session that has no anchor account yet pays that account's rent, which goes
+    to the authority when it closes;
+  - until a kernel-halted session is sealed, closing a state span or the
+    resource copy needs the authority's signature (the refund account signs),
+    so no one else can trim the session first and deny its result. Once it is
+    sealed or trimmed, anyone may close as before; an authority halt is
+    unaffected. Anyone may seal, so the rent is never stuck;
+  - the authority can always end a seal someone else began and clean up: an
+    abort and a signed close in one transaction leave no gap for another
+    begin.
 - `stateful::v3::read_session_result` then reads the session as a
   `result::ResultRef` (mode consensus, scheme `STATE_SEAL_V1`), and
   `ResultRef::open_state` / `open_state_spans` check the state bytes against
@@ -285,7 +300,10 @@ opened on chain by an example consumer that keeps the result, then the
 session closed; refusals for a live session, an authority halt, another
 cursor, another signer, early finish and a wrong chunk offset; abort and
 reseal; record bytes claiming a seal the program did not write; a seal after a
-span closed, closes during a seal, and a result read after cleanup.
+span closed, closes during a seal, and a result read after cleanup. With
+`pipelines-v1`: a stranger's seal equals the authority's, a stranger cannot
+abort, an unsigned close before the seal is refused, and an abort with a close
+in one transaction ends a stranger's seal.
 
 ### Call frames left to a kernel
 

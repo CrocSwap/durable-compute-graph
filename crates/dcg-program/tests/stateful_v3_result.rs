@@ -279,6 +279,14 @@ fn close(s: Pubkey, target: Pubkey, refund: Pubkey, kind: u8) -> Instruction {
     ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, kind], vec![w(s), w(target), w(refund)])
 }
 
+/// A close the authority signs: with `pipelines-v1`, the only way to close a
+/// kernel-halted session's state before it is sealed.
+fn close_signed(s: Pubkey, target: Pubkey, refund: Pubkey, kind: u8) -> Instruction {
+    ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, kind], vec![w(s), w(target), AccountMeta::new(refund, true)])
+}
+
+const OPEN_SEAL: bool = cfg!(feature = "pipelines-v1");
+
 
 /// Real account bytes for the Python reader's cross-check
 /// (`python/tests/test_result.py`): written with `DCG_WRITE_GOLDENS=1`,
@@ -377,7 +385,9 @@ async fn seals_need_a_kernel_halt_the_authority_and_the_halt_cursor() {
     // Not at the halt cursor; not the authority.
     assert_eq!(send(&mut ctx, begin(payer, auth.pubkey(), s, v3::ANCHOR_OP_SEAL, 9), &[&auth]).await, Err(v3::REFUSAL_CURSOR));
     let other = keypair(73);
-    assert_eq!(send(&mut ctx, begin(payer, other.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&other]).await, Err(v3::REFUSAL_AUTHORITY));
+    if !OPEN_SEAL {
+        assert_eq!(send(&mut ctx, begin(payer, other.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&other]).await, Err(v3::REFUSAL_AUTHORITY));
+    }
     // Begun: no finish before the chunks, no chunk at another offset; abort,
     // then seal again.
     send(&mut ctx, begin(payer, auth.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&auth]).await.unwrap();
@@ -414,7 +424,7 @@ async fn a_seal_covers_the_whole_final_state_or_nothing() {
 
     // F1: a span closed after the halt, then a seal of what is left: refused.
     let s = halted(&mut ctx, &auth, 1).await;
-    send(&mut ctx, close(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
+    send(&mut ctx, close_signed(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[&auth]).await.unwrap();
     assert_eq!(send(&mut ctx, begin(payer, auth.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&auth]).await, Err(v3::REFUSAL_STATE));
     // The rest still closes, and the session with it.
     for (key, kind) in [(state_pda(&s, 0), v3::KIND_STATE), (stream_pda(&s), v3::KIND_STREAM)] {
@@ -432,7 +442,7 @@ async fn a_seal_covers_the_whole_final_state_or_nothing() {
     }
     send(&mut ctx, abort(auth.pubkey(), s, 10), &[&auth]).await.unwrap();
     for (key, kind) in [(anchor_pda(&s), v3::KIND_ANCHOR), (state_pda(&s, 1), v3::KIND_STATE), (state_pda(&s, 0), v3::KIND_STATE), (stream_pda(&s), v3::KIND_STREAM)] {
-        send(&mut ctx, close(s, key, auth.pubkey(), kind), &[]).await.unwrap();
+        send(&mut ctx, close_signed(s, key, auth.pubkey(), kind), &[&auth]).await.unwrap();
     }
     send(&mut ctx, ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, v3::KIND_SESSION], vec![w(s), w(auth.pubkey())]), &[]).await.unwrap();
     assert!(ctx.banks_client.get_account(s).await.unwrap().is_none(), "every ending reclaims the session");
@@ -651,4 +661,72 @@ async fn the_readers_and_openings_cost_on_chain() {
         }
     }
     println!("result compute (sbf {}): {}", std::env::var("V3_SBF").unwrap_or_default(), line.join("; "));
+}
+
+/// Pipelines slice 1 B (design §3.4 B): anyone may begin, continue and finish
+/// a seal, and the result equals the authority's own; only the authority
+/// aborts; a sealed session takes no second seal. Until the seal, a
+/// kernel-halted session's state closes only with the authority's signature,
+/// so no one can trim it first and deny its result; the authority escapes a
+/// stranger's seal with an abort and a close in one transaction.
+#[cfg(feature = "pipelines-v1")]
+#[tokio::test]
+async fn anyone_may_seal_and_only_the_authority_trims_before_a_seal() {
+    let mut ctx = start().await;
+    let auth = keypair(75);
+    let (alice, bob) = (keypair(76), keypair(77));
+    let payer = ctx.payer.pubkey();
+
+    // The authority's own seal, for comparison.
+    let mine = halted(&mut ctx, &auth, 1).await;
+    seal(&mut ctx, &auth, mine, 10).await.unwrap();
+    let mine = read(&mut ctx, mine).await.unwrap();
+
+    // Alice begins (paying), Bob chunks and finishes; Alice cannot abort.
+    let s = halted(&mut ctx, &auth, 2).await;
+    send(&mut ctx, begin(payer, alice.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&alice]).await.unwrap();
+    assert_eq!(send(&mut ctx, abort(alice.pubkey(), s, 10), &[&alice]).await, Err(v3::REFUSAL_AUTHORITY));
+    send(&mut ctx, chunk(bob.pubkey(), s, 10, 0), &[&bob]).await.unwrap();
+    send(&mut ctx, finish(bob.pubkey(), s, 10), &[&bob]).await.unwrap();
+    let theirs = read(&mut ctx, s).await.unwrap();
+    assert_eq!((theirs.root, theirs.count), (mine.root, mine.count), "the same state seals the same, whoever sends it");
+    assert_eq!(theirs.open_state(&state_bytes(&mut ctx, s).await), Ok(()));
+    assert_eq!(send(&mut ctx, begin(payer, alice.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&alice]).await, Err(v3::REFUSAL_CURSOR), "sealed once");
+    // Sealed: anyone may close, and the result reads until a span closes.
+    send(&mut ctx, close(s, anchor_pda(&s), auth.pubkey(), v3::KIND_ANCHOR), &[]).await.unwrap();
+    send(&mut ctx, close(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
+    assert_eq!(read(&mut ctx, s).await, Err(ResultError::Trimmed));
+
+    // Before a seal, a stranger cannot trim; the anchor and stream still close.
+    let s = halted(&mut ctx, &auth, 3).await;
+    assert_eq!(send(&mut ctx, close(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[]).await, Err(v3::REFUSAL_AUTHORITY));
+    send(&mut ctx, close(s, stream_pda(&s), auth.pubkey(), v3::KIND_STREAM), &[]).await.unwrap();
+    // A stranger's seal blocks closes; the authority aborts and closes in one
+    // transaction, so no one can re-begin in between.
+    send(&mut ctx, begin(payer, alice.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&alice]).await.unwrap();
+    assert_eq!(send(&mut ctx, close_signed(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[&auth]).await, Err(v3::REFUSAL_LIVE));
+    let blockhash = ctx.get_new_latest_blockhash().await.unwrap();
+    let both = [abort(auth.pubkey(), s, 10), close_signed(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE)];
+    let tx = Transaction::new(&[&ctx.payer, &auth], solana_message::Message::new(&both, Some(&ctx.payer.pubkey())), blockhash);
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    assert_eq!(ctx.banks_client.get_account(s).await.unwrap().unwrap().data[1278], 2, "trimmed, not sealed");
+    assert_eq!(read(&mut ctx, s).await, Err(ResultError::NotSealed));
+    assert_eq!(send(&mut ctx, begin(payer, alice.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&alice]).await, Err(v3::REFUSAL_STATE), "trimmed: no seal");
+    // Trimmed: the rest closes without a signature, the session with it.
+    for (key, kind) in [(anchor_pda(&s), v3::KIND_ANCHOR), (state_pda(&s, 0), v3::KIND_STATE)] {
+        send(&mut ctx, close(s, key, auth.pubkey(), kind), &[]).await.unwrap();
+    }
+    send(&mut ctx, ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, v3::KIND_SESSION], vec![w(s), w(auth.pubkey())]), &[]).await.unwrap();
+    assert!(ctx.banks_client.get_account(s).await.unwrap().is_none());
+
+    // An authority halt has no result to protect: anyone closes, as before.
+    let live = session(&mut ctx, &auth, 4).await;
+    let mut p = vec![v3::WIRE_VERSION];
+    p.extend_from_slice(&0u32.to_le_bytes());
+    send(&mut ctx, ix(sw::TAG_HALT_SESSION, p, vec![signer(auth.pubkey()), w(live)]), &[&auth]).await.unwrap();
+    send(&mut ctx, close(live, state_pda(&live, 1), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
+    // An anchor on a live session still needs the authority.
+    let active = session(&mut ctx, &auth, 5).await;
+    tick(&mut ctx, &auth, active, 0, 3).await.unwrap();
+    assert_eq!(send(&mut ctx, begin(payer, alice.pubkey(), active, v3::ANCHOR_OP_BEGIN, 3), &[&alice]).await, Err(v3::REFUSAL_AUTHORITY));
 }

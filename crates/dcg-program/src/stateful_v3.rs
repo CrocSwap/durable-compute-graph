@@ -4038,6 +4038,20 @@ fn close_child(
     {
         return Err(refusal(REFUSAL_STATE));
     }
+    // With `pipelines-v1`, a session its kernel halted keeps its whole final
+    // state until it is sealed unless its authority signs the close
+    // (pipelines design §3.4 B): otherwise anyone could trim it first and deny
+    // its result. Anyone may seal it, so its rent is never stuck; once it is
+    // sealed or trimmed, anyone may close as before.
+    if cfg!(feature = "pipelines-v1")
+        && matches!(kind, KIND_STATE | KIND_RESOURCE)
+        && session.halt_reason != 0
+        && !session.sealed
+        && !session.trimmed
+        && !refund.is_signer
+    {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
     drop(raw);
     if kind == KIND_ANCHOR {
         checked_anchor(program, target, session_account, true)?;
@@ -4211,6 +4225,26 @@ fn write_anchor(
     Ok(())
 }
 
+/// The session for an anchor chunk or finish. The caller signs; it must be
+/// the authority, except in a seal with `pipelines-v1`, which anyone may
+/// continue and finish (pipelines design §3.4 B). Abort stays the authority's.
+fn anchor_caller(
+    program: &Pubkey,
+    caller: &AccountInfo,
+    session_account: &AccountInfo,
+    kernel: &dyn StatefulKernel,
+) -> Result<Session, ProgramError> {
+    if !caller.is_signer {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    let session = checked_session_from(program, session_account, true, kernel, None)?;
+    let open_seal = cfg!(feature = "pipelines-v1") && session.phase == PHASE_STATE_SEAL;
+    if !open_seal && caller.key != &session.authority {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    Ok(session)
+}
+
 fn begin_anchor(
     program: &Pubkey,
     accounts: &[AccountInfo],
@@ -4227,17 +4261,26 @@ fn begin_anchor(
     };
     check_unique(accounts)?;
     let state_count = accounts.len().saturating_sub(6);
+    // With `pipelines-v1` anyone may seal (pipelines design §3.4 B): the seal
+    // is fixed by the frozen state, so only the payer signs and the authority
+    // slot is not checked. An anchor still needs the authority.
+    let open_seal = seal && cfg!(feature = "pipelines-v1");
     if !payer.is_signer
         || !payer.is_writable
-        || !authority.is_signer
+        || (!open_seal && !authority.is_signer)
         || *rest.last().unwrap().key != system_program::id()
     {
         return Err(refusal(REFUSAL_AUTHORITY));
     }
     let system = rest.last().unwrap();
     let state_accounts = &rest[..rest.len() - 1];
-    let mut session =
-        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    let mut session = checked_session_from(
+        program,
+        session_account,
+        true,
+        kernel,
+        (!open_seal).then_some(authority.key),
+    )?;
     let cursor = u32_at(data, 3);
     // An anchor runs on a live session; a seal only on a session its kernel
     // halted, once (the halt cursor is the session cursor).
@@ -4358,11 +4401,7 @@ fn run_anchor_chunk(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     check_unique(accounts)?;
-    if !authority.is_signer {
-        return Err(refusal(REFUSAL_AUTHORITY));
-    }
-    let mut session =
-        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    let mut session = anchor_caller(program, authority, session_account, kernel)?;
     let cursor = u32_at(data, 3);
     let offset = u32_at(data, 7);
     if !in_anchor_phase(&session)
@@ -4462,11 +4501,7 @@ fn finish_anchor(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     check_unique(accounts)?;
-    if !authority.is_signer {
-        return Err(refusal(REFUSAL_AUTHORITY));
-    }
-    let mut session =
-        checked_session_from(program, session_account, true, kernel, Some(authority.key))?;
+    let mut session = anchor_caller(program, authority, session_account, kernel)?;
     let cursor = u32_at(data, 3);
     if !in_anchor_phase(&session)
         || session.cursor != cursor

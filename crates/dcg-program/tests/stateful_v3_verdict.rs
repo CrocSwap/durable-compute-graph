@@ -209,6 +209,12 @@ fn close(s: Pubkey, target: Pubkey, refund: Pubkey, kind: u8) -> Instruction {
     ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, kind], vec![w(s), w(target), w(refund)])
 }
 
+/// A close the authority signs (with `pipelines-v1`, the only way to close a
+/// kernel-halted session's state before it is sealed).
+fn close_signed(s: Pubkey, target: Pubkey, refund: Pubkey, kind: u8) -> Instruction {
+    ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, kind], vec![w(s), w(target), AccountMeta::new(refund, true)])
+}
+
 // --- tests ------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -243,8 +249,14 @@ async fn a_kernel_halt_is_a_verdict_a_registry_copies_before_the_session_closes(
     let payer = ctx.payer.pubkey();
     assert_eq!(send(&mut ctx, record_ix(payer, s, 1), &[]).await, Err(100 + v3::VerdictError::Reason as u32));
     send(&mut ctx, record_ix(payer, s, app::V3_REJECT_HALT_REASON), &[]).await.unwrap();
-    // The session closes; the record stays.
-    for (key, kind) in [(state_pda(&s, 1), v3::KIND_STATE), (state_pda(&s, 0), v3::KIND_STATE), (stream_pda(&s), v3::KIND_STREAM)] {
+    // The session closes; the record stays. With `pipelines-v1` the unsealed
+    // final state closes only with the authority's signature; once trimmed,
+    // the rest closes as before.
+    if cfg!(feature = "pipelines-v1") {
+        assert_eq!(send(&mut ctx, close(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[]).await, Err(v3::REFUSAL_AUTHORITY));
+    }
+    send(&mut ctx, close_signed(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[&auth]).await.unwrap();
+    for (key, kind) in [(state_pda(&s, 0), v3::KIND_STATE), (stream_pda(&s), v3::KIND_STREAM)] {
         send(&mut ctx, close(s, key, auth.pubkey(), kind), &[]).await.unwrap();
     }
     send(&mut ctx, ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, v3::KIND_SESSION], vec![w(s), w(auth.pubkey())]), &[])
