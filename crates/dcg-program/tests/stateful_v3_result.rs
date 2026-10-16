@@ -873,3 +873,102 @@ async fn a_tree_seal_is_the_chunked_value_digest_and_opens_by_chunk() {
     send(&mut ctx, finish(stranger.pubkey(), t, 10), &[&stranger]).await.unwrap();
     assert_eq!(read(&mut ctx, t).await.unwrap().root, res::tree_seal_spans(&[&state_bytes(&mut ctx, t).await], 6));
 }
+
+/// A tick-and-reject session halted by its kernel and tree-sealed at 2^6.
+#[cfg(feature = "pipelines-v1")]
+async fn tree_sealed(ctx: &mut ProgramTestContext, auth: &Keypair, id: u64) -> Pubkey {
+    let s = halted(ctx, auth, id).await;
+    let payer = ctx.payer.pubkey();
+    send(ctx, begin_tree(payer, auth.pubkey(), s, 10, 6), &[auth]).await.unwrap();
+    send(ctx, chunk(auth.pubkey(), s, 10, 0), &[auth]).await.unwrap();
+    send(ctx, finish(auth.pubkey(), s, 10), &[auth]).await.unwrap();
+    s
+}
+
+/// Pipelines slice 1 D (design §3.1): a v2.1 run takes a tree-sealed
+/// session's whole final state as a chunked external input. `IMPORT` checks
+/// the run's ref against the seal (layout 3, the chunk size, the length, the
+/// digest) and the requirements against the session; a linear seal, a
+/// trimmed session, another kernel and a ref with another length are refused.
+#[cfg(all(feature = "pipelines-v1", feature = "graph-v21"))]
+#[tokio::test]
+async fn a_run_imports_a_tree_sealed_sessions_state() {
+    use dcg_program::disputes_v21 as V;
+    use dcg_program::hash::sha256;
+    let mut ctx = start().await;
+    let auth = keypair(80);
+    let payer = ctx.payer.pubkey();
+    let s = tree_sealed(&mut ctx, &auth, 1).await;
+    let sealed = read(&mut ctx, s).await.unwrap();
+    let linear = halted(&mut ctx, &auth, 2).await;
+    seal(&mut ctx, &auth, linear, 10).await.unwrap();
+    let trimmed = tree_sealed(&mut ctx, &auth, 3).await;
+    send(&mut ctx, close(trimmed, state_pda(&trimmed, 1), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
+
+    // Template: input 3 is a tree-sealed state of the tick-and-reject kernel.
+    let m = app::V3_TICK_REJECT.manifest();
+    let req = ResultRequirements { mode: Some(res::MODE_CONSENSUS), kernel: Some((m.id, m.semantic_version, m.abi_version)), halt_reason: Some(app::V3_REJECT_HALT_REASON), ..Default::default() };
+    let spec = V::ImportSpec { external_id: 3, scheme: res::SCHEME_STATE_TREE_V1, out_index: 0, requirements_digest: req.digest(), host: PROGRAM };
+    let mut data = vec![1u8];
+    for x in [1u64, 1, 750, 750, 2_000_000, 1_000_000] {
+        data.extend_from_slice(&x.to_le_bytes());
+    }
+    data.extend_from_slice(&[0; 8]);
+    data.extend_from_slice(&[0x5A; 32]);
+    data.extend_from_slice(&5_000u16.to_le_bytes());
+    data.extend_from_slice(&[0x5B; 32]);
+    data.extend_from_slice(V::IMPORT_TAIL_MAGIC);
+    data.extend_from_slice(&[1, 0, 0, 0]);
+    data.extend_from_slice(&spec.encode());
+    let template_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
+    let template = Pubkey::find_program_address(&[b"dcg21tmpl", &template_id, payer.as_ref()], &PROGRAM).0;
+    send(&mut ctx, ix(227, [&[V::SUB_CREATE_TEMPLATE][..], &data].concat(), vec![AccountMeta::new(payer, true), w(template), r(SYSTEM)]), &[]).await.unwrap();
+
+    // A run whose input 3 is the state as a chunked value: layout 3, version
+    // = the chunk log2, the state's length and the seal as its digest.
+    let executor = keypair(81);
+    let state_ref = |len: u32, log2: u16| {
+        let mut r = 3u32.to_le_bytes().to_vec();
+        r.extend_from_slice(&3u32.to_le_bytes());
+        r.extend_from_slice(&log2.to_le_bytes());
+        r.extend_from_slice(&1u32.to_le_bytes());
+        r.extend_from_slice(&1u16.to_le_bytes());
+        r.extend_from_slice(&len.to_le_bytes());
+        r.extend_from_slice(&sealed.root);
+        r
+    };
+    let init = |ext: &[u8], nonce: u8| {
+        let mut d = vec![nonce; 32];
+        d.extend_from_slice(executor.pubkey().as_ref());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(ext);
+        d.extend_from_slice(&[0x99; 32]);
+        let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &[nonce; 32], &1u32.to_le_bytes(), ext, executor.pubkey().as_ref()]);
+        let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, payer.as_ref()], &PROGRAM).0;
+        (ix(227, [&[V::SUB_INIT_RUN_V1][..], &d].concat(), vec![AccountMeta::new(payer, true), w(run), w(template), r(SYSTEM)]), run)
+    };
+    let import = |run: Pubkey, source: Pubkey, drq: &[u8]| {
+        let mut d = vec![V::SUB_IMPORT];
+        d.extend_from_slice(&3u32.to_le_bytes());
+        d.extend_from_slice(&(drq.len() as u16).to_le_bytes());
+        d.extend_from_slice(drq);
+        ix(227, d, vec![AccountMeta::new_readonly(payer, true), w(run), r(template), r(source)])
+    };
+    let refused = Err(0x6600 + 51);
+    let (i, run) = init(&state_ref(16, 6), 1);
+    send(&mut ctx, i, &[]).await.unwrap();
+    let drq = req.encode();
+    for (what, source) in [("a linear seal", linear), ("a trimmed session", trimmed)] {
+        assert_eq!(send(&mut ctx, import(run, source, &drq), &[]).await, refused, "{what}");
+    }
+    let other_kernel = ResultRequirements { kernel: Some((app::V3_COUNTER.manifest().id, 1, 1)), ..req };
+    assert_eq!(send(&mut ctx, import(run, s, &other_kernel.encode()), &[]).await, refused, "requirements not the template's");
+    for (what, ext, nonce) in [("another length", state_ref(15, 6), 2), ("another chunk size", state_ref(16, 7), 3)] {
+        let (i, other) = init(&ext, nonce);
+        send(&mut ctx, i, &[]).await.unwrap();
+        assert_eq!(send(&mut ctx, import(other, s, &drq), &[]).await, refused, "{what}");
+    }
+    send(&mut ctx, import(run, s, &drq), &[]).await.unwrap();
+    let account = ctx.banks_client.get_account(run).await.unwrap().unwrap();
+    assert_eq!((account.data[5], &account.data[account.data.len() - 4..]), (2, &0u32.to_le_bytes()[..]), "imported");
+}

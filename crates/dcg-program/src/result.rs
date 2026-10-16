@@ -207,6 +207,115 @@ pub struct ResultRequirements {
     pub stream_root: Option<[u8; 32]>,
 }
 
+/// `DRQ1`: the canonical encoding of [`ResultRequirements`] (pipelines design
+/// §3.1), so a template can commit to what an imported result must satisfy.
+/// `magic "DRQ1" version:u16 present:u16`, then, for each bit `i` of `present`
+/// in order, field `i` at its fixed width (integers little-endian): mode (1),
+/// source (32), template_id (32), run_id (32), root_aux (32), the four
+/// minimums (8 each), kernel (16 + 2 + 2), state_schema (4 + 2), halt_reason
+/// (4), resource_schema (4 + 2), resource_commitment, input_root, stream_root
+/// (32 each).
+pub const REQUIREMENTS_MAGIC: &[u8; 4] = b"DRQ1";
+pub const REQUIREMENTS_DIGEST_DOMAIN: &[u8] = b"dcg.requirements.v1\0";
+const REQUIREMENT_WIDTHS: [usize; 16] = [1, 32, 32, 32, 32, 8, 8, 8, 8, 20, 6, 4, 6, 32, 32, 32];
+/// The longest `DRQ1` (every field present).
+pub const REQUIREMENTS_MAX_BYTES: usize = 8 + 1 + 32 * 4 + 8 * 4 + 20 + 6 + 4 + 6 + 32 * 3;
+
+impl ResultRequirements {
+    /// The canonical `DRQ1` bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut present = 0u16;
+        let mut body = Vec::new();
+        let mut put = |bit: u16, bytes: &[u8]| {
+            present |= 1 << bit;
+            body.extend_from_slice(bytes);
+        };
+        if let Some(m) = self.mode { put(0, &[m]); }
+        if let Some(k) = self.source { put(1, k.as_ref()); }
+        if let Some(x) = self.template_id { put(2, &x); }
+        if let Some(x) = self.run_id { put(3, &x); }
+        if let Some(x) = self.root_aux { put(4, &x); }
+        if let Some(x) = self.min_challenge_window { put(5, &x.to_le_bytes()); }
+        if let Some(x) = self.min_phase_window { put(6, &x.to_le_bytes()); }
+        if let Some(x) = self.min_executor_bond { put(7, &x.to_le_bytes()); }
+        if let Some(x) = self.min_challenger_bond { put(8, &x.to_le_bytes()); }
+        if let Some((id, sv, av)) = self.kernel {
+            let mut k = [0u8; 20];
+            k[0..16].copy_from_slice(&id.0);
+            k[16..18].copy_from_slice(&sv.to_le_bytes());
+            k[18..20].copy_from_slice(&av.to_le_bytes());
+            put(9, &k);
+        }
+        let schema = |v: VersionedId| {
+            let mut b = [0u8; 6];
+            b[0..4].copy_from_slice(&v.id.to_le_bytes());
+            b[4..6].copy_from_slice(&v.version.to_le_bytes());
+            b
+        };
+        if let Some(v) = self.state_schema { put(10, &schema(v)); }
+        if let Some(x) = self.halt_reason { put(11, &x.to_le_bytes()); }
+        if let Some(v) = self.resource_schema { put(12, &schema(v)); }
+        if let Some(x) = self.resource_commitment { put(13, &x); }
+        if let Some(x) = self.input_root { put(14, &x); }
+        if let Some(x) = self.stream_root { put(15, &x); }
+        let mut out = Vec::with_capacity(8 + body.len());
+        out.extend_from_slice(REQUIREMENTS_MAGIC);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&present.to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Parse `DRQ1` bytes, refusing anything [`encode`](Self::encode) would
+    /// not write (a wrong length for the fields present).
+    pub fn decode(raw: &[u8]) -> Result<Self, ResultError> {
+        if raw.len() < 8 || &raw[0..4] != REQUIREMENTS_MAGIC || u16_at(raw, 4) != 1 {
+            return Err(ResultError::Layout);
+        }
+        let present = u16_at(raw, 6);
+        let want: usize = 8 + (0..16).filter(|b| present >> b & 1 == 1).map(|b| REQUIREMENT_WIDTHS[b]).sum::<usize>();
+        if raw.len() != want {
+            return Err(ResultError::Layout);
+        }
+        let mut at = 8;
+        let mut r = ResultRequirements::default();
+        for bit in 0..16 {
+            if present >> bit & 1 == 0 {
+                continue;
+            }
+            let f = &raw[at..at + REQUIREMENT_WIDTHS[bit]];
+            at += REQUIREMENT_WIDTHS[bit];
+            let key = |f: &[u8]| -> [u8; 32] { f.try_into().expect("fixed width") };
+            let u64_of = |f: &[u8]| u64::from_le_bytes(f.try_into().expect("fixed width"));
+            let schema = |f: &[u8]| VersionedId { id: u32_at(f, 0), version: u16_at(f, 4) };
+            match bit {
+                0 => r.mode = Some(f[0]),
+                1 => r.source = Some(Pubkey::new_from_array(key(f))),
+                2 => r.template_id = Some(key(f)),
+                3 => r.run_id = Some(key(f)),
+                4 => r.root_aux = Some(key(f)),
+                5 => r.min_challenge_window = Some(u64_of(f)),
+                6 => r.min_phase_window = Some(u64_of(f)),
+                7 => r.min_executor_bond = Some(u64_of(f)),
+                8 => r.min_challenger_bond = Some(u64_of(f)),
+                9 => r.kernel = Some((KernelId(f[0..16].try_into().expect("fixed width")), u16_at(f, 16), u16_at(f, 18))),
+                10 => r.state_schema = Some(schema(f)),
+                11 => r.halt_reason = Some(u32_at(f, 0)),
+                12 => r.resource_schema = Some(schema(f)),
+                13 => r.resource_commitment = Some(key(f)),
+                14 => r.input_root = Some(key(f)),
+                _ => r.stream_root = Some(key(f)),
+            }
+        }
+        Ok(r)
+    }
+
+    /// `SHA256("dcg.requirements.v1\0" || DRQ1)`: what a template commits to.
+    pub fn digest(&self) -> [u8; 32] {
+        crate::hash::sha256(&[REQUIREMENTS_DIGEST_DOMAIN, &self.encode()])
+    }
+}
+
 /// What a result's security rests on (design §5): always the host program,
 /// then the mode's own assumptions. Not a single scalar: a composed output's
 /// basis is the union over its ancestry.
@@ -688,6 +797,8 @@ pub fn read_run_result_bytes(
             let trailer = match r[RUN_VERSION] {
                 0 => 4,
                 1 => 4 + 32,
+                // Pipelines slice 1: remainder_to and the pending-import bitmap.
+                2 => 4 + 32 + 4,
                 _ => return Err(ResultError::Layout),
             };
             let n_ext = u32_at(r, RUN_N_EXT) as usize;

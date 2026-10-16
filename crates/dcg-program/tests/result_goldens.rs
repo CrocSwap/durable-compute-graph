@@ -104,3 +104,44 @@ fn the_tree_seal_matches_the_chunked_value_digest() {
     raw[112 + 33] = 10;
     assert!(ResultRef::decode(&raw).is_err());
 }
+
+/// Pipelines slice 1 D: `DRQ1` requirements encode and digest as the Python
+/// reference, and decoding refuses a wrong length.
+#[test]
+fn requirements_encode_as_the_python_reference() {
+    let v = vectors();
+    for q in v["requirements"].as_array().unwrap() {
+        let raw = hex(q["encoded"].as_str().unwrap());
+        let r = res::ResultRequirements::decode(&raw).unwrap();
+        assert_eq!(r.encode(), raw);
+        assert_eq!(r.digest().to_vec(), hex(q["digest"].as_str().unwrap()));
+        let mut long = raw.clone();
+        long.push(0);
+        assert!(res::ResultRequirements::decode(&long).is_err());
+        if raw.len() > 8 {
+            assert!(res::ResultRequirements::decode(&raw[..raw.len() - 1]).is_err());
+        }
+    }
+}
+
+/// Pipelines slice 1 D: the Python import table encodes as the program's
+/// `ImportSpec` records.
+#[cfg(feature = "graph-v21")]
+#[test]
+fn import_specs_encode_as_the_python_reference() {
+    use dcg_program::disputes_v21 as V;
+    let v = vectors();
+    let tail = hex(v["import_tail"].as_str().unwrap());
+    assert_eq!(&tail[0..4], V::IMPORT_TAIL_MAGIC);
+    assert_eq!((tail[4], &tail[5..8]), (2, &[0u8; 3][..]));
+    let q = |i: usize| res::ResultRequirements::decode(&hex(v["requirements"][i]["encoded"].as_str().unwrap())).unwrap();
+    let want = [
+        V::ImportSpec { external_id: 5, scheme: res::SCHEME_OUT_TREE_V21, out_index: 3, requirements_digest: q(1).digest(), host: solana_program::pubkey::Pubkey::new_from_array([0xDA; 32]) },
+        V::ImportSpec { external_id: 9, scheme: res::SCHEME_STATE_TREE_V1, out_index: 0, requirements_digest: q(2).digest(), host: solana_program::pubkey::Pubkey::new_from_array([0xDB; 32]) },
+    ];
+    for (i, spec) in want.iter().enumerate() {
+        let raw = &tail[8 + V::IMPORT_SPEC_BYTES * i..8 + V::IMPORT_SPEC_BYTES * (i + 1)];
+        assert_eq!(raw, &spec.encode()[..]);
+        assert_eq!(V::ImportSpec::parse(raw), Some(*spec));
+    }
+}

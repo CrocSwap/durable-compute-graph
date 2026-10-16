@@ -13,6 +13,7 @@ from pathlib import Path
 
 from dcg import result as R
 from dcg.disputes_v21 import lx, trees
+from dcg.disputes_v21.imports import ImportSpec, import_tail
 from dcg.disputes_v21.run import chunk_tree as chunk_tree_of
 from dcg.disputes_v21.run import out_leaf
 
@@ -70,7 +71,30 @@ def build() -> dict:
         "out_tree": {"values": [v.hex() for v, _ in refs], "refs": [r.hex() for _, r in refs],
                      "index": 3, "path": [p.hex() for p in tree.path(3)], "root": tree.root.hex()},
         "lx_outputs": [None if v is None else v.hex() for v in lx_outputs],
+        "requirements": [{"encoded": q.encode().hex(), "digest": q.digest().hex()} for q in requirements()],
+        "import_tail": import_tail([
+            ImportSpec(5, R.SCHEME_OUT_TREE_V21, 3, requirements()[1], bytes([0xDA] * 32)),
+            ImportSpec(9, R.SCHEME_STATE_TREE_V1, 0, requirements()[2], bytes([0xDB] * 32)),
+        ]).hex(),
     }
+
+
+def requirements() -> list[R.Requirements]:
+    """DRQ1 samples (pipelines design §3.1): none, a typical run import, a
+    typical state import, and every field."""
+    full = R.Requirements(
+        mode=1, source=bytes([0x41] * 32), template_id=bytes([0x42] * 32), run_id=bytes([0x43] * 32),
+        root_aux=bytes([0x44] * 32), min_challenge_window=750, min_phase_window=751, min_executor_bond=2 ** 40,
+        min_challenger_bond=3, kernel=(b"dcg-tickrej-v1\x00\x00", 1, 3), state_schema=(0x5354, 1),
+        halt_reason=0xBEEF, resource_schema=(7, 2), resource_commitment=bytes([0x45] * 32),
+        input_root=bytes([0x46] * 32), stream_root=bytes([0x47] * 32))
+    out = [R.Requirements(),
+           R.Requirements(mode=2, template_id=bytes([0x21] * 32), min_challenge_window=750),
+           R.Requirements(mode=1, kernel=(b"dcg-tickrej-v1\x00\x00", 1, 3), halt_reason=0xBEEF),
+           full]
+    for q in out:
+        assert R.Requirements.decode(q.encode()) == q
+    return out
 
 
 if __name__ == "__main__":

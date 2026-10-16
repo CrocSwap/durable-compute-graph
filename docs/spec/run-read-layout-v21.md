@@ -19,7 +19,7 @@ receipt is never closed. A reader therefore sees one of:
 
 | Magic (0..4) | Form | Length |
 |---|---|---|
-| `D21R` | live run | `192 + 176 + 52·n_ext + 4`, plus 32 on a version-1 run (byte 5 = 1, `remainder_to`) |
+| `D21R` | live run | `192 + 176 + 52·n_ext + 4`, plus 32 on a version-1 run (byte 5 = 1, `remainder_to`), plus 36 on a version-2 run (byte 5 = 2: `remainder_to` and a 4-byte pending-import bitmap; run-read v2, `pipelines-v1`) |
 | `D21P` | receipt of a settled run | `312` |
 | `D21Q` | receipt of a settled run that also carries the template's fields (run-read v2, programs built with `pipelines-v1`) | `380` |
 | (no data, system-owned) | an uncommitted run cancelled after its commit deadline | 0 |

@@ -45,6 +45,13 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
     a path (`open_state_chunk`) and the state can feed a v2.1 run as a chunked
     input. `ConsensusBody` gains `chunk_log2` (body byte 33, zero for the
     linear seal); the session record uses byte 1278 bit 2 and byte 1279.
+  - imported inputs: a v2.1 template may end its create data with an import
+    table (`ImportSpec`, bound by the template id); its runs are version 2
+    and commit only after `IMPORT` (tag 227 sub 29) has checked each imported
+    input against a final run's output or a tree-sealed session's state, under
+    requirements the template commits to (`DRQ1`,
+    `ResultRequirements::encode`/`digest`). Python:
+    `dcg.disputes_v21.imports`, `dcg.result.Requirements`.
 
 ## v0.3.0-alpha (2026-10-14)
 

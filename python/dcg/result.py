@@ -219,6 +219,93 @@ def seal_digest(c: ConsensusBody, state: bytes) -> bytes:
     return hashlib.sha256(SEAL_DOMAIN + acc + tail).digest()
 
 
+# --- requirements (DRQ1, pipelines design §3.1) -----------------------------------------------
+
+REQUIREMENTS_MAGIC = b"DRQ1"
+REQUIREMENTS_DIGEST_DOMAIN = b"dcg.requirements.v1\x00"
+# (name, width, encoder) in bit order.
+_REQ_FIELDS = ("mode", "source", "template_id", "run_id", "root_aux", "min_challenge_window",
+               "min_phase_window", "min_executor_bond", "min_challenger_bond", "kernel", "state_schema",
+               "halt_reason", "resource_schema", "resource_commitment", "input_root", "stream_root")
+_REQ_WIDTHS = (1, 32, 32, 32, 32, 8, 8, 8, 8, 20, 6, 4, 6, 32, 32, 32)
+
+
+@dataclass(frozen=True)
+class Requirements:
+    """``dcg_program::result::ResultRequirements``; ``None`` is not required.
+    ``kernel`` is (kernel_id[16], semantic_version, abi_version); schemas are
+    (id, version)."""
+    mode: int | None = None
+    source: bytes | None = None
+    template_id: bytes | None = None
+    run_id: bytes | None = None
+    root_aux: bytes | None = None
+    min_challenge_window: int | None = None
+    min_phase_window: int | None = None
+    min_executor_bond: int | None = None
+    min_challenger_bond: int | None = None
+    kernel: tuple[bytes, int, int] | None = None
+    state_schema: tuple[int, int] | None = None
+    halt_reason: int | None = None
+    resource_schema: tuple[int, int] | None = None
+    resource_commitment: bytes | None = None
+    input_root: bytes | None = None
+    stream_root: bytes | None = None
+
+    def encode(self) -> bytes:
+        present, body = 0, b""
+        for bit, name in enumerate(_REQ_FIELDS):
+            v = getattr(self, name)
+            if v is None:
+                continue
+            present |= 1 << bit
+            if name == "mode":
+                body += bytes([v])
+            elif name in ("min_challenge_window", "min_phase_window", "min_executor_bond", "min_challenger_bond"):
+                body += struct.pack("<Q", v)
+            elif name == "kernel":
+                body += bytes(v[0]) + struct.pack("<HH", v[1], v[2])
+            elif name in ("state_schema", "resource_schema"):
+                body += struct.pack("<IH", *v)
+            elif name == "halt_reason":
+                body += struct.pack("<I", v)
+            else:
+                assert len(v) == 32
+                body += bytes(v)
+        return REQUIREMENTS_MAGIC + struct.pack("<HH", 1, present) + body
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Requirements:
+        raw = bytes(raw)
+        if len(raw) < 8 or raw[:4] != REQUIREMENTS_MAGIC or struct.unpack_from("<H", raw, 4)[0] != 1:
+            raise ResultError("Layout")
+        present = struct.unpack_from("<H", raw, 6)[0]
+        if len(raw) != 8 + sum(w for b, w in enumerate(_REQ_WIDTHS) if present >> b & 1):
+            raise ResultError("Layout")
+        at, out = 8, {}
+        for bit, name in enumerate(_REQ_FIELDS):
+            if not present >> bit & 1:
+                continue
+            f = raw[at:at + _REQ_WIDTHS[bit]]
+            at += _REQ_WIDTHS[bit]
+            if name == "mode":
+                out[name] = f[0]
+            elif name in ("min_challenge_window", "min_phase_window", "min_executor_bond", "min_challenger_bond"):
+                out[name] = struct.unpack("<Q", f)[0]
+            elif name == "kernel":
+                out[name] = (f[:16], *struct.unpack("<HH", f[16:]))
+            elif name in ("state_schema", "resource_schema"):
+                out[name] = struct.unpack("<IH", f)
+            elif name == "halt_reason":
+                out[name] = struct.unpack("<I", f)[0]
+            else:
+                out[name] = f
+        return cls(**out)
+
+    def digest(self) -> bytes:
+        return hashlib.sha256(REQUIREMENTS_DIGEST_DOMAIN + self.encode()).digest()
+
+
 # --- readers ------------------------------------------------------------------------------------
 
 def _u32(d: bytes, at: int) -> int:
@@ -240,9 +327,9 @@ def read_run_result(host: Pubkey, run: tuple[Pubkey, Pubkey, bytes],
     if run_owner != host or (template is not None and template[1] != host):
         raise ResultError("Owner")
     if r[:4] == b"D21R":
-        if len(r) < 368 or r[5] not in (0, 1):
+        if len(r) < 368 or r[5] not in (0, 1, 2):
             raise ResultError("Layout")
-        trailer = 4 if r[5] == 0 else 36
+        trailer = (4, 36, 40)[r[5]]  # version 2: remainder_to and the pending-import bitmap
         if len(r) != 368 + 52 * _u32(r, 156) + trailer:
             raise ResultError("Layout")
         root_at = 192

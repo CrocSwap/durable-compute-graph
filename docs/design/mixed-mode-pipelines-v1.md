@@ -105,53 +105,84 @@ in this order.
 An external input of a v2.1 template may be declared **imported**: its value
 must be an output of a final result, checked by the program before the run
 can commit. This is the "optimistic run reads a result" direction, and it is
-what pipelines use to bind stages.
+what pipelines use to bind stages. Implemented 2026-10-16 behind feature
+`pipelines-v1`; this section describes what was built.
 
-**Spec record `ImportSpec`** (new spec-tree leaf type 10, 104 bytes):
-`magic "DIM1" external_id:u32 source:u8 (1 a pipeline stage, 2 any result)
-scheme:u8 reserved:u8[2] stage:u32 reserved:u32 out_index:u64
-requirements_digest:[32] reserved:u8[40]`.
-- `scheme` is `OUT_TREE_V21` (one output becomes one external input) or
+**Import table in the template** (not in the spec tree). The program's v2.1
+template id is `SHA256(TEMPLATE_DOMAIN || create data)`, so a table appended
+to the create data is bound by the id without touching the spec tree or its
+header: `"DIM0" count:u8 zero(3)` then `count` (1 to 16) `ImportSpec`
+records, external ids strictly increasing. The template account stores it
+after the tracking extension (`"D21I" count zero(3)` + 16 record slots; the
+account grows by 1,672 bytes). LX1 templates take no imports in slice 1.
+
+**`ImportSpec`** (104 bytes): `magic "DIM1" external_id:u32 source:u8
+scheme:u8 zero(6) out_index:u64 requirements_digest[32] host[32] zero(16)`.
+- `source` is 2 (any final result the requirements accept); 1, a pipeline
+  stage, is reserved for slice 3 and refused.
+- `scheme` is `OUT_TREE_V21` (output `out_index` becomes the input) or
   `STATE_TREE_V1` (a tree-sealed session's whole state becomes one chunked
-  external input, or one of its chunks a plain one; §3.4 C). `out_index` is
-  the output index, or for a single chunk its chunk index plus one (zero
-  means the whole state).
-- `requirements_digest` is `SHA256("dcg.requirements.v1\0" || DRQ1)`, where
-  `DRQ1` is a new canonical, fixed-length encoding of `ResultRequirements`
-  (every field present, with a presence bitmap). For `source = 1` it is zero;
-  the pipeline supplies the requirements (§3.3).
-- The external id's `InSpec` header must equal the source output's
-  `OutSpec` header bytes 0..23 (checked when the import verifies, since the
-  source template is known only then for `source = 2`).
+  input; `out_index` 0). Importing one chunk of a state is deferred: a chunk of
+  up to 64 KiB does not fit in a transaction, and staging it is later work.
+- `host` is the program the source account must belong to. Trusting a host is
+  part of the result's security basis (mode results §2), so the template
+  fixes it.
+- `requirements_digest` is `SHA256("dcg.requirements.v1\0" || DRQ1)`. `DRQ1`
+  is the canonical encoding of `ResultRequirements`: `magic "DRQ1" version:u16
+  present:u16`, then each present field at its fixed width in a fixed order
+  (`result.rs`), so a typical requirement is 50 to 80 bytes. The template
+  stores only the digest; `IMPORT` carries the bytes.
 
-**Run account version 2.** A run of a template with imports is created with
-`R_VERSION = 2` and an import bitmap after the refs. Its live length grows by
-`ceil(n_import / 8)` bytes, padded to 4. `docs/spec/run-read-layout-v21.md`
-gains the form under its versioning rule, and `read_run_result` accepts it.
+**Run account version 2.** A run of a template with imports must use
+version-1 init (sub 28, a remainder destination); it becomes version 2:
+remainder_to and then a 4-byte pending-import bitmap (bit `i`: import `i` of
+the table outstanding) after the executor-wait trailer. Init refuses a run
+whose refs lack an imported external id. `COMMIT` refuses while any bit is
+set. `docs/spec/run-read-layout-v21.md` gives the form, and `read_run_result`
+reads it.
 
-**`IMPORT(external_id, path)`** (new sub, anyone may send, before commit):
-1. reads the source result: a `FINAL` run through `read_run_result`, or a
-   pipeline record's stored stage result (§3.3);
-2. checks it against the import's requirements with `ResultRef::require`;
-3. opens the value against the result's root with the 55-byte ref recorded
-   in the run (the run id already binds it): output `out_index` with its
-   `path`; or, for a whole tree-sealed state, checks that the ref's digest
-   equals the root and its `byte_length` the state bytes (no path, no
-   posting: the chunked-value digest is the root); or one chunk with its path;
-4. sets the input's bit.
+**`IMPORT`** (tag 227 sub 29; anyone may send it, before the commit deadline):
+`[caller(s), run(w), template, source, source template (optional)]`,
+`external_id:u32 drq_len:u16 DRQ1`, then for an out-tree import the output's
+`ValueRefV1` (55) with `path_len:u8` and the path. The program:
+1. finds the import, checks `DRQ1` against its digest;
+2. reads the source's result: a v2.1 run of `host` (live with its template,
+   or a receipt; a `D21Q` needs no template), or a sealed session of `host`;
+3. requires its scheme to be the import's and `ResultRef::require` to pass;
+4. checks the run's external ref for the input: for an output, that the ref's
+   bytes are the value ref's bytes 7..55 and the value ref opens at
+   `out_index`; for a state, that the ref is a chunked value (layout 3) with
+   the seal's chunk size as layout version, the state's length and the seal as
+   its digest (no path and no posting);
+5. clears the input's bit. When the last bit clears, the commit deadline
+   starts afresh (`now + challenge_window`): the `INPUTS_COMPLETE` rule of
+   v2.1 §4.4, for imports.
 
-The commit deadline starts when the last import bit is set. This is the
-`INPUTS_COMPLETE` rule of v2.1 §4.4, implemented for imports only (plain and
-chunked input posting stays a roadmap item). If an import can never verify
-(the asserted ref is false, or the source is refuted), the payer cancels
-after the existing deadline, as for a missed commit.
+If an import can never verify (the asserted ref is false, the source is
+refuted or trimmed), the payer cancels after the deadline, as for a missed
+commit.
 
-Disputes do not change. An imported input is an external input (EDGE kind 2),
-and its ref was checked against a final result before commit.
+Disputes do not change. An imported input is an external input (EDGE kind 2,
+or kind 5 chunks of a chunked input), and its ref was checked against a final
+result before commit. As for any external input, a challenger needs the value's
+bytes: an output's from wherever the source run's outputs are published, a
+state's from the session's state accounts while they are open (or a copy taken
+at seal).
 
-Cost: one source read (2,400 to 3,900 CU, *measured*) plus one opening (285 CU
-plus about 150 CU per tree level, *estimated*) per import, one transaction
-each.
+Transaction size: `DRQ1` plus the value ref and a path of `h` levels must fit
+in one transaction, so out trees up to about 2^18 outputs (*estimated*).
+
+Cost: one source read (2,400 to 3,900 CU for a run, about 5,300 for a
+session, *measured*) plus one opening (285 CU plus about 150 CU per tree
+level, *estimated*) per import, one transaction each.
+
+Tests: `disputes_v21_skeleton.rs` (a run imports a FINAL run's output, from
+the live run and from its `D21Q` after its template closed; refusals for
+requirements, value, path, source, an input imported twice, a missing ref, a
+version-0 init, a non-canonical table); `stateful_v3_result.rs` (a run imports
+a tree-sealed session's state; refusals for a linear seal, a trimmed session,
+another kernel, another length or chunk size); goldens for `DRQ1` and the
+table (`vectors.json`, Python `dcg.disputes_v21.imports`).
 
 ### 3.2 Consensus runs of v2.1 templates
 

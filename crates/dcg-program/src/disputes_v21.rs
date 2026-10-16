@@ -123,6 +123,9 @@ pub const SUB_RETIRE_TEMPLATE: u8 = 22;
 /// that receives a convicted executor's bond remainder (mainnet hardening H4,
 /// 2026-10-06). Subs 23-27 are the LX1 subs.
 pub const SUB_INIT_RUN_V1: u8 = 28;
+/// Verify one imported input of an uncommitted run against a final result
+/// (pipelines slice 1, feature `pipelines-v1`; anyone may send it).
+pub const SUB_IMPORT: u8 = 29;
 /// Builds the pre-provenance template encoding for backwards-compatibility
 /// tests. This subtype is absent from non-test program builds.
 #[cfg(feature = "test-legacy-template-create")]
@@ -274,6 +277,118 @@ const T_TRACKING: usize = T_BYTES;
 const T_PAYER: usize = T_TRACKING + 4;
 const T_ACTIVE_RUNS: usize = T_PAYER + 32;
 const T_RETIRED: usize = 134;
+// Pipelines slice 1 (feature `pipelines-v1`, design mixed-mode-pipelines-v1
+// §3.1): a template with imported inputs appends, after the tracking
+// extension, magic "D21I", count:u8, zero(3), then `count` ImportSpec records
+// (104 bytes each). Its create data ends with the same table under magic
+// "DIM0", so the template id binds it.
+pub const IMPORT_SPEC_BYTES: usize = 104;
+pub const MAX_IMPORTS: usize = 16;
+pub const IMPORT_TAIL_MAGIC: &[u8; 4] = b"DIM0";
+pub const IMPORT_SPEC_MAGIC: &[u8; 4] = b"DIM1";
+const T_IMPORTS: usize = T_BYTES_V2;
+const T_IMPORTS_MAGIC: &[u8; 4] = b"D21I";
+const T_BYTES_V3: usize = T_IMPORTS + 8 + IMPORT_SPEC_BYTES * MAX_IMPORTS;
+/// An import's source is any final result its requirements accept (1, a
+/// pipeline stage, is reserved for slice 3).
+pub const IMPORT_SOURCE_RESULT: u8 = 2;
+
+/// Whether a template account has the close-tracking extension (with or
+/// without an import table).
+fn tracked_len(len: usize) -> bool {
+    len == T_BYTES_V2 || (cfg!(feature = "pipelines-v1") && len == T_BYTES_V3)
+}
+
+/// One imported input (`ImportSpec`, 104 bytes): magic "DIM1"
+/// external_id:u32 source:u8 scheme:u8 zero(2) stage:u32 out_index:u64
+/// requirements_digest[32] host[32] zero(16). `scheme` is the result scheme
+/// the input opens against: `OUT_TREE_V21` (output `out_index` becomes the
+/// input) or `STATE_TREE_V1` (the whole state becomes a chunked input;
+/// `out_index` 0). `host` is the program the source must belong to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportSpec {
+    pub external_id: u32,
+    pub scheme: u8,
+    pub out_index: u64,
+    pub requirements_digest: [u8; 32],
+    pub host: Pubkey,
+}
+
+impl ImportSpec {
+    pub fn parse(raw: &[u8]) -> Option<ImportSpec> {
+        let scheme = raw.get(9).copied()?;
+        let out_index = u64::from_le_bytes(raw.get(16..24)?.try_into().ok()?);
+        let digest: [u8; 32] = raw.get(24..56)?.try_into().ok()?;
+        let host: [u8; 32] = raw.get(56..88)?.try_into().ok()?;
+        let ok = raw.len() == IMPORT_SPEC_BYTES
+            && &raw[0..4] == IMPORT_SPEC_MAGIC
+            && raw[8] == IMPORT_SOURCE_RESULT
+            && (scheme == crate::result::SCHEME_OUT_TREE_V21 || (scheme == crate::result::SCHEME_STATE_TREE_V1 && out_index == 0))
+            && raw[10..16] == [0; 6]
+            && digest != [0; 32]
+            && host != [0; 32]
+            && raw[88..104] == [0; 16];
+        ok.then(|| ImportSpec {
+            external_id: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
+            scheme,
+            out_index,
+            requirements_digest: digest,
+            host: Pubkey::new_from_array(host),
+        })
+    }
+
+    pub fn encode(&self) -> [u8; IMPORT_SPEC_BYTES] {
+        let mut out = [0u8; IMPORT_SPEC_BYTES];
+        out[0..4].copy_from_slice(IMPORT_SPEC_MAGIC);
+        out[4..8].copy_from_slice(&self.external_id.to_le_bytes());
+        out[8] = IMPORT_SOURCE_RESULT;
+        out[9] = self.scheme;
+        out[16..24].copy_from_slice(&self.out_index.to_le_bytes());
+        out[24..56].copy_from_slice(&self.requirements_digest);
+        out[56..88].copy_from_slice(self.host.as_ref());
+        out
+    }
+}
+
+/// A template's imports, in table order (empty for a template without).
+fn template_imports(d: &[u8]) -> Result<Vec<ImportSpec>, ProgramError> {
+    if d.len() != T_BYTES_V3 {
+        return Ok(Vec::new());
+    }
+    let count = d[T_IMPORTS + 4] as usize;
+    if &d[T_IMPORTS..T_IMPORTS + 4] != T_IMPORTS_MAGIC || !(1..=MAX_IMPORTS).contains(&count) || d[T_IMPORTS + 5..T_IMPORTS + 8] != [0; 3] {
+        return Err(err(4));
+    }
+    let at = T_IMPORTS + 8;
+    (0..count)
+        .map(|i| ImportSpec::parse(&d[at + IMPORT_SPEC_BYTES * i..at + IMPORT_SPEC_BYTES * (i + 1)]).ok_or(err(4)))
+        .collect()
+}
+
+/// Split create data into the template proper and a trailing import table,
+/// which must be canonical: 1..=16 records, external ids strictly increasing.
+fn split_import_tail(data: &[u8]) -> Result<(&[u8], Option<&[u8]>), ProgramError> {
+    if !cfg!(feature = "pipelines-v1") {
+        return Ok((data, None));
+    }
+    for count in 1..=MAX_IMPORTS {
+        let len = 8 + IMPORT_SPEC_BYTES * count;
+        let Some(at) = data.len().checked_sub(len) else { break };
+        let tail = &data[at..];
+        if &tail[0..4] != IMPORT_TAIL_MAGIC || tail[4] as usize != count {
+            continue;
+        }
+        let specs = (0..count)
+            .map(|i| ImportSpec::parse(&tail[8 + IMPORT_SPEC_BYTES * i..8 + IMPORT_SPEC_BYTES * (i + 1)]))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(err(6))?;
+        if tail[5..8] != [0; 3] || specs.windows(2).any(|w| w[0].external_id >= w[1].external_id) {
+            return Err(err(6));
+        }
+        return Ok((&data[..at], Some(tail)));
+    }
+    Ok((data, None))
+}
 
 struct Template {
     depth: u32,
@@ -339,10 +454,10 @@ fn check_blocks(blocks: &[Block], total_steps: u64) -> Result<u32, ProgramError>
 
 fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, ProgramError> {
     let d = account.try_borrow_data()?;
-    if (d.len() != T_BYTES && d.len() != T_BYTES_V2) || &d[0..4] != b"D21T" {
+    if (d.len() != T_BYTES && !tracked_len(d.len())) || &d[0..4] != b"D21T" {
         return Err(err(4));
     }
-    if d.len() == T_BYTES_V2
+    if tracked_len(d.len())
         && (&d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
             || d[T_PAYER..T_PAYER + 32] == [0; 32]
             || d[T_RETIRED] > 1)
@@ -350,7 +465,7 @@ fn template(program_id: &Pubkey, account: &AccountInfo) -> Result<Template, Prog
         return Err(err(4));
     }
     let old_address = Pubkey::find_program_address(&[b"dcg21tmpl", &d[96..128]], program_id).0;
-    let new_address = (d.len() == T_BYTES_V2).then(|| Pubkey::find_program_address(
+    let new_address = tracked_len(d.len()).then(|| Pubkey::find_program_address(
         &[b"dcg21tmpl", &d[96..128], &d[T_PAYER..T_PAYER + 32]], program_id,
     ).0);
     if account.owner != program_id || (*account.key != old_address && new_address != Some(*account.key)) {
@@ -396,7 +511,7 @@ fn tracked_template(account: &AccountInfo) -> Result<Option<u32>, ProgramError> 
     if d.len() == T_BYTES {
         return Ok(None);
     }
-    if d.len() != T_BYTES_V2
+    if !tracked_len(d.len())
         || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
         || d[T_PAYER..T_PAYER + 32] == [0; 32]
     {
@@ -410,7 +525,7 @@ fn template_retired(account: &AccountInfo) -> Result<bool, ProgramError> {
     if d.len() == T_BYTES {
         return Ok(false);
     }
-    if d.len() != T_BYTES_V2
+    if !tracked_len(d.len())
         || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC
         || d[T_RETIRED] > 1
     {
@@ -424,7 +539,7 @@ fn change_template_run_count(template: &AccountInfo, delta: i8) -> ProgramResult
         return Err(err(35));
     }
     let mut d = template.try_borrow_mut_data()?;
-    if d.len() != T_BYTES_V2 || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC {
+    if !tracked_len(d.len()) || &d[T_TRACKING..T_TRACKING + 4] != T_TRACKING_MAGIC {
         return Err(err(4));
     }
     let count = u32_at(&d, T_ACTIVE_RUNS)?;
@@ -492,8 +607,21 @@ fn trailer_extra(r: &[u8]) -> Result<usize, ProgramError> {
     match r.get(R_VERSION).copied() {
         Some(0) => Ok(0),
         Some(1) => Ok(R_REMAINDER_BYTES),
+        // Version 2 (pipelines slice 1): remainder_to, then the pending-import
+        // bitmap (bit i: the template's import i is not yet verified).
+        Some(2) if cfg!(feature = "pipelines-v1") => Ok(R_REMAINDER_BYTES + R_IMPORTS_BYTES),
         _ => Err(err(8)),
     }
+}
+
+const R_IMPORTS_BYTES: usize = 4;
+
+/// The pending-import bitmap's offset on a version-2 run (None otherwise).
+fn pending_imports_at(r: &[u8]) -> Result<Option<usize>, ProgramError> {
+    if r.get(R_VERSION).copied() != Some(2) {
+        return Ok(None);
+    }
+    Ok(Some(load_offset(r)? + R_LOAD_BYTES + R_REMAINDER_BYTES))
 }
 
 /// Who receives a convicted executor's bond remainder: the payer on a
@@ -501,7 +629,7 @@ fn trailer_extra(r: &[u8]) -> Result<usize, ProgramError> {
 fn remainder_to(r: &[u8]) -> Result<[u8; 32], ProgramError> {
     match r.get(R_VERSION).copied() {
         Some(0) => key32(r, R_PAYER),
-        Some(1) => key32(r, load_offset(r)? + R_LOAD_BYTES),
+        Some(1 | 2) => key32(r, load_offset(r)? + R_LOAD_BYTES),
         _ => Err(err(8)),
     }
 }
@@ -548,6 +676,7 @@ pub fn process(
         SUB_TEST_CREATE_LEGACY_TEMPLATE => create_template_inner(program_id, accounts, &data[2..], false),
         SUB_INIT_RUN => init_run(program_id, accounts, &data[2..], false),
         SUB_INIT_RUN_V1 => init_run(program_id, accounts, &data[2..], true),
+        SUB_IMPORT if cfg!(feature = "pipelines-v1") => import(program_id, accounts, &data[2..]),
         SUB_COMMIT => commit(program_id, accounts, &data[2..], manifest),
         SUB_OPEN => open(program_id, accounts, &data[2..], manifest),
         lx::SUB_LX_MIDPOINTS => lx::midpoints(program_id, accounts, &data[2..]),
@@ -585,8 +714,11 @@ fn create_template(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     create_template_inner(program_id, accounts, data, true)
 }
 
-fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], track_close: bool) -> ProgramResult {
+fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], full: &[u8], track_close: bool) -> ProgramResult {
     let [admitter, tmpl, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    // An import table (pipelines slice 1) ends the create data; the id hashes
+    // all of it, the table included.
+    let (data, import_tail) = split_import_tail(full)?;
     const FIXED: usize = 1 + 6 * 8 + 8 + 32 + 2 + 32;
     if !admitter.is_signer || data.len() < FIXED {
         return Err(ProgramError::InvalidInstructionData);
@@ -664,8 +796,15 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     };
     let count = blocks.len();
     check_blocks(&blocks, total_steps)?;
-    let template_id = sha256(&[TEMPLATE_DOMAIN, data]);
-    let template_bytes = if track_close { T_BYTES_V2 } else { T_BYTES };
+    if import_tail.is_some() && (lx_tail.is_some() || !track_close) {
+        return Err(err(6));
+    }
+    let template_id = sha256(&[TEMPLATE_DOMAIN, full]);
+    let template_bytes = match (track_close, import_tail.is_some()) {
+        (false, _) => T_BYTES,
+        (true, false) => T_BYTES_V2,
+        (true, true) => T_BYTES_V3,
+    };
     if track_close {
         create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id, admitter.key.as_ref()], template_bytes)?;
     } else {
@@ -694,6 +833,10 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
         d[T_PAYER..T_PAYER + 32].copy_from_slice(admitter.key.as_ref());
         d[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&0u32.to_le_bytes());
         d[T_RETIRED] = 0;
+    }
+    if let Some(tail) = import_tail {
+        d[T_IMPORTS..T_IMPORTS + 4].copy_from_slice(T_IMPORTS_MAGIC);
+        d[T_IMPORTS + 4..T_IMPORTS + tail.len()].copy_from_slice(&tail[4..]);
     }
     Ok(())
 }
@@ -749,10 +892,22 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool
         return Err(err(31));
     }
     let template_id = key32(&tmpl.try_borrow_data()?, 96)?;
+    // A template with imported inputs (pipelines slice 1) takes version-1
+    // init (a remainder destination) and makes a version-2 run, whose
+    // pending-import bitmap starts with every import outstanding. Each import
+    // names one of the run's external refs.
+    let imports = template_imports(&tmpl.try_borrow_data()?)?;
+    if !imports.is_empty() {
+        let has_ref = |id: u32| (0..n).any(|i| u32_at(refs, 52 * i).is_ok_and(|x| x == id));
+        if !v1 || imports.iter().any(|i| !has_ref(i.external_id)) {
+            return Err(err(51));
+        }
+    }
+    let imports_extra = if imports.is_empty() { 0 } else { R_IMPORTS_BYTES };
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &data[0..32], &(n as u32).to_le_bytes(), refs, &data[32..64]]);
     // The payer is part of the run's address (review 10-03, F5): a cancelled
     // run cannot be re-initialized at the same address by someone else.
-    let space = R_REFS + refs.len() + R_LOAD_BYTES + extra;
+    let space = R_REFS + refs.len() + R_LOAD_BYTES + extra + imports_extra;
     create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], space)?;
     // Fund the D21Q receipt's rent now if the run is shorter than it, so
     // anyone can close it later (close_run); the payer gets it back then.
@@ -770,6 +925,12 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool
         let at = R_REFS + refs.len() + R_LOAD_BYTES;
         d[at..at + 32].copy_from_slice(&data[refs_end..refs_end + 32]);
     }
+    if !imports.is_empty() {
+        d[R_VERSION] = 2;
+        let at = R_REFS + refs.len() + R_LOAD_BYTES + R_REMAINDER_BYTES;
+        let pending: u32 = (1u32 << imports.len()) - 1;
+        d[at..at + 4].copy_from_slice(&pending.to_le_bytes());
+    }
     d[R_TEMPLATE..R_TEMPLATE + 32].copy_from_slice(tmpl.key.as_ref());
     d[R_PAYER..R_PAYER + 32].copy_from_slice(payer.key.as_ref());
     d[R_EXECUTOR..R_EXECUTOR + 32].copy_from_slice(&data[32..64]);
@@ -785,6 +946,88 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool
     if let Some(next) = next_active_runs {
         let mut t = tmpl.try_borrow_mut_data()?;
         t[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&next.to_le_bytes());
+    }
+    Ok(())
+}
+
+// 29: [caller(s), run(w), template, source, source template (optional)]
+// external_id:u32 drq_len:u16 DRQ1[drq_len], then for an OUT_TREE_V21 import
+// the output's ValueRefV1[55] path_len:u8 path[32 x path_len] (nothing for a
+// whole-state STATE_TREE_V1 import). Pipelines design §3.1: reads the source's
+// final result (a v2.1 run of `host`, live or receipt, or a sealed session of
+// `host`), requires it to meet the requirements whose digest the template
+// names, and checks that the run's external ref for the input is that result's
+// value. The last import starts the commit deadline afresh.
+fn import(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    use crate::result::{self as res, ResultRequirements};
+    let [caller, run, tmpl, source, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
+    if !caller.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let t = template(program_id, tmpl)?;
+    run_checked(program_id, run, tmpl)?;
+    let imports = template_imports(&tmpl.try_borrow_data()?)?;
+    let external_id = u32_at(data, 0)?;
+    let (index, spec) = imports.iter().enumerate().find(|(_, i)| i.external_id == external_id).ok_or(err(51))?;
+    let drq_len = u16_at(data, 4)? as usize;
+    let drq = data.get(6..6 + drq_len).ok_or(err(1))?;
+    let tail = &data[6 + drq_len..];
+    let requirements = ResultRequirements::decode(drq).map_err(|_| err(51))?;
+    if requirements.digest() != spec.requirements_digest {
+        return Err(err(51));
+    }
+    // The source's final result, read as a consumer reads it.
+    let refused = |e: res::ResultError| {
+        solana_program::msg!("import {}: {:?}", external_id, e);
+        err(51)
+    };
+    let result = if spec.scheme == res::SCHEME_STATE_TREE_V1 {
+        crate::stateful::v3::read_session_result(&spec.host, source).map_err(refused)?
+    } else {
+        res::read_run_result(&spec.host, source, rest.first()).map_err(refused)?
+    };
+    if result.scheme != spec.scheme {
+        return Err(err(51));
+    }
+    result.require(&requirements).map_err(refused)?;
+    let mut r = run.try_borrow_mut_data()?;
+    let at = pending_imports_at(&r)?.ok_or(err(51))?;
+    let pending = u32_at(&r, at)?;
+    if r[R_STATUS] != RUN_OPEN || now()? > u64_at(&r, R_DEADLINE)? || pending & (1 << index) == 0 {
+        return Err(err(51));
+    }
+    let n = u32_at(&r, R_NEXT)? as usize;
+    let slot = (0..n).find(|i| u32_at(&r, R_REFS + 52 * i).is_ok_and(|x| x == external_id)).ok_or(err(51))?;
+    let ext: [u8; 52] = r[R_REFS + 52 * slot..R_REFS + 52 * (slot + 1)].try_into().unwrap();
+    // The external ref holds the value ref's bytes 7..55 (layout, scheme,
+    // length, digest), as EDGE kind 2 compares them.
+    if spec.scheme == res::SCHEME_STATE_TREE_V1 {
+        // The whole state as a chunked value (layout 3, version = chunk log2):
+        // its digest is the tree seal itself.
+        let res::Body::Consensus(c) = &result.body else { return Err(err(51)) };
+        if !tail.is_empty()
+            || u32::from_le_bytes(ext[4..8].try_into().unwrap()) != 3
+            || u16::from_le_bytes(ext[8..10].try_into().unwrap()) != u16::from(c.chunk_log2)
+            || u64::from(u32::from_le_bytes(ext[16..20].try_into().unwrap())) != result.count
+            || ext[20..52] != result.root
+        {
+            return Err(err(51));
+        }
+    } else {
+        let vref: [u8; D::VALUE_REF_BYTES] = tail.get(..D::VALUE_REF_BYTES).ok_or(err(1))?.try_into().unwrap();
+        let h = *tail.get(D::VALUE_REF_BYTES).ok_or(err(1))? as usize;
+        let path_bytes = tail.get(D::VALUE_REF_BYTES + 1..).ok_or(err(1))?;
+        if path_bytes.len() != 32 * h || ext[4..52] != vref[7..55] {
+            return Err(err(51));
+        }
+        let path: Vec<[u8; 32]> = path_bytes.chunks(32).map(|c| c.try_into().unwrap()).collect();
+        result.open_output(spec.out_index, &vref, &path).map_err(refused)?;
+    }
+    let pending = pending & !(1 << index);
+    r[at..at + 4].copy_from_slice(&pending.to_le_bytes());
+    if pending == 0 {
+        let deadline = now()?.checked_add(t.challenge_window).ok_or(err(8))?;
+        r[R_DEADLINE..R_DEADLINE + 8].copy_from_slice(&deadline.to_le_bytes());
     }
     Ok(())
 }
@@ -806,6 +1049,12 @@ fn commit(
         }
         if d[R_STATUS] != RUN_OPEN || now()? > u64_at(&d, R_DEADLINE)? {
             return Err(err(7));
+        }
+        // Every imported input verified first (pipelines slice 1).
+        if let Some(at) = pending_imports_at(&d)? {
+            if u32_at(&d, at)? != 0 {
+                return Err(err(52));
+            }
         }
     }
     let lx_root;

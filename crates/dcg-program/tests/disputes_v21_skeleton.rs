@@ -2928,3 +2928,173 @@ async fn a_refuted_run_is_not_a_result() {
     assert_eq!(ch.run_status().await, V::RUN_REFUTED);
     assert_eq!(run_result(&mut ch).await, Err(dcg_program::result::ResultError::NotFinal));
 }
+
+// --- imported inputs (pipelines slice 1 D) ------------------------------------------------------
+
+#[cfg(feature = "pipelines-v1")]
+fn refusal(code: u32) -> Result<(), TransactionError> {
+    Err(TransactionError::InstructionError(0, solana_instruction::error::InstructionError::Custom(0x6600 + code)))
+}
+
+/// Create data for a one-step, one-output template (no blocks) whose ids and
+/// roots are placeholders, ending with `imports` as an import table.
+#[cfg(feature = "pipelines-v1")]
+fn import_template_data(imports: &[V::ImportSpec]) -> Vec<u8> {
+    let mut data = vec![1u8];
+    for x in [1u64, 1, 750, 750, EXECUTOR_BOND, CHALLENGER_BOND] {
+        data.extend_from_slice(&x.to_le_bytes());
+    }
+    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&[0x5A; 32]);
+    data.extend_from_slice(&SLASHER_BPS.to_le_bytes());
+    data.extend_from_slice(&[0x5B; 32]);
+    if !imports.is_empty() {
+        data.extend_from_slice(V::IMPORT_TAIL_MAGIC);
+        data.push(imports.len() as u8);
+        data.extend_from_slice(&[0; 3]);
+        for i in imports {
+            data.extend_from_slice(&i.encode());
+        }
+    }
+    data
+}
+
+/// IMPORT data for an out-tree import.
+#[cfg(feature = "pipelines-v1")]
+fn import_data(external_id: u32, drq: &[u8], vref: &[u8], path: &[D::Hash]) -> Vec<u8> {
+    let mut d = external_id.to_le_bytes().to_vec();
+    d.extend_from_slice(&(drq.len() as u16).to_le_bytes());
+    d.extend_from_slice(drq);
+    d.extend_from_slice(vref);
+    d.push(path.len() as u8);
+    for p in path {
+        d.extend_from_slice(p);
+    }
+    d
+}
+
+/// Pipelines slice 1 D (design §3.1): a template imports another run's output.
+/// Its run is version 2 and commits only once every import is verified: from
+/// the source run live (with its template) and from its D21Q receipt (alone).
+/// A wrong requirement, path, value or source, an import twice, a run without
+/// the imported ref and a version-0 init are refused.
+#[cfg(feature = "pipelines-v1")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_imports_a_final_runs_output_and_commits_once_every_import_is_verified() {
+    use dcg_program::result::{self as res, ResultRequirements};
+    let mut ch = Chain::new(750).await;
+    let c = ch.honest();
+    finalize_honest(&mut ch).await;
+    let a_template = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap().data;
+    let a_template_id: [u8; 32] = a_template[96..128].try_into().unwrap();
+    let out0: [u8; 55] = c.outs[0].as_slice().try_into().unwrap();
+    let out_hashes: Vec<D::Hash> = c.outs.iter().enumerate().map(|(j, e)| D::out_leaf(&Soft, j as u64, Some(e))).collect();
+    let path0 = path(&levels(D::Tree::Out, &out_hashes), 0);
+
+    // Template B: inputs 5 and 6 are A's output 0; input 9 is a plain input.
+    let req = ResultRequirements { mode: Some(res::MODE_OPTIMISTIC), template_id: Some(a_template_id), min_challenge_window: Some(750), ..Default::default() };
+    let spec = |id| V::ImportSpec { external_id: id, scheme: res::SCHEME_OUT_TREE_V21, out_index: 0, requirements_digest: req.digest(), host: PROGRAM };
+    let data = import_template_data(&[spec(5), spec(6)]);
+    let b_id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
+    let admitter = kp(0xA1);
+    let b_template = Pubkey::find_program_address(&[b"dcg21tmpl", &b_id, admitter.pubkey().as_ref()], &PROGRAM).0;
+    let create = |d: &[u8], t: Pubkey| ix(V::SUB_CREATE_TEMPLATE, d, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(t, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    // Unsorted or duplicate import ids are not canonical.
+    let unsorted = import_template_data(&[spec(6), spec(5)]);
+    let u_id = sha256(&[V::TEMPLATE_DOMAIN, &unsorted]);
+    let u_template = Pubkey::find_program_address(&[b"dcg21tmpl", &u_id, admitter.pubkey().as_ref()], &PROGRAM).0;
+    assert_eq!(send(&mut ch.ctx, create(&unsorted, u_template), &[&admitter]).await, refusal(6));
+    send(&mut ch.ctx, create(&data, b_template), &[&admitter]).await.unwrap();
+
+    // Init: version 1 only, and every import names one of the run's refs.
+    let executor = kp(0xE1);
+    let ext = |id: u32| {
+        let mut r = id.to_le_bytes().to_vec();
+        r.extend_from_slice(&out0[7..55]);
+        r
+    };
+    let init = |ids: &[u32], v1: bool| {
+        let mut d = vec![0x77u8; 32];
+        d.extend_from_slice(executor.pubkey().as_ref());
+        d.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in ids {
+            d.extend(ext(*id));
+        }
+        if v1 {
+            d.extend_from_slice(kp(0xB1).pubkey().as_ref());
+        }
+        let mut refs = Vec::new();
+        for id in ids {
+            refs.extend(ext(*id));
+        }
+        let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &b_id, &[0x77; 32], &(ids.len() as u32).to_le_bytes(), &refs, executor.pubkey().as_ref()]);
+        let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
+        let sub = if v1 { V::SUB_INIT_RUN_V1 } else { V::SUB_INIT_RUN };
+        (ix(sub, &d, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(b_template, false), AccountMeta::new_readonly(SYSTEM, false)]), run, run_id)
+    };
+    assert_eq!(send(&mut ch.ctx, init(&[5, 6, 9], false).0, &[&admitter]).await, refusal(51), "version 0");
+    assert_eq!(send(&mut ch.ctx, init(&[5, 9], true).0, &[&admitter]).await, refusal(51), "input 6 missing");
+    let (i, run, run_id) = init(&[5, 6, 9], true);
+    send(&mut ch.ctx, i, &[&admitter]).await.unwrap();
+    let r = ch.ctx.banks_client.get_account(run).await.unwrap().unwrap();
+    assert_eq!(r.data[5], 2, "version 2");
+    assert_eq!(&r.data[r.data.len() - 4..], &3u32.to_le_bytes(), "both imports pending");
+
+    let mut root = Vec::new();
+    root.extend_from_slice(&[0x5B; 32]);
+    root.extend_from_slice(&run_id);
+    root.extend_from_slice(&[0x5A; 32]);
+    root.extend_from_slice(&1u64.to_le_bytes());
+    root.extend_from_slice(&[0x11; 32]);
+    root.extend_from_slice(&1u64.to_le_bytes());
+    root.extend_from_slice(&[0x12; 32]);
+    let commit = ix(V::SUB_COMMIT, &root, vec![AccountMeta::new(executor.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(b_template, false), AccountMeta::new_readonly(SYSTEM, false)]);
+    assert_eq!(send(&mut ch.ctx, commit.clone(), &[&executor]).await, refusal(52), "imports pending");
+
+    let caller = kp(0xC1);
+    let import = |d: Vec<u8>, source: Pubkey, source_template: Option<Pubkey>| {
+        let mut accounts = vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new_readonly(b_template, false), AccountMeta::new_readonly(source, false)];
+        if let Some(t) = source_template {
+            accounts.push(AccountMeta::new_readonly(t, false));
+        }
+        ix(V::SUB_IMPORT, &d, accounts)
+    };
+    let drq = req.encode();
+    let weaker = ResultRequirements { min_challenge_window: Some(1), ..req }.encode();
+    let mut wrong_value = out0;
+    wrong_value[54] ^= 1;
+    let mut wrong_path = path0.clone();
+    if let Some(p) = wrong_path.first_mut() {
+        p[0] ^= 1;
+    }
+    for (what, d, source) in [
+        ("requirements not the template's", import_data(5, &weaker, &out0, &path0), ch.run),
+        ("a value not the run's ref", import_data(5, &drq, &wrong_value, &path0), ch.run),
+        ("a source that is not final", import_data(5, &drq, &out0, &path0), run),
+        ("an input that is not imported", import_data(9, &drq, &out0, &path0), ch.run),
+    ] {
+        let t = if source == run { b_template } else { ch.template };
+        assert_eq!(send(&mut ch.ctx, import(d, source, Some(t)), &[&caller]).await, refusal(51), "{what}");
+    }
+    if !path0.is_empty() {
+        assert_eq!(send(&mut ch.ctx, import(import_data(5, &drq, &out0, &wrong_path), ch.run, Some(ch.template)), &[&caller]).await, refusal(51), "a wrong path");
+    }
+    // Input 5 from the live run, with its template.
+    send(&mut ch.ctx, import(import_data(5, &drq, &out0, &path0), ch.run, Some(ch.template)), &[&caller]).await.unwrap();
+    assert_eq!(send(&mut ch.ctx, import(import_data(5, &drq, &out0, &path0), ch.run, Some(ch.template)), &[&caller]).await, refusal(51), "twice");
+    assert_eq!(send(&mut ch.ctx, commit.clone(), &[&executor]).await, refusal(52), "one import pending");
+    // Input 6 from A's D21Q receipt, after A's template closed.
+    ch.close_run(0xC1).await.unwrap();
+    ch.close_template().await.unwrap();
+    assert_eq!(send(&mut ch.ctx, import(import_data(6, &drq, &out0, &path0), ch.run, Some(ch.template)), &[&caller]).await, refusal(51), "a closed template account");
+    send(&mut ch.ctx, import(import_data(6, &drq, &out0, &path0), ch.run, None), &[&caller]).await.unwrap();
+    let r = ch.ctx.banks_client.get_account(run).await.unwrap().unwrap();
+    assert_eq!(&r.data[r.data.len() - 4..], &0u32.to_le_bytes());
+    let now = ch.ctx.banks_client.get_sysvar::<solana_program::clock::Clock>().await.unwrap().slot;
+    assert_eq!(u64::from_le_bytes(r.data[144..152].try_into().unwrap()), now + 750, "the commit deadline starts afresh");
+    send(&mut ch.ctx, commit, &[&executor]).await.unwrap();
+    // The imported run is a result like any other (version-2 layout).
+    let b = ch.ctx.banks_client.get_account(b_template).await.unwrap().unwrap();
+    assert_eq!(res::read_run_result_bytes(&PROGRAM, (&run, &r.owner, &ch.ctx.banks_client.get_account(run).await.unwrap().unwrap().data), Some((&b_template, &b.owner, &b.data))).err(), Some(res::ResultError::NotFinal));
+}
