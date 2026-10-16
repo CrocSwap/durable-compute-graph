@@ -1,7 +1,8 @@
 # Mixed modes in one template: pipelines of single-mode stages (2026-10-15)
 
-**Status: designed, not started (owner 2026-10-15: design mixed regions
-now; mode results §8 answered the same day, folded into slice 1).** Numbers are *estimated* unless marked *measured*. Builds on
+**Status: designed and accepted, not started (owner 2026-10-15: design
+mixed regions now; mode results §8 answered the same day, folded into slice
+1; 2026-10-16: every §11 recommendation accepted).** Numbers are *estimated* unless marked *measured*. Builds on
 `mode-results-v1.md` (merged to main 2026-10-15) and on the v2.1 design
 (`optimistic-descent-v2.1.md`, §11 reserved per-region modes). Follows the
 composition rules of Basanos `docs/design/dcg-graph-sweeps-modes-2026-09-30.md`
@@ -376,8 +377,9 @@ honest-challenger assumption.
 
 New, all additive to existing accounts and records:
 - spec leaf type 10 (`ImportSpec`), `DRQ1`, run account version 2;
-- the template `mode` field (v2.1 template id gains it; existing templates are
-  optimistic and keep their ids under a version rule decided at implementation);
+- the template `mode` field, bound by a new template id domain
+  `dcg.template.id.v2.2\0` (§11 decision 6); existing templates keep their
+  v2.1 ids and are optimistic;
 - `EXECUTE`, `EXECUTE_SKIP`, `FOLD_OUTPUTS`, the leaf table;
 - `DPT1`, `DPR1` and their instructions;
 - the `(consensus, OUT_TREE_V21)` result pair.
@@ -434,23 +436,23 @@ alone lets a whole template run in consensus.
 Decided 2026-10-15: mode results §8 Q1 (anyone seals; §3.4 B), Q2 (receipts
 carry the template id; §3.4 A) and Q3 (tree seals; §3.4 C), all in slice 1.
 
-Open:
+Decided 2026-10-16 (owner accepted every recommendation):
+1. "Mixed regions" means pipelines of single-mode stages (§2); proven blocks
+   inside one tree are rejected (§2.1).
+2. Slice 1 is built first.
+3. Consensus stages are consensus v2.1 runs with permissionless execution
+   (§3.2), not v3 sessions; sessions may join later as stages from other
+   hosts.
+4. Each slice is built behind a feature on the test image and trialled with a
+   workload (qushta or Basanos) before the shared-image upgrade.
+5. Per-kernel modes chosen by the executor are deferred (§12); slice 2
+   reserves their fields in the step spec and leaf.
+6. Template ids take the `mode` field through a **new id domain**,
+   `dcg.template.id.v2.2\0`, over the v2.1 fields plus `mode` (and the reserved
+   per-kernel mode fields). Existing templates keep their v2.1 ids and read as
+   optimistic; readers accept both domains (option A, slice 2).
 
-1. Adopt the stage model (pipelines of single-mode stages) as the meaning of
-   "mixed regions", rejecting proven blocks inside one tree (§2.1).
-   Recommended.
-2. Build slice 1 first; it is useful without pipelines. Recommended.
-3. Consensus stages as consensus v2.1 runs with permissionless execution
-   (§3.2), rather than v3 sessions. Recommended: the graph and kernels stay
-   the same across modes, and sessions remain the streaming consensus form.
-   Sessions as stages come later through foreign hosts.
-4. Build behind a feature on the test image first and trial it with a
-   workload (qushta or Basanos) before the shared-image upgrade. Recommended.
-5. Decided 2026-10-16: per-kernel modes chosen by the executor are deferred
-   (§12); slice 2 reserves their fields in the step spec and leaf.
-6. How existing v2.1 template ids absorb the `mode` field: a new template id
-   domain for mode-carrying templates (old ids unchanged), or mode only in a
-   new template version. Decide at slice 2.
+Open: the go to start building slice 1.
 
 ## 12. Per-kernel modes chosen by the executor (evaluated 2026-10-16, deferred)
 
