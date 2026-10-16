@@ -43,6 +43,12 @@ pub const SCHEME_OUT_TREE_V21: u8 = 1;
 pub const SCHEME_LX_OUTPUTS_V1: u8 = 2;
 /// The whole final state rehashes to a session seal.
 pub const SCHEME_STATE_SEAL_V1: u8 = 3;
+/// `root` is a session's tree seal: the v2.1 chunked-value digest of its
+/// final state, in chunks of `2^chunk_log2` bytes (pipelines design §3.4 C).
+pub const SCHEME_STATE_TREE_V1: u8 = 4;
+/// The chunk sizes a tree seal may use (v2.1 chunked values, §4.2).
+pub const TREE_SEAL_LOG2_MIN: u8 = 6;
+pub const TREE_SEAL_LOG2_MAX: u8 = 16;
 
 pub const SEAL_INIT_DOMAIN: &[u8] = b"dcg/state-seal-init/1";
 pub const SEAL_CHUNK_DOMAIN: &[u8] = b"dcg/state-seal-chunk/1";
@@ -145,6 +151,9 @@ pub struct ConsensusBody {
     pub input_root: [u8; 32],
     pub stream_root: [u8; 32],
     pub resource_commitment: [u8; 32],
+    /// A tree seal's chunk size as a power of two (body byte 33); 0 for the
+    /// linear seal.
+    pub chunk_log2: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +285,7 @@ impl ResultRef {
                 b[26..30].copy_from_slice(&c.resource_schema.id.to_le_bytes());
                 b[30..32].copy_from_slice(&c.resource_schema.version.to_le_bytes());
                 b[32] = c.features;
+                b[33] = c.chunk_log2;
                 b[36..40].copy_from_slice(&c.halt_reason.to_le_bytes());
                 b[40..44].copy_from_slice(&c.halt_cursor.to_le_bytes());
                 b[48..80].copy_from_slice(&c.input_root);
@@ -311,8 +321,13 @@ impl ResultRef {
                     steps: u64_at(b, 128),
                 })
             }
-            (MODE_CONSENSUS, SCHEME_STATE_SEAL_V1) => {
-                if b[33..36].iter().any(|x| *x != 0) || b[44..48].iter().any(|x| *x != 0) {
+            (MODE_CONSENSUS, SCHEME_STATE_SEAL_V1 | SCHEME_STATE_TREE_V1) => {
+                let log2_ok = if scheme == SCHEME_STATE_TREE_V1 {
+                    (TREE_SEAL_LOG2_MIN..=TREE_SEAL_LOG2_MAX).contains(&b[33])
+                } else {
+                    b[33] == 0
+                };
+                if !log2_ok || b[34..36].iter().any(|x| *x != 0) || b[44..48].iter().any(|x| *x != 0) {
                     return Err(ResultError::Layout);
                 }
                 Body::Consensus(ConsensusBody {
@@ -327,6 +342,7 @@ impl ResultRef {
                     input_root: key_at(b, 48),
                     stream_root: key_at(b, 80),
                     resource_commitment: key_at(b, 112),
+                    chunk_log2: b[33],
                 })
             }
             _ => return Err(ResultError::Layout),
@@ -465,14 +481,120 @@ impl ResultRef {
             return Err(ResultError::Opening);
         };
         let total: u64 = spans.iter().map(|s| s.len() as u64).sum();
-        if self.scheme != SCHEME_STATE_SEAL_V1 || total != self.count || total > u64::from(u32::MAX) {
+        if total != self.count || total > u64::from(u32::MAX) {
             return Err(ResultError::Opening);
         }
-        if seal_digest_spans(c, spans) != self.root {
+        let digest = match self.scheme {
+            SCHEME_STATE_SEAL_V1 => seal_digest_spans(c, spans),
+            SCHEME_STATE_TREE_V1 => tree_seal_spans(spans, c.chunk_log2),
+            _ => return Err(ResultError::Opening),
+        };
+        if digest != self.root {
             return Err(ResultError::Opening);
         }
         Ok(())
     }
+
+    /// Open one chunk of a tree-sealed state (scheme `STATE_TREE_V1`): chunk
+    /// `index` of `2^chunk_log2` bytes (the last may be shorter) with its
+    /// sibling path, of height `tree_height(leaves)`.
+    pub fn open_state_chunk(&self, index: u64, chunk: &[u8], path: &[[u8; 32]]) -> Result<(), ResultError> {
+        let Body::Consensus(c) = &self.body else {
+            return Err(ResultError::Opening);
+        };
+        if self.scheme != SCHEME_STATE_TREE_V1 {
+            return Err(ResultError::Opening);
+        }
+        let size = 1u64 << c.chunk_log2;
+        let leaves = tree_seal_leaves(self.count, c.chunk_log2);
+        if index >= leaves {
+            return Err(ResultError::Opening);
+        }
+        let want = if index + 1 == leaves { self.count - index * size } else { size };
+        if chunk.len() as u64 != want || path.len() != tree_height(leaves) {
+            return Err(ResultError::Opening);
+        }
+        let leaf = D::chunk_leaf(&Hasher, index, chunk);
+        if D::root_from_path(&Hasher, D::Tree::Chunk, &leaf, index, path) != self.root {
+            return Err(ResultError::Opening);
+        }
+        Ok(())
+    }
+}
+
+/// The number of chunks of a tree seal over `total` bytes.
+pub fn tree_seal_leaves(total: u64, chunk_log2: u8) -> u64 {
+    total.div_ceil(1u64 << chunk_log2).max(1)
+}
+
+/// Append a node at level `base` to `frontier`, a binary counter of complete
+/// left subtrees: after `count` appends, `frontier[j]` (at level `base + j`)
+/// is occupied exactly when bit `j` of `count` is set. The program keeps a
+/// tree seal's frontier in its anchor account between transactions.
+pub fn frontier_push(frontier: &mut [[u8; 32]], count: u64, base: u16, mut node: [u8; 32]) -> Result<(), ResultError> {
+    let mut j = 0usize;
+    while (count >> j) & 1 == 1 {
+        node = D::node(&Hasher, D::Tree::Chunk, base + j as u16, frontier.get(j).ok_or(ResultError::Layout)?, &node);
+        j += 1;
+    }
+    *frontier.get_mut(j).ok_or(ResultError::Layout)? = node;
+    Ok(())
+}
+
+/// The root of the chunk tree of height `height` over the `count` nodes
+/// pushed at level `base` (`count <= 2^(height - base)`), padded with
+/// `EMPTY_CHUNK`.
+pub fn frontier_root(frontier: &[[u8; 32]], count: u64, base: u16, height: u16) -> [u8; 32] {
+    let levels = height - base;
+    let mut empty = D::empty(&Hasher, D::Tree::Chunk, base);
+    if count == 1u64 << levels {
+        return frontier[levels as usize];
+    }
+    let mut tail: Option<[u8; 32]> = None;
+    for j in 0..levels {
+        let level = base + j;
+        let left = ((count >> j) & 1 == 1).then(|| frontier[j as usize]);
+        tail = match (left, tail) {
+            (Some(left), Some(right)) => Some(D::node(&Hasher, D::Tree::Chunk, level, &left, &right)),
+            (Some(left), None) => Some(D::node(&Hasher, D::Tree::Chunk, level, &left, &empty)),
+            (None, Some(right)) => Some(D::node(&Hasher, D::Tree::Chunk, level, &right, &empty)),
+            (None, None) => None,
+        };
+        empty = D::node(&Hasher, D::Tree::Chunk, level, &empty, &empty);
+    }
+    tail.unwrap_or(empty)
+}
+
+/// Hash chunk-tree leaf `index`, the bytes `from..to` of the concatenated
+/// `spans` (a chunk may cross spans).
+pub fn chunk_leaf_spans(spans: &[&[u8]], index: u64, from: u64, to: u64) -> [u8; 32] {
+    let index_bytes = index.to_le_bytes();
+    let mut parts = crate::hash::Parts::new();
+    parts.push(D::CHUNK_LEAF_DOMAIN).push(&index_bytes);
+    let mut at = 0u64;
+    for span in spans {
+        let end = at + span.len() as u64;
+        let (a, b) = (from.max(at), to.min(end));
+        if a < b {
+            parts.push(&span[(a - at) as usize..(b - at) as usize]);
+        }
+        at = end;
+    }
+    parts.finish()
+}
+
+/// The tree seal of a state given as spans in order: the v2.1 chunked-value
+/// digest of their concatenation in chunks of `2^chunk_log2` bytes.
+pub fn tree_seal_spans(spans: &[&[u8]], chunk_log2: u8) -> [u8; 32] {
+    let total: u64 = spans.iter().map(|s| s.len() as u64).sum();
+    let size = 1u64 << chunk_log2;
+    let leaves = tree_seal_leaves(total, chunk_log2);
+    let mut frontier = [[0u8; 32]; 64];
+    for i in 0..leaves {
+        let leaf = chunk_leaf_spans(spans, i, i * size, ((i + 1) * size).min(total));
+        frontier_push(&mut frontier, i, 0, leaf).expect("64 levels cover any u64 count");
+    }
+    frontier_root(&frontier, leaves, 0, tree_height(leaves) as u16)
 }
 
 /// The v2.1 tree height over `count` leaves: `ceil(log2 max(count, 1))`.
@@ -663,6 +785,58 @@ pub fn read_run_result_bytes(
 mod tests {
     use super::*;
 
+    /// The chunk tree built level by level, as v2.1 §6.1 states it.
+    fn naive_tree_seal(state: &[u8], log2: u8) -> [u8; 32] {
+        let size = 1usize << log2;
+        let n = state.len().div_ceil(size).max(1);
+        let mut level: Vec<[u8; 32]> =
+            (0..n).map(|i| D::chunk_leaf(&Hasher, i as u64, &state[i * size..((i + 1) * size).min(state.len())])).collect();
+        let height = tree_height(n as u64);
+        level.resize(1 << height, D::empty(&Hasher, D::Tree::Chunk, 0));
+        for l in 0..height {
+            level = level.chunks(2).map(|p| D::node(&Hasher, D::Tree::Chunk, l as u16, &p[0], &p[1])).collect();
+        }
+        level[0]
+    }
+
+    #[test]
+    fn the_streaming_tree_seal_is_the_chunk_tree() {
+        for log2 in [6u8, 7, 10, 16] {
+            for len in [0usize, 1, 63, 64, 65, 127, 128, 129, 1000, 4096, 4097, 70_000, 131_073] {
+                let state: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+                let want = naive_tree_seal(&state, log2);
+                assert_eq!(tree_seal_spans(&[&state], log2), want, "log2 {log2} len {len}");
+                let cut = len / 3;
+                assert_eq!(tree_seal_spans(&[&state[..cut], &state[cut..]], log2), want, "split log2 {log2} len {len}");
+                // The program's shape: one subtree per 64 KiB, folded at its
+                // base level (the whole tree if smaller).
+                if len > 0 {
+                    let size = 1u64 << log2;
+                    let leaves = tree_seal_leaves(len as u64, log2);
+                    let height = tree_height(leaves) as u16;
+                    let base = height.min(16 - u16::from(log2));
+                    let mut frontier = [[0u8; 32]; 17];
+                    let mut count = 0u64;
+                    for offset in (0..len).step_by(65_536) {
+                        let end = (offset + 65_536).min(len);
+                        let mut local = [[0u8; 32]; 17];
+                        let first = offset as u64 >> log2;
+                        let k = (end - offset) as u64;
+                        let k = k.div_ceil(size);
+                        for i in 0..k {
+                            let index = first + i;
+                            let to = ((index + 1) * size).min(len as u64);
+                            frontier_push(&mut local, i, 0, chunk_leaf_spans(&[&state], index, index * size, to)).unwrap();
+                        }
+                        frontier_push(&mut frontier, count, base, frontier_root(&local, k, 0, base)).unwrap();
+                        count += 1;
+                    }
+                    assert_eq!(frontier_root(&frontier, count, base, height), want, "chunked log2 {log2} len {len}");
+                }
+            }
+        }
+    }
+
     fn consensus() -> ResultRef {
         ResultRef {
             scheme: SCHEME_STATE_SEAL_V1,
@@ -682,6 +856,7 @@ mod tests {
                 input_root: [4; 32],
                 stream_root: [5; 32],
                 resource_commitment: [0; 32],
+                chunk_log2: 0,
             }),
         }
     }

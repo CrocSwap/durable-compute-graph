@@ -730,3 +730,146 @@ async fn anyone_may_seal_and_only_the_authority_trims_before_a_seal() {
     tick(&mut ctx, &auth, active, 0, 3).await.unwrap();
     assert_eq!(send(&mut ctx, begin(payer, alice.pubkey(), active, v3::ANCHOR_OP_BEGIN, 3), &[&alice]).await, Err(v3::REFUSAL_AUTHORITY));
 }
+
+// --- tree seals (pipelines slice 1 C) -----------------------------------------------------------
+
+#[cfg(feature = "pipelines-v1")]
+fn begin_tree(payer: Pubkey, auth: Pubkey, s: Pubkey, cursor: u32, log2: u8) -> Instruction {
+    let mut i = begin(payer, auth, s, v3::ANCHOR_OP_TREE_SEAL, cursor);
+    i.data.push(log2);
+    i
+}
+
+/// One transaction with a 1.4M compute limit (a tree seal's chunk hashes up
+/// to 1,024 leaves); returns the compute used.
+#[cfg(feature = "pipelines-v1")]
+async fn send_big(ctx: &mut ProgramTestContext, i: Instruction, signers: &[&Keypair]) -> Result<u64, u32> {
+    let blockhash = ctx.get_new_latest_blockhash().await.unwrap();
+    let mut all = vec![&ctx.payer];
+    all.extend_from_slice(signers);
+    let ixs = [solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), i];
+    let tx = Transaction::new(&all, solana_message::Message::new(&ixs, Some(&ctx.payer.pubkey())), blockhash);
+    let out = ctx.banks_client.process_transaction_with_metadata(tx).await.unwrap();
+    match out.result {
+        Ok(()) => Ok(out.metadata.map_or(0, |m| m.compute_units_consumed)),
+        Err(TransactionError::InstructionError(_, InstructionError::Custom(code))) => Err(code),
+        Err(_) => Err(u32::MAX),
+    }
+}
+
+/// The sibling path of chunk `index` in the chunk tree over `state`.
+#[cfg(feature = "pipelines-v1")]
+fn chunk_path(state: &[u8], log2: u8, index: usize) -> Vec<[u8; 32]> {
+    use dcg_program::hash::sha256;
+    let size = 1usize << log2;
+    let n = state.len().div_ceil(size).max(1);
+    let leaf = |i: usize| sha256(&[b"dcg.chunk.leaf.v2.1\0", &(i as u64).to_le_bytes(), &state[i * size..((i + 1) * size).min(state.len())]]);
+    let mut level: Vec<[u8; 32]> = (0..n).map(leaf).collect();
+    let height = res::tree_height(n as u64);
+    let mut empty = sha256(&[b"dcg.chunk.empty.v2.1\0"]);
+    let mut path = Vec::new();
+    let mut at = index;
+    for l in 0..height {
+        if level.len() % 2 == 1 {
+            level.push(empty);
+        }
+        path.push(level[at ^ 1]);
+        level = level.chunks(2).map(|p| sha256(&[b"dcg.chunk.node.v2.1\0", &(l as u16).to_le_bytes(), &p[0], &p[1]])).collect();
+        empty = sha256(&[b"dcg.chunk.node.v2.1\0", &(l as u16).to_le_bytes(), &empty, &empty]);
+        at >>= 1;
+    }
+    path
+}
+
+/// Pipelines slice 1 C (design §3.4 C): a tree seal through the program is the
+/// v2.1 chunked-value digest of the final state, for one chunk and for 80,000
+/// bytes in two transactions at the smallest and largest chunk sizes; a chunk
+/// opens with its path, also one that crosses the span boundary; the record
+/// marks it (byte 1278 bit 2, byte 1279); an aborted tree seal leaves the
+/// anchor account usable for a linear seal.
+#[cfg(feature = "pipelines-v1")]
+#[tokio::test]
+async fn a_tree_seal_is_the_chunked_value_digest_and_opens_by_chunk() {
+    let mut ctx = start().await;
+    let auth = keypair(78);
+    let payer = ctx.payer.pubkey();
+
+    // A 16-byte state: one 64-byte chunk.
+    let s = halted(&mut ctx, &auth, 1).await;
+    for bad in [5u8, 17] {
+        assert_eq!(send(&mut ctx, begin_tree(payer, auth.pubkey(), s, 10, bad), &[&auth]).await, Err(u32::MAX), "log2 {bad}");
+    }
+    send(&mut ctx, begin_tree(payer, auth.pubkey(), s, 10, 6), &[&auth]).await.unwrap();
+    assert_eq!(ctx.banks_client.get_account(anchor_pda(&s)).await.unwrap().unwrap().data.len(), 704);
+    send(&mut ctx, chunk(auth.pubkey(), s, 10, 0), &[&auth]).await.unwrap();
+    send(&mut ctx, finish(auth.pubkey(), s, 10), &[&auth]).await.unwrap();
+    let record = ctx.banks_client.get_account(s).await.unwrap().unwrap();
+    assert_eq!((record.data[1278], record.data[1279]), (1 | 4, 6));
+    let state = state_bytes(&mut ctx, s).await;
+    let result = read(&mut ctx, s).await.unwrap();
+    let res::Body::Consensus(c) = result.body else { panic!("consensus") };
+    assert_eq!((result.scheme, c.chunk_log2, result.count), (res::SCHEME_STATE_TREE_V1, 6, 16));
+    assert_eq!(result.root, res::tree_seal_spans(&[&state], 6));
+    assert_eq!(result.open_state(&state), Ok(()));
+    assert_eq!(result.open_state_chunk(0, &state, &[]), Ok(()));
+    assert_eq!(ResultRef::decode(&result.encode()), Ok(result));
+    // Record bytes claiming a tree seal the program did not write.
+    for (flags, log2) in [(1u8 | 4, 0u8), (1 | 4, 5), (4, 6), (1, 6)] {
+        let mut bad = record.data.clone();
+        bad[1278] = flags;
+        bad[1279] = log2;
+        assert_eq!(v3::read_session_result_bytes(&PROGRAM, &s, &record.owner, &bad).err(), Some(ResultError::Layout), "flags {flags} log2 {log2}");
+    }
+    result_fixture("tree_session", serde_json::json!({
+        "host": hex_of(PROGRAM.as_ref()), "key": hex_of(s.as_ref()), "owner": hex_of(record.owner.as_ref()),
+        "record": hex_of(&record.data), "state": hex_of(&state), "result": hex_of(&result.encode()),
+    }));
+
+    // 80,000 bytes in two transactions, chunks of 64 bytes and of 64 KiB.
+    let commands = [7u8, 9, app::V3_BIG_SEAL_HALT_COMMAND];
+    let n = app::V3_BIG_SEAL_SPAN_BYTES as usize;
+    for (id, log2) in [(2u64, 6u8), (3, 16)] {
+        let s = big_halted(&mut ctx, &auth, id, &commands).await;
+        send(&mut ctx, begin_tree(payer, auth.pubkey(), s, 3, log2), &[&auth]).await.unwrap();
+        let cu0 = send_big(&mut ctx, chunk(auth.pubkey(), s, 3, 0), &[&auth]).await.unwrap();
+        assert_eq!(send(&mut ctx, finish(auth.pubkey(), s, 3), &[&auth]).await, Err(v3::REFUSAL_PHASE_CURSOR), "one chunk to go");
+        let cu1 = send_big(&mut ctx, chunk(auth.pubkey(), s, 3, res::SEAL_CHUNK_BYTES as u32), &[&auth]).await.unwrap();
+        let cu2 = send_big(&mut ctx, finish(auth.pubkey(), s, 3), &[&auth]).await.unwrap();
+        println!("tree seal log2 {log2}: chunk {cu0} CU, last chunk {cu1} CU, finish {cu2} CU");
+        let state = state_bytes(&mut ctx, s).await;
+        let result = read(&mut ctx, s).await.unwrap();
+        assert_eq!((result.scheme, result.count), (res::SCHEME_STATE_TREE_V1, 80_000));
+        assert_eq!(result.root, res::tree_seal_spans(&[&state], log2), "log2 {log2}");
+        let (a, b) = state.split_at(n);
+        assert_eq!(result.open_state_spans(&[a, b]), Ok(()));
+        let size = 1usize << log2;
+        for index in [0usize, n / size, (state.len() - 1) / size] {
+            let chunk = &state[index * size..((index + 1) * size).min(state.len())];
+            assert_eq!(result.open_state_chunk(index as u64, chunk, &chunk_path(&state, log2, index)), Ok(()), "log2 {log2} chunk {index}");
+        }
+        let mut forged = state.clone();
+        forged[n] ^= 1;
+        assert_eq!(result.open_state(&forged), Err(ResultError::Opening));
+    }
+
+    // An aborted tree seal; then a linear seal on the grown anchor account.
+    let s = halted(&mut ctx, &auth, 4).await;
+    send(&mut ctx, begin_tree(payer, auth.pubkey(), s, 10, 7), &[&auth]).await.unwrap();
+    send(&mut ctx, chunk(auth.pubkey(), s, 10, 0), &[&auth]).await.unwrap();
+    send(&mut ctx, abort(auth.pubkey(), s, 10), &[&auth]).await.unwrap();
+    seal(&mut ctx, &auth, s, 10).await.unwrap();
+    let record = ctx.banks_client.get_account(s).await.unwrap().unwrap();
+    assert_eq!((record.data[1278], record.data[1279]), (1, 0));
+    let linear = read(&mut ctx, s).await.unwrap();
+    assert_eq!(linear.scheme, res::SCHEME_STATE_SEAL_V1);
+    assert_eq!(linear.open_state(&state_bytes(&mut ctx, s).await), Ok(()));
+    let anchor = ctx.banks_client.get_account(anchor_pda(&s)).await.unwrap().unwrap();
+    assert!(anchor.data.len() == 704 && anchor.data[116..].iter().all(|b| *b == 0), "the frontier is cleared");
+    // A stranger's tree seal (anyone may seal) equals the authority's.
+    let stranger = keypair(79);
+    let t = halted(&mut ctx, &auth, 5).await;
+    send(&mut ctx, begin_tree(payer, stranger.pubkey(), t, 10, 6), &[&stranger]).await.unwrap();
+    send(&mut ctx, chunk(stranger.pubkey(), t, 10, 0), &[&stranger]).await.unwrap();
+    send(&mut ctx, finish(stranger.pubkey(), t, 10), &[&stranger]).await.unwrap();
+    assert_eq!(read(&mut ctx, t).await.unwrap().root, res::tree_seal_spans(&[&state_bytes(&mut ctx, t).await], 6));
+}

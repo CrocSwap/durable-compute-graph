@@ -268,7 +268,19 @@ of the final state, with its own domains and no link to earlier anchors
     unaffected. Anyone may seal, so the rent is never stuck;
   - the authority can always end a seal someone else began and clean up: an
     abort and a signed close in one transaction leave no gap for another
-    begin.
+    begin;
+  - **tree seals:** `ANCHOR_OP_TREE_SEAL` (0xF9) with one more byte, the chunk
+    size's log2 (6 to 16), begins a seal whose value is the v2.1 chunked-value
+    digest of the final state (`docs/design/optimistic-descent-v2.1.md` §4.2:
+    chunk leaves, the chunk tree's node domain, `EMPTY_CHUNK` padding). Chunk,
+    finish and abort are the anchor's; each 64 KiB chunk instruction folds its
+    chunks into one subtree, and the anchor account grows to 704 bytes (the
+    payer funds it) to keep a frontier of subtree roots between transactions.
+    The record sets byte 1278 bit 2 and keeps the log2 in byte 1279; the result
+    has scheme `STATE_TREE_V1` (4), its body's byte 33 the log2, and one chunk
+    opens with `ResultRef::open_state_chunk` (index, bytes, path). Because the
+    root is a chunked-value digest, a v2.1 run can take the state as a chunked
+    input (pipelines slice 1 D).
 - `stateful::v3::read_session_result` then reads the session as a
   `result::ResultRef` (mode consensus, scheme `STATE_SEAL_V1`), and
   `ResultRef::open_state` / `open_state_spans` check the state bytes against

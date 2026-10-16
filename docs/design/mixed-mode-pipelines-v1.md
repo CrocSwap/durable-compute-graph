@@ -320,7 +320,7 @@ lets an optimistic run take a session's state as a chunked input.
 - The record's `state_anchor` holds that chunked-value digest; byte 1278 bit 2
   marks a tree seal and byte 1279 (zero today, refused if nonzero) holds `v`.
   The `ResultRef` has `root` = the chunked-value digest, `count` = state bytes,
-  and the body's spare bytes 33..36 hold `v`. Its other body fields (kernel,
+  and the body's byte 33 holds `v` (34..36 stay zero). Its other body fields (kernel,
   schemas, halt reason and cursor, input chain and stream roots) are as for
   the linear seal, so the requirements bind the computation as before.
 - Openings: one chunk with its path (about 0.5 CU per byte plus about 150 CU
@@ -333,6 +333,21 @@ lets an optimistic run take a session's state as a chunked input.
   its windows so the payer can keep them open, or the challenger relies on its
   own copy taken at seal (stated in the result's basis).
 - The linear seal stays for small states read whole on chain.
+
+Implemented 2026-10-16 behind feature `pipelines-v1`: op `ANCHOR_OP_TREE_SEAL`
+(0xF9) plus the log2 byte. Each 64 KiB chunk instruction hashes its chunks
+into one aligned subtree (of height `16 − log2`, or the whole tree if smaller)
+and pushes it onto a frontier of at most 17 subtree roots kept in the anchor
+account, which grows to 704 bytes for it (bytes 116..120 the subtrees folded,
+120 the log2, 121 a tree flag; the payer funds the growth). Finish folds the
+frontier into the root. Abort and finish clear the frontier, so a linear seal
+can follow an aborted tree seal. Checked: Rust and Python agree on goldens
+(`vectors.json`, a 150,000-byte state at 1 KiB chunks) and on the program's
+record (`tree_session.json`); the streaming fold equals the level-by-level
+tree for chunk sizes 2^6 to 2^16 and lengths 0 to 131,073; through the program,
+80,000 bytes at 2^6 and 2^16 in two transactions, chunks opening across the
+span boundary; the session fuzzer models tree seals (seed 1051, 400 sequences,
+60 seals begun, clean). Compute on SBF is not yet measured.
 
 ## 4. Additions to mode results
 

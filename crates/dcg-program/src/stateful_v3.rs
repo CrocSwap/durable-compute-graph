@@ -63,6 +63,10 @@ pub const ANCHOR_OP_ABORT: u8 = 0xFB;
 /// `docs/design/mode-results-v1.md` §3.2). Chunks, finish and abort use the
 /// anchor operations; the session's phase says which digest they build.
 pub const ANCHOR_OP_SEAL: u8 = 0xFA;
+/// Begin a tree seal (pipelines design §3.4 C, feature `pipelines-v1`): as
+/// `ANCHOR_OP_SEAL` plus one byte, the chunk size's log2 (6..=16). Chunk,
+/// finish and abort are the anchor's.
+pub const ANCHOR_OP_TREE_SEAL: u8 = 0xF9;
 pub const RESOURCE_CHUNK_TAG: u8 = 240;
 pub const RESOURCE_GROW_OP: u8 = 0xFE;
 pub const RESOURCE_CHUNK_BYTES: u32 = 65_536;
@@ -143,12 +147,19 @@ const PHASE_VIEW_PUBLICATION: u8 = 1;
 const PHASE_INITIALIZATION: u8 = 2;
 const PHASE_STATE_ANCHOR: u8 = 3;
 const PHASE_STATE_SEAL: u8 = 4;
-use crate::result::{SEAL_CHUNK_DOMAIN, SEAL_DOMAIN, SEAL_INIT_DOMAIN};
+use crate::result::{SEAL_CHUNK_DOMAIN, SEAL_DOMAIN, SEAL_INIT_DOMAIN, TREE_SEAL_LOG2_MAX, TREE_SEAL_LOG2_MIN};
 const _: () = assert!(crate::result::SEAL_CHUNK_BYTES == ANCHOR_CHUNK_BYTES as usize);
 const RESOURCE_SEED: &[u8] = b"dcg-resource-v3";
 const ANCHOR_SEED: &[u8] = b"dcg-anchor-v3";
 const RESOURCE_HEADER_BYTES: usize = 128;
 const ANCHOR_ACCOUNT_BYTES: usize = 160;
+/// An anchor account carrying a tree seal's frontier (pipelines design
+/// §3.4 C, feature `pipelines-v1`): bytes 116..120 the subtrees folded so
+/// far, 120 the chunk size's log2, 121 = 1, and from 160 seventeen 32-byte
+/// frontier slots (one per level above the per-transaction subtree; 2^16
+/// transactions of 64 KiB cover any u32 state length).
+const ANCHOR_TREE_BYTES: usize = ANCHOR_ACCOUNT_BYTES + TREE_FRONTIER_SLOTS * 32;
+const TREE_FRONTIER_SLOTS: usize = 17;
 const RESOURCE_MAGIC: &[u8; 4] = b"DRS3";
 const ANCHOR_MAGIC: &[u8; 4] = b"DAN3";
 const RESOURCE_BITMAP_AT: usize = 88;
@@ -218,6 +229,9 @@ struct Session {
     /// 1278, bit 1): the record no longer describes the whole final state, so
     /// it takes no seal and reads as no result (review 10-14 findings 1, 4).
     trimmed: bool,
+    /// A tree seal's chunk size log2 (byte 1279, with byte 1278 bit 2); 0 for
+    /// none or the linear seal.
+    seal_log2: u8,
 }
 
 impl Session {
@@ -279,6 +293,10 @@ struct AnchorMeta {
     progress: u32,
     input_root: [u8; 32],
     accumulator: [u8; 32],
+    /// A tree seal's chunk size log2 (0: an anchor or a linear seal) and the
+    /// per-transaction subtrees folded into its frontier so far.
+    tree_log2: u8,
+    tree_count: u32,
 }
 
 struct PublicationAccounts<'a> {
@@ -792,7 +810,8 @@ fn encode_session(account: &AccountInfo, session: &Session) -> ProgramResult {
     put_u32(&mut raw, 1269, session.last_captured);
     raw[1273] = session.features;
     put_u32(&mut raw, 1274, session.rejected_count);
-    raw[1278] = u8::from(session.sealed) | (u8::from(session.trimmed) << 1);
+    raw[1278] = u8::from(session.sealed) | (u8::from(session.trimmed) << 1) | (u8::from(session.seal_log2 != 0) << 2);
+    raw[1279] = session.seal_log2;
     Ok(())
 }
 
@@ -824,8 +843,11 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || (raw[1273] & FEATURE_TICKS != 0 && (raw[1273] & FEATURE_RING_STREAM == 0 || raw[7] != POLICY_INDEXED))
         // (No such rule for FEATURE_READS_RESOURCE: closing the resource copy
         // of a halted session clears the resource key.)
-        || raw[1278] & !3 != 0
-        || raw[1279] != 0
+        || raw[1278] & !7 != 0
+        // A tree seal's chunk size: present exactly with bit 2, on a sealed
+        // record, in range (pipelines design §3.4 C).
+        || (raw[1278] & 4 != 0) != (raw[1279] != 0)
+        || (raw[1278] & 4 != 0 && (raw[1278] & 1 == 0 || !(TREE_SEAL_LOG2_MIN..=TREE_SEAL_LOG2_MAX).contains(&raw[1279])))
         || (raw[1273] & FEATURE_REJECTABLE == 0 && u32_at(raw, 1274) != 0)
         || (raw[1273] & FEATURE_RING_STREAM != 0 && u32_at(raw, 10) < MIN_RING_CAPACITY)
         || raw[1267] as usize > lanes::MAX_LANES
@@ -968,6 +990,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         rejected_count: u32_at(raw, 1274),
         sealed: raw[1278] & 1 == 1,
         trimmed: raw[1278] & 2 != 0,
+        seal_log2: raw[1279],
     })
 }
 
@@ -1287,6 +1310,7 @@ fn open_session(
             rejected_count: 0,
             sealed: false,
             trimmed: false,
+            seal_log2: 0,
         },
     )
 }
@@ -3409,6 +3433,7 @@ mod workspace_first_account_tests {
             rejected_count: 0,
             sealed: false,
             trimmed: false,
+            seal_log2: 0,
         }
     }
 
@@ -4174,11 +4199,14 @@ fn checked_anchor(
     writable: bool,
 ) -> Result<AnchorMeta, ProgramError> {
     check_program_owned(account, program, writable)?;
+    // A tree seal grows the anchor account to carry its frontier
+    // (`pipelines-v1` only).
+    let max_len = if cfg!(feature = "pipelines-v1") { ANCHOR_TREE_BYTES } else { ANCHOR_ACCOUNT_BYTES };
     expect_derived(
         account,
         program,
         &[ANCHOR_SEED, session_account.key.as_ref()],
-        AccountKind::exact(ANCHOR_MAGIC, ANCHOR_ACCOUNT_BYTES).with_version(4, WIRE_VERSION as u16),
+        AccountKind::variable(ANCHOR_MAGIC, ANCHOR_ACCOUNT_BYTES, max_len).with_version(4, WIRE_VERSION as u16),
         RoleFlags {
             writable,
             signer: false,
@@ -4186,13 +4214,19 @@ fn checked_anchor(
     )
     .map_err(|_| refusal(REFUSAL_SESSION))?;
     let raw = account.try_borrow_data()?;
-    if raw.len() != ANCHOR_ACCOUNT_BYTES
+    let tree = raw.len() == ANCHOR_TREE_BYTES && raw[121] == 1;
+    let tree_ok = if tree {
+        (TREE_SEAL_LOG2_MIN..=TREE_SEAL_LOG2_MAX).contains(&raw[120]) && raw[122..160].iter().all(|byte| *byte == 0)
+    } else {
+        raw[116..].iter().all(|byte| *byte == 0)
+    };
+    if (raw.len() != ANCHOR_ACCOUNT_BYTES && raw.len() != max_len)
         || &raw[..4] != ANCHOR_MAGIC
         || u16_at(&raw, 4) != WIRE_VERSION as u16
         || !matches!(raw[6], 0 | 1)
         || raw[7] != 0
         || raw[8..40] != session_account.key.to_bytes()
-        || raw[116..].iter().any(|byte| *byte != 0)
+        || !tree_ok
     {
         return Err(refusal(REFUSAL_SESSION));
     }
@@ -4203,16 +4237,23 @@ fn checked_anchor(
         progress: u32_at(&raw, 48),
         input_root: raw[52..84].try_into().expect("fixed width"),
         accumulator: raw[84..116].try_into().expect("fixed width"),
+        tree_log2: if tree { raw[120] } else { 0 },
+        tree_count: if tree { u32_at(&raw, 116) } else { 0 },
     })
 }
 
+/// Write an anchor record. A tree seal's frontier slots (160..) are kept;
+/// an anchor or a linear seal zeroes them.
 fn write_anchor(
     account: &AccountInfo,
     session_account: &AccountInfo,
     meta: AnchorMeta,
 ) -> ProgramResult {
     let mut raw = account.try_borrow_mut_data()?;
-    raw.fill(0);
+    raw[..ANCHOR_ACCOUNT_BYTES].fill(0);
+    if meta.tree_log2 == 0 {
+        raw[ANCHOR_ACCOUNT_BYTES..].fill(0);
+    }
     raw[..4].copy_from_slice(ANCHOR_MAGIC);
     put_u16(&mut raw, 4, WIRE_VERSION as u16);
     raw[6] = u8::from(meta.open);
@@ -4222,7 +4263,31 @@ fn write_anchor(
     put_u32(&mut raw, 48, meta.progress);
     raw[52..84].copy_from_slice(&meta.input_root);
     raw[84..116].copy_from_slice(&meta.accumulator);
+    if meta.tree_log2 != 0 {
+        put_u32(&mut raw, 116, meta.tree_count);
+        raw[120] = meta.tree_log2;
+        raw[121] = 1;
+    }
     Ok(())
+}
+
+/// A tree seal's frontier slots in its anchor account.
+fn tree_frontier(raw: &[u8]) -> [[u8; 32]; TREE_FRONTIER_SLOTS] {
+    let mut out = [[0u8; 32]; TREE_FRONTIER_SLOTS];
+    for (j, slot) in out.iter_mut().enumerate() {
+        let at = ANCHOR_ACCOUNT_BYTES + 32 * j;
+        slot.copy_from_slice(&raw[at..at + 32]);
+    }
+    out
+}
+
+/// The per-transaction subtree height of a tree seal over `total` bytes:
+/// a 64 KiB transaction covers `2^(16 - log2)` chunks, unless the whole tree
+/// is smaller. Returns (subtree height, whole tree height).
+fn tree_heights(total: u32, log2: u8) -> (u16, u16) {
+    let leaves = crate::result::tree_seal_leaves(u64::from(total), log2);
+    let height = crate::result::tree_height(leaves) as u16;
+    (height.min(16 - u16::from(log2)), height)
 }
 
 /// The session for an anchor chunk or finish. The caller signs; it must be
@@ -4251,6 +4316,7 @@ fn begin_anchor(
     data: &[u8],
     kernel: &dyn StatefulKernel,
     seal: bool,
+    tree_log2: u8,
 ) -> ProgramResult {
     exact_data(data, 7)?;
     if accounts.len() < 7 {
@@ -4367,6 +4433,20 @@ fn begin_anchor(
             return Err(refusal(REFUSAL_LIVE));
         }
     }
+    if tree_log2 != 0 && anchor_account.data_len() != ANCHOR_TREE_BYTES {
+        // A tree seal's frontier: the payer funds the larger account.
+        let top_up = Rent::get()?.minimum_balance(ANCHOR_TREE_BYTES).saturating_sub(anchor_account.lamports());
+        if top_up != 0 {
+            invoke(
+                &system_instruction::transfer(payer.key, anchor_account.key, top_up),
+                &[payer.clone(), anchor_account.clone(), system.clone()],
+            )?;
+        }
+        anchor_account.realloc(ANCHOR_TREE_BYTES, true)?;
+    }
+    if tree_log2 != 0 {
+        anchor_account.try_borrow_mut_data()?[ANCHOR_ACCOUNT_BYTES..].fill(0);
+    }
     write_anchor(
         anchor_account,
         session_account,
@@ -4376,7 +4456,10 @@ fn begin_anchor(
             total: session.state_bytes,
             progress: 0,
             input_root,
-            accumulator: initial.finish(),
+            // A tree seal folds chunks, not a running hash.
+            accumulator: if tree_log2 != 0 { [0; 32] } else { initial.finish() },
+            tree_log2,
+            tree_count: 0,
         },
     )?;
     session.phase = if seal { PHASE_STATE_SEAL } else { PHASE_STATE_ANCHOR };
@@ -4443,6 +4526,58 @@ fn run_anchor_chunk(
         .iter()
         .map(AccountInfo::try_borrow_data)
         .collect::<Result<Vec<_>, _>>()?;
+    if anchor.tree_log2 != 0 {
+        // A tree seal (pipelines design §3.4 C): hash this transaction's
+        // chunks into one aligned subtree and fold it into the frontier.
+        let mut spans: Vec<&[u8]> = Vec::with_capacity(guards.len());
+        let mut at = 0u32;
+        for (index, (raw, meta)) in guards.iter().zip(metas.iter()).enumerate() {
+            let header_len = if session.primary_state && index == 0 { 0 } else { CHILD_HEADER_BYTES };
+            if meta.offset != at {
+                return Err(refusal(REFUSAL_STATE));
+            }
+            spans.push(raw.get(header_len..header_len + meta.len as usize).ok_or_else(|| refusal(REFUSAL_STATE))?);
+            at = at.checked_add(meta.len).ok_or_else(|| refusal(REFUSAL_STATE))?;
+        }
+        if at != anchor.total {
+            return Err(refusal(REFUSAL_STATE));
+        }
+        let log2 = anchor.tree_log2;
+        let size = 1u64 << log2;
+        let (base, _) = tree_heights(anchor.total, log2);
+        let mut local = [[0u8; 32]; TREE_FRONTIER_SLOTS];
+        let first = u64::from(offset) >> log2;
+        let leaves = (u64::from(end) - u64::from(offset)).div_ceil(size);
+        for i in 0..leaves {
+            let index = first + i;
+            let to = ((index + 1) * size).min(u64::from(anchor.total));
+            let leaf = crate::result::chunk_leaf_spans(&spans, index, index * size, to);
+            crate::result::frontier_push(&mut local, i, 0, leaf).map_err(|_| refusal(REFUSAL_STATE))?;
+        }
+        let subtree = crate::result::frontier_root(&local, leaves, 0, base);
+        drop(guards);
+        let mut frontier = tree_frontier(&anchor_account.try_borrow_data()?);
+        crate::result::frontier_push(&mut frontier, u64::from(anchor.tree_count), base, subtree)
+            .map_err(|_| refusal(REFUSAL_STATE))?;
+        write_anchor(
+            anchor_account,
+            session_account,
+            AnchorMeta {
+                progress: end,
+                tree_count: anchor.tree_count + 1,
+                ..anchor
+            },
+        )?;
+        {
+            let mut raw = anchor_account.try_borrow_mut_data()?;
+            for (j, slot) in frontier.iter().enumerate() {
+                let at = ANCHOR_ACCOUNT_BYTES + 32 * j;
+                raw[at..at + 32].copy_from_slice(slot);
+            }
+        }
+        session.phase_cursor = end;
+        return store_session(session_account, &session);
+    }
     let mut digest = crate::hash::Parts::new();
     let offset_bytes = offset.to_le_bytes();
     let chunk_domain: &[u8] = if session.phase == PHASE_STATE_SEAL {
@@ -4526,25 +4661,36 @@ fn finish_anchor(
         return Err(refusal(REFUSAL_STATE));
     }
     let final_domain: &[u8] = if sealing { SEAL_DOMAIN } else { b"dcg/state-anchor-chunked/3" };
-    session.state_anchor = crate::hash::sha256(&[
-        final_domain,
-        &anchor.accumulator,
-        &anchor.input_root,
-        &session.kernel_id.0,
-        &schema_id,
-        &schema_version,
-        &cursor.to_le_bytes(),
-        &anchor.total.to_le_bytes(),
-    ]);
+    session.state_anchor = if anchor.tree_log2 != 0 {
+        // A tree seal is the chunked-value digest itself (pipelines design
+        // §3.4 C); the record and the result's body bind the computation.
+        let (base, height) = tree_heights(anchor.total, anchor.tree_log2);
+        let frontier = tree_frontier(&anchor_account.try_borrow_data()?);
+        crate::result::frontier_root(&frontier, u64::from(anchor.tree_count), base, height)
+    } else {
+        crate::hash::sha256(&[
+            final_domain,
+            &anchor.accumulator,
+            &anchor.input_root,
+            &session.kernel_id.0,
+            &schema_id,
+            &schema_version,
+            &cursor.to_le_bytes(),
+            &anchor.total.to_le_bytes(),
+        ])
+    };
     session.input_root = anchor.input_root;
     session.anchor_cursor = cursor;
     session.sealed = sealing;
+    session.seal_log2 = anchor.tree_log2;
     clear_phase(&mut session);
     write_anchor(
         anchor_account,
         session_account,
         AnchorMeta {
             open: false,
+            tree_log2: 0,
+            tree_count: 0,
             ..anchor
         },
     )?;
@@ -4581,6 +4727,8 @@ fn abort_anchor(
         session_account,
         AnchorMeta {
             open: false,
+            tree_log2: 0,
+            tree_count: 0,
             ..anchor
         },
     )?;
@@ -4690,8 +4838,15 @@ fn anchor(
         return Err(ProgramError::InvalidInstructionData);
     };
     match operation {
-        ANCHOR_OP_BEGIN => begin_anchor(program, accounts, data, kernel, false),
-        ANCHOR_OP_SEAL => begin_anchor(program, accounts, data, kernel, true),
+        ANCHOR_OP_BEGIN => begin_anchor(program, accounts, data, kernel, false, 0),
+        ANCHOR_OP_SEAL => begin_anchor(program, accounts, data, kernel, true, 0),
+        ANCHOR_OP_TREE_SEAL if cfg!(feature = "pipelines-v1") => {
+            let log2 = match data {
+                [.., log2] if data.len() == 8 && (TREE_SEAL_LOG2_MIN..=TREE_SEAL_LOG2_MAX).contains(log2) => *log2,
+                _ => return Err(ProgramError::InvalidInstructionData),
+            };
+            begin_anchor(program, accounts, &data[..7], kernel, true, log2)
+        }
         ANCHOR_OP_CHUNK => run_anchor_chunk(program, accounts, data, kernel),
         ANCHOR_OP_FINISH => finish_anchor(program, accounts, data, kernel),
         ANCHOR_OP_ABORT => abort_anchor(program, accounts, data, kernel),
@@ -4904,7 +5059,7 @@ pub fn read_session_result_bytes(
     owner: &Pubkey,
     raw: &[u8],
 ) -> Result<crate::result::ResultRef, crate::result::ResultError> {
-    use crate::result::{Body, ConsensusBody, ResultError, ResultRef, SCHEME_STATE_SEAL_V1};
+    use crate::result::{Body, ConsensusBody, ResultError, ResultRef, SCHEME_STATE_SEAL_V1, SCHEME_STATE_TREE_V1};
     let verdict = read_verdict_bytes(host, key, owner, raw).map_err(|e| match e {
         VerdictError::Owner => ResultError::Owner,
         VerdictError::Address => ResultError::Address,
@@ -4920,7 +5075,7 @@ pub fn read_session_result_bytes(
         return Err(ResultError::Trimmed);
     }
     Ok(ResultRef {
-        scheme: SCHEME_STATE_SEAL_V1,
+        scheme: if session.seal_log2 != 0 { SCHEME_STATE_TREE_V1 } else { SCHEME_STATE_SEAL_V1 },
         host: *host,
         source: *key,
         root: verdict.state_anchor,
@@ -4937,6 +5092,7 @@ pub fn read_session_result_bytes(
             input_root: verdict.input_root,
             stream_root: verdict.stream_root,
             resource_commitment: verdict.resource_commitment,
+            chunk_log2: session.seal_log2,
         }),
     })
 }

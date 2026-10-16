@@ -145,3 +145,36 @@ def test_a_d21q_receipt_reads_without_its_template(name):
     refuted[4] = 3
     with pytest.raises(R.ResultError, match="NotFinal"):
         R.read_run_result(host, (run, host, bytes(refuted)))
+
+
+def test_a_tree_sealed_session_reads_as_the_programs_result():
+    """Pipelines slice 1 C: the record the program wrote (fixture from a
+    ``pipelines-v1`` build) reads as its result, and the state opens whole and
+    by chunk."""
+    f = load("tree_session")
+    host, k, owner, record = key(f["host"]), key(f["key"]), key(f["owner"]), bytes.fromhex(f["record"])
+    ref = R.read_session_result(host, k, owner, record)
+    assert ref.encode().hex() == f["result"]
+    assert ref.scheme == R.SCHEME_STATE_TREE_V1 and ref.body.chunk_log2 == 6
+    state = bytes.fromhex(f["state"])
+    ref.open_state(state)
+    ref.open_state_chunk(0, state, [])
+    with pytest.raises(R.ResultError, match="Opening"):
+        ref.open_state_chunk(0, bytes([state[0] ^ 1]) + state[1:], [])
+    for flags, log2 in ((1 | 4, 0), (1 | 4, 5), (4, 6), (1, 6), (1 | 8, 0)):
+        bad = bytearray(record)
+        bad[1278], bad[1279] = flags, log2
+        with pytest.raises(R.ResultError, match="Layout"):
+            R.read_session_result(host, k, owner, bytes(bad))
+
+
+def test_tree_seal_vectors_open_by_chunk():
+    v = load("vectors")
+    tree = R.ResultRef.decode(bytes.fromhex(next(r for r in v["refs"] if r["name"] == "tree")["encoded"]))
+    state = bytes((i * 31 + 7) % 251 for i in range(v["seal"]["state_len"]))
+    size = 1 << v["tree_seal"]["chunk_log2"]
+    for o in v["tree_seal"]["openings"]:
+        i = o["index"]
+        tree.open_state_chunk(i, state[i * size:(i + 1) * size], [bytes.fromhex(p) for p in o["path"]])
+    with pytest.raises(R.ResultError, match="Opening"):
+        tree.open_state_chunk(0, state[:size], [])

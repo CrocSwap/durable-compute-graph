@@ -40,6 +40,11 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
     sealed, closing a state span or the resource copy needs the authority's
     signature (otherwise anyone could trim the session first and deny its
     result).
+  - tree seals (`ANCHOR_OP_TREE_SEAL`, scheme `STATE_TREE_V1`): the seal is
+    the v2.1 chunked-value digest of the final state, so one chunk opens with
+    a path (`open_state_chunk`) and the state can feed a v2.1 run as a chunked
+    input. `ConsensusBody` gains `chunk_log2` (body byte 33, zero for the
+    linear seal); the session record uses byte 1278 bit 2 and byte 1279.
 
 ## v0.3.0-alpha (2026-10-14)
 

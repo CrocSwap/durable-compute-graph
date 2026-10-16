@@ -20,6 +20,8 @@ from solders.pubkey import Pubkey
 
 from dcg.disputes_v21 import lx as _lx
 from dcg.disputes_v21 import trees as _trees
+from dcg.disputes_v21.run import chunk_leaf as _chunk_leaf
+from dcg.disputes_v21.run import chunked_digest as _chunked_digest
 from dcg.disputes_v21.run import out_leaf
 
 RESULT_BYTES = 256
@@ -33,6 +35,10 @@ MODE_OPTIMISTIC = 2
 SCHEME_OUT_TREE_V21 = 1
 SCHEME_LX_OUTPUTS_V1 = 2
 SCHEME_STATE_SEAL_V1 = 3
+# A tree seal: the v2.1 chunked-value digest of the final state (pipelines
+# design docs/design/mixed-mode-pipelines-v1.md §3.4 C).
+SCHEME_STATE_TREE_V1 = 4
+TREE_SEAL_LOG2 = range(6, 17)
 
 SEAL_INIT_DOMAIN = b"dcg/state-seal-init/1"
 SEAL_CHUNK_DOMAIN = b"dcg/state-seal-chunk/1"
@@ -77,6 +83,7 @@ class ConsensusBody:
     input_root: bytes
     stream_root: bytes
     resource_commitment: bytes
+    chunk_log2: int = 0  # a tree seal's chunk size log2 (body byte 33); 0 for the linear seal
 
 
 @dataclass(frozen=True)
@@ -104,7 +111,7 @@ class ResultRef:
             body = (b.kernel_id + struct.pack("<HHIHIHB", b.semantic_version, b.abi_version, b.state_schema[0],
                                               b.state_schema[1], b.resource_schema[0], b.resource_schema[1],
                                               b.features)
-                    + bytes(3) + struct.pack("<II", b.halt_reason, b.halt_cursor) + bytes(4)
+                    + bytes([b.chunk_log2]) + bytes(2) + struct.pack("<II", b.halt_reason, b.halt_cursor) + bytes(4)
                     + b.input_root + b.stream_root + b.resource_commitment)
         out = head + body
         assert len(out) == RESULT_BYTES
@@ -123,13 +130,14 @@ class ResultRef:
                 raise ResultError("Layout")
             body: OptimisticBody | ConsensusBody = OptimisticBody(
                 b[0:32], b[32:64], b[64:96], *struct.unpack_from("<QQQQQ", b, 96))
-        elif mode == MODE_CONSENSUS and scheme == SCHEME_STATE_SEAL_V1:
-            if any(b[33:36]) or any(b[44:48]):
+        elif mode == MODE_CONSENSUS and scheme in (SCHEME_STATE_SEAL_V1, SCHEME_STATE_TREE_V1):
+            log2_ok = b[33] in TREE_SEAL_LOG2 if scheme == SCHEME_STATE_TREE_V1 else b[33] == 0
+            if not log2_ok or any(b[34:36]) or any(b[44:48]):
                 raise ResultError("Layout")
             sv, av, sid, sver, rid, rver, features = struct.unpack_from("<HHIHIHB", b, 16)
             reason, cursor = struct.unpack_from("<II", b, 36)
             body = ConsensusBody(b[0:16], sv, av, (sid, sver), (rid, rver), features, reason, cursor,
-                                 b[48:80], b[80:112], b[112:144])
+                                 b[48:80], b[80:112], b[112:144], b[33])
         else:
             raise ResultError("Layout")
         return cls(scheme, raw[8:40], raw[40:72], raw[72:104], count, body)
@@ -156,8 +164,33 @@ class ResultRef:
             raise ResultError("Opening")
 
     def open_state(self, state: bytes) -> None:
-        if (not isinstance(self.body, ConsensusBody) or self.scheme != SCHEME_STATE_SEAL_V1
-                or len(state) != self.count or seal_digest(self.body, state) != self.root):
+        if not isinstance(self.body, ConsensusBody) or len(state) != self.count:
+            raise ResultError("Opening")
+        if self.scheme == SCHEME_STATE_SEAL_V1:
+            digest = seal_digest(self.body, state)
+        elif self.scheme == SCHEME_STATE_TREE_V1:
+            digest = tree_seal(state, self.body.chunk_log2)
+        else:
+            raise ResultError("Opening")
+        if digest != self.root:
+            raise ResultError("Opening")
+
+    def open_state_chunk(self, index: int, chunk: bytes, path: list[bytes]) -> None:
+        """``STATE_TREE_V1``: chunk ``index`` of the sealed state, with its path."""
+        if not isinstance(self.body, ConsensusBody) or self.scheme != SCHEME_STATE_TREE_V1:
+            raise ResultError("Opening")
+        size = 1 << self.body.chunk_log2
+        leaves = max(-(-self.count // size), 1)
+        if index >= leaves:
+            raise ResultError("Opening")
+        want = self.count - index * size if index + 1 == leaves else size
+        if len(chunk) != want or len(path) != tree_height(leaves):
+            raise ResultError("Opening")
+        acc, pos = _chunk_leaf(index, chunk), index
+        for level, sibling in enumerate(path):
+            acc = _trees.node("chunk", level, sibling, acc) if pos & 1 else _trees.node("chunk", level, acc, sibling)
+            pos >>= 1
+        if acc != self.root:
             raise ResultError("Opening")
 
 
@@ -168,6 +201,11 @@ def tree_height(count: int) -> int:
 def plain_value_matches(value_ref: bytes, value: bytes) -> bool:
     return (struct.unpack_from("<I", value_ref, 19)[0] == len(value)
             and hashlib.sha256(VALUE_DOMAIN + value).digest() == value_ref[23:55])
+
+
+def tree_seal(state: bytes, chunk_log2: int) -> bytes:
+    """A tree seal: the v2.1 chunked-value digest of the state."""
+    return _chunked_digest(state, 1 << chunk_log2)
 
 
 def seal_digest(c: ConsensusBody, state: bytes) -> bytes:
@@ -255,9 +293,12 @@ def read_session_result(host: Pubkey, key: Pubkey, owner: Pubkey, raw: bytes) ->
     if owner != host:
         raise ResultError("Owner")
     if (len(raw) != 1280 or raw[:4] != b"DSS3" or struct.unpack_from("<H", raw, 4)[0] != 3
-            or struct.unpack_from("<IH", raw, 106) != (0x434F_4E53, 3) or raw[1278] & ~3 or raw[1279]):
+            or struct.unpack_from("<IH", raw, 106) != (0x434F_4E53, 3) or raw[1278] & ~7):
         raise ResultError("Layout")
-    sealed, trimmed = raw[1278] & 1, raw[1278] & 2
+    sealed, trimmed, tree = raw[1278] & 1, raw[1278] & 2, raw[1278] & 4
+    # A tree seal's chunk size: exactly with bit 2, on a sealed record, in range.
+    if bool(tree) != bool(raw[1279]) or (tree and (not sealed or raw[1279] not in TREE_SEAL_LOG2)):
+        raise ResultError("Layout")
     # The program's record rules for the flags (decode_session).
     if (sealed or trimmed) and raw[6] != 2:
         raise ResultError("Layout")
@@ -284,5 +325,7 @@ def read_session_result(host: Pubkey, key: Pubkey, owner: Pubkey, raw: bytes) ->
         state_schema=struct.unpack_from("<IH", raw, 1183), resource_schema=struct.unpack_from("<IH", raw, 1124),
         features=raw[1273], halt_reason=_u32(raw, 1254), halt_cursor=_u32(raw, 1258),
         input_root=raw[156:188], stream_root=raw[124:156], resource_commitment=raw[1132:1164],
+        chunk_log2=raw[1279],
     )
-    return ResultRef(SCHEME_STATE_SEAL_V1, bytes(host), bytes(key), raw[192:224], _u32(raw, 224), body)
+    scheme = SCHEME_STATE_TREE_V1 if tree else SCHEME_STATE_SEAL_V1
+    return ResultRef(scheme, bytes(host), bytes(key), raw[192:224], _u32(raw, 224), body)

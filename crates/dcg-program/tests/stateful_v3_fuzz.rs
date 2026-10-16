@@ -343,7 +343,8 @@ enum Op {
     AnchorAbort { auth: Actor, cursor: u32 },
     /// Mode results v1: seal a kernel-halted session's final state (chunks,
     /// finish and abort are the anchor ops in the seal phase).
-    SealBegin { payer: Actor, auth: Actor, cursor: u32 },
+    /// `tree`: a tree seal's chunk size log2 (pipelines §3.4 C), 0 linear.
+    SealBegin { payer: Actor, auth: Actor, cursor: u32, tree: u8 },
     /// `signed`: the refund (the authority) signs; with `pipelines-v1` the
     /// only way to close a kernel-halted session's state before its seal.
     Close { child: Child, kind: u8, refund: Actor, signed: bool },
@@ -429,6 +430,7 @@ struct AnchorM {
     progress: u32,
     input_root: [u8; 32],
     acc: [u8; 32],
+    tree: u8,
 }
 
 /// The host reference model of one session.
@@ -471,6 +473,8 @@ struct M {
     /// closed after the halt (record byte 1278, bits 0 and 1).
     sealed: bool,
     trimmed: bool,
+    /// A tree seal's chunk size log2 (record byte 1279).
+    seal_log2: u8,
     /// Newest stamp ever published (for monotonicity).
     newest_stamp: Option<u32>,
 }
@@ -1156,9 +1160,12 @@ impl Fuzz {
                 a.push(r(SYSTEM));
                 one(ix(sw::TAG_ANCHOR, d, a))
             }
-            Op::SealBegin { payer, auth, cursor } => {
-                let mut d = vec![ver, v3::ANCHOR_OP_SEAL];
+            Op::SealBegin { payer, auth, cursor, tree } => {
+                let mut d = vec![ver, if tree != 0 { v3::ANCHOR_OP_TREE_SEAL } else { v3::ANCHOR_OP_SEAL }];
                 d.extend_from_slice(&cursor.to_le_bytes());
+                if tree != 0 {
+                    d.push(tree);
+                }
                 let mut a = vec![self.payer_meta(payer), self.signer(auth), w(s), r(k.stream), w(k.anchor)];
                 a.extend(self.state_metas(false));
                 a.push(r(SYSTEM));
@@ -1469,8 +1476,9 @@ impl Fuzz {
                 let Some(a) = &m.anchor else { return false };
                 in_anchor && *auth == A && *cursor == m.ph_state && a.open && a.progress == m.ph_at
             }
-            Op::SealBegin { payer, auth, cursor } => {
-                m.open && !m.active && m.halt_reason != 0 && !m.sealed && !m.trimmed && *payer != A && (*auth == A || OPEN_SEAL)
+            Op::SealBegin { payer, auth, cursor, tree } => {
+                (*tree == 0 || (OPEN_SEAL && (6..=16).contains(tree)))
+                    && m.open && !m.active && m.halt_reason != 0 && !m.sealed && !m.trimmed && *payer != A && (*auth == A || OPEN_SEAL)
                     && m.phase == PH_NONE && m.initialized && *cursor == m.cursor && m.anchor_cursor <= *cursor && m.states > 0
                     && m.anchor.as_ref().is_none_or(|a| !a.open)
             }
@@ -1662,18 +1670,20 @@ impl Fuzz {
                 let input_root = self.input_root(m);
                 let total = p.state_bytes();
                 let acc = sha256(&[b"dcg/state-anchor-init/3", &m.state_anchor, &input_root, &p.kernel_id(), &sid, &sver, &cursor.to_le_bytes(), &total.to_le_bytes()]);
-                m.anchor = Some(AnchorM { open: true, cursor: *cursor, total, progress: 0, input_root, acc });
+                m.anchor = Some(AnchorM { open: true, cursor: *cursor, total, progress: 0, input_root, acc, tree: 0 });
                 m.phase = PH_ANCHOR;
                 m.ph_state = *cursor;
                 m.ph_at = 0;
                 m.ph_total = total;
             }
-            Op::SealBegin { cursor, .. } => {
+            Op::SealBegin { cursor, tree, .. } => {
                 let (sid, sver) = self.schema_parts();
                 let input_root = self.input_root(m);
                 let total = p.state_bytes();
                 let acc = sha256(&[dcg_program::result::SEAL_INIT_DOMAIN, &input_root, &p.kernel_id(), &sid, &sver, &cursor.to_le_bytes(), &total.to_le_bytes()]);
-                m.anchor = Some(AnchorM { open: true, cursor: *cursor, total, progress: 0, input_root, acc });
+                // A tree seal keeps no running hash (the program folds chunks).
+                let acc = if *tree != 0 { [0; 32] } else { acc };
+                m.anchor = Some(AnchorM { open: true, cursor: *cursor, total, progress: 0, input_root, acc, tree: *tree });
                 m.phase = PH_SEAL;
                 m.ph_state = *cursor;
                 m.ph_at = 0;
@@ -1684,7 +1694,9 @@ impl Fuzz {
                 let domain: &[u8] = if m.phase == PH_SEAL { dcg_program::result::SEAL_CHUNK_DOMAIN } else { b"dcg/state-anchor-chunk/3" };
                 let a = m.anchor.as_mut().unwrap();
                 let end = (a.total - offset).min(v3::ANCHOR_CHUNK_BYTES) + offset;
-                a.acc = sha256(&[domain, &a.acc, &offset.to_le_bytes(), &state[*offset as usize..end as usize]]);
+                if a.tree == 0 {
+                    a.acc = sha256(&[domain, &a.acc, &offset.to_le_bytes(), &state[*offset as usize..end as usize]]);
+                }
                 a.progress = end;
                 m.ph_at = end;
             }
@@ -1693,14 +1705,19 @@ impl Fuzz {
                 let sealing = m.phase == PH_SEAL;
                 m.sealed |= sealing;
                 let domain: &[u8] = if sealing { dcg_program::result::SEAL_DOMAIN } else { b"dcg/state-anchor-chunked/3" };
+                let tree = m.anchor.as_ref().unwrap().tree;
+                let tree_root = (tree != 0).then(|| dcg_program::result::tree_seal_spans(&[&self.state_at(m, m.cursor)], tree));
+                m.seal_log2 = tree;
                 let a = m.anchor.as_mut().unwrap();
-                m.state_anchor = sha256(&[domain, &a.acc, &a.input_root, &p.kernel_id(), &sid, &sver, &cursor.to_le_bytes(), &a.total.to_le_bytes()]);
+                m.state_anchor = tree_root.unwrap_or_else(|| sha256(&[domain, &a.acc, &a.input_root, &p.kernel_id(), &sid, &sver, &cursor.to_le_bytes(), &a.total.to_le_bytes()]));
                 a.open = false;
+                a.tree = 0;
                 m.anchor_cursor = *cursor;
                 m.clear_phase();
             }
             Op::AnchorAbort { .. } => {
                 m.anchor.as_mut().unwrap().open = false;
+                m.anchor.as_mut().unwrap().tree = 0;
                 m.clear_phase();
             }
             Op::Close { child, .. } => match child {
@@ -1942,7 +1959,7 @@ impl Fuzz {
         }
         let want_status = if m.active { 1 } else { 2 };
         let checks: [(&str, u64, u64); 17] = [
-            ("seal flags", d[1278] as u64, m.sealed as u64 | (m.trimmed as u64) << 1),
+            ("seal flags", d[1278] as u64 | (d[1279] as u64) << 8, m.sealed as u64 | (m.trimmed as u64) << 1 | ((m.seal_log2 != 0) as u64) << 2 | (m.seal_log2 as u64) << 8),
             ("status", d[6] as u64, want_status),
             ("cursor", cursor as u64, m.cursor as u64),
             ("frontier", frontier as u64, m.frontier as u64),
@@ -2105,6 +2122,16 @@ impl Fuzz {
             let a = &get(self.k.anchor).unwrap().data;
             if (a[6] == 1) != anchor.open || u32_at(a, 40) != anchor.cursor || u32_at(a, 48) != anchor.progress || a[84..116] != anchor.acc {
                 fail!(self, "anchor account differs from the host accumulator");
+            }
+            // A tree seal in progress: its chunk size and folded subtrees;
+            // otherwise the frontier area is clear.
+            let tree_ok = if anchor.tree != 0 {
+                a.len() == 704 && a[120] == anchor.tree && a[121] == 1 && u32_at(a, 116) == anchor.progress.div_ceil(v3::ANCHOR_CHUNK_BYTES)
+            } else {
+                a[116..].iter().all(|b| *b == 0)
+            };
+            if !tree_ok {
+                fail!(self, "anchor account's tree seal fields differ from the model");
             }
         }
         self.stats.max_cursor = self.stats.max_cursor.max(cursor);
@@ -2279,7 +2306,12 @@ impl Fuzz {
                 (PH_SEAL, Some(a)) if a.progress < a.total => Op::AnchorChunk { auth: A, cursor: m.ph_state, offset: m.ph_at },
                 (PH_SEAL, _) if self.rng.pct(85) => Op::AnchorFinish { auth: A, cursor: m.ph_state },
                 (PH_SEAL, _) => Op::AnchorAbort { auth: A, cursor: m.ph_state },
-                _ => Op::SealBegin { payer: nonauth_payer, auth: A, cursor: m.cursor },
+                _ => Op::SealBegin {
+                    payer: nonauth_payer,
+                    auth: A,
+                    cursor: m.cursor,
+                    tree: if OPEN_SEAL && self.rng.pct(50) { 6 + self.rng.below(11) as u8 } else { 0 },
+                },
             },
             _ => return None,
         })
@@ -2391,10 +2423,11 @@ impl Fuzz {
                 1 => Op::AnchorBegin { payer, auth: a, cursor },
                 _ => Op::AnchorBegin { payer, auth, cursor: d(&mut self.rng, cursor) },
             },
-            Op::SealBegin { payer, auth, cursor } => match self.rng.below(3) {
-                0 => Op::SealBegin { payer: a, auth, cursor },
-                1 => Op::SealBegin { payer, auth: a, cursor },
-                _ => Op::SealBegin { payer, auth, cursor: d(&mut self.rng, cursor) },
+            Op::SealBegin { payer, auth, cursor, tree } => match self.rng.below(4) {
+                0 => Op::SealBegin { payer: a, auth, cursor, tree },
+                1 => Op::SealBegin { payer, auth: a, cursor, tree },
+                2 => Op::SealBegin { payer, auth, cursor, tree: [0u8, 5, 6, 16, 17][self.rng.below(5) as usize] },
+                _ => Op::SealBegin { payer, auth, cursor: d(&mut self.rng, cursor), tree },
             },
             Op::AnchorChunk { auth, cursor, offset } => match self.rng.below(3) {
                 0 => Op::AnchorChunk { auth: a, cursor, offset },
