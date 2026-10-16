@@ -111,7 +111,8 @@ pub const RECEIPT_WRITTEN: (&[u8; 4], usize) = (b"D21P", RECEIPT_BYTES);
 
 /// Whether `r` is a run receipt, of either form.
 fn is_receipt(r: &[u8]) -> bool {
-    (r.len() == RECEIPT_BYTES && &r[0..4] == b"D21P") || (r.len() == RECEIPT_V2_BYTES && &r[0..4] == b"D21Q")
+    (r.len() == RECEIPT_BYTES && &r[0..4] == b"D21P")
+        || (cfg!(feature = "pipelines-v1") && r.len() == RECEIPT_V2_BYTES && &r[0..4] == b"D21Q")
 }
 /// Close a reveal cache once its run is settled with no open dispute, or gone.
 pub const SUB_CLOSE_CACHE: u8 = 20;
@@ -896,7 +897,7 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool
     // init (a remainder destination) and makes a version-2 run, whose
     // pending-import bitmap starts with every import outstanding. Each import
     // names one of the run's external refs.
-    let imports = template_imports(&tmpl.try_borrow_data()?)?;
+    let imports = if cfg!(feature = "pipelines-v1") { template_imports(&tmpl.try_borrow_data()?)? } else { Vec::new() };
     if !imports.is_empty() {
         let has_ref = |id: u32| (0..n).any(|i| u32_at(refs, 52 * i).is_ok_and(|x| x == id));
         if !v1 || imports.iter().any(|i| !has_ref(i.external_id)) {
@@ -1051,7 +1052,7 @@ fn commit(
             return Err(err(7));
         }
         // Every imported input verified first (pipelines slice 1).
-        if let Some(at) = pending_imports_at(&d)? {
+        if let Some(at) = pending_imports_at(&d)?.filter(|_| cfg!(feature = "pipelines-v1")) {
             if u32_at(&d, at)? != 0 {
                 return Err(err(52));
             }
