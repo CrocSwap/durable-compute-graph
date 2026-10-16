@@ -257,15 +257,17 @@ of the final state, with its own domains and no link to earlier anchors
 - **With feature `pipelines-v1`** (pipelines design §3.4 B, test images until
   the workload trial):
   - anyone may begin, continue and finish a seal: the begin needs only the
-    payer's signature (the authority slot is not checked), and the chunk and
-    finish any signer. Only the authority aborts. A payer who begins on a
+    payer's signature, and the chunk and finish any signer. A stranger may
+    begin only the form the kernel declares (`StatefulKernel::open_seal_log2`:
+    0 linear, or a tree's chunk log2); the authority (signing in its slot) may
+    begin either. Only the authority aborts. A payer who begins on a
     session that has no anchor account yet pays that account's rent, which goes
     to the authority when it closes;
-  - until a kernel-halted session is sealed, closing a state span or the
-    resource copy needs the authority's signature (the refund account signs),
-    so no one else can trim the session first and deny its result. Once it is
-    sealed or trimmed, anyone may close as before; an authority halt is
-    unaffected. Anyone may seal, so the rent is never stuck;
+  - closing a kernel-halted session's state span or resource copy needs the
+    authority's signature (the refund account signs), sealed or not, so no
+    one else can trim the session and end its result. Once the authority has
+    trimmed it, anyone may close the rest; an authority halt and the anchor,
+    stream, view and lane accounts are unaffected;
   - the authority can always end a seal someone else began and clean up: an
     abort and a signed close in one transaction leave no gap for another
     begin;
@@ -280,7 +282,9 @@ of the final state, with its own domains and no link to earlier anchors
     has scheme `STATE_TREE_V1` (4), its body's byte 33 the log2, and one chunk
     opens with `ResultRef::open_state_chunk` (index, bytes, path). Because the
     root is a chunked-value digest, a v2.1 run can take the state as a chunked
-    input (pipelines slice 1 D).
+    input (pipelines slice 1 D). Measured on SBF: a full 64 KiB chunk
+    instruction costs 533,329 CU at 2^6 chunks and 46,431 CU at 2^16; set the
+    compute limit accordingly.
 - `stateful::v3::read_session_result` then reads the session as a
   `result::ResultRef` (mode consensus, scheme `STATE_SEAL_V1`), and
   `ResultRef::open_state` / `open_state_spans` check the state bytes against

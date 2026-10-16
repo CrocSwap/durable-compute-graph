@@ -169,6 +169,14 @@ bytes: an output's from wherever the source run's outputs are published, a
 state's from the session's state accounts while they are open (or a copy taken
 at seal).
 
+**Requirements must name the computation** (review 2026-10-16 M2): `IMPORT`
+refuses a run import whose requirements name neither a template id nor a run
+id, a state import whose requirements name no kernel, and a stated mode that is
+not the scheme's (optimistic for outputs, consensus for states). A template
+with weaker requirements is created but its runs never import (fail closed);
+the Python builder refuses them. Binding one instance (a session's input root
+or address, a run id) is the template author's choice.
+
 Transaction size: `DRQ1` plus the value ref and a path of `h` levels must fit
 in one transaction, so out trees up to about 2^18 outputs (*estimated*).
 
@@ -334,6 +342,20 @@ the same document. Implemented 2026-10-16 behind feature `pipelines-v1`.
 - A stranger's begun seal blocks closes until it ends. The authority ends it
   with an abort and a signed close in one transaction, which leaves no gap for
   another begin; or anyone finishes it.
+- **Independent review 2026-10-16, fixed:**
+  - *H1, a stranger could fix the seal form.* The first to seal chose linear or
+    tree and the chunk size, for good, and could do it in one transaction
+    before the authority could abort; a consumer expecting another form could
+    then never import. Now the kernel declares the form strangers use
+    (`StatefulKernel::open_seal_log2`, default 0: linear); the authority may
+    begin either form.
+  - *H2, anyone could trim a sealed session.* The close rule held only until
+    the seal, so a griefer could close a span right after it and end the result
+    before any consumer imported. Now a kernel-halted session's state spans and
+    resource copy close only with the authority's signature until the
+    authority has trimmed it, sealed or not. The rent goes to the authority in
+    any case, so no one else gains by closing; the authority decides when a
+    result ends.
 
 Implemented 2026-10-16 behind feature `pipelines-v1`; tests in
 `tests/stateful_v3_result.rs`, and the session fuzzer models open seals and
@@ -378,7 +400,11 @@ record (`tree_session.json`); the streaming fold equals the level-by-level
 tree for chunk sizes 2^6 to 2^16 and lengths 0 to 131,073; through the program,
 80,000 bytes at 2^6 and 2^16 in two transactions, chunks opening across the
 span boundary; the session fuzzer models tree seals (seed 1051, 400 sequences,
-60 seals begun, clean). Compute on SBF is not yet measured.
+60 seals begun, clean). Compute, *measured* on SBF (2026-10-16, 80,000-byte
+state): a full 64 KiB chunk instruction costs 533,329 CU at 2^6 chunks and
+46,431 CU at 2^16, the last (short) chunk 132,591 and 21,073 CU, and finish
+13,682 and 10,269 CU. The worst case is within the 1.4M transaction limit with
+a margin of about 2.6; clients set a compute limit above the 200,000 default.
 
 ## 4. Additions to mode results
 
