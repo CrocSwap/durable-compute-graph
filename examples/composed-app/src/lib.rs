@@ -150,7 +150,7 @@ fn import(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     let path: Vec<[u8; 32]> = body[head..].chunks_exact(32).map(|c| c.try_into().unwrap()).collect();
 
     // The run: FINAL, the trusted template, a long enough challenge window.
-    let r = result::read_run_result(&RUN_HOST, run, template).map_err(fail)?;
+    let r = result::read_run_result(&RUN_HOST, run, Some(template)).map_err(fail)?;
     r.require(&ResultRequirements {
         mode: Some(result::MODE_OPTIMISTIC),
         template_id: Some(TRUSTED_TEMPLATE_ID),

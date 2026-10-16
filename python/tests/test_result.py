@@ -117,3 +117,31 @@ def test_a_final_lx_run_reads_as_the_programs_result_and_its_outputs_open():
         live.open_lx_outputs(outputs[:-1] + [b"x"])
     with pytest.raises(R.ResultError, match="Opening"):
         live.open_output(0, bytes(55), [])
+
+
+@pytest.mark.parametrize("name", ["run_q", "lx_run_q"])
+def test_a_d21q_receipt_reads_without_its_template(name):
+    """Pipelines slice 1 (design §3.4 A): the receipt carries the template's
+    id, kind, windows and bonds (fixtures from a ``pipelines-v1`` build)."""
+    f = load(name)
+    host, run, template = key(f["host"]), key(f["run"]), key(f["template"])
+    t = (template, host, bytes.fromhex(f["template_data"]))
+    receipt = bytes.fromhex(f["receipt"])
+    assert receipt[:4] == b"D21Q" and len(receipt) == 380
+    assert R.read_run_result(host, (run, host, receipt)).encode().hex() == f["result"]
+    assert R.read_run_result(host, (run, host, receipt), t).encode().hex() == f["result"]
+    assert R.read_run_result(host, (run, host, bytes.fromhex(f["live"])), t).encode().hex() == f["result"]
+    with pytest.raises(R.ResultError, match="Template"):
+        R.read_run_result(host, (run, host, bytes.fromhex(f["live"])))
+    other = bytearray(t[2])
+    other[96] ^= 1
+    with pytest.raises(R.ResultError, match="Template"):
+        R.read_run_result(host, (run, host, receipt), (template, host, bytes(other)))
+    pad = bytearray(receipt)
+    pad[345] = 1
+    with pytest.raises(R.ResultError, match="Layout"):
+        R.read_run_result(host, (run, host, bytes(pad)))
+    refuted = bytearray(receipt)
+    refuted[4] = 3
+    with pytest.raises(R.ResultError, match="NotFinal"):
+        R.read_run_result(host, (run, host, bytes(refuted)))

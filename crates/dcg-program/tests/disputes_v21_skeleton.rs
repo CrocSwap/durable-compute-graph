@@ -1501,8 +1501,8 @@ impl Chain {
     /// The receipt left at the run's address: magic, status, root.
     async fn receipt(&mut self) -> (Vec<u8>, u8, Vec<u8>) {
         let a = self.ctx.banks_client.get_account(self.run).await.unwrap().unwrap();
-        assert_eq!(a.data.len(), V::RECEIPT_BYTES);
-        (a.data[0..4].to_vec(), a.data[4], a.data[136..].to_vec())
+        assert_eq!(a.data.len(), V::RECEIPT_WRITTEN.1);
+        (a.data[0..4].to_vec(), a.data[4], a.data[136..V::RECEIPT_BYTES].to_vec())
     }
 
     async fn close_cache(&mut self, cache: Pubkey, executor: Pubkey) -> Result<(), TransactionError> {
@@ -1584,10 +1584,10 @@ async fn an_honest_run_closes_every_account_and_returns_all_rent() {
     assert!(ch.close_template().await.is_err(), "a finalized run still needs its template until it becomes a receipt");
     assert!(ch.close_cache(cache, kp(0xC1).pubkey()).await.is_err(), "rent goes to the recorded executor only");
     assert!(ch.close_run_by(0xC1, 0xC1).await.is_err(), "the freed rent goes to the run's payer only");
-    let receipt_rent = ch.ctx.banks_client.get_rent().await.unwrap().minimum_balance(V::RECEIPT_BYTES);
+    let receipt_rent = ch.ctx.banks_client.get_rent().await.unwrap().minimum_balance(V::RECEIPT_WRITTEN.1);
     ch.close_run(0xC1).await.unwrap(); // anyone may shrink a settled run
     let (magic, status, root) = ch.receipt().await;
-    assert_eq!((magic.as_slice(), status, root.as_slice()), (&b"D21P"[..], V::RUN_FINAL, &c.root_bytes[..]));
+    assert_eq!((magic.as_slice(), status, root.as_slice()), (&V::RECEIPT_WRITTEN.0[..], V::RUN_FINAL, &c.root_bytes[..]));
     assert_eq!(ch.ctx.banks_client.get_balance(ch.run).await.unwrap(), receipt_rent);
     assert!(ch.close_run(0xC1).await.is_err(), "a receipt is not a run");
     // The run id stays single-use: the same run cannot be initialized again.
@@ -2741,7 +2741,7 @@ fn hex_of(b: &[u8]) -> String {
 async fn run_result(ch: &mut Chain) -> Result<dcg_program::result::ResultRef, dcg_program::result::ResultError> {
     let run = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
     let template = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap();
-    dcg_program::result::read_run_result_bytes(&PROGRAM, (&ch.run, &run.owner, &run.data), (&ch.template, &template.owner, &template.data))
+    dcg_program::result::read_run_result_bytes(&PROGRAM, (&ch.run, &run.owner, &run.data), Some((&ch.template, &template.owner, &template.data)))
 }
 
 /// A FINAL run reads as an optimistic result, the same live and as its
@@ -2786,7 +2786,7 @@ async fn a_final_run_is_a_result_live_and_as_its_receipt() {
     let run = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
     let other = Pubkey::new_from_array([7; 32]);
     let read = |host: &Pubkey, key: &Pubkey, tkey: &Pubkey, tdata: &[u8]| {
-        res::read_run_result_bytes(host, (key, &run.owner, &run.data), (tkey, &run.owner, tdata))
+        res::read_run_result_bytes(host, (key, &run.owner, &run.data), Some((tkey, &run.owner, tdata)))
     };
     assert_eq!(read(&other, &ch.run, &ch.template, &t), Err(ResultError::Owner));
     assert_eq!(read(&PROGRAM, &other, &ch.template, &t), Err(ResultError::Address));
@@ -2794,21 +2794,116 @@ async fn a_final_run_is_a_result_live_and_as_its_receipt() {
     assert_eq!(read(&PROGRAM, &ch.run, &ch.template, &run.data), Err(ResultError::Template), "the run is not a template");
     let mut cut = run.data.clone();
     cut.pop();
-    assert_eq!(res::read_run_result_bytes(&PROGRAM, (&ch.run, &run.owner, &cut), (&ch.template, &run.owner, &t)), Err(ResultError::Layout));
+    assert_eq!(res::read_run_result_bytes(&PROGRAM, (&ch.run, &run.owner, &cut), Some((&ch.template, &run.owner, &t))), Err(ResultError::Layout));
 
     // The receipt reads as the same result.
     ch.close_run(0xC1).await.unwrap();
-    assert_eq!(ch.receipt().await.0, b"D21P".to_vec());
+    assert_eq!(ch.receipt().await.0, V::RECEIPT_WRITTEN.0.to_vec());
     let receipt = run_result(&mut ch).await.unwrap();
     assert_eq!(receipt.encode(), live.encode(), "receipt and live run give the same result");
     let receipt_data = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap().data;
     let first_ref = c.outs[0].clone();
-    result_fixture("run", serde_json::json!({
+    // The receipt's bytes depend on the build's receipt form.
+    result_fixture(if cfg!(feature = "pipelines-v1") { "run_q" } else { "run" }, serde_json::json!({
         "host": hex_of(PROGRAM.as_ref()), "run": hex_of(ch.run.as_ref()), "template": hex_of(ch.template.as_ref()),
         "live": hex_of(&run.data), "receipt": hex_of(&receipt_data), "template_data": hex_of(&t),
         "result": hex_of(&live.encode()), "output0": hex_of(&first_ref),
         "output0_path": path(&out_levels, 0).iter().map(|h| hex_of(h)).collect::<Vec<_>>(),
     }));
+}
+
+/// Finalize the Chain's honest run (slot 800 is past its 750-slot window).
+async fn finalize_honest(ch: &mut Chain) {
+    let c = ch.honest();
+    ch.commit(&c).await;
+    ch.ctx.warp_to_slot(800).unwrap();
+    let caller = kp(0xA1);
+    send(&mut ch.ctx, ix(V::SUB_FINALIZE, &[], vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(ch.run, false), AccountMeta::new_readonly(ch.template, false), AccountMeta::new(kp(0xE1).pubkey(), false)]), &[&caller]).await.unwrap();
+}
+
+/// A D21Q receipt (pipelines slice 1, design §3.4 A) reads as the live run's
+/// result without its template, also after the template closes; a template
+/// passed with it must be the one it recorded.
+#[cfg(feature = "pipelines-v1")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_d21q_receipt_reads_without_its_template() {
+    use dcg_program::result::{self as res, ResultError};
+    let mut ch = Chain::new(750).await;
+    finalize_honest(&mut ch).await;
+    let live = run_result(&mut ch).await.unwrap();
+    let t = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap();
+    ch.close_run(0xC1).await.unwrap();
+    let r = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
+    assert_eq!((&r.data[0..4], r.data.len()), (&b"D21Q"[..], V::RECEIPT_V2_BYTES));
+    assert_eq!(r.lamports, ch.ctx.banks_client.get_rent().await.unwrap().minimum_balance(V::RECEIPT_V2_BYTES));
+    assert_eq!((&r.data[312..344], r.data[344], &r.data[348..380]), (&t.data[96..128], t.data[5], &t.data[24..56]));
+    let run_key = ch.run;
+    let read = |data: &[u8], template: Option<(&Pubkey, &Pubkey, &[u8])>| res::read_run_result_bytes(&PROGRAM, (&run_key, &r.owner, data), template);
+    assert_eq!(read(&r.data, None).map(|x| x.encode()), Ok(live.encode()), "no template");
+    assert_eq!(read(&r.data, Some((&ch.template, &t.owner, &t.data))).map(|x| x.encode()), Ok(live.encode()), "its template");
+    let mut other = t.data.clone();
+    other[96] ^= 1;
+    assert_eq!(read(&r.data, Some((&ch.template, &t.owner, &other))).err(), Some(ResultError::Template), "another template id");
+    let mut lx = t.data.clone();
+    lx[5] = 1;
+    assert_eq!(read(&r.data, Some((&ch.template, &t.owner, &lx))).err(), Some(ResultError::Template), "another kind");
+    assert_eq!(read(&r.data, Some((&Pubkey::new_unique(), &t.owner, &t.data))).err(), Some(ResultError::Template), "another template account");
+    let mut pad = r.data.clone();
+    pad[345] = 1;
+    assert_eq!(read(&pad, None).err(), Some(ResultError::Layout), "nonzero padding");
+    assert_eq!(read(&r.data[..379], None).err(), Some(ResultError::Layout), "short");
+    let mut refuted = r.data.clone();
+    refuted[4] = V::RUN_REFUTED;
+    assert_eq!(read(&refuted, None).err(), Some(ResultError::NotFinal), "refuted");
+
+    // The template closes; the result still reads from the receipt alone.
+    ch.close_template().await.unwrap();
+    assert!(ch.ctx.banks_client.get_account(ch.template).await.unwrap().is_none());
+    assert_eq!(read(&r.data, None).map(|x| x.encode()), Ok(live.encode()), "template closed");
+}
+
+/// A run whose rent does not cover a D21Q (for example one created before the
+/// upgrade) closes into the old D21P form, which needs its template.
+#[cfg(feature = "pipelines-v1")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_short_of_receipt_rent_closes_into_d21p() {
+    use dcg_program::result::{self as res, ResultError};
+    let mut ch = Chain::new(750).await;
+    finalize_honest(&mut ch).await;
+    let live = run_result(&mut ch).await.unwrap();
+    let rent = ch.ctx.banks_client.get_rent().await.unwrap();
+    let mut acct = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
+    acct.lamports = rent.minimum_balance(V::RECEIPT_V2_BYTES) - 1;
+    ch.ctx.set_account(&ch.run, &acct.into());
+    ch.close_run(0xC1).await.unwrap();
+    let r = ch.ctx.banks_client.get_account(ch.run).await.unwrap().unwrap();
+    assert_eq!((&r.data[0..4], r.data.len()), (&b"D21P"[..], V::RECEIPT_BYTES));
+    let t = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap();
+    assert_eq!(res::read_run_result_bytes(&PROGRAM, (&ch.run, &r.owner, &r.data), Some((&ch.template, &t.owner, &t.data))).map(|x| x.encode()), Ok(live.encode()));
+    assert_eq!(res::read_run_result_bytes(&PROGRAM, (&ch.run, &r.owner, &r.data), None).err(), Some(ResultError::Template));
+}
+
+/// A run shorter than a D21Q receipt (no external refs) is funded for it at
+/// init, and an uncommitted cancel still returns everything to the payer.
+#[cfg(feature = "pipelines-v1")]
+#[tokio::test(flavor = "multi_thread")]
+async fn init_funds_the_receipt_of_a_short_run() {
+    let mut ch = Chain::new(750).await;
+    let admitter = kp(0xA1);
+    let executor = kp(0xE1).pubkey();
+    let template_id: [u8; 32] = ch.ctx.banks_client.get_account(ch.template).await.unwrap().unwrap().data[96..128].try_into().unwrap();
+    let mut init = vec![9u8; 32];
+    init.extend_from_slice(executor.as_ref());
+    init.extend_from_slice(&0u32.to_le_bytes());
+    let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &[9u8; 32], &0u32.to_le_bytes(), executor.as_ref()]);
+    let run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
+    let before = ch.ctx.banks_client.get_balance(admitter.pubkey()).await.unwrap();
+    send(&mut ch.ctx, ix(V::SUB_INIT_RUN, &init, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(run, false), AccountMeta::new(ch.template, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
+    let a = ch.ctx.banks_client.get_account(run).await.unwrap().unwrap();
+    let rent = ch.ctx.banks_client.get_rent().await.unwrap();
+    assert!(a.data.len() < V::RECEIPT_V2_BYTES);
+    assert_eq!(a.lamports, rent.minimum_balance(V::RECEIPT_V2_BYTES));
+    assert!(before - ch.ctx.banks_client.get_balance(admitter.pubkey()).await.unwrap() >= a.lamports);
 }
 
 /// A refuted run is never a result.

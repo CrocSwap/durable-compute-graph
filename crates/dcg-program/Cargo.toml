@@ -43,6 +43,9 @@ sbf-real-lifecycle-test = ["test-kernel"]
 # (re-review H1). Build that image with
 # `--features sbf-real-lifecycle-test,kernel-conform-entry`.
 kernel-conform-entry = []
+# Pipelines slice 1 (docs/design/mixed-mode-pipelines-v1.md): D21Q receipts,
+# imported inputs. Test images only until the workload trial (owner 10-16).
+pipelines-v1 = []
 
 [lib]
 name = "dcg_program"

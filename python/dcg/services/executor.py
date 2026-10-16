@@ -116,7 +116,7 @@ class ExecutorService:
             run = Pubkey.from_string(run_s)
             try:
                 data = self.cl.gc.account(run)
-                if data is None or data[:4] == b"D21P":
+                if data is None or data[:4] in (b"D21P", b"D21Q"):
                     entry["done"] = True
                     log(event="run_closed", run=run_s)
                     continue

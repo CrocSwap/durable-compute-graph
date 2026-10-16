@@ -1222,7 +1222,7 @@ async fn staged_buffers_never_strand() {
     assert!(ch.lamports(kp(0xC1).pubkey()).await - c0 >= b0, "the staged buffer's rent returns with the dispute");
     // The run closes into a receipt with the unopened buffer still there.
     ch.close_run().await.unwrap();
-    assert_eq!(&ch.account(ch.run).await.data[0..4], b"D21P");
+    assert_eq!(&ch.account(ch.run).await.data[0..4], V::RECEIPT_WRITTEN.0);
     let c1 = ch.lamports(kp(0xC1).pubkey()).await;
     ch.prestage(0xB1, 2, ch.dispute(2), 2, &[]).await.unwrap();
     assert_eq!((ch.lamports(stranded).await, ch.lamports(kp(0xC1).pubkey()).await - c1), (0, rent));
@@ -1261,7 +1261,7 @@ async fn a_final_lx_run_is_a_result_whose_outputs_open() {
     let mut ch = Chain::new(p["arity"].as_u64().unwrap() as u8, 3_000).await;
     ch.commit(&p["commitment"]).await.unwrap();
     let read = |run: &Account, t: &Account, ch: &Chain| {
-        res::read_run_result_bytes(&PROGRAM, (&ch.run, &run.owner, &run.data), (&ch.template, &t.owner, &t.data))
+        res::read_run_result_bytes(&PROGRAM, (&ch.run, &run.owner, &run.data), Some((&ch.template, &t.owner, &t.data)))
     };
     let (run, t) = (ch.account(ch.run).await, ch.account(ch.template).await);
     assert_eq!(read(&run, &t, &ch), Err(ResultError::NotFinal));
@@ -1287,9 +1287,9 @@ async fn a_final_lx_run_is_a_result_whose_outputs_open() {
     assert_eq!(live.open_output(0, &[0; 55], &[]), Err(ResultError::Opening), "no single-output opening for LX1");
     ch.close_run().await.unwrap();
     let receipt = ch.account(ch.run).await;
-    assert_eq!(&receipt.data[0..4], b"D21P");
+    assert_eq!(&receipt.data[0..4], V::RECEIPT_WRITTEN.0);
     assert_eq!(read(&receipt, &t, &ch).unwrap().encode(), live.encode());
-    result_fixture("lx_run", serde_json::json!({
+    result_fixture(if cfg!(feature = "pipelines-v1") { "lx_run_q" } else { "lx_run" }, serde_json::json!({
         "host": hex_of(PROGRAM.as_ref()), "run": hex_of(ch.run.as_ref()), "template": hex_of(ch.template.as_ref()),
         "live": hex_of(&run.data), "receipt": hex_of(&receipt.data), "template_data": hex_of(&t.data),
         "result": hex_of(&live.encode()), "outputs": p["commitment"]["outputs"].clone(),

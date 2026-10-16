@@ -631,7 +631,7 @@ impl World {
     }
 
     async fn run_data(&mut self) -> Option<Vec<u8>> {
-        self.account(self.run).await.map(|a| a.data).filter(|d| d.len() != V::RECEIPT_BYTES)
+        self.account(self.run).await.map(|a| a.data).filter(|d| d.len() != V::RECEIPT_WRITTEN.1)
     }
 
     // --- sending, and the shadow ledger ---------------------------------------------
@@ -657,7 +657,7 @@ impl World {
             }
         }
         if let Op::CloseRun(r) = op {
-            p.run_open = self.account(r).await.is_some_and(|a| a.data.len() != V::RECEIPT_BYTES && a.data[R_STATUS] == V::RUN_OPEN);
+            p.run_open = self.account(r).await.is_some_and(|a| a.data.len() != V::RECEIPT_WRITTEN.1 && a.data[R_STATUS] == V::RUN_OPEN);
         }
         p
     }
@@ -734,7 +734,7 @@ impl World {
                 mv(key, pk(who), lam(&key));
             }
             Op::CloseRun(r) => {
-                let keep = if pre.run_open { 0 } else { rent_of(self, V::RECEIPT_BYTES) };
+                let keep = if pre.run_open { 0 } else { rent_of(self, V::RECEIPT_WRITTEN.1) };
                 mv(r, pk(A), lam(&r) - keep);
             }
             Op::CloseCache => mv(self.cache, pk(E), lam(&self.cache)),
@@ -804,11 +804,11 @@ impl World {
             self.fail(&format!("run status {} -> {status}", self.status));
         }
         self.status = status;
-        if run.data.len() == V::RECEIPT_BYTES {
+        if run.data.len() == V::RECEIPT_WRITTEN.1 {
             if !self.run_closed {
                 self.fail("the run shrank to its receipt without an accepted close");
             }
-            if run.lamports != self.rent.minimum_balance(V::RECEIPT_BYTES) {
+            if run.lamports != self.rent.minimum_balance(V::RECEIPT_WRITTEN.1) {
                 self.fail("the receipt holds more than its rent floor");
             }
             return;
@@ -1744,7 +1744,7 @@ impl World {
                 self.fail(&format!("{k} still holds lamports or data after settlement"));
             }
         }
-        if self.account(self.run).await.unwrap().data.len() != V::RECEIPT_BYTES {
+        if self.account(self.run).await.unwrap().data.len() != V::RECEIPT_WRITTEN.1 {
             self.fail("the run did not shrink to its receipt");
         }
         let refuted = self.status == V::RUN_REFUTED;

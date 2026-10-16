@@ -192,12 +192,14 @@ def _u64(d: bytes, at: int) -> int:
 
 
 def read_run_result(host: Pubkey, run: tuple[Pubkey, Pubkey, bytes],
-                    template: tuple[Pubkey, Pubkey, bytes]) -> ResultRef:
-    """A FINAL v2.1 run's result from (key, owner, data) of the run (live or
-    receipt) and its template (``docs/spec/run-read-layout-v21.md``)."""
-    (run_key, run_owner, r), (template_key, template_owner, t) = run, template
-    r, t = bytes(r), bytes(t)
-    if run_owner != host or template_owner != host:
+                    template: tuple[Pubkey, Pubkey, bytes] | None = None) -> ResultRef:
+    """A FINAL v2.1 run's result from (key, owner, data) of the run (live, or
+    receipt D21P or D21Q) and its template (``docs/spec/run-read-layout-v21.md``).
+    A D21Q receipt carries what the result needs from the template, so the
+    template may be omitted for it; every other form needs it."""
+    run_key, run_owner, r = run
+    r = bytes(r)
+    if run_owner != host or (template is not None and template[1] != host):
         raise ResultError("Owner")
     if r[:4] == b"D21R":
         if len(r) < 368 or r[5] not in (0, 1):
@@ -208,24 +210,40 @@ def read_run_result(host: Pubkey, run: tuple[Pubkey, Pubkey, bytes],
         root_at = 192
     elif r[:4] == b"D21P" and len(r) == 312:
         root_at = 136
+    elif r[:4] == b"D21Q" and len(r) == 380:
+        if any(r[345:348]):
+            raise ResultError("Layout")
+        root_at = 136
     else:
         raise ResultError("Layout")
     run_id = r[104:136]
     if Pubkey.find_program_address([b"dcg21run", run_id, r[40:72]], host)[0] != run_key:
         raise ResultError("Address")
-    if r[8:40] != bytes(template_key) or len(t) < 168 or t[:4] != b"D21T":
-        raise ResultError("Template")
+    if template is not None:
+        template_key, _, t = template
+        t = bytes(t)
+        if r[8:40] != bytes(template_key) or len(t) < 168 or t[:4] != b"D21T":
+            raise ResultError("Template")
+    if r[:4] == b"D21Q":
+        tail = r[312:]
+        if template is not None and (t[96:128] != tail[0:32] or t[5] != tail[32]):
+            raise ResultError("Template")
+        template_id, kind, windows = tail[0:32], tail[32], tail[36:68]
+    else:
+        if template is None:
+            raise ResultError("Template")
+        template_id, kind, windows = t[96:128], t[5], t[24:56]
     if r[4] != 2:
         raise ResultError("NotFinal")
     root = r[root_at:root_at + 176]
-    lx = t[5] == 1
+    lx = kind == 1
     if (root[0:32] if lx else root[32:64]) != run_id:
         raise ResultError("Layout")
     if lx:
         scheme, value_root, count, aux, steps = SCHEME_LX_OUTPUTS_V1, root[64:96], 0, root[96:128], _u64(root, 128)
     else:
         scheme, value_root, count, aux, steps = SCHEME_OUT_TREE_V21, root[144:176], _u64(root, 136), root[64:96], _u64(root, 96)
-    body = OptimisticBody(t[96:128], run_id, aux, _u64(t, 24), _u64(t, 32), _u64(t, 40), _u64(t, 48), steps)
+    body = OptimisticBody(template_id, run_id, aux, *struct.unpack("<4Q", windows), steps)
     return ResultRef(scheme, bytes(host), bytes(run_key), value_root, count, body)
 
 

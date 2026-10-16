@@ -285,7 +285,7 @@ class DisputeClient:
     def run_status(self, run: Pubkey) -> int:
         """A live run's or a receipt's status byte (both keep it at byte 4)."""
         data = self.gc.account(run)
-        if data is None or data[:4] not in (b"D21R", b"D21P"):
+        if data is None or data[:4] not in (b"D21R", b"D21P", b"D21Q"):
             raise ValueError(f"{run} is not a v2.1 run or receipt")
         return data[4]
 
@@ -421,7 +421,7 @@ class DisputeClient:
             return None
         u64 = lambda d, at: struct.unpack_from("<Q", d, at)[0]  # noqa: E731
         u32 = lambda d, at: struct.unpack_from("<I", d, at)[0]  # noqa: E731
-        receipt = r[:4] == b"D21P"
+        receipt = r[:4] in (b"D21P", b"D21Q")
         executor = Pubkey.from_bytes(r[R_EXECUTOR:R_EXECUTOR + 32])
         if receipt:
             for cache, k in self.caches_of(run, candidates):
@@ -532,7 +532,7 @@ class DisputeClient:
             refused = 0
             if step is None:
                 data = self.gc.account(run)
-                state = "closed" if data is None or data[:4] == b"D21P" else "stuck"
+                state = "closed" if data is None or data[:4] in (b"D21P", b"D21Q") else "stuck"
                 return {"state": state, "steps": steps}
             if step.startswith("wait: "):
                 if time.monotonic() >= give_up:

@@ -21,6 +21,7 @@ receipt is never closed. A reader therefore sees one of:
 |---|---|---|
 | `D21R` | live run | `192 + 176 + 52·n_ext + 4`, plus 32 on a version-1 run (byte 5 = 1, `remainder_to`) |
 | `D21P` | receipt of a settled run | `312` |
+| `D21Q` | receipt of a settled run that also carries the template's fields (run-read v2, programs built with `pipelines-v1`) | `380` |
 | (no data, system-owned) | an uncommitted run cancelled after its commit deadline | 0 |
 
 ## Live run (`D21R`)
@@ -49,6 +50,28 @@ Bytes 0..136 are the run's bytes 0..136 with the magic replaced (so status,
 template, payer, executor and run_id read at the same offsets). Bytes
 136..312 are the run root. A receipt exists only for a settled run: status
 `FINAL`, or `REFUTED` with the pot paid.
+
+## Receipt with the template's fields (`D21Q`, run-read v2)
+
+Added 2026-10-16 (pipelines slice 1, `docs/design/mixed-mode-pipelines-v1.md`
+§3.4 A), so a run's result stays readable after its template closes.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0..312 | 312 | as `D21P` (magic `D21Q`) |
+| 312 | 32 | template_id (the template's offset 96) |
+| 344 | 1 | template kind (the template's offset 5; 1 = LX1) |
+| 345 | 3 | zero |
+| 348 | 8 | challenge_window (the template's offset 24) |
+| 356 | 8 | phase_window (offset 32) |
+| 364 | 8 | executor_bond (offset 40) |
+| 372 | 8 | challenger_bond (offset 48) |
+
+A program built with `pipelines-v1` funds, at `init_run`, the rent a run
+needs to become a `D21Q` (a run with no external refs is 372 bytes, shorter
+than the receipt). A run whose balance does not cover a `D21Q` when it closes
+(for example one created by an older image) closes into a `D21P`. Readers
+accept both; only a `D21Q` reads without its template.
 
 ## Status
 
@@ -123,8 +146,10 @@ To accept a run's outputs, a consumer checks, in order:
 
 1. The account is owned by the expected DCG program and is the PDA
    `["dcg21run", run_id, payer]` for the run id it expects.
-2. Magic `D21R` with the exact length above, or `D21P` with length 312.
-3. Template (offset 8) is the expected template; executor (offset 72) is the
+2. Magic `D21R` with the exact length above, `D21P` with length 312, or
+   `D21Q` with length 380 (its padding zero).
+3. Template (offset 8) is the expected template (for a `D21Q`, its template id
+   at 312 is the expected template id); executor (offset 72) is the
    expected executor; run_id (offset 104) equals the expected run id.
 4. Status is `FINAL` (2).
 5. For LX1: `params_digest` (root offset 96) equals the expected parameters,

@@ -63,6 +63,9 @@ const RUN_LIVE_ROOT: usize = 192;
 const RUN_RECEIPT_ROOT: usize = 136;
 const RUN_ROOT_BYTES: usize = D::RUN_ROOT_BYTES;
 const RECEIPT_BYTES: usize = 136 + RUN_ROOT_BYTES;
+/// `D21Q`: a `D21P` plus template_id, kind, 3 zero bytes and the template's
+/// windows and bonds (pipelines design §3.4 A).
+const RECEIPT_V2_BYTES: usize = RECEIPT_BYTES + 68;
 const RUN_FINAL: u8 = 2;
 const RUN_SEED: &[u8] = b"dcg21run";
 // The template (`D21T`) fields a result reads.
@@ -530,23 +533,29 @@ pub fn seal_digest_spans(c: &ConsensusBody, spans: &[&[u8]]) -> [u8; 32] {
 }
 
 /// Read a finished v2.1 run's result (design §3.1) from the run account (live
-/// `D21R` or receipt `D21P`) and its template account, both owned by `host`.
-/// Only a `FINAL` run is a result.
-pub fn read_run_result(host: &Pubkey, run: &AccountInfo, template: &AccountInfo) -> Result<ResultRef, ResultError> {
+/// `D21R`, or receipt `D21P` or `D21Q`) and its template account, both owned
+/// by `host`. Only a `FINAL` run is a result. A `D21Q` receipt carries what the
+/// result needs from the template, so `template` may be `None` for it (the
+/// template may have closed); every other form needs the template.
+pub fn read_run_result(host: &Pubkey, run: &AccountInfo, template: Option<&AccountInfo>) -> Result<ResultRef, ResultError> {
     let r = run.try_borrow_data().map_err(|_| ResultError::Layout)?;
-    let t = template.try_borrow_data().map_err(|_| ResultError::Layout)?;
-    read_run_result_bytes(host, (run.key, run.owner, &r), (template.key, template.owner, &t))
+    match template {
+        Some(template) => {
+            let t = template.try_borrow_data().map_err(|_| ResultError::Layout)?;
+            read_run_result_bytes(host, (run.key, run.owner, &r), Some((template.key, template.owner, &t)))
+        }
+        None => read_run_result_bytes(host, (run.key, run.owner, &r), None),
+    }
 }
 
 /// [`read_run_result`] over each account's key, owner and data (for clients).
 pub fn read_run_result_bytes(
     host: &Pubkey,
     run: (&Pubkey, &Pubkey, &[u8]),
-    template: (&Pubkey, &Pubkey, &[u8]),
+    template: Option<(&Pubkey, &Pubkey, &[u8])>,
 ) -> Result<ResultRef, ResultError> {
     let (run_key, run_owner, r) = run;
-    let (template_key, template_owner, t) = template;
-    if run_owner != host || template_owner != host {
+    if run_owner != host || template.is_some_and(|(_, owner, _)| owner != host) {
         return Err(ResultError::Owner);
     }
     let root_at = match r.get(0..4) {
@@ -569,6 +578,12 @@ pub fn read_run_result_bytes(
             RUN_LIVE_ROOT
         }
         Some(b"D21P") if r.len() == RECEIPT_BYTES => RUN_RECEIPT_ROOT,
+        Some(b"D21Q") if r.len() == RECEIPT_V2_BYTES => {
+            if r[RECEIPT_BYTES + 33..RECEIPT_BYTES + 36].iter().any(|b| *b != 0) {
+                return Err(ResultError::Layout);
+            }
+            RUN_RECEIPT_ROOT
+        }
         _ => return Err(ResultError::Layout),
     };
     let run_id = key_at(r, RUN_ID);
@@ -577,17 +592,43 @@ pub fn read_run_result_bytes(
     if &derived != run_key {
         return Err(ResultError::Address);
     }
-    if r[RUN_TEMPLATE..RUN_TEMPLATE + 32] != template_key.to_bytes() {
-        return Err(ResultError::Template);
+    if let Some((template_key, _, t)) = template {
+        if r[RUN_TEMPLATE..RUN_TEMPLATE + 32] != template_key.to_bytes() {
+            return Err(ResultError::Template);
+        }
+        if t.len() < TEMPLATE_MIN_BYTES || &t[0..4] != b"D21T" {
+            return Err(ResultError::Template);
+        }
     }
-    if t.len() < TEMPLATE_MIN_BYTES || &t[0..4] != b"D21T" {
-        return Err(ResultError::Template);
-    }
+    // What the result takes from the template: from the receipt when it
+    // carries it (D21Q), else from the template account.
+    let (template_id, kind, windows) = if &r[0..4] == b"D21Q" {
+        let tail = &r[RECEIPT_BYTES..];
+        // A template passed with a D21Q must be the one it recorded.
+        if let Some((_, _, t)) = template {
+            if t[TEMPLATE_ID..TEMPLATE_ID + 32] != tail[0..32] || t[TEMPLATE_KIND] != tail[32] {
+                return Err(ResultError::Template);
+            }
+        }
+        (key_at(tail, 0), tail[32], [u64_at(tail, 36), u64_at(tail, 44), u64_at(tail, 52), u64_at(tail, 60)])
+    } else {
+        let Some((_, _, t)) = template else { return Err(ResultError::Template) };
+        (
+            key_at(t, TEMPLATE_ID),
+            t[TEMPLATE_KIND],
+            [
+                u64_at(t, TEMPLATE_CHALLENGE_WINDOW),
+                u64_at(t, TEMPLATE_PHASE_WINDOW),
+                u64_at(t, TEMPLATE_EXECUTOR_BOND),
+                u64_at(t, TEMPLATE_CHALLENGER_BOND),
+            ],
+        )
+    };
     if r[RUN_STATUS] != RUN_FINAL {
         return Err(ResultError::NotFinal);
     }
     let root = &r[root_at..root_at + RUN_ROOT_BYTES];
-    let lx = t[TEMPLATE_KIND] == TEMPLATE_KIND_LX;
+    let lx = kind == TEMPLATE_KIND_LX;
     // The committed root names the run (COMMIT checks it); refuse a record
     // that says otherwise rather than mix two runs.
     let root_run_id = if lx { key_at(root, 0) } else { key_at(root, 32) };
@@ -606,13 +647,13 @@ pub fn read_run_result_bytes(
         root: value_root,
         count,
         body: Body::Optimistic(OptimisticBody {
-            template_id: key_at(t, TEMPLATE_ID),
+            template_id,
             run_id,
             root_aux,
-            challenge_window: u64_at(t, TEMPLATE_CHALLENGE_WINDOW),
-            phase_window: u64_at(t, TEMPLATE_PHASE_WINDOW),
-            executor_bond: u64_at(t, TEMPLATE_EXECUTOR_BOND),
-            challenger_bond: u64_at(t, TEMPLATE_CHALLENGER_BOND),
+            challenge_window: windows[0],
+            phase_window: windows[1],
+            executor_bond: windows[2],
+            challenger_bond: windows[3],
             steps,
         }),
     })

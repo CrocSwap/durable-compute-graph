@@ -1640,7 +1640,7 @@ pub fn result_probe(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
             let [run, template, ..] = accounts else {
                 return Err(ProgramError::NotEnoughAccountKeys);
             };
-            let result = crate::result::read_run_result(&host, run, template).map_err(fail)?;
+            let result = crate::result::read_run_result(&host, run, Some(template)).map_err(fail)?;
             if op == 4 {
                 let rest = data.get(34..).ok_or(ProgramError::InvalidInstructionData)?;
                 if rest.len() < 63 || (rest.len() - 63) % 32 != 0 {

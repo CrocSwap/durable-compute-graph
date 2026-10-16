@@ -27,6 +27,14 @@ migrate. Formats may change before beta (see `docs/release-terms.md`).
   are verified outputs of FINAL v2.1 runs (mode composition), native and SBF.
 - **Docs:** the v2.1 run read layout gives the live length of a version-1 run
   (32 more bytes).
+- **Pipelines slice 1 (design `docs/design/mixed-mode-pipelines-v1.md`),
+  behind feature `pipelines-v1`, test images only:**
+  - run receipts `D21Q` (380 bytes) carry the template's id, kind, windows and
+    bonds, so a result reads without its template (run-read v2); `init_run`
+    funds the receipt's rent for short runs; underfunded runs still close into
+    `D21P`. **Breaking for the unreleased mode-results API:**
+    `read_run_result` and `read_run_result_bytes` take the template as an
+    `Option` (Python: an optional argument).
 
 ## v0.3.0-alpha (2026-10-14)
 

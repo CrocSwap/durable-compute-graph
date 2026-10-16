@@ -96,6 +96,23 @@ pub const SUB_CLOSE_RUN: u8 = 19;
 /// Run receipt "D21P": the run's first 136 bytes (magic, status, template,
 /// payer, executor, run id) then its 176-byte root, at the run's own address.
 pub const RECEIPT_BYTES: usize = 136 + D::RUN_ROOT_BYTES;
+/// Run receipt "D21Q" (pipelines slice 1, feature `pipelines-v1`): a `D21P`
+/// receipt plus what a result needs from the template, so the result stays
+/// readable after the template closes: template_id (32), kind (1), zero (3),
+/// challenge_window, phase_window, executor_bond, challenger_bond (8 each).
+pub const RECEIPT_V2_BYTES: usize = RECEIPT_BYTES + 68;
+
+/// The receipt form `close_run` writes in this build for a run whose rent
+/// covers it (magic, length).
+#[cfg(feature = "pipelines-v1")]
+pub const RECEIPT_WRITTEN: (&[u8; 4], usize) = (b"D21Q", RECEIPT_V2_BYTES);
+#[cfg(not(feature = "pipelines-v1"))]
+pub const RECEIPT_WRITTEN: (&[u8; 4], usize) = (b"D21P", RECEIPT_BYTES);
+
+/// Whether `r` is a run receipt, of either form.
+fn is_receipt(r: &[u8]) -> bool {
+    (r.len() == RECEIPT_BYTES && &r[0..4] == b"D21P") || (r.len() == RECEIPT_V2_BYTES && &r[0..4] == b"D21Q")
+}
 /// Close a reveal cache once its run is settled with no open dispute, or gone.
 pub const SUB_CLOSE_CACHE: u8 = 20;
 /// Close a template with no live runs; its rent returns to its recorded payer.
@@ -735,7 +752,17 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &data[0..32], &(n as u32).to_le_bytes(), refs, &data[32..64]]);
     // The payer is part of the run's address (review 10-03, F5): a cancelled
     // run cannot be re-initialized at the same address by someone else.
-    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], R_REFS + refs.len() + R_LOAD_BYTES + extra)?;
+    let space = R_REFS + refs.len() + R_LOAD_BYTES + extra;
+    create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], space)?;
+    // Fund the D21Q receipt's rent now if the run is shorter than it, so
+    // anyone can close it later (close_run); the payer gets it back then.
+    #[cfg(feature = "pipelines-v1")]
+    {
+        let margin = Rent::get()?.minimum_balance(RECEIPT_V2_BYTES).saturating_sub(run.lamports());
+        if margin > 0 {
+            invoke(&system_instruction::transfer(payer.key, run.key, margin), &[payer.clone(), run.clone(), system.clone()])?;
+        }
+    }
     let mut d = run.try_borrow_mut_data()?;
     d[0..4].copy_from_slice(b"D21R");
     if v1 {
@@ -1232,7 +1259,7 @@ fn disputable(program_id: &Pubkey, run: &AccountInfo) -> Result<bool, ProgramErr
     }
     let r = run.try_borrow_data()?;
     if r.len() < R_REFS || &r[0..4] != b"D21R" {
-        return Ok(false); // a receipt (D21P)
+        return Ok(false); // a receipt (D21P or D21Q)
     }
     Ok(r[R_STATUS] == RUN_COMMITTED && now()? <= u64_at(&r, R_DEADLINE)?)
 }
@@ -2329,13 +2356,43 @@ fn close_run(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if status == RUN_OPEN {
         return close_into(run, payer);
     }
-    {
+    #[cfg(not(feature = "pipelines-v1"))]
+    let receipt_bytes = {
         let mut r = run.try_borrow_mut_data()?;
         r.copy_within(R_ROOT..R_REFS, 136);
         r[0..4].copy_from_slice(b"D21P");
-    }
-    run.resize(RECEIPT_BYTES)?;
-    let floor = Rent::get()?.minimum_balance(RECEIPT_BYTES);
+        RECEIPT_BYTES
+    };
+    #[cfg(feature = "pipelines-v1")]
+    let receipt_bytes = {
+        // The template's id, kind, windows and bonds, read before the run
+        // shrinks (pipelines design §3.4 A). A run with no external refs is
+        // 372 bytes, shorter than the receipt: init funds the difference
+        // (`receipt_margin`), and a run created before that (or otherwise
+        // short of rent) closes into the old D21P form instead.
+        let v2 = run.lamports() >= Rent::get()?.minimum_balance(RECEIPT_V2_BYTES);
+        let mut tail = [0u8; RECEIPT_V2_BYTES - RECEIPT_BYTES];
+        {
+            let t = tmpl.try_borrow_data()?;
+            tail[0..32].copy_from_slice(&t[96..128]);
+            tail[32] = t[5];
+            tail[36..68].copy_from_slice(&t[24..56]);
+        }
+        {
+            let mut r = run.try_borrow_mut_data()?;
+            r.copy_within(R_ROOT..R_REFS, 136);
+            r[0..4].copy_from_slice(if v2 { b"D21Q" } else { b"D21P" });
+        }
+        if v2 {
+            run.resize(RECEIPT_V2_BYTES)?;
+            run.try_borrow_mut_data()?[RECEIPT_BYTES..RECEIPT_V2_BYTES].copy_from_slice(&tail);
+            RECEIPT_V2_BYTES
+        } else {
+            RECEIPT_BYTES
+        }
+    };
+    run.resize(receipt_bytes)?;
+    let floor = Rent::get()?.minimum_balance(receipt_bytes);
     let extra = run.lamports().checked_sub(floor).ok_or(err(8))?;
     if !payer.is_writable {
         return Err(err(35));
@@ -2403,7 +2460,7 @@ fn close_cache(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let payee = if live {
         // A live run (settled, no open dispute) or its receipt.
         let r = run.try_borrow_data()?;
-        let receipt = r.len() == RECEIPT_BYTES && &r[0..4] == b"D21P";
+        let receipt = is_receipt(&r);
         if !receipt && (r.len() < R_REFS || &r[0..4] != b"D21R") {
             return Err(err(5));
         }

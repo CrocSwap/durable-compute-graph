@@ -266,15 +266,19 @@ mode results §3.2) are a later extension through the `host` field of the
 The owner's answers to mode results §8 (2026-10-15) put three more changes
 into slice 1, so the shared image changes once.
 
-**A. Run receipts carry the template id (mode results §8 Q2).** A run closes
-into a new receipt form `D21Q`, 348 bytes: bytes 0..312 as in `D21P` (magic
-replaced), then `template_id` (32, the template's offset 96), the template
-kind byte (1, the template's offset 5) and 3 zero bytes. `read_run_result`
-reads a `D21Q` without the template account, so a result stays readable after
-its template closes. `D21P` receipts already written keep their form and still
-need the template. The run read layout becomes run-read v2 (new magic, under
-v1's versioning rule); the live run's version 2 (imports) is in the same
-document.
+**A. Run receipts carry the template's fields (mode results §8 Q2).** A run
+closes into a new receipt form `D21Q`, 380 bytes: bytes 0..312 as in `D21P`
+(magic replaced), then `template_id` (32, the template's offset 96), the
+template kind byte (1, offset 5), 3 zero bytes, and the template's
+challenge window, phase window, executor bond and challenger bond (8 each,
+offsets 24..56), which the result's body also needs. `read_run_result` reads a
+`D21Q` without the template account (its `template` argument is an `Option`),
+so a result stays readable after its template closes. `init_run` funds the
+`D21Q`'s rent for a run shorter than it; a run short of that rent at close (one
+created by an older image) closes into a `D21P`, which keeps its form and still
+needs the template. The run read layout gains the form as run-read v2
+(`docs/spec/run-read-layout-v21.md`); the live run's version 2 (imports) is in
+the same document. Implemented 2026-10-16 behind feature `pipelines-v1`.
 
 **B. Anyone may seal a halted session (mode results §8 Q1).**
 - `SEAL` begin, chunk and finish no longer require the authority's
