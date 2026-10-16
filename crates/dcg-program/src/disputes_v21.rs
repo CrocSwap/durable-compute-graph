@@ -352,6 +352,7 @@ impl ImportSpec {
 }
 
 /// A template's imports, in table order (empty for a template without).
+#[cfg(feature = "pipelines-v1")]
 fn template_imports(d: &[u8]) -> Result<Vec<ImportSpec>, ProgramError> {
     if d.len() != T_BYTES_V3 {
         return Ok(Vec::new());
@@ -368,6 +369,7 @@ fn template_imports(d: &[u8]) -> Result<Vec<ImportSpec>, ProgramError> {
 
 /// Split create data into the template proper and a trailing import table,
 /// which must be canonical: 1..=16 records, external ids strictly increasing.
+#[cfg(feature = "pipelines-v1")]
 fn split_import_tail(data: &[u8]) -> Result<(&[u8], Option<&[u8]>), ProgramError> {
     if !cfg!(feature = "pipelines-v1") {
         return Ok((data, None));
@@ -618,6 +620,7 @@ fn trailer_extra(r: &[u8]) -> Result<usize, ProgramError> {
 const R_IMPORTS_BYTES: usize = 4;
 
 /// The pending-import bitmap's offset on a version-2 run (None otherwise).
+#[cfg(feature = "pipelines-v1")]
 fn pending_imports_at(r: &[u8]) -> Result<Option<usize>, ProgramError> {
     if r.get(R_VERSION).copied() != Some(2) {
         return Ok(None);
@@ -630,7 +633,9 @@ fn pending_imports_at(r: &[u8]) -> Result<Option<usize>, ProgramError> {
 fn remainder_to(r: &[u8]) -> Result<[u8; 32], ProgramError> {
     match r.get(R_VERSION).copied() {
         Some(0) => key32(r, R_PAYER),
-        Some(1 | 2) => key32(r, load_offset(r)? + R_LOAD_BYTES),
+        Some(1) => key32(r, load_offset(r)? + R_LOAD_BYTES),
+        #[cfg(feature = "pipelines-v1")]
+        Some(2) => key32(r, load_offset(r)? + R_LOAD_BYTES),
         _ => Err(err(8)),
     }
 }
@@ -677,7 +682,8 @@ pub fn process(
         SUB_TEST_CREATE_LEGACY_TEMPLATE => create_template_inner(program_id, accounts, &data[2..], false),
         SUB_INIT_RUN => init_run(program_id, accounts, &data[2..], false),
         SUB_INIT_RUN_V1 => init_run(program_id, accounts, &data[2..], true),
-        SUB_IMPORT if cfg!(feature = "pipelines-v1") => import(program_id, accounts, &data[2..]),
+        #[cfg(feature = "pipelines-v1")]
+        SUB_IMPORT => import(program_id, accounts, &data[2..]),
         SUB_COMMIT => commit(program_id, accounts, &data[2..], manifest),
         SUB_OPEN => open(program_id, accounts, &data[2..], manifest),
         lx::SUB_LX_MIDPOINTS => lx::midpoints(program_id, accounts, &data[2..]),
@@ -719,7 +725,10 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], full: &[
     let [admitter, tmpl, system, ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
     // An import table (pipelines slice 1) ends the create data; the id hashes
     // all of it, the table included.
+    #[cfg(feature = "pipelines-v1")]
     let (data, import_tail) = split_import_tail(full)?;
+    #[cfg(not(feature = "pipelines-v1"))]
+    let data = full;
     const FIXED: usize = 1 + 6 * 8 + 8 + 32 + 2 + 32;
     if !admitter.is_signer || data.len() < FIXED {
         return Err(ProgramError::InvalidInstructionData);
@@ -797,15 +806,19 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], full: &[
     };
     let count = blocks.len();
     check_blocks(&blocks, total_steps)?;
+    #[cfg(feature = "pipelines-v1")]
     if import_tail.is_some() && (lx_tail.is_some() || !track_close) {
         return Err(err(6));
     }
     let template_id = sha256(&[TEMPLATE_DOMAIN, full]);
+    #[cfg(feature = "pipelines-v1")]
     let template_bytes = match (track_close, import_tail.is_some()) {
         (false, _) => T_BYTES,
         (true, false) => T_BYTES_V2,
         (true, true) => T_BYTES_V3,
     };
+    #[cfg(not(feature = "pipelines-v1"))]
+    let template_bytes = if track_close { T_BYTES_V2 } else { T_BYTES };
     if track_close {
         create_pda(program_id, admitter, tmpl, system, &[b"dcg21tmpl", &template_id, admitter.key.as_ref()], template_bytes)?;
     } else {
@@ -835,6 +848,7 @@ fn create_template_inner(program_id: &Pubkey, accounts: &[AccountInfo], full: &[
         d[T_ACTIVE_RUNS..T_ACTIVE_RUNS + 4].copy_from_slice(&0u32.to_le_bytes());
         d[T_RETIRED] = 0;
     }
+    #[cfg(feature = "pipelines-v1")]
     if let Some(tail) = import_tail {
         d[T_IMPORTS..T_IMPORTS + 4].copy_from_slice(T_IMPORTS_MAGIC);
         d[T_IMPORTS + 4..T_IMPORTS + tail.len()].copy_from_slice(&tail[4..]);
@@ -897,14 +911,19 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool
     // init (a remainder destination) and makes a version-2 run, whose
     // pending-import bitmap starts with every import outstanding. Each import
     // names one of the run's external refs.
-    let imports = if cfg!(feature = "pipelines-v1") { template_imports(&tmpl.try_borrow_data()?)? } else { Vec::new() };
+    #[cfg(feature = "pipelines-v1")]
+    let imports = template_imports(&tmpl.try_borrow_data()?)?;
+    #[cfg(feature = "pipelines-v1")]
     if !imports.is_empty() {
         let has_ref = |id: u32| (0..n).any(|i| u32_at(refs, 52 * i).is_ok_and(|x| x == id));
         if !v1 || imports.iter().any(|i| !has_ref(i.external_id)) {
             return Err(err(51));
         }
     }
+    #[cfg(feature = "pipelines-v1")]
     let imports_extra = if imports.is_empty() { 0 } else { R_IMPORTS_BYTES };
+    #[cfg(not(feature = "pipelines-v1"))]
+    let imports_extra = 0;
     let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &template_id, &data[0..32], &(n as u32).to_le_bytes(), refs, &data[32..64]]);
     // The payer is part of the run's address (review 10-03, F5): a cancelled
     // run cannot be re-initialized at the same address by someone else.
@@ -926,6 +945,7 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool
         let at = R_REFS + refs.len() + R_LOAD_BYTES;
         d[at..at + 32].copy_from_slice(&data[refs_end..refs_end + 32]);
     }
+    #[cfg(feature = "pipelines-v1")]
     if !imports.is_empty() {
         d[R_VERSION] = 2;
         let at = R_REFS + refs.len() + R_LOAD_BYTES + R_REMAINDER_BYTES;
@@ -959,6 +979,7 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool
 // `host`), requires it to meet the requirements whose digest the template
 // names, and checks that the run's external ref for the input is that result's
 // value. The last import starts the commit deadline afresh.
+#[cfg(feature = "pipelines-v1")]
 fn import(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     use crate::result::{self as res, ResultRequirements};
     let [caller, run, tmpl, source, rest @ ..] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
@@ -1052,7 +1073,8 @@ fn commit(
             return Err(err(7));
         }
         // Every imported input verified first (pipelines slice 1).
-        if let Some(at) = pending_imports_at(&d)?.filter(|_| cfg!(feature = "pipelines-v1")) {
+        #[cfg(feature = "pipelines-v1")]
+        if let Some(at) = pending_imports_at(&d)? {
             if u32_at(&d, at)? != 0 {
                 return Err(err(52));
             }
