@@ -91,7 +91,8 @@ Two designs that keep everything in one run were considered and rejected.
 Several verifiers over **one** commitment (for example Freivalds or sampling
 checks over an optimistic run's committed trace) are a different thing: they
 are a property of a single stage's mode, designed with those modes. The stage
-model does not prevent them.
+model does not prevent them. §12 evaluates the general form, per-kernel modes
+chosen by the executor, which is sound in one tree, and defers it.
 
 ## 3. The three pieces
 
@@ -445,6 +446,95 @@ Open:
    Sessions as stages come later through foreign hosts.
 4. Build behind a feature on the test image first and trial it with a
    workload (qushta or Basanos) before the shared-image upgrade. Recommended.
-5. How existing v2.1 template ids absorb the `mode` field: a new template id
+5. Decided 2026-10-16: per-kernel modes chosen by the executor are deferred
+   (§12); slice 2 reserves their fields in the step spec and leaf.
+6. How existing v2.1 template ids absorb the `mode` field: a new template id
    domain for mode-carrying templates (old ids unchanged), or mode only in a
    new template version. Decide at slice 2.
+
+## 12. Per-kernel modes chosen by the executor (evaluated 2026-10-16, deferred)
+
+**Proposal (owner 2026-10-16).** Each kernel in a template lists the modes it
+accepts. On each run the executor picks, for each step, one mode from its
+kernel's list. The owner's motivation is mostly a cost trade-off for the
+executor, not steps that are too large.
+
+**Mechanics (designed).**
+- The step spec carries the kernel's allowed-mode set and the step leaf the
+  chosen mode. Both are frozen bytes today, so this is a new protocol version
+  (step leaf and spec v2).
+- SHAPE rules for C when the chosen mode is not allowed.
+- STEP dispatches on the leaf's mode: optimistic replays C's witness (today);
+  consensus rules for E if and only if the program recorded the step as
+  executed on chain before `COMMIT`; Freivalds runs a randomized check with
+  randomness drawn after the claim; ZK needs E's proof.
+
+**Soundness.** It is sound in one tree. A proven step shows only that its
+outputs follow from its own claimed inputs. If it is the first divergent leaf,
+its inputs or prior state differ from H's, and EDGE, STATE or SHAPE refute it
+against earlier leaves, which are honest by the descent invariant (v2.1 §7.1).
+This corrects §2.1, which considered only template-fixed consensus blocks.
+
+**Every step must still fit replay.** v2.1 admission requires every step to fit
+its declared compute and the 1 MiB staging limit. Large work is decomposed
+(lazy decomposition, LX1 checkpoints) until each leaf a dispute can reach is
+small. Under per-kernel modes, a kernel that allows optimistic must still fit
+replay, because the executor can always choose it. Only a kernel without
+optimistic could skip the rule, and decomposition already covers large steps.
+So no mode makes a step checkable that is not checkable today.
+
+**The executor's choice buys little with today's modes.**
+- An honest executor never loses a dispute, so proving a step at commit buys
+  it no protection. It pays compute now to avoid answering a dispute it would
+  win.
+- A run finalizes as one unit at its window (v2.1 §11), so proving some steps
+  does not shorten finality. A run with every step proven could finalize at
+  once, but that is a consensus run (slice 2).
+- The guarantee a consumer gets is the weakest allowed mode, since the executor
+  may always pick it. The allowed list is therefore a security parameter of the
+  template.
+- What proving does buy is a smaller dispute surface, which helps the payer
+  more than the executor.
+
+**Freivalds for a 4B decode token** (all *estimated* unless marked).
+- About 98 to 99% of a decode token's arithmetic is matrix-vector products
+  (about one multiply-add per weight, 3.5 to 4 billion per token), so that
+  much is eligible by operation count. Requantization of every output cell
+  still needs an exact check in another mode.
+- **As a dispute resolver it is worse than first divergence.** Checking
+  `y = W·x` needs `rᵀW`, which for one token touches all of `W`: for the 4B
+  `up_proj` (2,560 × 9,216) about 23.6M multiply-adds, about 175M CU at the
+  *measured* 7.42 CU per multiply-add of the exact matmul path (Basanos
+  `docs/experiments/matmul-kernel-cu-2026-09-03.md`), at least 126 full
+  instructions. First divergence replays one small window instead, at most
+  1.4M CU.
+- **As a check of every token, without a window,** the compute amortizes
+  (one `rᵀW` per matrix per run, about 3×10^10 CU, then a dot product per
+  token per matrix), but the data does not: the program must read every
+  token's inputs and accumulators for every matrix, about 2 million values,
+  roughly 5 to 15 MB, per token. Requantization adds about 10^8 CU per token.
+  Against an honest optimistic run, which costs nothing on chain, it is never
+  a saving.
+- **Finality.** The window is sized to the worst case: the executor publishes
+  only its commitment and a challenger recomputes from the inputs
+  (`challenge_window ≥ honest_compute_slots + phase_window`). Freivalds speeds
+  up checking only a trace the executor chose to publish, and a published trace
+  already allows a parallel, teacher-forced re-check. The program cannot
+  enforce off-chain availability, and on-chain posting is the data cost above.
+  Honest finality shrinks through faster honest recomputation (faster exact
+  kernels, better hardware), not through Freivalds.
+- **Privacy.** Worse than optimistic. An honest optimistic run puts only its
+  commitment and inputs on chain, and a dispute reveals one window's witness;
+  Freivalds needs the operands and accumulators of every checked matrix. Neither
+  hides the weights, which optimistic challengers must already have. Only ZK
+  offers privacy, at the cost of proving 4B off chain.
+- Where it could still help: a watcher's off-chain tool to locate a divergent
+  layer quickly before disputing optimistically; matrix-matrix work such as
+  batch prefill, which still carries the data cost.
+
+**Decision (owner 2026-10-16): deferred.** No practical upside now. Slice 2
+reserves the mode fields in the step spec and leaf when it changes the
+template format, at almost no cost. Per-step dispatch is built together with
+the first mode whose cost on the executor's side differs enough for the choice
+to matter (for example a ZK proof posted once in place of an interactive
+dispute, or a bond released early).
