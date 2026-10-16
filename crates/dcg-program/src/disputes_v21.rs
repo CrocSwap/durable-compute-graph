@@ -362,6 +362,10 @@ fn template_imports(d: &[u8]) -> Result<Vec<ImportSpec>, ProgramError> {
         return Err(err(4));
     }
     let at = T_IMPORTS + 8;
+    // Slots past `count` are never written (review 10-16 L4).
+    if d[at + IMPORT_SPEC_BYTES * count..T_BYTES_V3].iter().any(|b| *b != 0) {
+        return Err(err(4));
+    }
     (0..count)
         .map(|i| ImportSpec::parse(&d[at + IMPORT_SPEC_BYTES * i..at + IMPORT_SPEC_BYTES * (i + 1)]).ok_or(err(4)))
         .collect()
@@ -930,7 +934,8 @@ fn init_run(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8], v1: bool
     let space = R_REFS + refs.len() + R_LOAD_BYTES + extra + imports_extra;
     create_pda(program_id, payer, run, system, &[b"dcg21run", &run_id, payer.key.as_ref()], space)?;
     // Fund the D21Q receipt's rent now if the run is shorter than it, so
-    // anyone can close it later (close_run); the payer gets it back then.
+    // anyone can close it later (close_run). The margin stays in the receipt,
+    // which is never closed (review 10-16 L5).
     #[cfg(feature = "pipelines-v1")]
     {
         let margin = Rent::get()?.minimum_balance(RECEIPT_V2_BYTES).saturating_sub(run.lamports());
@@ -996,6 +1001,20 @@ fn import(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     let tail = &data[6 + drq_len..];
     let requirements = ResultRequirements::decode(drq).map_err(|_| err(51))?;
     if requirements.digest() != spec.requirements_digest {
+        return Err(err(51));
+    }
+    // Requirements must name the computation (review 10-16 M2), or any final
+    // result of `host` would do: a run import its template or run, a state
+    // import its kernel (a tree seal's root binds only the bytes). A stated
+    // mode must be the scheme's. A template with weaker requirements never
+    // imports.
+    let identity = if spec.scheme == res::SCHEME_STATE_TREE_V1 {
+        requirements.kernel.is_some() && requirements.mode.is_none_or(|m| m == res::MODE_CONSENSUS)
+    } else {
+        (requirements.template_id.is_some() || requirements.run_id.is_some())
+            && requirements.mode.is_none_or(|m| m == res::MODE_OPTIMISTIC)
+    };
+    if !identity {
         return Err(err(51));
     }
     // The source's final result, read as a consumer reads it.

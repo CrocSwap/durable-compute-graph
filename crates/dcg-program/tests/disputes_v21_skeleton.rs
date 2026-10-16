@@ -3094,6 +3094,28 @@ async fn a_run_imports_a_final_runs_output_and_commits_once_every_import_is_veri
     let now = ch.ctx.banks_client.get_sysvar::<solana_program::clock::Clock>().await.unwrap().slot;
     assert_eq!(u64::from_le_bytes(r.data[144..152].try_into().unwrap()), now + 750, "the commit deadline starts afresh");
     send(&mut ch.ctx, commit, &[&executor]).await.unwrap();
+    // Requirements that do not name the computation, or state another mode,
+    // never import (review 10-16 M2): a template with them is created but its
+    // runs cannot commit.
+    for (what, weak) in [
+        ("no template or run", ResultRequirements { mode: Some(res::MODE_OPTIMISTIC), min_challenge_window: Some(750), ..Default::default() }),
+        ("the consensus mode", ResultRequirements { mode: Some(res::MODE_CONSENSUS), ..req }),
+    ] {
+        let data = import_template_data(&[V::ImportSpec { requirements_digest: weak.digest(), ..spec(5) }]);
+        let id = sha256(&[V::TEMPLATE_DOMAIN, &data]);
+        let t = Pubkey::find_program_address(&[b"dcg21tmpl", &id, admitter.pubkey().as_ref()], &PROGRAM).0;
+        send(&mut ch.ctx, create(&data, t), &[&admitter]).await.unwrap();
+        let mut d = vec![0x78u8; 32];
+        d.extend_from_slice(executor.pubkey().as_ref());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend(ext(5));
+        d.extend_from_slice(kp(0xB1).pubkey().as_ref());
+        let run_id = sha256(&[b"dcg.run.id.v2.1\x00", &id, &[0x78; 32], &1u32.to_le_bytes(), &ext(5), executor.pubkey().as_ref()]);
+        let weak_run = Pubkey::find_program_address(&[b"dcg21run", &run_id, admitter.pubkey().as_ref()], &PROGRAM).0;
+        send(&mut ch.ctx, ix(V::SUB_INIT_RUN_V1, &d, vec![AccountMeta::new(admitter.pubkey(), true), AccountMeta::new(weak_run, false), AccountMeta::new(t, false), AccountMeta::new_readonly(SYSTEM, false)]), &[&admitter]).await.unwrap();
+        let i = ix(V::SUB_IMPORT, &import_data(5, &weak.encode(), &out0, &path0), vec![AccountMeta::new_readonly(caller.pubkey(), true), AccountMeta::new(weak_run, false), AccountMeta::new_readonly(t, false), AccountMeta::new_readonly(ch.run, false)]);
+        assert_eq!(send(&mut ch.ctx, i, &[&caller]).await, refusal(51), "{what}");
+    }
     // The imported run is a result like any other (version-2 layout).
     let b = ch.ctx.banks_client.get_account(b_template).await.unwrap().unwrap();
     assert_eq!(res::read_run_result_bytes(&PROGRAM, (&run, &r.owner, &ch.ctx.banks_client.get_account(run).await.unwrap().unwrap().data), Some((&b_template, &b.owner, &b.data))).err(), Some(res::ResultError::NotFinal));

@@ -226,7 +226,8 @@ def main() -> int:
             CL.DisputeClient(returns[-1]).fund(gc.payer.pubkey(), left - 5_000)
     spent = payer0 - balance(gc, gc.payer.pubkey())
     txs = sum(len(c.signatures) for c in (gc, gce, gcw, *returns))
-    receipts = 2 * gc.rpc("getMinimumBalanceForRentExemption", [CL.RECEIPT_BYTES])
+    # The larger receipt form (D21Q, programs with pipelines-v1) bounds both.
+    receipts = 2 * gc.rpc("getMinimumBalanceForRentExemption", [CL.RECEIPT_V2_BYTES])
     print(f"done in {time.monotonic() - t0:.0f} s, {txs} transactions. The payer spent {spent:,} lamports: {receipts:,} stay in the two "
           f"run receipts (each run's permanent record), the rest is fees. Every other account was closed and its "
           f"rent returned; the slashed bond went to the challenger and the payer.")

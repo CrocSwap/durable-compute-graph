@@ -1558,6 +1558,11 @@ impl Kernel for V3BigSealKernel {
 }
 
 impl StatefulKernel for V3BigSealKernel {
+    /// Strangers tree-seal it in 64-byte chunks (pipelines slice 1 tests).
+    fn open_seal_log2(&self) -> u8 {
+        6
+    }
+
     fn initial_state(&self, _output: &mut [u8]) -> Result<usize, KernelError> {
         Err(KernelError::Refused)
     }

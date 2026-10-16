@@ -35,6 +35,16 @@ class ImportSpec:
             raise ValueError("a state import takes the whole state (out_index 0)")
         if self.scheme not in (R.SCHEME_OUT_TREE_V21, R.SCHEME_STATE_TREE_V1) or len(self.host) != 32:
             raise ValueError("unsupported import")
+        # The program never verifies requirements that do not name the
+        # computation (a run import its template or run, a state import its
+        # kernel) or that state another mode.
+        q = self.requirements
+        if self.scheme == R.SCHEME_STATE_TREE_V1:
+            named, mode = q.kernel is not None, R.MODE_CONSENSUS
+        else:
+            named, mode = q.template_id is not None or q.run_id is not None, R.MODE_OPTIMISTIC
+        if not named or q.mode not in (None, mode):
+            raise ValueError("requirements must name the computation and match the scheme's mode")
         return (IMPORT_SPEC_MAGIC + struct.pack("<IBB", self.external_id, SOURCE_RESULT, self.scheme) + bytes(6)
                 + struct.pack("<Q", self.out_index) + self.requirements.digest() + bytes(self.host) + bytes(16))
 

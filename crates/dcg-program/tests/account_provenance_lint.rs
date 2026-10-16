@@ -431,6 +431,7 @@ const CURRENT_AUDIT_FINDINGS: &[&str] = &[
     "disputes_v21.rs::private commit", // run_checked binds D21R to D21T; only its recorded executor signer can commit.
     "disputes_v21.rs::private create_pda", // exact seed/bump, empty system owner and caller-signed payer precede allocation.
     "disputes_v21.rs::private finalize", // run_checked binds D21R to D21T; deadline and recorded executor key gate payout.
+    "disputes_v21.rs::private import", // run_checked binds D21R to D21T; the source is read by owner, PDA and status (result readers); writes only the pending bit and deadline.
     "disputes_v21.rs::private moot", // dispute_ctx binds both PDAs; best-win sequence and challenger key gate the ruling.
     "disputes_v21.rs::private move_lamports", // callers authenticate program-owned source and recorded payout recipient before transfer.
     "disputes_v21.rs::private open", // template and run_checked authenticate the run; the challenger signs; open_record creates the dispute at its derived dcg21dsp address.

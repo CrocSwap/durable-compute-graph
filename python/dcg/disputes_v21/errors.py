@@ -132,6 +132,10 @@ _TABLE: list[tuple[int, str, str, str]] = [
      "Open from the committed state with valid paths."),
     (50, "BadConstantOpening", "too many constant reads, or a chunk path too long",
      "Stay within the step's read and path limits."),
+    (51, "ImportRefused", "an imported input did not verify against a final result (pipelines-v1)",
+     "Name a final source of the import's host that meets the template's requirements, with the run's value."),
+    (52, "ImportsPending", "the run has imported inputs not yet verified (pipelines-v1)",
+     "Send IMPORT for every imported input before COMMIT."),
 ]
 
 ERRORS: dict[int, DisputeError] = {c: DisputeError(c, n, m, f) for c, n, m, f in _TABLE}

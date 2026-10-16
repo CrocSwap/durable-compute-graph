@@ -352,9 +352,11 @@ async fn a_sealed_session_is_a_result_a_consumer_opens_and_keeps_after_the_sessi
     assert_eq!(record.data, result.encode().to_vec());
 
     // The whole session closes (anchor account included); the kept result
-    // still opens against the state a client recorded.
+    // still opens against the state a client recorded. The authority signs
+    // the closes (with `pipelines-v1`, a kernel-halted session's state closes
+    // only that way).
     for (key, kind) in [(anchor_pda(&s), v3::KIND_ANCHOR), (state_pda(&s, 1), v3::KIND_STATE), (state_pda(&s, 0), v3::KIND_STATE), (stream_pda(&s), v3::KIND_STREAM)] {
-        send(&mut ctx, close(s, key, auth.pubkey(), kind), &[]).await.unwrap();
+        send(&mut ctx, close_signed(s, key, auth.pubkey(), kind), &[&auth]).await.unwrap();
     }
     send(&mut ctx, ix(sw::TAG_CLOSE_ACCOUNT, vec![v3::WIRE_VERSION, v3::KIND_SESSION], vec![w(s), w(auth.pubkey())]), &[])
         .await
@@ -464,7 +466,7 @@ async fn a_seal_covers_the_whole_final_state_or_nothing() {
         send(&mut ctx, close(s, key, auth.pubkey(), kind), &[]).await.unwrap();
         assert_eq!(read(&mut ctx, s).await, Ok(sealed), "after closing kind {kind}");
     }
-    send(&mut ctx, close(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
+    send(&mut ctx, close_signed(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[&auth]).await.unwrap();
     assert_eq!(read(&mut ctx, s).await, Err(ResultError::Trimmed));
     let payer = ctx.payer.pubkey();
     assert_eq!(send(&mut ctx, keep(payer, s, app::V3_REJECT_HALT_REASON), &[]).await, Err(100 + ResultError::Trimmed as u32));
@@ -692,10 +694,18 @@ async fn anyone_may_seal_and_only_the_authority_trims_before_a_seal() {
     assert_eq!((theirs.root, theirs.count), (mine.root, mine.count), "the same state seals the same, whoever sends it");
     assert_eq!(theirs.open_state(&state_bytes(&mut ctx, s).await), Ok(()));
     assert_eq!(send(&mut ctx, begin(payer, alice.pubkey(), s, v3::ANCHOR_OP_SEAL, 10), &[&alice]).await, Err(v3::REFUSAL_CURSOR), "sealed once");
-    // Sealed: anyone may close, and the result reads until a span closes.
+    // A stranger may begin only the kernel's declared form (review H1): the
+    // tick-and-reject kernel declares the linear seal.
+    let other = halted(&mut ctx, &auth, 9).await;
+    assert_eq!(send(&mut ctx, begin_tree(payer, alice.pubkey(), other, 10, 6), &[&alice]).await, Err(v3::REFUSAL_AUTHORITY));
+    // Sealed: the anchor still closes for anyone, but the state stays until the
+    // authority signs (review H2), and the result reads until then.
     send(&mut ctx, close(s, anchor_pda(&s), auth.pubkey(), v3::KIND_ANCHOR), &[]).await.unwrap();
-    send(&mut ctx, close(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
+    assert_eq!(send(&mut ctx, close(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[]).await, Err(v3::REFUSAL_AUTHORITY));
+    assert_eq!(read(&mut ctx, s).await.map(|r| r.root), Ok(theirs.root));
+    send(&mut ctx, close_signed(s, state_pda(&s, 1), auth.pubkey(), v3::KIND_STATE), &[&auth]).await.unwrap();
     assert_eq!(read(&mut ctx, s).await, Err(ResultError::Trimmed));
+    send(&mut ctx, close(s, state_pda(&s, 0), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
 
     // Before a seal, a stranger cannot trim; the anchor and stream still close.
     let s = halted(&mut ctx, &auth, 3).await;
@@ -865,12 +875,22 @@ async fn a_tree_seal_is_the_chunked_value_digest_and_opens_by_chunk() {
     assert_eq!(linear.open_state(&state_bytes(&mut ctx, s).await), Ok(()));
     let anchor = ctx.banks_client.get_account(anchor_pda(&s)).await.unwrap().unwrap();
     assert!(anchor.data.len() == 704 && anchor.data[116..].iter().all(|b| *b == 0), "the frontier is cleared");
-    // A stranger's tree seal (anyone may seal) equals the authority's.
+    // A stranger seals in the kernel's declared form only (review H1): the
+    // big-seal kernel declares a tree at 2^6; the result equals the
+    // authority's own.
     let stranger = keypair(79);
-    let t = halted(&mut ctx, &auth, 5).await;
-    send(&mut ctx, begin_tree(payer, stranger.pubkey(), t, 10, 6), &[&stranger]).await.unwrap();
-    send(&mut ctx, chunk(stranger.pubkey(), t, 10, 0), &[&stranger]).await.unwrap();
-    send(&mut ctx, finish(stranger.pubkey(), t, 10), &[&stranger]).await.unwrap();
+    let t = big_halted(&mut ctx, &auth, 6, &commands).await;
+    for (form, op) in [(0u8, v3::ANCHOR_OP_SEAL), (7, v3::ANCHOR_OP_TREE_SEAL)] {
+        let mut i = begin(payer, stranger.pubkey(), t, op, 3);
+        if form != 0 {
+            i.data.push(form);
+        }
+        assert_eq!(send(&mut ctx, i, &[&stranger]).await, Err(v3::REFUSAL_AUTHORITY), "form {form}");
+    }
+    send(&mut ctx, begin_tree(payer, stranger.pubkey(), t, 3, 6), &[&stranger]).await.unwrap();
+    send_big(&mut ctx, chunk(stranger.pubkey(), t, 3, 0), &[&stranger]).await.unwrap();
+    send_big(&mut ctx, chunk(stranger.pubkey(), t, 3, res::SEAL_CHUNK_BYTES as u32), &[&stranger]).await.unwrap();
+    send(&mut ctx, finish(stranger.pubkey(), t, 3), &[&stranger]).await.unwrap();
     assert_eq!(read(&mut ctx, t).await.unwrap().root, res::tree_seal_spans(&[&state_bytes(&mut ctx, t).await], 6));
 }
 
@@ -903,7 +923,7 @@ async fn a_run_imports_a_tree_sealed_sessions_state() {
     let linear = halted(&mut ctx, &auth, 2).await;
     seal(&mut ctx, &auth, linear, 10).await.unwrap();
     let trimmed = tree_sealed(&mut ctx, &auth, 3).await;
-    send(&mut ctx, close(trimmed, state_pda(&trimmed, 1), auth.pubkey(), v3::KIND_STATE), &[]).await.unwrap();
+    send(&mut ctx, close_signed(trimmed, state_pda(&trimmed, 1), auth.pubkey(), v3::KIND_STATE), &[&auth]).await.unwrap();
 
     // Template: input 3 is a tree-sealed state of the tick-and-reject kernel.
     let m = app::V3_TICK_REJECT.manifest();

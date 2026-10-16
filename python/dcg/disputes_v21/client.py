@@ -39,6 +39,9 @@ PH_RULED, RULING_OPEN, RULING_CHALLENGER = 5, 0, 2
 CACHE_BYTES = 56 + 32 * 32
 CACHE_BYTES_V2 = CACHE_BYTES + 32
 RECEIPT_BYTES = 136 + 176  # a closed run: its first 136 bytes, then its root
+# With the program feature pipelines-v1 a run closes into a 380-byte D21Q
+# (its template's id, kind, windows and bonds appended); budget with this.
+RECEIPT_V2_BYTES = RECEIPT_BYTES + 68
 
 
 def remainder_recipient(run: bytes) -> bytes:

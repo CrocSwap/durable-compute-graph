@@ -843,7 +843,7 @@ fn decode_session(raw: &[u8]) -> Result<Session, ProgramError> {
         || (raw[1273] & FEATURE_TICKS != 0 && (raw[1273] & FEATURE_RING_STREAM == 0 || raw[7] != POLICY_INDEXED))
         // (No such rule for FEATURE_READS_RESOURCE: closing the resource copy
         // of a halted session clears the resource key.)
-        || raw[1278] & !7 != 0
+        || raw[1278] & !(if cfg!(feature = "pipelines-v1") { 7 } else { 3 }) != 0
         // A tree seal's chunk size: present exactly with bit 2, on a sealed
         // record, in range (pipelines design §3.4 C).
         || (raw[1278] & 4 != 0) != (raw[1279] != 0)
@@ -4064,14 +4064,15 @@ fn close_child(
         return Err(refusal(REFUSAL_STATE));
     }
     // With `pipelines-v1`, a session its kernel halted keeps its whole final
-    // state until it is sealed unless its authority signs the close
-    // (pipelines design §3.4 B): otherwise anyone could trim it first and deny
-    // its result. Anyone may seal it, so its rent is never stuck; once it is
-    // sealed or trimmed, anyone may close as before.
+    // state, sealed or not, until its authority signs a close of a state span
+    // or the resource copy (pipelines design §3.4 B; review 10-16 H2: after
+    // the seal too, or anyone could trim a sealed session and end its result
+    // before a consumer imports it). The rent goes to the authority in any
+    // case, so no one else gains by closing. Once the authority has trimmed
+    // it, anyone may close the rest as before.
     if cfg!(feature = "pipelines-v1")
         && matches!(kind, KIND_STATE | KIND_RESOURCE)
         && session.halt_reason != 0
-        && !session.sealed
         && !session.trimmed
         && !refund.is_signer
     {
@@ -4348,6 +4349,16 @@ fn begin_anchor(
         (!open_seal).then_some(authority.key),
     )?;
     let cursor = u32_at(data, 3);
+    // A stranger may begin only the seal form the kernel declares (review
+    // 10-16 H1): otherwise the first to seal would fix a form the session's
+    // consumers cannot import. The authority may begin either.
+    if open_seal && !(authority.is_signer && authority.key == &session.authority) && tree_log2 != kernel.open_seal_log2() {
+        return Err(refusal(REFUSAL_AUTHORITY));
+    }
+    // A tree seal of an empty state is undefined (review 10-16 L2).
+    if tree_log2 != 0 && session.state_bytes == 0 {
+        return Err(refusal(REFUSAL_STATE));
+    }
     // An anchor runs on a live session; a seal only on a session its kernel
     // halted, once (the halt cursor is the session cursor).
     let status_ok = if seal {

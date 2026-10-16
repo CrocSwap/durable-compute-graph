@@ -428,6 +428,15 @@ pub trait Kernel: Sync {
 /// this without advertising or implementing optimistic replay.
 pub trait StatefulKernel: Kernel {
     fn initial_state(&self, output: &mut [u8]) -> Result<usize, KernelError>;
+
+    /// The seal form anyone may begin on a session this kernel halted
+    /// (feature `pipelines-v1`, pipelines design §3.4 B): 0 for the linear
+    /// seal, or a tree seal's chunk size log2 (6..=16). The session's
+    /// authority may begin either form; a stranger only this one, so a
+    /// stranger cannot fix a form the session's consumers do not expect.
+    fn open_seal_log2(&self) -> u8 {
+        0
+    }
     fn transition(
         &self,
         input: &[u8],

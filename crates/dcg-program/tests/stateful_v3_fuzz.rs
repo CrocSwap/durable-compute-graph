@@ -1478,6 +1478,9 @@ impl Fuzz {
             }
             Op::SealBegin { payer, auth, cursor, tree } => {
                 (*tree == 0 || (OPEN_SEAL && (6..=16).contains(tree)))
+                    // A stranger only in the kernel's declared form (0 for
+                    // every fuzzed kernel; review H1).
+                    && (*auth == A || *tree == 0)
                     && m.open && !m.active && m.halt_reason != 0 && !m.sealed && !m.trimmed && *payer != A && (*auth == A || OPEN_SEAL)
                     && m.phase == PH_NONE && m.initialized && *cursor == m.cursor && m.anchor_cursor <= *cursor && m.states > 0
                     && m.anchor.as_ref().is_none_or(|a| !a.open)
@@ -1485,7 +1488,7 @@ impl Fuzz {
             Op::Close { child, kind, refund, signed } => {
                 // With `pipelines-v1`, the unsealed final state of a kernel
                 // halt closes only with the authority's signature.
-                let guarded = OPEN_SEAL && matches!(child, Child::State(_) | Child::Resource) && m.halt_reason != 0 && !m.sealed && !m.trimmed;
+                let guarded = OPEN_SEAL && matches!(child, Child::State(_) | Child::Resource) && m.halt_reason != 0 && !m.trimmed;
                 if guarded && !*signed {
                     return false;
                 }
